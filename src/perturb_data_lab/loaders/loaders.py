@@ -243,10 +243,12 @@ class WebDatasetCellReader(BackendCellReader):
         corpus_index_path: Path,
         shard_paths: list[Path],
         meta_path: Path,
+        feature_registry_path: Path | None = None,
     ):
         super().__init__(release_id, corpus_index_path)
         self.shard_paths = shard_paths
         self.meta_path = meta_path
+        self.feature_registry_path = feature_registry_path
         self._cell_index_to_shard: dict[int, tuple[int, int]] = {}
         self._build_index()
 
@@ -272,15 +274,18 @@ class WebDatasetCellReader(BackendCellReader):
 
     @property
     def total_genes(self) -> int:
-        # WebDataset reader does not have direct vocab access;
-        # estimate from max index seen during _build_index
+        """Total genes from feature registry when available, else from metadata."""
+        if self.feature_registry_path is not None:
+            from ..materializers.models import FeatureRegistryManifest
+
+            reg = FeatureRegistryManifest.from_yaml_file(self.feature_registry_path)
+            return len(reg.entries)
+        # Fallback: infer from max index seen during _build_index
         max_idx = 0
         for cell_idx in range(self._n_cells):
             _, local_idx = self._cell_index_to_shard[cell_idx]
             if local_idx > max_idx:
                 max_idx = local_idx
-        # This is an approximation; in practice the feature registry from
-        # materializers/models.py should be used for accurate vocab size
         return max_idx + 1
 
     def read_cell(self, cell_index: int) -> CellState:
@@ -331,6 +336,7 @@ class ZarrCellReader(BackendCellReader):
         sf_zarr_path: Path,
         meta_path: Path,
         chunk_cells: int = 1024,
+        feature_registry_path: Path | None = None,
     ):
         super().__init__(release_id, corpus_index_path)
         self.indices_zarr_path = indices_zarr_path
@@ -338,6 +344,7 @@ class ZarrCellReader(BackendCellReader):
         self.sf_zarr_path = sf_zarr_path
         self.meta_path = meta_path
         self.chunk_cells = chunk_cells
+        self.feature_registry_path = feature_registry_path
         self._n_cells: int | None = None
         self._n_vars: int | None = None
 
@@ -353,6 +360,13 @@ class ZarrCellReader(BackendCellReader):
 
     @property
     def total_genes(self) -> int:
+        """Total genes from feature registry when available, else from metadata."""
+        if self.feature_registry_path is not None:
+            from ..materializers.models import FeatureRegistryManifest
+
+            reg = FeatureRegistryManifest.from_yaml_file(self.feature_registry_path)
+            return len(reg.entries)
+        # Fallback: use n_vars from Zarr metadata JSON
         if self._n_vars is None:
             import json
 
