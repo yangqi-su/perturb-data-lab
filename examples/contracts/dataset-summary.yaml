@@ -6,13 +6,60 @@ dataset:
   source_path: /protected/read-only/source.h5ad
   obs_rows: 0
   var_rows: 0
+  obs_index_name: cell_id
+  var_index_name: gene_id
+structure:
+  has_raw: true
+  raw_var_rows: 0
+  layers:
+    - counts
+    - lognorm
+obs_fields:
+  - name: guide_name
+    dtype: category
+    null_count: 0
+    sampled_unique_values: 2
+    examples:
+      - NTC_1
+      - STAT1_1
+var_fields:
+  - name: feature_name
+    dtype: string
+    null_count: 0
+    sampled_unique_values: 2
+    examples:
+      - STAT1
+      - IFIT1
 count_source_candidates:
-  - name: X
+  - candidate: .raw.X
     rank: 1
-    status: needs-review
-    integer_likeness: unknown
+    status: pass
+    storage: sparse
+    dtype: int32
+    shape:
+      - 0
+      - 0
+    sampled_rows: 32
+    sampled_nonzero_values: 100
+    sampled_density: 0.01
+    fraction_noninteger_nonzero: 0.0
+    max_abs_integer_deviation: 0.0
+    nonnegative: true
+    inferred_transform: identity
+    recovery_policy: not-needed
+    notes:
+      - sample is exactly integer-valued
+count_source_decision:
+  selected_candidate: .raw.X
+  status: pass
+  confidence: high
+  recovery_policy: not-needed
+  rationale: Prefer raw backed counts when they remain integer-valued.
+materialization_readiness: pass
 canonical_defaults:
   missing_value_literal: NA
 raw_field_policy:
   preserve_source_obs_fields: true
   preserve_source_var_fields: true
+inspector_notes:
+  - metadata-first scan only; no full matrix materialization

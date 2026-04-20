@@ -7,6 +7,12 @@ name = "perturb-data-lab"
 version = "0.1.0"
 description = "Phase 1 blueprint and contracts for perturb-seq data onboarding."
 requires-python = ">=3.10"
+dependencies = [
+    "anndata>=0.11",
+    "numpy>=2.0",
+    "PyYAML>=6.0",
+    "scipy>=1.14",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

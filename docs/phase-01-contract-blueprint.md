@@ -11,7 +11,7 @@ perturb-data-lab/
 ├── docs/
 ├── examples/contracts/
 ├── src/perturb_data_lab/
-│   ├── contracts/
+│   ├── contracts.py
 │   ├── inspectors/
 │   ├── materializers/
 │   └── loaders/

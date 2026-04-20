@@ -1,19 +1,61 @@
 kind: schema-proposal
 contract_version: 0.1.0
 dataset_id: marson2025_k562
+source_path: /protected/read-only/source.h5ad
+summary_artifact: dataset-summary.yaml
 canonical_defaults:
   missing_value_literal: NA
+count_source_decision:
+  selected_candidate: .raw.X
+  status: pass
+  confidence: high
+  recovery_policy: not-needed
+  rationale: Raw matrix is the highest-ranked integer-valued candidate.
+transform_catalog:
+  - name: strip_prefix
+    description: Remove a known prefix from the raw value.
+  - name: strip_suffix
+    description: Remove a known suffix from the raw value.
+  - name: regex_sub
+    description: Apply a regex substitution before canonicalization.
+  - name: normalize_case
+    description: Normalize case to lower, upper, or title.
+  - name: recognize_control
+    description: Mark control-like perturbations from a source label.
+  - name: join_with_plus
+    description: Join multiple cleaned source fields with `+`.
 field_mappings:
   perturbation_label:
-    source_field: guide_name
+    source_fields:
+      - guide_name
+    strategy: source-field
     transforms: []
+    confidence: high
   perturbation_type:
-    source_field: guide_type
+    source_fields: []
+    strategy: literal
+    literal_value: CRISPR
     transforms: []
+    confidence: medium
   cell_context:
-    source_field: cell_line
+    source_fields:
+      - cell_line
+    strategy: source-field
     transforms: []
+    confidence: high
+  control_flag:
+    source_fields:
+      - guide_name
+    strategy: derived
+    transforms:
+      - name: recognize_control
+        args:
+          patterns:
+            - ^NTC
+            - control
+    confidence: medium
 unresolved_fields:
   - target_id
   - dose
   - timepoint
+materialization_readiness: needs-review
