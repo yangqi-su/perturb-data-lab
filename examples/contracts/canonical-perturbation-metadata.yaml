@@ -1,0 +1,14 @@
+kind: canonical-perturbation-metadata
+contract_version: 0.1.0
+missing_value_literal: NA
+fields:
+  - perturbation_label
+  - perturbation_type
+  - target_id
+  - target_label
+  - control_flag
+  - dose
+  - dose_unit
+  - timepoint
+  - timepoint_unit
+  - combination_key

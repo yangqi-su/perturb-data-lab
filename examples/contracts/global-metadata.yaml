@@ -1,0 +1,9 @@
+kind: global-metadata
+contract_version: 0.1.0
+corpus_id: perturb-data-lab-v0
+feature_registry: examples/contracts/feature-registry.yaml
+default_missing_value_literal: NA
+raw_field_policy: preserve-unchanged
+active_contracts:
+  perturbation_metadata: canonical-perturbation-metadata
+  context_metadata: canonical-context-metadata

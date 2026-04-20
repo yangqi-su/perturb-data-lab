@@ -1,0 +1,13 @@
+kind: schema-patch
+contract_version: 0.1.0
+dataset_id: marson2025_k562
+patches:
+  - field: target_id
+    action: set-literal
+    value: NA
+  - field: control_flag
+    action: regex-map
+    source_field: guide_name
+    pattern: ^NTC
+    value_if_match: true
+    value_if_no_match: false

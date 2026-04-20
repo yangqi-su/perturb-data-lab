@@ -1,0 +1,16 @@
+kind: canonical-context-metadata
+contract_version: 0.1.0
+missing_value_literal: NA
+fields:
+  - dataset_id
+  - dataset_release
+  - cell_context
+  - cell_line_or_type
+  - species
+  - tissue
+  - assay
+  - condition
+  - batch_id
+  - donor_id
+  - sex
+  - disease_state

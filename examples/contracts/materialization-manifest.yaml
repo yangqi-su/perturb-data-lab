@@ -1,0 +1,15 @@
+kind: materialization-manifest
+contract_version: 0.1.0
+dataset_id: marson2025_k562
+release_id: marson2025_k562-v0
+route: create_new
+count_source:
+  selected: X
+  integer_only: true
+outputs:
+  metadata_root: outputs/metadata/marson2025_k562-v0
+  matrix_root: outputs/matrix/marson2025_k562-v0
+provenance:
+  source_path: /protected/read-only/source.h5ad
+  schema_proposal: examples/contracts/schema-proposal.yaml
+  schema_patch: examples/contracts/schema-patch.yaml

@@ -1,0 +1,19 @@
+kind: schema-proposal
+contract_version: 0.1.0
+dataset_id: marson2025_k562
+canonical_defaults:
+  missing_value_literal: NA
+field_mappings:
+  perturbation_label:
+    source_field: guide_name
+    transforms: []
+  perturbation_type:
+    source_field: guide_type
+    transforms: []
+  cell_context:
+    source_field: cell_line
+    transforms: []
+unresolved_fields:
+  - target_id
+  - dose
+  - timepoint

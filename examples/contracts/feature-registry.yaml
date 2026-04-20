@@ -1,0 +1,12 @@
+kind: feature-registry
+contract_version: 0.1.0
+registry_id: human-gene-v1
+append_only: true
+namespace: ensembl
+feature_id_field: gene_id
+feature_label_field: gene_symbol
+default_missing_value: NA
+entries:
+  - token_id: 0
+    feature_id: ENSG00000000003
+    feature_label: TSPAN6
