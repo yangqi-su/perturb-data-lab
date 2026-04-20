@@ -2,7 +2,7 @@
 
 This module implements the canonical materialization layer:
 - sparse per-cell storage contract
-- three join/mutation modes: create_new, append_monolithic, append_routed
+- two join/mutation modes: create_new, append_routed
 - per-dataset manifest and feature registry append logic
 
 All materialization writes go to repo-local real directories only.
@@ -19,6 +19,9 @@ from typing import Any, Iterable, Sequence
 
 import anndata as ad
 import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import scipy.sparse as sp
 from scipy.sparse import csr_matrix, issparse
 
@@ -39,7 +42,10 @@ from .models import (
     SizeFactorManifest,
 )
 from .backends import materialize_arrow_hf, materialize_webdataset, materialize_zarr
+from .schema_execution import resolve_all_cell_rows, resolve_all_feature_rows
+from .validation import validate_schema_readiness
 from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
+from ..inspectors.models import SchemaDocument
 
 
 # ---------------------------------------------------------------------------
@@ -124,15 +130,25 @@ class MaterializationRoute:
     def materialize(
         self,
         source_path: str,
-        schema_proposal_path: str,
-        schema_patch_path: str,
-        patch_accepted: bool = True,
+        schema_path: str,
     ) -> MaterializationManifest:
         """Materialize a dataset using this route.
 
         Returns a filled MaterializationManifest with paths to all written artifacts.
         Subclasses override _write_cells() for backend-specific storage.
+
+        Raises
+        ------
+        ValueError
+            If the schema is not in ``status: ready`` or required fields are null.
         """
+        # --- Schema readiness validation gate ---
+        readiness = validate_schema_readiness(schema_path)
+        readiness.raise_if_not_ready()
+
+        # Load the reviewed schema (used for row-wise canonical metadata execution)
+        schema = SchemaDocument.from_yaml_file(Path(schema_path))
+
         # Resolve source h5ad
         source_h5ad = Path(source_path)
         if not source_h5ad.exists():
@@ -201,7 +217,16 @@ class MaterializationRoute:
         # Write cell metadata table (parquet-backed via Arrow, or simple SQLite)
         cell_meta_path = self._write_cell_metadata(
             adata=adata,
+            schema=schema,
             size_factors=size_factors,
+            meta_root=meta_root,
+        )
+
+        # Write per-dataset feature objects (original order + tokenized companion)
+        feature_meta_paths = self._write_feature_metadata(
+            adata=adata,
+            schema=schema,
+            registry=registry,
             meta_root=meta_root,
         )
 
@@ -230,10 +255,12 @@ class MaterializationRoute:
             outputs=self.output_roots,
             provenance=ProvenanceSpec(
                 source_path=str(source_h5ad),
-                schema_proposal=schema_proposal_path,
-                schema_patch=schema_patch_path,
+                schema=schema_path,
             ),
             feature_manifest_path=str(feature_registry_path),
+            feature_meta_paths={
+                k: str(v) for k, v in feature_meta_paths.items()
+            },
             size_factor_manifest_path=str(sf_path),
             qa_manifest_path=str(qa_path),
             integer_verified=all_passed,
@@ -270,7 +297,7 @@ class MaterializationRoute:
             raise ValueError(
                 f"count matrix in {source_name} contains non-integer values; "
                 "materialization requires strict integer counts. "
-                "Provide a schema-patch that selects an integer-compliant count source."
+                "Provide a schema that selects an integer-compliant count source."
             )
 
     def _compute_size_factors(self, count_matrix: Any, n_obs: int) -> np.ndarray:
@@ -359,42 +386,148 @@ class MaterializationRoute:
     def _write_cell_metadata(
         self,
         adata: ad.AnnData,
+        schema: SchemaDocument,
         size_factors: np.ndarray,
         meta_root: Path,
     ) -> Path:
-        """Write cell metadata as SQLite (phase-3 minimal metadata store)."""
+        """Write cell metadata as SQLite with full canonical cell metadata per cell.
+
+        Canonical perturbation and context fields are resolved row-wise from the
+        schema. Raw obs fields not used as canonical sources are preserved as JSON.
+        """
+        import json
+
         db_path = meta_root / f"{self.release_id}-cell-meta.sqlite"
+
+        # Collect source field names used by the schema so we can exclude them
+        # from raw_obs preservation
+        source_columns: set[str] = set()
+        for entry in list(schema.perturbation_fields.values()) + list(
+            schema.context_fields.values()
+        ):
+            source_columns.update(entry.source_fields)
+
+        # Load obs into memory once for efficient per-row access
+        # to_memory() exists on backed AnnData obs/var views; for non-backed
+        # or plain pandas objects, the DataFrame is already in memory
+        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
+
+        # Resolve canonical metadata for all cells via schema execution
+        perturbations, contexts = resolve_all_cell_rows(schema, obs_mem)
+
         conn = sqlite3.connect(str(db_path))
         conn.execute(
             "CREATE TABLE IF NOT EXISTS cell_meta "
             "(cell_id TEXT, dataset_id TEXT, dataset_release TEXT, "
-            "size_factor REAL, raw_obs TEXT)"
+            "size_factor REAL, canonical_perturbation TEXT, "
+            "canonical_context TEXT, raw_obs TEXT)"
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cell_id ON cell_meta(cell_id)")
 
         batch_size = 256
-        for start in range(0, adata.n_obs, batch_size):
-            end = min(start + batch_size, adata.n_obs)
+        n_obs = adata.n_obs
+        for start in range(0, n_obs, batch_size):
+            end = min(start + batch_size, n_obs)
             batch = []
             for i in range(start, end):
-                # Access obs by index position only, no iloc on backed AnnData
-                cell_id = str(adata.obs.index[i])
+                cell_id = str(obs_mem.index[i])
+                pert = perturbations[i]
+                ctx = contexts[i]
+                # Preserve raw obs fields not used as schema sources
+                raw: dict[str, Any] = {}
+                for col in obs_mem.columns:
+                    if col not in source_columns:
+                        val = obs_mem.loc[obs_mem.index[i], col]
+                        raw[str(col)] = None if pd.isna(val) else str(val)
+                raw_json = json.dumps(raw) if raw else "{}"
                 batch.append(
                     (
                         cell_id,
                         self.dataset_id,
                         self.release_id,
                         float(size_factors[i]),
-                        "",
+                        json.dumps(dict(pert)),
+                        json.dumps(dict(ctx)),
+                        raw_json,
                     )
                 )
             conn.executemany(
-                "INSERT INTO cell_meta VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO cell_meta VALUES (?, ?, ?, ?, ?, ?, ?)",
                 batch,
             )
         conn.commit()
         conn.close()
         return db_path
+
+    def _write_feature_metadata(
+        self,
+        adata: ad.AnnData,
+        schema: SchemaDocument,
+        registry: FeatureRegistryManifest,
+        meta_root: Path,
+    ) -> dict[str, Path]:
+        """Write per-dataset canonical feature objects.
+
+        Two objects are written per dataset:
+        1. ``{release_id}-features-origin.parquet`` — canonical feature metadata
+           in original dataset feature order (var index order), resolved via
+           schema execution.  One row per feature.
+        2. ``{release_id}-features-token.parquet`` — tokenized companion mapping
+           each original feature index to its token ID from the feature registry.
+           One row per feature in original order.
+
+        Both objects are compact (one row per feature, not one per cell) and
+        shared by all cells of the dataset.  The tokenized object enables loaders
+        to translate dataset-order sparse indices to token-space without
+        re-tokenizing at load time.
+        """
+        import json
+
+        # Resolve all feature rows via schema execution (one row per feature)
+        var_mem = adata.var.to_memory() if hasattr(adata.var, "to_memory") else adata.var
+        feature_rows = resolve_all_feature_rows(schema, var_mem)
+
+        # Build origin-order feature table
+        origin_path = meta_root / f"{self.release_id}-features-origin.parquet"
+        origin_indices = list(range(adata.n_vars))
+        origin_feature_ids = [str(adata.var.index[i]) for i in origin_indices]
+
+        origin_table = pa.table(
+            {
+                "origin_index": pa.array(origin_indices, type=pa.int32()),
+                "feature_id": pa.array(origin_feature_ids, type=pa.string()),
+            }
+        )
+        # Attach resolved canonical feature fields as a struct column
+        field_names = list(schema.feature_fields.keys())
+        canonical_struct = pa.struct([
+            (fname, pa.string()) for fname in field_names
+        ])
+        canonical_values = [[row.get(fname, MISSING_VALUE_LITERAL) for row in feature_rows] for fname in field_names]
+        canonical_array = pa.array([dict(zip(field_names, vals)) for vals in zip(*canonical_values)], type=canonical_struct)
+        origin_table = origin_table.append_column("canonical", canonical_array)
+        pq.write_table(origin_table, origin_path)
+
+        # Build tokenized companion: map original var index → token ID
+        token_path = meta_root / f"{self.release_id}-features-token.parquet"
+        registry_map = {
+            str(entry.feature_id): entry.token_id
+            for entry in registry.entries
+        }
+        token_ids = [
+            registry_map.get(str(adata.var.index[i]), -1)
+            for i in range(adata.n_vars)
+        ]
+        token_table = pa.table(
+            {
+                "origin_index": pa.array(origin_indices, type=pa.int32()),
+                "feature_id": pa.array(origin_feature_ids, type=pa.string()),
+                "token_id": pa.array(token_ids, type=pa.int32()),
+            }
+        )
+        pq.write_table(token_table, token_path)
+
+        return {"features_origin": origin_path, "features_token": token_path}
 
     def _run_qa_checks(
         self,
@@ -417,7 +550,11 @@ class MaterializationRoute:
 
 
 class CreateNewRoute(MaterializationRoute):
-    """Materialization route: create a new standalone dataset release."""
+    """Materialization route: create a new standalone dataset release.
+
+    This is used when materializing the first dataset of a new corpus,
+    or a standalone dataset that will not be joined to a corpus.
+    """
 
     route_name = "create_new"
 
@@ -433,35 +570,13 @@ class CreateNewRoute(MaterializationRoute):
         )
 
 
-class AppendMonolithicRoute(MaterializationRoute):
-    """Materialization route: append a dataset to a monolithic corpus.
-
-    Append means adding cell records to the existing releases, and extending
-    the feature registry with new token IDs while preserving existing ones.
-    The corpus index is updated to reflect the new dataset join record.
-    """
-
-    route_name = "append_monolithic"
-
-    def _write_cells(
-        self,
-        count_matrix: Any,
-        adata: ad.AnnData,
-        size_factors: np.ndarray,
-        matrix_root: Path,
-    ) -> dict[str, Path]:
-        return materialize_arrow_hf(
-            adata, count_matrix, size_factors, self.release_id, matrix_root
-        )
-
-
 class AppendRoutedRoute(MaterializationRoute):
-    """Materialization route: add a dataset via routed/indexed assembly.
+    """Materialization route: add a dataset to a growing indexed corpus.
 
-    Instead of a single monolithic output, each dataset is stored independently
-    with its own manifest. A corpus index maps dataset IDs to release IDs and
-    join modes. This enables flexible downstream sampling without full corpus
-    materialization.
+    Each dataset is stored independently with its own manifest. A corpus index
+    maps dataset IDs to release IDs. The feature registry is appended with new
+    token IDs while preserving existing entries. This is the default path for
+    corpora expected to grow with additional datasets.
     """
 
     route_name = "append_routed"
@@ -494,7 +609,6 @@ def build_materialization_route(
     """Factory to build the correct materialization route by name."""
     routes = {
         "create_new": CreateNewRoute,
-        "append_monolithic": AppendMonolithicRoute,
         "append_routed": AppendRoutedRoute,
     }
     if route not in routes:

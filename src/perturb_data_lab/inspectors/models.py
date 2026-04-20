@@ -272,6 +272,220 @@ class DatasetSummaryDocument(YamlDocument):
 
 
 @dataclass(frozen=True)
+class SchemaFieldEntry:
+    source_fields: tuple[str, ...]
+    strategy: str  # source-field | literal | derived | null
+    transforms: tuple[TransformSpec, ...]
+    confidence: str  # high | medium | low
+    required: bool
+    literal_value: str | None = None
+    notes: tuple[str, ...] = ()
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "SchemaFieldEntry":
+        return cls(
+            source_fields=tuple(str(item) for item in data.get("source_fields", [])),
+            strategy=str(data["strategy"]),
+            transforms=_coerce_tuple(data.get("transforms"), TransformSpec),
+            confidence=str(data["confidence"]),
+            required=bool(data.get("required", False)),
+            literal_value=data.get("literal_value"),
+            notes=tuple(str(item) for item in data.get("notes", [])),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+
+@dataclass(frozen=True)
+class CountSourceSpec:
+    selected: str
+    integer_only: bool
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "CountSourceSpec":
+        return cls(
+            selected=str(data["selected"]),
+            integer_only=bool(data.get("integer_only", True)),
+        )
+
+
+@dataclass(frozen=True)
+class FeatureTokenizationSpec:
+    selected: str  # which var column is the tokenization target
+    namespace: str  # e.g. "ensembl", "gene_symbol"
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "FeatureTokenizationSpec":
+        return cls(
+            selected=str(data["selected"]),
+            namespace=str(data.get("namespace", "unknown")),
+        )
+
+
+@dataclass(frozen=True)
+class SchemaDocument(YamlDocument):
+    """Unified schema artifact: one editable document replacing schema-proposal + schema-patch.
+
+    Status lifecycle:
+    - ``status: draft`` — auto-generated; requires human review before materialization
+    - ``status: ready`` — reviewed; all required fields have non-null strategies; materialization permitted
+
+    Unresolved fields are represented inline with ``strategy: null`` (no separate unresolved list).
+    Multi-source values are joined with ``_`` before transforms are applied.
+    """
+
+    kind: str
+    contract_version: str
+    dataset_id: str
+    source_path: str
+    status: str  # draft | ready
+    dataset_metadata: dict[str, SchemaFieldEntry]
+    perturbation_fields: dict[str, SchemaFieldEntry]
+    context_fields: dict[str, SchemaFieldEntry]
+    feature_fields: dict[str, SchemaFieldEntry]
+    count_source: CountSourceSpec
+    feature_tokenization: FeatureTokenizationSpec
+    transform_catalog: tuple[TransformCatalogEntry, ...]
+    materialization_notes: tuple[str, ...] = ()
+
+    def validate(self) -> None:
+        if self.kind != "schema":
+            raise ValueError("schema kind mismatch")
+        if self.contract_version != CONTRACT_VERSION:
+            raise ValueError("schema contract version mismatch")
+        if not self.dataset_id:
+            raise ValueError("dataset_id is required")
+        if self.status not in {"draft", "ready"}:
+            raise ValueError("invalid schema status")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = super().to_dict()
+        # Serialize nested dicts of SchemaFieldEntry
+        for section in (
+            "dataset_metadata",
+            "perturbation_fields",
+            "context_fields",
+            "feature_fields",
+        ):
+            if section in payload and isinstance(payload[section], dict):
+                payload[section] = {
+                    key: (
+                        value.to_dict()
+                        if isinstance(value, YamlDocument)
+                        else _serialize(value)
+                    )
+                    for key, value in payload[section].items()
+                }
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "SchemaDocument":
+        def _parse_field_entry(entry_data: Any) -> SchemaFieldEntry:
+            if isinstance(entry_data, SchemaFieldEntry):
+                return entry_data
+            return SchemaFieldEntry.from_dict(entry_data)
+
+        document = cls(
+            kind=str(data["kind"]),
+            contract_version=str(data["contract_version"]),
+            dataset_id=str(data["dataset_id"]),
+            source_path=str(data["source_path"]),
+            status=str(data["status"]),
+            dataset_metadata={
+                str(k): _parse_field_entry(v)
+                for k, v in dict(data.get("dataset_metadata", {})).items()
+            },
+            perturbation_fields={
+                str(k): _parse_field_entry(v)
+                for k, v in dict(data.get("perturbation_fields", {})).items()
+            },
+            context_fields={
+                str(k): _parse_field_entry(v)
+                for k, v in dict(data.get("context_fields", {})).items()
+            },
+            feature_fields={
+                str(k): _parse_field_entry(v)
+                for k, v in dict(data.get("feature_fields", {})).items()
+            },
+            count_source=CountSourceSpec.from_dict(data["count_source"]),
+            feature_tokenization=FeatureTokenizationSpec.from_dict(
+                data.get("feature_tokenization", {})
+            ),
+            transform_catalog=_coerce_tuple(
+                data.get("transform_catalog"), TransformCatalogEntry
+            ),
+            materialization_notes=tuple(
+                str(item) for item in data.get("materialization_notes", [])
+            ),
+        )
+        document.validate()
+        return document
+
+    @classmethod
+    def from_yaml_file(cls, file_path: Path) -> "SchemaDocument":
+        return cls.from_dict(cls._load_yaml_dict(file_path))
+
+    @classmethod
+    def new_draft(
+        cls,
+        dataset_id: str,
+        source_path: str,
+        dataset_metadata: dict[str, SchemaFieldEntry],
+        perturbation_fields: dict[str, SchemaFieldEntry],
+        context_fields: dict[str, SchemaFieldEntry],
+        feature_fields: dict[str, SchemaFieldEntry],
+        count_source: CountSourceSpec,
+        feature_tokenization: FeatureTokenizationSpec,
+        transform_catalog: tuple[TransformCatalogEntry, ...] = (),
+        materialization_notes: tuple[str, ...] = (),
+    ) -> "SchemaDocument":
+        """Factory: create a new ``status: draft`` schema document."""
+        return cls(
+            kind="schema",
+            contract_version=CONTRACT_VERSION,
+            dataset_id=dataset_id,
+            source_path=source_path,
+            status="draft",
+            dataset_metadata=dataset_metadata,
+            perturbation_fields=perturbation_fields,
+            context_fields=context_fields,
+            feature_fields=feature_fields,
+            count_source=count_source,
+            feature_tokenization=feature_tokenization,
+            transform_catalog=transform_catalog,
+            materialization_notes=materialization_notes,
+        )
+
+    def is_ready(self) -> bool:
+        """Return True when all required fields have a non-null strategy."""
+        if self.status != "ready":
+            return False
+        for section in (
+            self.perturbation_fields,
+            self.context_fields,
+            self.feature_fields,
+        ):
+            for name, entry in section.items():
+                if entry.required and entry.strategy == "null":
+                    return False
+        return True
+
+    def required_cell_fields(self) -> list[str]:
+        """List of required cell field names (both perturbation and context)."""
+        result = []
+        for section in (self.perturbation_fields, self.context_fields):
+            for name, entry in section.items():
+                if entry.required:
+                    result.append(name)
+        return result
+
+    def required_feature_fields(self) -> list[str]:
+        """List of required feature field names."""
+        return [name for name, entry in self.feature_fields.items() if entry.required]
+
+
+@dataclass(frozen=True)
 class SchemaProposalDocument(YamlDocument):
     kind: str
     contract_version: str
@@ -414,8 +628,7 @@ class InspectionBatchConfig(YamlDocument):
 class InspectionBatchRecord:
     dataset_id: str
     dataset_summary: str
-    schema_proposal: str
-    schema_patch: str
+    schema: str
     selected_count_source: str
     materialization_readiness: str
 

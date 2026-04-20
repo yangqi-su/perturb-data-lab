@@ -1,4 +1,4 @@
-"""Phase 4 training-facing loaders and samplers."""
+"""Phase 4/8 training-facing loaders and samplers."""
 
 from .loaders import (
     ArrowHFCellReader,
@@ -8,6 +8,7 @@ from .loaders import (
     HVGRandomSampler,
     PerturbDataLoader,
     PerturbIterableDataset,
+    PreloadedFeatureObjects,
     RandomContextSampler,
     SamplerState,
     WebDatasetCellReader,
@@ -18,6 +19,7 @@ from .loaders import (
 
 __all__ = [
     "CellState",
+    "PreloadedFeatureObjects",
     "BackendCellReader",
     "ArrowHFCellReader",
     "WebDatasetCellReader",

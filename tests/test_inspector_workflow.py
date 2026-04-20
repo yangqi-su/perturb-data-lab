@@ -10,8 +10,7 @@ from scipy.sparse import csr_matrix
 from perturb_data_lab.inspectors.models import (
     DatasetSummaryDocument,
     InspectionBatchConfig,
-    SchemaPatchDocument,
-    SchemaProposalDocument,
+    SchemaDocument,
 )
 from perturb_data_lab.inspectors.workflow import run_batch
 
@@ -57,16 +56,13 @@ def test_inspector_workflow_round_trip(tmp_path: Path) -> None:
     summary = DatasetSummaryDocument.from_yaml_file(
         dataset_dir / "dataset-summary.yaml"
     )
-    proposal = SchemaProposalDocument.from_yaml_file(
-        dataset_dir / "schema-proposal.yaml"
-    )
-    patch = SchemaPatchDocument.from_yaml_file(dataset_dir / "schema-patch.yaml")
+    schema = SchemaDocument.from_yaml_file(dataset_dir / "schema.yaml")
 
     assert summary.count_source_decision.selected_candidate == ".raw.X"
     assert summary.count_source_decision.status == "pass"
-    assert proposal.field_mappings["dataset_id"].literal_value == "tiny_crispr"
-    assert proposal.field_mappings["perturbation_type"].literal_value == "CRISPR"
-    assert patch.review_status == "pending"
+    assert schema.dataset_metadata["dataset_id"].literal_value == "tiny_crispr"
+    assert schema.perturbation_fields["perturbation_type"].literal_value == "CRISPR"
+    assert schema.status == "draft"
 
 
 def test_inspector_prefers_textual_guide_fields_over_numeric_scores(
@@ -105,12 +101,12 @@ def test_inspector_prefers_textual_guide_fields_over_numeric_scores(
     )
 
     run_batch(InspectionBatchConfig.from_yaml_file(config_path), workers=1)
-    proposal = SchemaProposalDocument.from_yaml_file(
-        output_root / "marson_like" / "schema-proposal.yaml"
+    schema = SchemaDocument.from_yaml_file(
+        output_root / "marson_like" / "schema.yaml"
     )
 
-    assert proposal.field_mappings["perturbation_label"].source_fields == ("guide_id",)
-    assert proposal.field_mappings["target_label"].source_fields == (
+    assert schema.perturbation_fields["perturbation_label"].source_fields == ("guide_id",)
+    assert schema.perturbation_fields["target_label"].source_fields == (
         "perturbed_gene_name",
     )
-    assert proposal.field_mappings["target_id"].source_fields == ("perturbed_gene_id",)
+    assert schema.perturbation_fields["target_id"].source_fields == ("perturbed_gene_id",)

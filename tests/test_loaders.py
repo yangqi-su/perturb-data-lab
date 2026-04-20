@@ -283,17 +283,27 @@ def _make_synthetic_arrow_parquet(tmp_path: Path) -> tuple[Path, Path, Path]:
     )
     pq.write_table(meta_table, meta_path)
 
-    # Synthetic SQLite
+    # Synthetic SQLite — Phase 6+ schema with canonical_perturbation/context columns
+    import json
     conn = sqlite3.connect(str(sqlite_path))
     conn.execute(
         "CREATE TABLE IF NOT EXISTS cell_meta "
         "(cell_id TEXT, dataset_id TEXT, dataset_release TEXT, "
-        "size_factor REAL, raw_obs TEXT)"
+        "size_factor REAL, canonical_perturbation TEXT, "
+        "canonical_context TEXT, raw_obs TEXT)"
     )
     for i in range(n_cells):
         conn.execute(
-            "INSERT INTO cell_meta VALUES (?, ?, ?, ?, ?)",
-            (f"syn_cell_{i}", "synthetic_ds", "v0", sf_list[i], ""),
+            "INSERT INTO cell_meta VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"syn_cell_{i}",
+                "synthetic_ds",
+                "v0",
+                sf_list[i],
+                json.dumps({}),
+                json.dumps({}),
+                json.dumps({}),
+            ),
         )
     conn.commit()
     conn.close()

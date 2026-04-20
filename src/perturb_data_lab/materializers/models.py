@@ -82,15 +82,13 @@ class OutputRoots:
 @dataclass(frozen=True)
 class ProvenanceSpec:
     source_path: str
-    schema_proposal: str
-    schema_patch: str
+    schema: str  # single unified schema artifact path
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ProvenanceSpec":
         return cls(
             source_path=str(data["source_path"]),
-            schema_proposal=str(data["schema_proposal"]),
-            schema_patch=str(data.get("schema_patch", "")),
+            schema=str(data["schema"]),
         )
 
 
@@ -154,6 +152,7 @@ class MaterializationManifest(YamlDocument):
     outputs: OutputRoots
     provenance: ProvenanceSpec
     feature_manifest_path: str | None = None
+    feature_meta_paths: dict[str, str] | None = None
     size_factor_manifest_path: str | None = None
     qa_manifest_path: str | None = None
     hvg_sidecar_path: str | None = None
@@ -165,7 +164,7 @@ class MaterializationManifest(YamlDocument):
             raise ValueError("materialization manifest kind mismatch")
         if self.contract_version != CONTRACT_VERSION:
             raise ValueError("materialization manifest contract version mismatch")
-        if self.route not in {"create_new", "append_monolithic", "append_routed"}:
+        if self.route not in {"create_new", "append_routed"}:
             raise ValueError(f"invalid route: {self.route}")
 
     @classmethod
@@ -180,6 +179,9 @@ class MaterializationManifest(YamlDocument):
             outputs=OutputRoots.from_dict(data["outputs"]),
             provenance=ProvenanceSpec.from_dict(data["provenance"]),
             feature_manifest_path=data.get("feature_manifest_path"),
+            feature_meta_paths={
+                k: str(v) for k, v in (data.get("feature_meta_paths") or {}).items()
+            },
             size_factor_manifest_path=data.get("size_factor_manifest_path"),
             qa_manifest_path=data.get("qa_manifest_path"),
             hvg_sidecar_path=data.get("hvg_sidecar_path"),

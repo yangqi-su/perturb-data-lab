@@ -13,16 +13,17 @@ from ..contracts import BLUEPRINT, CONTRACT_VERSION, MISSING_VALUE_LITERAL
 from .models import (
     CountSourceCandidate,
     CountSourceDecision,
+    CountSourceSpec,
     DatasetIdentity,
     DatasetSummaryDocument,
-    FieldMapping,
+    FeatureTokenizationSpec,
     FieldProfile,
     InspectionBatchConfig,
     InspectionBatchManifest,
     InspectionBatchRecord,
     InspectionTarget,
-    SchemaPatchDocument,
-    SchemaProposalDocument,
+    SchemaDocument,
+    SchemaFieldEntry,
     StructureSummary,
 )
 from .transforms import TRANSFORM_CATALOG, build_transform
@@ -32,9 +33,35 @@ DEFAULT_FIELD_SAMPLE_SIZE = 5
 DEFAULT_MATRIX_SAMPLE_ROWS = 32
 CONTROL_PATTERNS = (r"^ntc", r"non[-_ ]?target", r"control", r"mock", r"wt")
 
+# Feature-field aliases for tokenization identity and label heuristics
+FEATURE_FIELD_ALIASES = {
+    "feature_id": (
+        "feature_id",
+        "gene_id",
+        "ensembl",
+        "ensembl_id",
+        "feature_id_from_multiome",
+    ),
+    "feature_label": (
+        "feature_name",
+        "gene_symbol",
+        "gene_name",
+        "feature_name_from_multiome",
+    ),
+    "feature_namespace": (
+        "namespace",
+        "feature_namespace",
+        "gene_name_db",
+    ),
+}
+
+CANONICAL_FEATURE_FIELDS = ("feature_id", "feature_label", "feature_namespace")
+
 CANONICAL_FIELDS = tuple(
-    field.name for field in BLUEPRINT.perturbation_fields + BLUEPRINT.context_fields
-)
+    field.name
+    for field in BLUEPRINT.perturbation_fields + BLUEPRINT.context_fields
+) + CANONICAL_FEATURE_FIELDS
+
 REQUIRED_CANONICAL_FIELDS = {
     field.name
     for field in BLUEPRINT.perturbation_fields + BLUEPRINT.context_fields
@@ -72,6 +99,45 @@ FIELD_ALIASES = {
         "gene",
         "target",
     ),
+    "perturbation_type": (
+        "perturbation_type",
+        "pert_type",
+        "perttype",
+        "type",
+    ),
+    "control_flag": (
+        "control_flag",
+        "is_control",
+        "is_neg",
+        "neg_control",
+    ),
+    "dose": (
+        "dose",
+        "concentration",
+        "conc",
+        "amount",
+    ),
+    "dose_unit": (
+        "dose_unit",
+        "conc_unit",
+        "unit",
+    ),
+    "timepoint": (
+        "timepoint",
+        "time",
+        "duration",
+        "exposure_time",
+    ),
+    "timepoint_unit": (
+        "timepoint_unit",
+        "time_unit",
+    ),
+    "combination_key": (
+        "combination_key",
+        "combo_key",
+        "combo",
+        "multiplex_key",
+    ),
     "cell_context": (
         "cell_context",
         "cell_line",
@@ -103,8 +169,7 @@ FIELD_ALIASES = {
 class InspectionArtifacts:
     dataset_id: str
     dataset_summary: Path
-    schema_proposal: Path
-    schema_patch: Path
+    schema: Path
     selected_count_source: str
     materialization_readiness: str
 
@@ -355,6 +420,136 @@ def _is_text_like_dtype(dtype_name: str) -> bool:
     return any(token in lowered for token in ("object", "string", "category"))
 
 
+def _build_feature_field_entry(
+    field_name: str,
+    source_field: str | None,
+    confidence: str,
+    required: bool,
+    notes: tuple[str, ...] = (),
+    literal_value: str | None = None,
+) -> SchemaFieldEntry:
+    """Build a SchemaFieldEntry for a feature field, using null strategy when no source is found."""
+    if source_field is None:
+        return SchemaFieldEntry(
+            source_fields=(),
+            strategy="null",
+            transforms=(),
+            confidence=confidence,
+            required=required,
+            literal_value=None,
+            notes=notes,
+        )
+    return SchemaFieldEntry(
+        source_fields=(source_field,),
+        strategy="source-field",
+        transforms=(),
+        confidence=confidence,
+        required=required,
+        literal_value=literal_value,
+        notes=notes,
+    )
+
+
+def _rank_feature_candidates(
+    var_fields: tuple[FieldProfile, ...],
+) -> list[tuple[FieldProfile, int]]:
+    """Rank var columns as tokenization identity candidates.
+
+    Scoring logic mirrors count-source priority: exact matches on high-signal
+    alias keys score highest; text-like dtypes are preferred for id/label fields.
+    Returns a list of (profile, score) sorted descending.
+    """
+    results = []
+    for profile in var_fields:
+        normalized = _normalize_label(profile.name)
+        dtype_score = 30 if _is_text_like_dtype(profile.dtype) else -50
+        alias_score = 0
+        for field_name, aliases in FEATURE_FIELD_ALIASES.items():
+            for position, alias in enumerate(aliases):
+                alias_key = _normalize_label(alias)
+                if not alias_key:
+                    continue
+                base = max(0, 100 - position)
+                if normalized == alias_key:
+                    alias_score = max(alias_score, base + 500)
+                elif normalized.startswith(alias_key):
+                    alias_score = max(alias_score, base + 200)
+                elif alias_key in normalized:
+                    alias_score = max(alias_score, base)
+        score = alias_score + dtype_score
+        results.append((profile, score))
+    return sorted(results, key=lambda item: item[1], reverse=True)
+
+
+def _build_feature_fields_section(
+    var_fields: tuple[FieldProfile, ...],
+    var_index_name: str,
+) -> dict[str, SchemaFieldEntry]:
+    """Build the complete feature_fields dict for the new schema artifact.
+
+    All three canonical feature fields are always present. When no reliable
+    source is found for a given field, the entry uses ``strategy: null`` so
+    the field is unresolved inline rather than in a separate list.
+    """
+    ranked = _rank_feature_candidates(var_fields)
+    # Pick best candidate per field_name
+    best_per_field: dict[str, str | None] = {
+        "feature_id": None,
+        "feature_label": None,
+        "feature_namespace": None,
+    }
+    for profile, score in ranked:
+        if score < 0:
+            continue
+        normalized = _normalize_label(profile.name)
+        for field_name, aliases in FEATURE_FIELD_ALIASES.items():
+            if best_per_field[field_name] is not None:
+                continue
+            for alias in aliases:
+                if _normalize_label(alias) == normalized:
+                    best_per_field[field_name] = profile.name
+                    break
+            if best_per_field[field_name] is not None:
+                break
+
+    # Build entries: feature_id is required, others optional
+    feature_fields: dict[str, SchemaFieldEntry] = {}
+    feature_fields["feature_id"] = _build_feature_field_entry(
+        "feature_id",
+        best_per_field["feature_id"],
+        confidence="high" if best_per_field["feature_id"] else "low",
+        required=True,
+        notes=(
+            "primary tokenization identity source; "
+            + ("found via var column " + best_per_field["feature_id"]
+               if best_per_field["feature_id"] else "no reliable source found — set manually")
+        ),
+    )
+    feature_fields["feature_label"] = _build_feature_field_entry(
+        "feature_label",
+        best_per_field["feature_label"],
+        confidence="high" if best_per_field["feature_label"] else "low",
+        required=False,
+        notes=(
+            "human-readable feature label; "
+            + ("found via var column " + best_per_field["feature_label"]
+               if best_per_field["feature_label"] else "no reliable source found — set manually")
+        ),
+    )
+    feature_fields["feature_namespace"] = _build_feature_field_entry(
+        "feature_namespace",
+        best_per_field["feature_namespace"],
+        confidence="high" if best_per_field["feature_namespace"] else "low",
+        required=False,
+        notes=(
+            "namespace for tokenization identity (e.g. ensembl, gene_symbol); "
+            + ("found via var column " + best_per_field["feature_namespace"]
+               if best_per_field["feature_namespace"] else "no reliable source found — set manually")
+        ),
+    )
+    return feature_fields
+
+
 def _find_best_profiled_column(
     field_name: str,
     field_profiles: tuple[FieldProfile, ...],
@@ -412,119 +607,382 @@ def _infer_literal_perturbation_type(columns: tuple[str, ...]) -> str | None:
     return None
 
 
-def _build_field_mappings(
+def _build_schema_field_entry(
+    field_name: str,
+    source_field: str | None,
+    strategy: str,
+    confidence: str,
+    required: bool,
+    notes: tuple[str, ...] = (),
+    literal_value: str | None = None,
+    transforms: tuple[TransformSpec, ...] = (),
+) -> SchemaFieldEntry:
+    """Build a SchemaFieldEntry for a cell field."""
+    if source_field is None and strategy == "null":
+        return SchemaFieldEntry(
+            source_fields=(),
+            strategy="null",
+            transforms=(),
+            confidence=confidence,
+            required=required,
+            notes=notes,
+        )
+    if source_field is None:
+        return SchemaFieldEntry(
+            source_fields=(),
+            strategy=strategy,
+            transforms=transforms,
+            confidence=confidence,
+            required=required,
+            literal_value=literal_value,
+            notes=notes,
+        )
+    return SchemaFieldEntry(
+        source_fields=(source_field,),
+        strategy=strategy,
+        transforms=transforms,
+        confidence=confidence,
+        required=required,
+        literal_value=literal_value,
+        notes=notes,
+    )
+
+
+def _build_cell_field_sections(
     target: InspectionTarget,
     obs_columns: tuple[str, ...],
     obs_fields: tuple[FieldProfile, ...],
-) -> dict[str, FieldMapping]:
-    mappings: dict[str, FieldMapping] = {
-        "dataset_id": FieldMapping(
-            source_fields=(),
+) -> tuple[dict[str, SchemaFieldEntry], dict[str, SchemaFieldEntry]]:
+    """Build perturbation_fields and context_fields dicts for the new schema artifact.
+
+    All canonical cell fields are always present. Unresolved fields use
+    ``strategy: null`` so they are inline rather than in a separate list.
+    """
+    perturbation_fields: dict[str, SchemaFieldEntry] = {}
+    context_fields: dict[str, SchemaFieldEntry] = {}
+
+    # Literal dataset_id (always present)
+    perturbation_fields["perturbation_label"] = _build_schema_field_entry(
+        "perturbation_label",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=True,
+        notes=("set manually — no perturbation_label source found",),
+    )
+    perturbation_fields["perturbation_type"] = _build_schema_field_entry(
+        "perturbation_type",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=True,
+        notes=("set manually or infer from obs column names",),
+    )
+    perturbation_fields["target_id"] = _build_schema_field_entry(
+        "target_id",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    perturbation_fields["target_label"] = _build_schema_field_entry(
+        "target_label",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    perturbation_fields["control_flag"] = _build_schema_field_entry(
+        "control_flag",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=True,
+        notes=("set manually — no perturbation source for derive",),
+    )
+    perturbation_fields["dose"] = _build_schema_field_entry(
+        "dose",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    perturbation_fields["dose_unit"] = _build_schema_field_entry(
+        "dose_unit",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    perturbation_fields["timepoint"] = _build_schema_field_entry(
+        "timepoint",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    perturbation_fields["timepoint_unit"] = _build_schema_field_entry(
+        "timepoint_unit",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    perturbation_fields["combination_key"] = _build_schema_field_entry(
+        "combination_key",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+
+    # Literal dataset_id in dataset_metadata section
+    dataset_metadata: dict[str, SchemaFieldEntry] = {
+        "dataset_id": _build_schema_field_entry(
+            "dataset_id",
+            source_field=None,
             strategy="literal",
-            transforms=(),
             confidence="high",
+            required=True,
             literal_value=target.dataset_id,
             notes=("dataset id is set from the inspection target",),
         ),
-        "dataset_release": FieldMapping(
-            source_fields=(),
-            strategy="literal",
-            transforms=(),
-            confidence="high",
-            literal_value=target.source_release,
-            notes=("dataset release is set from the inspection target",),
-        ),
     }
 
+    # Context fields
+    context_fields["cell_context"] = _build_schema_field_entry(
+        "cell_context",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=True,
+    )
+    context_fields["cell_line_or_type"] = _build_schema_field_entry(
+        "cell_line_or_type",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    context_fields["species"] = _build_schema_field_entry(
+        "species",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    context_fields["tissue"] = _build_schema_field_entry(
+        "tissue",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    context_fields["assay"] = _build_schema_field_entry(
+        "assay",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    context_fields["condition"] = _build_schema_field_entry(
+        "condition",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    context_fields["batch_id"] = _build_schema_field_entry(
+        "batch_id",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    context_fields["donor_id"] = _build_schema_field_entry(
+        "donor_id",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    context_fields["sex"] = _build_schema_field_entry(
+        "sex",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+    context_fields["disease_state"] = _build_schema_field_entry(
+        "disease_state",
+        source_field=None,
+        strategy="null",
+        confidence="low",
+        required=False,
+    )
+
+    # Now populate from obs heuristics
     perturbation_source = _find_best_profiled_column(
         "perturbation_label", obs_fields, FIELD_ALIASES["perturbation_label"]
     )
     if perturbation_source is not None:
-        mappings["perturbation_label"] = FieldMapping(
-            source_fields=(perturbation_source,),
+        perturbation_fields["perturbation_label"] = _build_schema_field_entry(
+            "perturbation_label",
+            source_field=perturbation_source,
             strategy="source-field",
-            transforms=(),
             confidence="high",
+            required=True,
         )
-        mappings["target_label"] = FieldMapping(
-            source_fields=(perturbation_source,),
-            strategy="source-field",
-            transforms=(),
-            confidence="medium",
-            notes=("fallback target label reuses the perturbation label source",),
-        )
-        mappings["control_flag"] = FieldMapping(
-            source_fields=(perturbation_source,),
+        perturbation_fields["control_flag"] = _build_schema_field_entry(
+            "control_flag",
+            source_field=perturbation_source,
             strategy="derived",
-            transforms=(
-                build_transform("recognize_control", patterns=list(CONTROL_PATTERNS)),
-            ),
             confidence="medium",
+            required=True,
+            transforms=(build_transform("recognize_control", patterns=list(CONTROL_PATTERNS)),),
+            notes=("derived from perturbation_label source",),
         )
 
     target_label_source = _find_best_profiled_column(
         "target_label", obs_fields, FIELD_ALIASES["target_label"]
     )
     if target_label_source is not None:
-        mappings["target_label"] = FieldMapping(
-            source_fields=(target_label_source,),
+        perturbation_fields["target_label"] = _build_schema_field_entry(
+            "target_label",
+            source_field=target_label_source,
             strategy="source-field",
-            transforms=(),
             confidence="high",
+            required=False,
+        )
+
+    target_id_source = _find_best_profiled_column(
+        "target_id", obs_fields, FIELD_ALIASES["target_id"]
+    )
+    if target_id_source is not None:
+        perturbation_fields["target_id"] = _build_schema_field_entry(
+            "target_id",
+            source_field=target_id_source,
+            strategy="source-field",
+            confidence="high",
+            required=False,
         )
 
     perturbation_type = _infer_literal_perturbation_type(obs_columns)
     if perturbation_type is not None:
-        mappings["perturbation_type"] = FieldMapping(
-            source_fields=(),
+        perturbation_fields["perturbation_type"] = _build_schema_field_entry(
+            "perturbation_type",
+            source_field=None,
             strategy="literal",
-            transforms=(),
             confidence="medium",
+            required=True,
             literal_value=perturbation_type,
             notes=("literal perturbation type inferred from guide-like field names",),
         )
 
+    dose_source = _find_best_profiled_column("dose", obs_fields, FIELD_ALIASES["dose"])
+    if dose_source is not None:
+        perturbation_fields["dose"] = _build_schema_field_entry(
+            "dose",
+            source_field=dose_source,
+            strategy="source-field",
+            confidence="high",
+            required=False,
+        )
+        dose_unit_source = _find_best_profiled_column(
+            "dose_unit", obs_fields, FIELD_ALIASES["dose_unit"]
+        )
+        if dose_unit_source is not None:
+            perturbation_fields["dose_unit"] = _build_schema_field_entry(
+                "dose_unit",
+                source_field=dose_unit_source,
+                strategy="source-field",
+                confidence="high",
+                required=False,
+            )
+
+    timepoint_source = _find_best_profiled_column(
+        "timepoint", obs_fields, FIELD_ALIASES["timepoint"]
+    )
+    if timepoint_source is not None:
+        perturbation_fields["timepoint"] = _build_schema_field_entry(
+            "timepoint",
+            source_field=timepoint_source,
+            strategy="source-field",
+            confidence="high",
+            required=False,
+        )
+        timepoint_unit_source = _find_best_profiled_column(
+            "timepoint_unit", obs_fields, FIELD_ALIASES["timepoint_unit"]
+        )
+        if timepoint_unit_source is not None:
+            perturbation_fields["timepoint_unit"] = _build_schema_field_entry(
+                "timepoint_unit",
+                source_field=timepoint_unit_source,
+                strategy="source-field",
+                confidence="high",
+                required=False,
+            )
+
     for field_name, aliases in FIELD_ALIASES.items():
-        if field_name in mappings:
+        canonical_name = field_name
+        if canonical_name in perturbation_fields:
+            entry = perturbation_fields[canonical_name]
+            if entry.strategy != "null":
+                continue
+        elif canonical_name in context_fields:
+            entry = context_fields[canonical_name]
+            if entry.strategy != "null":
+                continue
+        else:
             continue
-        source_field = _find_best_profiled_column(field_name, obs_fields, aliases)
+        source_field = _find_best_profiled_column(canonical_name, obs_fields, aliases)
         if source_field is None:
             continue
-        mappings[field_name] = FieldMapping(
-            source_fields=(source_field,),
-            strategy="source-field",
-            transforms=(),
-            confidence="high",
-        )
+        if canonical_name in perturbation_fields:
+            perturbation_fields[canonical_name] = _build_schema_field_entry(
+                canonical_name,
+                source_field=source_field,
+                strategy="source-field",
+                confidence="high",
+                required=entry.required,
+            )
+        elif canonical_name in context_fields:
+            context_fields[canonical_name] = _build_schema_field_entry(
+                canonical_name,
+                source_field=source_field,
+                strategy="source-field",
+                confidence="high",
+                required=entry.required,
+            )
 
     normalized_target = _normalize_label(target.dataset_id + target.source_path)
     if "k562" in normalized_target:
         for field_name in ("cell_context", "cell_line_or_type"):
-            mappings.setdefault(
+            context_fields[field_name] = _build_schema_field_entry(
                 field_name,
-                FieldMapping(
-                    source_fields=(),
-                    strategy="literal",
-                    transforms=(),
-                    confidence="medium",
-                    literal_value="K562",
-                    notes=("literal value inferred from dataset identifier or path",),
-                ),
+                source_field=None,
+                strategy="literal",
+                confidence="medium",
+                required=(field_name == "cell_context"),
+                literal_value="K562",
+                notes=("literal value inferred from dataset identifier or path",),
             )
 
-    return mappings
+    return perturbation_fields, context_fields
 
 
-def _materialization_readiness(
-    count_source: CountSourceDecision,
-    field_mappings: dict[str, FieldMapping],
+def _materialization_readiness_schema(
+    count_status: str,
+    perturbation_fields: dict[str, SchemaFieldEntry],
+    context_fields: dict[str, SchemaFieldEntry],
 ) -> str:
-    if count_source.status == "fail":
+    if count_status == "fail":
         return "fail"
-    unresolved_required = REQUIRED_CANONICAL_FIELDS.difference(field_mappings)
-    if unresolved_required:
-        return "needs-review"
-    if count_source.status == "needs-review":
+    for section in (perturbation_fields, context_fields):
+        for name, entry in section.items():
+            if entry.required and entry.strategy == "null":
+                return "needs-review"
+    if count_status == "needs-review":
         return "needs-review"
     return "pass"
 
@@ -539,7 +997,11 @@ def inspect_target(target: InspectionTarget, output_root: Path) -> InspectionArt
         obs_fields = _profile_fields(adata.obs)
         var_fields = _profile_fields(adata.var)
 
-        candidates = [_audit_matrix_candidate(".X", adata.X, adata.n_obs, adata.n_vars)]
+        candidates = []
+        try:
+            candidates.append(_audit_matrix_candidate(".X", adata.X, adata.n_obs, adata.n_vars))
+        except KeyError:
+            pass  # no .X in this file
         if adata.raw is not None:
             candidates.append(
                 _audit_matrix_candidate(
@@ -562,12 +1024,63 @@ def inspect_target(target: InspectionTarget, output_root: Path) -> InspectionArt
         ranked_candidates = _rank_candidates(candidates)
         count_decision = _choose_count_source(ranked_candidates)
         obs_columns = tuple(str(column) for column in adata.obs.columns.tolist())
-        field_mappings = _build_field_mappings(target, obs_columns, obs_fields)
-        readiness = _materialization_readiness(count_decision, field_mappings)
-        unresolved_fields = tuple(
-            field_name
-            for field_name in CANONICAL_FIELDS
-            if field_name not in field_mappings
+
+        perturbation_fields, context_fields = _build_cell_field_sections(
+            target, obs_columns, obs_fields
+        )
+        feature_fields = _build_feature_fields_section(
+            var_fields, var_index_name=str(adata.var.index.name or "index")
+        )
+
+        readiness = _materialization_readiness_schema(
+            count_decision.status, perturbation_fields, context_fields
+        )
+
+        # Build count_source spec
+        count_source_spec = CountSourceSpec(
+            selected=count_decision.selected_candidate,
+            integer_only=(count_decision.status == "pass"),
+        )
+
+        # Build feature_tokenization spec: pick the best-ranked feature_id source
+        # as the dataset-level tokenization target
+        best_feature_id: str | None = None
+        best_namespace: str | None = None
+        if "feature_id" in feature_fields:
+            entry = feature_fields["feature_id"]
+            if entry.strategy == "source-field" and entry.source_fields:
+                best_feature_id = entry.source_fields[0]
+        if "feature_namespace" in feature_fields:
+            ns_entry = feature_fields["feature_namespace"]
+            if ns_entry.strategy == "source-field" and ns_entry.source_fields:
+                best_namespace = ns_entry.source_fields[0]
+        feature_tokenization_spec = FeatureTokenizationSpec(
+            selected=best_feature_id or "set-manually",
+            namespace=best_namespace or "unknown",
+        )
+
+        schema = SchemaDocument.new_draft(
+            dataset_id=target.dataset_id,
+            source_path=target.source_path,
+            dataset_metadata={
+                "dataset_id": SchemaFieldEntry(
+                    source_fields=(),
+                    strategy="literal",
+                    transforms=(),
+                    confidence="high",
+                    required=True,
+                    literal_value=target.dataset_id,
+                ),
+            },
+            perturbation_fields=perturbation_fields,
+            context_fields=context_fields,
+            feature_fields=feature_fields,
+            count_source=count_source_spec,
+            feature_tokenization=feature_tokenization_spec,
+            transform_catalog=TRANSFORM_CATALOG,
+            materialization_notes=(
+                "auto-generated schema draft; review and set status: ready before materialization",
+            ),
         )
 
         summary = DatasetSummaryDocument(
@@ -602,43 +1115,14 @@ def inspect_target(target: InspectionTarget, output_root: Path) -> InspectionArt
                 "matrix audit used sampled rows only and did not materialize the full matrix",
             ),
         )
-        proposal = SchemaProposalDocument(
-            kind="schema-proposal",
-            contract_version=CONTRACT_VERSION,
-            dataset_id=target.dataset_id,
-            source_path=target.source_path,
-            summary_artifact="dataset-summary.yaml",
-            canonical_defaults={"missing_value_literal": MISSING_VALUE_LITERAL},
-            count_source_decision=count_decision,
-            transform_catalog=TRANSFORM_CATALOG,
-            field_mappings=field_mappings,
-            unresolved_fields=unresolved_fields,
-            materialization_readiness=readiness,
-        )
-        patch = SchemaPatchDocument(
-            kind="schema-patch",
-            contract_version=CONTRACT_VERSION,
-            dataset_id=target.dataset_id,
-            review_status="pending",
-            summary_artifact="dataset-summary.yaml",
-            proposal_artifact="schema-proposal.yaml",
-            unresolved_fields=unresolved_fields,
-            patches=(),
-            notes=(
-                "fill this file only when review needs to override the generated proposal",
-            ),
-        )
 
         summary_path = dataset_dir / "dataset-summary.yaml"
-        proposal_path = dataset_dir / "schema-proposal.yaml"
-        patch_path = dataset_dir / "schema-patch.yaml"
+        schema_path = dataset_dir / "schema.yaml"
 
         summary.validate()
-        proposal.validate()
-        patch.validate()
+        schema.validate()
         summary.write_yaml(summary_path)
-        proposal.write_yaml(proposal_path)
-        patch.write_yaml(patch_path)
+        schema.write_yaml(schema_path)
     finally:
         if getattr(adata, "file", None) is not None:
             adata.file.close()
@@ -649,8 +1133,7 @@ def inspect_target(target: InspectionTarget, output_root: Path) -> InspectionArt
     return InspectionArtifacts(
         dataset_id=target.dataset_id,
         dataset_summary=summary_path,
-        schema_proposal=proposal_path,
-        schema_patch=patch_path,
+        schema=schema_path,
         selected_count_source=count_decision.selected_candidate,
         materialization_readiness=readiness,
     )
@@ -680,8 +1163,7 @@ def run_batch(
             InspectionBatchRecord(
                 dataset_id=artifact.dataset_id,
                 dataset_summary=str(artifact.dataset_summary),
-                schema_proposal=str(artifact.schema_proposal),
-                schema_patch=str(artifact.schema_patch),
+                schema=str(artifact.schema),
                 selected_count_source=artifact.selected_count_source,
                 materialization_readiness=artifact.materialization_readiness,
             )

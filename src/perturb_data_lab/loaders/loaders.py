@@ -1,4 +1,4 @@
-"""Phase 4 training-facing dataset and sampling layer.
+"""Phase 4/8 training-facing dataset and sampling layer.
 
 This module implements:
 - Common dataset interface exposing sparse indices, counts, metadata, size factors
@@ -6,6 +6,7 @@ This module implements:
 - Shared sampler implementations: random context, expressed+zeros, HVGs+random
 - Default streaming IterableDataset path and optional map-style path
 - Minimal integration examples for external collators
+- Feature preloading for efficient dataset-order → token-space index translation
 
 All write operations go to repo-local real directories only.
 Never write to protected symlink roots (data/, pertTF/, perturb/).
@@ -21,6 +22,7 @@ import numpy as np
 
 __all__ = [
     "CellState",
+    "PreloadedFeatureObjects",
     "BackendCellReader",
     "ArrowHFCellReader",
     "WebDatasetCellReader",
@@ -33,6 +35,92 @@ __all__ = [
     "PerturbDataLoader",
     "PerturbIterableDataset",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Feature preloading — per-dataset feature objects kept in memory
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PreloadedFeatureObjects:
+    """Preloaded per-dataset feature objects for a single dataset release.
+
+    These objects are small (one row per feature, not per cell) and are shared
+    across all cells of the dataset.  Preloading them once at loader startup
+    enables efficient dataset-order → token-space index translation during
+    sample decoding.
+
+    Two variants are stored:
+
+    - origin:  the canonical feature metadata in original dataset var order.
+               The `origin_index` column aligns with the sparse per-cell
+               `expressed_gene_indices` values stored during materialization.
+    - token:   a mapping from `origin_index` → `token_id` (int), enabling
+               O(1) translation of dataset-order indices to global token IDs.
+
+    Both variants are MaterializationRoute outputs written once per dataset
+    during the materialization phase (Phase 7).
+    """
+
+    # Release this object belongs to
+    release_id: str
+
+    # Parquet path for the origin feature object (canonical metadata in var order)
+    features_origin_path: Path
+
+    # Parquet path for the token companion (origin_index → token_id mapping)
+    features_token_path: Path
+
+    # Lazily-loaded PyArrow tables (loaded once on first access)
+    _origin_table: Any = field(default=None, repr=False)
+    _token_table: Any = field(default=None, repr=False)
+
+    def origin_table(self) -> Any:
+        """Load and cache the origin feature parquet table."""
+        if self._origin_table is None:
+            import pyarrow.parquet as pq
+
+            object.__setattr__(
+                self, "_origin_table", pq.read_table(str(self.features_origin_path))
+            )
+        return self._origin_table
+
+    def token_table(self) -> Any:
+        """Load and cache the token companion parquet table."""
+        if self._token_table is None:
+            import pyarrow.parquet as pq
+
+            object.__setattr__(
+                self, "_token_table", pq.read_table(str(self.features_token_path))
+            )
+        return self._token_table
+
+    def origin_index_to_token_id(self, origin_index: int) -> int:
+        """Translate a dataset-order feature index to a global token ID.
+
+        Uses the preloaded token parquet to look up the token_id for the
+        given origin_index.  Returns -1 if the origin_index is out of range
+        or not registered.
+        """
+        token_table = self.token_table()
+        origin_col = token_table["origin_index"]
+        # Binary search for the origin_index
+        try:
+            idx = origin_col.to_pylist().index(origin_index)
+        except ValueError:
+            return -1
+        if idx < 0:
+            return -1
+        return token_table["token_id"][idx].as_py()
+
+    def translate_indices(self, origin_indices: tuple[int, ...]) -> tuple[int, ...]:
+        """Translate a tuple of dataset-order indices to token IDs.
+
+        Convenience method for batch translation during sample decoding.
+        Returns a tuple of the same length with each index translated.
+        """
+        return tuple(self.origin_index_to_token_id(int(i)) for i in origin_indices)
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +138,7 @@ class CellState:
     cell_id: str
     dataset_id: str
     dataset_release: str
-    expressed_gene_indices: tuple[int, ...]
+    expressed_gene_indices: tuple[int, ...]  # dataset-order indices
     expression_counts: tuple[int, ...]
     size_factor: float
     canonical_perturbation: dict[str, str]
@@ -97,7 +185,14 @@ class BackendCellReader:
 
 
 class ArrowHFCellReader(BackendCellReader):
-    """Reader for Arrow/HF Parquet storage (primary backend from Phase 3)."""
+    """Reader for Arrow/HF Parquet storage (primary backend from Phase 3).
+
+    Redesigned in Phase 8 to:
+    - Preload per-dataset feature objects into memory for efficient
+      dataset-order → token-space index translation during sample decoding
+    - Load canonical cell metadata from the materialized SQLite file
+      rather than re-executing schema mappings from the schema YAML
+    """
 
     def __init__(
         self,
@@ -108,15 +203,51 @@ class ArrowHFCellReader(BackendCellReader):
         cell_meta_sqlite_path: Path,
         feature_registry_path: Path,
         size_factor_manifest_path: Path,
+        feature_meta_paths: dict[str, Path] | None = None,
     ):
+        """
+        Parameters
+        ----------
+        release_id : str
+            The dataset release identifier.
+        corpus_index_path : Path
+            Path to the corpus index YAML file.
+        cells_parquet_path : Path
+            Path to the cells parquet file.
+        meta_parquet_path : Path
+            Path to the metadata parquet file.
+        cell_meta_sqlite_path : Path
+            Path to the SQLite file containing full canonical cell metadata
+            (written by Phase 6 `_write_cell_metadata`).
+        feature_registry_path : Path
+            Path to the feature registry YAML.
+        size_factor_manifest_path : Path
+            Path to the size factor manifest YAML.
+        feature_meta_paths : dict[str, Path] | None
+            Optional dict with keys ``features_origin`` and ``features_token``
+            pointing to the per-dataset feature parquet files written by
+            Phase 7 `_write_feature_metadata`.  When provided, feature
+            objects are preloaded once at reader construction and used to
+            translate dataset-order indices to global token IDs.
+        """
         super().__init__(release_id, corpus_index_path)
         self.cells_parquet_path = cells_parquet_path
         self.meta_parquet_path = meta_parquet_path
         self.cell_meta_sqlite_path = cell_meta_sqlite_path
         self.feature_registry_path = feature_registry_path
         self.size_factor_manifest_path = size_factor_manifest_path
+        self._feature_meta_paths = feature_meta_paths
         self.__cells_table = None
         self.__meta_table = None
+        self.__preloaded_features: PreloadedFeatureObjects | None = (
+            PreloadedFeatureObjects(
+                release_id=release_id,
+                features_origin_path=feature_meta_paths["features_origin"],
+                features_token_path=feature_meta_paths["features_token"],
+            )
+            if feature_meta_paths
+            else None
+        )
 
     def _cells_table(self):
         if self.__cells_table is None:
@@ -132,6 +263,25 @@ class ArrowHFCellReader(BackendCellReader):
             self.__meta_table = pq.read_table(self.meta_parquet_path)
         return self.__meta_table
 
+    @property
+    def preloaded_features(self) -> PreloadedFeatureObjects | None:
+        """Return the preloaded feature objects for this dataset, if any."""
+        return self.__preloaded_features
+
+    def translate_to_token_ids(
+        self, origin_indices: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        """Translate dataset-order indices to global token IDs using preloaded objects.
+
+        If feature_meta_paths were provided at construction, this method uses
+        the preloaded token parquet to translate each dataset-order index to its
+        global token ID.  If no preloaded objects are available, the original
+        indices are returned unchanged (identity translation).
+        """
+        if self.__preloaded_features is None:
+            return origin_indices
+        return self.__preloaded_features.translate_indices(origin_indices)
+
     def __len__(self) -> int:
         return self._cells_table().num_rows
 
@@ -145,6 +295,7 @@ class ArrowHFCellReader(BackendCellReader):
     def read_cell(self, cell_index: int) -> CellState:
         import pyarrow.parquet as pq
 
+        import json
         import sqlite3
 
         table = self._cells_table()
@@ -152,7 +303,11 @@ class ArrowHFCellReader(BackendCellReader):
         counts = table["expression_counts"][cell_index].as_py()
         sf = table["size_factor"][cell_index].as_py()
 
-        # Load cell metadata from SQLite
+        # Load full canonical cell metadata from the materialized SQLite file.
+        # This was written by _write_cell_metadata() during Phase 6 materialization
+        # and contains all canonical perturbation and context fields resolved
+        # row-wise from the schema at materialization time.  No schema re-execution
+        # is needed at load time.
         conn = sqlite3.connect(str(self.cell_meta_sqlite_path))
         conn.row_factory = sqlite3.Row
         cur = conn.execute("SELECT * FROM cell_meta WHERE rowid = ?", (cell_index + 1,))
@@ -162,66 +317,16 @@ class ArrowHFCellReader(BackendCellReader):
         if row is None:
             raise IndexError(f"cell_index {cell_index} out of range")
 
-        # Load canonical perturbation/context from manifest if available
-        from ..materializers.models import (
-            MaterializationManifest,
-        )
-
-        manifest_path = (
-            Path(self.corpus_index_path).parent
-            / "metadata"
-            / self.release_id
-            / "materialization-manifest.yaml"
-        )
-        canonical_perturbation = {}
-        canonical_context = {}
-        raw_fields = {}
-
-        if manifest_path.exists():
-            manifest = MaterializationManifest.from_yaml_file(manifest_path)
-            # Load schema patch for canonical field values
-            if manifest.provenance.schema_patch:
-                from ..inspectors.models import SchemaPatchDocument
-
-                patch = SchemaPatchDocument.from_yaml_file(
-                    Path(manifest.provenance.schema_patch)
-                )
-                for p in patch.patches:
-                    if p.field in (
-                        "perturbation_label",
-                        "perturbation_type",
-                        "target_id",
-                        "target_label",
-                        "control_flag",
-                        "dose",
-                        "dose_unit",
-                        "timepoint",
-                        "timepoint_unit",
-                        "combination_key",
-                    ):
-                        canonical_perturbation[p.field] = p.value or "NA"
-                    elif p.field in (
-                        "dataset_id",
-                        "dataset_release",
-                        "cell_context",
-                        "cell_line_or_type",
-                        "species",
-                        "tissue",
-                        "assay",
-                        "condition",
-                        "batch_id",
-                        "donor_id",
-                        "sex",
-                        "disease_state",
-                    ):
-                        canonical_context[p.field] = p.value or "NA"
+        canonical_perturbation = json.loads(row["canonical_perturbation"])
+        canonical_context = json.loads(row["canonical_context"])
+        raw_fields = json.loads(row["raw_obs"])
 
         return CellState(
             cell_id=str(row["cell_id"]),
             dataset_id=str(row["dataset_id"]),
             dataset_release=str(row["dataset_release"]),
-            expressed_gene_indices=tuple(indices),
-            expression_counts=tuple(counts),
+            expressed_gene_indices=tuple(int(i) for i in indices),
+            expression_counts=tuple(int(c) for c in counts),
             size_factor=float(sf),
             canonical_perturbation=canonical_perturbation,
             canonical_context=canonical_context,
@@ -594,6 +699,11 @@ class PerturbIterableDataset:
     and yields (sparse_indices, sparse_counts, metadata_dict) tuples.
 
     Collators are expected to handle padding and masking externally.
+
+    Phase 8 adds optional token-space index translation: if the reader has
+    preloaded feature objects (via feature_meta_paths), the yielded dict can
+    include ``token_gene_indices`` — global token IDs translated from the
+    stored dataset-order indices using the preloaded token parquet.
     """
 
     def __init__(
@@ -605,12 +715,24 @@ class PerturbIterableDataset:
         context_size: int | None = None,
         max_context: int | None = None,
         hvg_set: tuple[int, ...] = (),
+        translate_indices: bool = False,
     ):
+        """
+        Parameters
+        ----------
+        translate_indices : bool
+            When True, translate stored dataset-order indices to global token
+            IDs using the reader's preloaded feature objects.  The yielded
+            dict will include ``token_gene_indices`` alongside the original
+            ``expressed_gene_indices``.  Default False to preserve the
+            original behaviour for existing callers.
+        """
         self.reader = reader
         self.shuffle = shuffle
         self.seed = seed
         self.context_size = context_size
         self.max_context = max_context
+        self.translate_indices = translate_indices
         self.rng = np.random.default_rng(seed)
 
         state = SamplerState(
@@ -648,7 +770,7 @@ class PerturbIterableDataset:
             else:
                 context = np.array(cell.expressed_gene_indices, dtype=np.int32)
 
-            yield {
+            result = {
                 "cell_id": cell.cell_id,
                 "dataset_id": cell.dataset_id,
                 "dataset_release": cell.dataset_release,
@@ -661,6 +783,12 @@ class PerturbIterableDataset:
                 "canonical_perturbation": cell.canonical_perturbation,
                 "canonical_context": cell.canonical_context,
             }
+            if self.translate_indices and hasattr(self.reader, "translate_to_token_ids"):
+                result["token_gene_indices"] = np.array(
+                    self.reader.translate_to_token_ids(cell.expressed_gene_indices),
+                    dtype=np.int32,
+                )
+            yield result
 
     def __len__(self) -> int:
         return len(self.reader)
@@ -677,6 +805,10 @@ class PerturbDataLoader:
     Use this when the backend supports efficient random reads (e.g., Arrow/HF).
     WebDataset (sequential tar shards) and Zarr/TensorStore (chunked sparse) are
     better suited for the streaming IterableDataset path.
+
+    Phase 8 adds optional token-space index translation: if the reader has
+    preloaded feature objects, ``__getitem__`` can include ``token_gene_indices``
+    translated from stored dataset-order indices.
     """
 
     def __init__(
@@ -688,12 +820,24 @@ class PerturbDataLoader:
         context_size: int | None = None,
         max_context: int | None = None,
         hvg_set: tuple[int, ...] = (),
+        translate_indices: bool = False,
     ):
+        """
+        Parameters
+        ----------
+        translate_indices : bool
+            When True, translate stored dataset-order indices to global token
+            IDs using the reader's preloaded feature objects.  The returned
+            dict will include ``token_gene_indices`` alongside the original
+            ``expressed_gene_indices``.  Default False to preserve the
+            original behaviour for existing callers.
+        """
         self.reader = reader
         self.shuffle = shuffle
         self.seed = seed
         self.context_size = context_size
         self.max_context = max_context
+        self.translate_indices = translate_indices
         self.rng = np.random.default_rng(seed)
 
         state = SamplerState(
@@ -724,7 +868,7 @@ class PerturbDataLoader:
         else:
             context = np.array(cell.expressed_gene_indices, dtype=np.int32)
 
-        return {
+        result = {
             "cell_id": cell.cell_id,
             "dataset_id": cell.dataset_id,
             "dataset_release": cell.dataset_release,
@@ -737,3 +881,9 @@ class PerturbDataLoader:
             "canonical_perturbation": cell.canonical_perturbation,
             "canonical_context": cell.canonical_context,
         }
+        if self.translate_indices and hasattr(self.reader, "translate_to_token_ids"):
+            result["token_gene_indices"] = np.array(
+                self.reader.translate_to_token_ids(cell.expressed_gene_indices),
+                dtype=np.int32,
+            )
+        return result

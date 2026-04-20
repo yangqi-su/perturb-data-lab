@@ -11,5 +11,4 @@ outputs:
   matrix_root: outputs/matrix/marson2025_k562-v0
 provenance:
   source_path: /protected/read-only/source.h5ad
-  schema_proposal: examples/contracts/schema-proposal.yaml
-  schema_patch: examples/contracts/schema-patch.yaml
+  schema: examples/contracts/schema.yaml

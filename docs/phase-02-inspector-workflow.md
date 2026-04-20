@@ -4,9 +4,8 @@
 
 Produce dataset-level YAML artifacts from real h5ad inputs before any materialization:
 
-- `dataset-summary.yaml`
-- `schema-proposal.yaml`
-- `schema-patch.yaml`
+- `dataset-summary.yaml` — dataset statistics, field inventory, count-source audit
+- `schema.yaml` — single editable canonical field mapping (replaces old proposal + patch pair)
 
 ## Design constraints
 

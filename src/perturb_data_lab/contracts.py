@@ -10,8 +10,7 @@ REQUIRED_ARTIFACTS = (
     "canonical-context-metadata",
     "feature-registry",
     "dataset-summary",
-    "schema-proposal",
-    "schema-patch",
+    "schema",
     "materialization-manifest",
     "corpus-index",
     "global-metadata",
@@ -120,7 +119,7 @@ def build_phase1_blueprint() -> Phase1Blueprint:
             CanonicalField(
                 "dataset_release",
                 "Immutable processed release identifier.",
-                required=True,
+                required=False,
             ),
             CanonicalField(
                 "cell_context", "Primary training context label.", required=True
@@ -172,20 +171,12 @@ def build_phase1_blueprint() -> Phase1Blueprint:
                 purpose="Stores lightweight inspector evidence before materialization.",
             ),
             ArtifactContract(
-                name="schema-proposal",
+                name="schema",
                 scope="dataset",
                 review_format="yaml",
-                runtime_model="SchemaProposalDocument",
+                runtime_model="SchemaDocument",
                 owner_repo="perturb-data-lab",
-                purpose="Maps raw source fields into canonical fields with explicit transforms.",
-            ),
-            ArtifactContract(
-                name="schema-patch",
-                scope="dataset",
-                review_format="yaml",
-                runtime_model="SchemaPatchDocument",
-                owner_repo="perturb-data-lab",
-                purpose="Records reviewed edits that override or complete a proposal.",
+                purpose="Maps raw source fields into canonical cell and feature fields with inline null markers for unresolved entries.",
             ),
             ArtifactContract(
                 name="materialization-manifest",

@@ -1,6 +1,6 @@
 # perturb-data-lab
 
-Phase 2 now includes a lightweight h5ad inspector and YAML schema-proposal workflow for perturb-seq onboarding.
+Phase 2 now includes a lightweight h5ad inspector and YAML schema workflow (single `schema.yaml` replacing the old proposal/patch pair) for perturb-seq onboarding.
 
 ## Current scope
 

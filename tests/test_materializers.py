@@ -12,7 +12,6 @@ from scipy.sparse import csr_matrix
 from perturb_data_lab.materializers import (
     CanonicalCellRecord,
     CreateNewRoute,
-    AppendMonolithicRoute,
     AppendRoutedRoute,
     build_materialization_route,
     update_corpus_index,
@@ -93,18 +92,6 @@ class TestBuildMaterializationRoute:
         )
         assert isinstance(route, CreateNewRoute)
         assert route.route_name == "create_new"
-
-    def test_append_monolithic_route(self):
-        roots = OutputRoots(metadata_root="/tmp/meta", matrix_root="/tmp/matrix")
-        route = build_materialization_route(
-            "append_monolithic",
-            roots,
-            "release-2",
-            "ds-2",
-            CountSourceSpec(selected=".X", integer_only=True),
-        )
-        assert isinstance(route, AppendMonolithicRoute)
-        assert route.route_name == "append_monolithic"
 
     def test_append_routed_route(self):
         roots = OutputRoots(metadata_root="/tmp/meta", matrix_root="/tmp/matrix")
@@ -284,8 +271,7 @@ class TestMaterializationManifest:
             outputs=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             provenance=ProvenanceSpec(
                 source_path="/data/test.h5ad",
-                schema_proposal="/proposal.yaml",
-                schema_patch="/patch.yaml",
+                schema="/reviewed-schema.yaml",
             ),
             integer_verified=True,
         )
