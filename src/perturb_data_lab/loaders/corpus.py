@@ -27,7 +27,6 @@ from ..materializers.models import (
 from ..materializers.tokenizer import CorpusTokenizer
 from ..materializers.emission_spec import CorpusEmissionSpec
 from .loaders import (
-    ArrowHFCellReader,
     BackendCellReader,
     CellState,
     HVGRandomSampler,
@@ -55,7 +54,7 @@ class DatasetReaderEntry:
     dataset_id: str
     release_id: str
     manifest_path: Path
-    reader: ArrowHFCellReader
+    reader: BackendCellReader  # any backend-specific reader
 
     # HVG arrays in dataset-original feature index space (int32)
     hvg_indices: tuple[int, ...] = ()

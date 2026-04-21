@@ -156,6 +156,10 @@ class BackendCellReader:
 
     All concrete reader implementations must produce CellState records so
     sampler logic stays backend-agnostic.
+
+    Concrete implementations must also implement ``preloaded_features``
+    (returns PreloadedFeatureObjects | None) and ``translate_to_token_ids``
+    (identity by default) so token-space translation is available uniformly.
     """
 
     def __init__(self, release_id: str, corpus_index_path: Path):
@@ -177,6 +181,21 @@ class BackendCellReader:
     def total_genes(self) -> int:
         """Total number of features in the global vocab."""
         raise NotImplementedError
+
+    @property
+    def preloaded_features(self) -> "PreloadedFeatureObjects | None":
+        """Preloaded feature objects for origin→token translation, or None if unavailable."""
+        return None
+
+    def translate_to_token_ids(
+        self, origin_indices: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        """Translate dataset-order indices to corpus token IDs.
+
+        Default implementation returns indices unchanged (identity translation).
+        ArrowHFCellReader overrides this when preloaded_features are available.
+        """
+        return origin_indices
 
 
 # ---------------------------------------------------------------------------
