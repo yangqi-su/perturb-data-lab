@@ -165,19 +165,19 @@ class TestCorpusTokenizerAppendCompatibility:
         assert compatible is True
         assert reason == ""
 
-    def test_duplicate_tokens_rejected(self):
-        """Appending tokens that already exist is rejected."""
+    def test_duplicate_tokens_accepted(self):
+        """Appending tokens that already exist is accepted — they just reuse existing IDs."""
         tok = CorpusTokenizer.create_new(
             corpus_id="test-corpus",
             namespace="gene_symbol",
             regular_tokens=["BRCA1", "TP53"],
         )
+        # Overlapping labels are fine — namespace match is all that matters
         compatible, reason = tok.append_compatible(
             ["BRCA1", "NEW-GENE"], append_namespace="gene_symbol"
         )
-        assert compatible is False
-        assert "duplicate" in reason
-        assert "BRCA1" in reason
+        assert compatible is True
+        assert reason == ""
 
     def test_all_new_tokens_accepted(self):
         """Appending only new tokens passes."""
@@ -243,15 +243,20 @@ class TestCorpusTokenizerAppendTokens:
         with pytest.raises(ValueError, match="namespace mismatch"):
             tok.append_tokens(["EGFR"], append_namespace="ensembl")
 
-    def test_append_tokens_rejects_duplicates(self):
-        """append_tokens raises ValueError on duplicate tokens."""
+    def test_append_tokens_reuses_existing_ids(self):
+        """append_tokens with duplicate labels reuses existing token IDs without error."""
         tok = CorpusTokenizer.create_new(
             corpus_id="test-corpus",
             namespace="gene_symbol",
             regular_tokens=["BRCA1"],
         )
-        with pytest.raises(ValueError, match="duplicate"):
-            tok.append_tokens(["BRCA1"], append_namespace="gene_symbol")
+        brca1_id = tok.to_id("BRCA1")
+        # Appending a token that already exists is fine (idempotent)
+        updated = tok.append_tokens(["BRCA1", "NEW-GENE"], append_namespace="gene_symbol")
+        # Existing token ID preserved
+        assert updated.to_id("BRCA1") == brca1_id
+        # New token added with next available ID
+        assert updated.to_id("NEW-GENE") > brca1_id
 
     def test_multiple_append_rounds_idempotent(self):
         """Multiple append rounds preserve stability."""
@@ -270,6 +275,37 @@ class TestCorpusTokenizerAppendTokens:
         assert tok.to_id("B") == a_id + 1
         assert tok.to_id("C") == a_id + 2
         assert tok.to_id("D") == a_id + 3
+
+    def test_three_step_append_overlap_reuses_existing_ids(self):
+        """Three-step append (Marson → Pancreatic → XORION pattern) reuses overlapping IDs."""
+        # Step 1: initial corpus with genes A, B, C
+        tok = CorpusTokenizer.create_new(
+            corpus_id="three-dataset-corpus",
+            namespace="gene_symbol",
+            regular_tokens=["A", "B", "C"],
+        )
+        assert tok.to_id("A") == 4
+        assert tok.to_id("B") == 5
+        assert tok.to_id("C") == 6
+
+        # Step 2: append with overlap — B, C, D (B and C overlap, D is novel)
+        tok = tok.append_tokens(["B", "C", "D"], append_namespace="gene_symbol")
+        # A, B, C keep original IDs; D gets next ID
+        assert tok.to_id("A") == 4
+        assert tok.to_id("B") == 5
+        assert tok.to_id("C") == 6
+        assert tok.to_id("D") == 7
+
+        # Step 3: append with more overlap — B, C, D, E, F (E, F novel)
+        tok = tok.append_tokens(["B", "C", "D", "E", "F"], append_namespace="gene_symbol")
+        assert tok.to_id("A") == 4
+        assert tok.to_id("B") == 5
+        assert tok.to_id("C") == 6
+        assert tok.to_id("D") == 7
+        assert tok.to_id("E") == 8
+        assert tok.to_id("F") == 9
+        # No new IDs assigned for the already-seen B, C, D
+        assert tok.n_tokens == 10  # 4 special + 6 unique regular
 
 
 # ---------------------------------------------------------------------------

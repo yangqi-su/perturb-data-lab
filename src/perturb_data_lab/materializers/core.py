@@ -120,6 +120,7 @@ class MaterializationRoute:
         dataset_id: str,
         count_source: CountSourceSpec,
         integer_only: bool = True,
+        backend: str = "arrow-hf",
         corpus_index_path: Path | None = None,
     ):
         self.output_roots = output_roots
@@ -127,6 +128,7 @@ class MaterializationRoute:
         self.dataset_id = dataset_id
         self.count_source = count_source
         self.integer_only = integer_only
+        self.backend = backend
         self._corpus_index_path = corpus_index_path
 
     @property
@@ -274,6 +276,7 @@ class MaterializationRoute:
             dataset_id=self.dataset_id,
             release_id=self.release_id,
             route=self.route_name,
+            backend=self.backend,
             count_source=self.count_source,
             outputs=self.output_roots,
             provenance=ProvenanceSpec(
@@ -726,12 +729,17 @@ def build_materialization_route(
     dataset_id: str,
     count_source: CountSourceSpec,
     integer_only: bool = True,
+    backend: str = "arrow-hf",
     corpus_index_path: Path | None = None,
 ) -> MaterializationRoute:
     """Factory to build the correct materialization route by name.
 
     Parameters
     ----------
+    backend : str
+        Storage backend for this materialization: ``arrow-hf``, ``webdataset``,
+        or ``zarr-ts``. This is recorded in the MaterializationManifest and
+        must match the corpus's declared backend. Defaults to ``arrow-hf``.
     corpus_index_path : Path | None
         Path to the corpus index YAML.  Used by ``append_routed`` to locate
         the existing corpus tokenizer and corpus root.  Optional for
@@ -749,6 +757,7 @@ def build_materialization_route(
         dataset_id=dataset_id,
         count_source=count_source,
         integer_only=integer_only,
+        backend=backend,
         corpus_index_path=corpus_index_path,
     )
 

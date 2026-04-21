@@ -32,6 +32,8 @@ from .loaders import (
     CellState,
     HVGRandomSampler,
     SamplerState,
+    AVAILABLE_READERS,
+    build_cell_reader,
 )
 
 __all__ = [
@@ -292,6 +294,62 @@ class CorpusLoader:
     # Factory
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _reader_kwargs(
+        manifest: "MaterializationManifest",
+        meta_root: Path,
+        backend: str,
+    ) -> dict[str, Any]:
+        """Build backend-specific kwargs for build_cell_reader.
+
+        Each backend reader has a different constructor signature. This method
+        bridges the manifest's declared paths to the reader's expected kwargs.
+        """
+        if backend == "arrow-hf":
+            cell_meta_sqlite = meta_root / f"{manifest.release_id}-cell-meta.sqlite"
+            cells_parquet = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-cells.parquet"
+            meta_parquet = meta_root / f"{manifest.release_id}-meta.parquet"
+            size_factor_manifest = meta_root / "size-factor-manifest.yaml"
+            feature_meta_paths: dict[str, Path] | None = None
+            if manifest.feature_meta_paths:
+                feature_meta_paths = {
+                    k: meta_root / v for k, v in manifest.feature_meta_paths.items()
+                }
+            return {
+                "cells_parquet_path": cells_parquet,
+                "meta_parquet_path": meta_parquet,
+                "cell_meta_sqlite_path": cell_meta_sqlite,
+                "feature_registry_path": meta_root / "feature-registry.yaml",  # legacy fallback
+                "size_factor_manifest_path": size_factor_manifest,
+                "feature_meta_paths": feature_meta_paths,
+            }
+        elif backend == "webdataset":
+            # WebDataset uses shard paths and metadata JSON
+            shard_dir = Path(manifest.outputs.matrix_root)
+            shard_paths = sorted(shard_dir.glob("*.tar"))
+            meta_path = meta_root / f"{manifest.release_id}-meta.json"
+            feature_registry_path = meta_root / "feature-registry.yaml"
+            return {
+                "shard_paths": shard_paths,
+                "meta_path": meta_path,
+                "feature_registry_path": feature_registry_path,
+            }
+        elif backend == "zarr-ts":
+            indices_zarr = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-indices.zarr"
+            counts_zarr = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-counts.zarr"
+            sf_zarr = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-sf.zarr"
+            meta_path = meta_root / f"{manifest.release_id}-meta.json"
+            feature_registry_path = meta_root / "feature-registry.yaml"
+            return {
+                "indices_zarr_path": indices_zarr,
+                "counts_zarr_path": counts_zarr,
+                "sf_zarr_path": sf_zarr,
+                "meta_path": meta_path,
+                "feature_registry_path": feature_registry_path,
+            }
+        else:
+            raise ValueError(f"unknown backend: {backend}")
+
     @classmethod
     def from_corpus_index(
         cls,
@@ -303,32 +361,35 @@ class CorpusLoader:
 
         This is the primary entry point. It:
         1. Reads ``corpus-index.yaml`` and ``global-metadata.yaml``
-        2. Loads the corpus tokenizer from the path stored in global-metadata
-        3. Loads the corpus emission spec from the path stored in global-metadata
-        4. Opens per-dataset Arrow/HF readers for each dataset in the index
-        5. Loads per-dataset HVG arrays from the hvg_sidecar_path stored in each manifest
-        6. Preloads per-dataset feature objects for efficient token-space translation
+        2. Loads the corpus backend from global-metadata (the authoritative source)
+        3. Validates that all manifests declare the same backend as global-metadata
+        4. Loads the corpus tokenizer from the path stored in global-metadata
+        5. Loads the corpus emission spec from the path stored in global-metadata
+        6. Opens per-dataset readers for each dataset in the index
+        7. Loads per-dataset HVG arrays from the hvg_sidecar_path stored in each manifest
+        8. Preloads per-dataset feature objects for efficient token-space translation
 
         Parameters
         ----------
         corpus_index_path : Path
             Path to the corpus index YAML file.
         backend : str
-            Backend reader type; only ``"arrow-hf"`` is supported for now.
-        backend_kwargs : dict[str, Any] | None
-            Additional kwargs passed to each dataset's backend reader constructor.
+            Deprecated; ignored. The corpus backend is read from global-metadata.yaml.
+            Kept for backwards API compatibility only.
 
         Returns
         -------
         CorpusLoader
             Fully initialized corpus loader.
+
+        Raises
+        ------
+        ValueError
+            If global-metadata backend does not match a manifest's backend.
+        NotImplementedError
+            If the declared corpus backend is not yet implemented.
         """
         from ..materializers.models import MaterializationManifest
-
-        if backend != "arrow-hf":
-            raise NotImplementedError(
-                f"backend '{backend}' not yet supported; use 'arrow-hf'"
-            )
 
         backend_kwargs = backend_kwargs or {}
 
@@ -337,14 +398,46 @@ class CorpusLoader:
         corpus_root = corpus_index_path.parent
         corpus_id = corpus_index.corpus_id
 
-        # Load global metadata
+        # Load global metadata — backend field is the authoritative corpus declaration
         gmeta_path = corpus_root / "global-metadata.yaml"
         if gmeta_path.exists():
             gmeta = GlobalMetadataDocument.from_yaml_file(gmeta_path)
+            corpus_backend = gmeta.backend
         else:
-            gmeta = None
+            # Legacy corpus without global-metadata: infer from first manifest
+            # (backwards compat path; new corpora must have global-metadata with backend)
+            if not corpus_index.datasets:
+                raise ValueError("corpus index has no datasets")
+            first_manifest_path = corpus_root / corpus_index.datasets[0].manifest_path
+            if first_manifest_path.exists():
+                first_manifest = MaterializationManifest.from_yaml_file(first_manifest_path)
+                corpus_backend = first_manifest.backend
+            else:
+                raise FileNotFoundError(
+                    f"corpus index references {first_manifest_path} which does not exist; "
+                    "cannot determine corpus backend"
+                )
 
-        # Load tokenizer
+        # Validate: all manifests must declare the same backend as global-metadata
+        for ds_record in corpus_index.datasets:
+            manifest_path = corpus_root / ds_record.manifest_path
+            if manifest_path.exists():
+                manifest = MaterializationManifest.from_yaml_file(manifest_path)
+                if manifest.backend != corpus_backend:
+                    raise ValueError(
+                        f"backend mismatch: manifest {manifest_path} declares backend "
+                        f"'{manifest.backend}' but corpus declares backend '{corpus_backend}' — "
+                        "all datasets in a corpus must use the same backend"
+                    )
+
+        # Dispatch reader by corpus backend (not by the deprecated caller-provided backend arg)
+        if corpus_backend not in AVAILABLE_READERS:
+            raise NotImplementedError(
+                f"backend '{corpus_backend}' not yet supported; "
+                f"use one of {list(AVAILABLE_READERS)}"
+            )
+
+        # Load tokenizer (required for all backends)
         tokenizer_path_str = (
             gmeta.tokenizer_path if gmeta and gmeta.tokenizer_path else "tokenizer.json"
         )
@@ -387,28 +480,13 @@ class CorpusLoader:
                     nonhvg_arr = np.load(str(nonhvg_path), allow_pickle=False)
                     nonhvg_indices = tuple(int(x) for x in nonhvg_arr)
 
-            # Build ArrowHFCellReader kwargs from manifest paths
-            cell_meta_sqlite = meta_root / f"{manifest.release_id}-cell-meta.sqlite"
-            cells_parquet = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-cells.parquet"
-            meta_parquet = meta_root / f"{manifest.release_id}-meta.parquet"
-            size_factor_manifest = meta_root / "size-factor-manifest.yaml"
-
-            # Feature meta paths for preloading (if available)
-            feature_meta_paths: dict[str, Path] | None = None
-            if manifest.feature_meta_paths:
-                feature_meta_paths = {
-                    k: meta_root / v for k, v in manifest.feature_meta_paths.items()
-                }
-
-            reader = ArrowHFCellReader(
+            # Build per-dataset reader via the backend factory
+            # Each backend has its own reader class and constructor signature
+            reader = build_cell_reader(
+                backend=corpus_backend,
                 release_id=manifest.release_id,
                 corpus_index_path=corpus_index_path,
-                cells_parquet_path=cells_parquet,
-                meta_parquet_path=meta_parquet,
-                cell_meta_sqlite_path=cell_meta_sqlite,
-                feature_registry_path=meta_root / "feature-registry.yaml",  # legacy fallback
-                size_factor_manifest_path=size_factor_manifest,
-                feature_meta_paths=feature_meta_paths,
+                **cls._reader_kwargs(manifest, meta_root, corpus_backend),
             )
 
             # Determine n_vars from features_origin parquet
@@ -445,7 +523,7 @@ def build_corpus_loader(
     corpus_index_path: Path,
     backend: str = "arrow-hf",
     backend_kwargs: dict[str, Any] | None = None,
-) -> CorpusLoader:
+) -> "CorpusLoader":
     """Alias for ``CorpusLoader.from_corpus_index`` for discoverability."""
     return CorpusLoader.from_corpus_index(
         corpus_index_path=corpus_index_path,

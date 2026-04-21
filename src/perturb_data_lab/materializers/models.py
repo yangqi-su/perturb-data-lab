@@ -148,6 +148,7 @@ class MaterializationManifest(YamlDocument):
     dataset_id: str
     release_id: str
     route: str  # create_new | append_monolithic | append_routed
+    backend: str  # arrow-hf | webdataset | zarr-ts — must match corpus declared backend
     count_source: CountSourceSpec
     outputs: OutputRoots
     provenance: ProvenanceSpec
@@ -166,6 +167,8 @@ class MaterializationManifest(YamlDocument):
             raise ValueError("materialization manifest contract version mismatch")
         if self.route not in {"create_new", "append_routed"}:
             raise ValueError(f"invalid route: {self.route}")
+        if self.backend not in {"arrow-hf", "webdataset", "zarr-ts"}:
+            raise ValueError(f"invalid backend: {self.backend}")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "MaterializationManifest":
@@ -175,6 +178,7 @@ class MaterializationManifest(YamlDocument):
             dataset_id=str(data["dataset_id"]),
             release_id=str(data["release_id"]),
             route=str(data["route"]),
+            backend=str(data.get("backend", "arrow-hf")),  # default for backwards compat
             count_source=CountSourceSpec.from_dict(data["count_source"]),
             outputs=OutputRoots.from_dict(data["outputs"]),
             provenance=ProvenanceSpec.from_dict(data["provenance"]),
@@ -380,11 +384,16 @@ class GlobalMetadataDocument(YamlDocument):
     contract_version: str
     schema_version: str
     feature_registry_id: str  # deprecated: replaced by tokenizer_path in contract 0.2.0
+    backend: str  # arrow-hf | webdataset | zarr-ts — declared corpus backend
     missing_value_literal: str
     raw_field_policy: str
     tokenizer_path: str | None = None  # relative path from corpus root to tokenizer.json
     emission_spec_path: str | None = None  # relative path from corpus root to corpus-emission-spec.yaml
     notes: tuple[str, ...] = ()
+
+    def validate(self) -> None:
+        if self.backend not in {"arrow-hf", "webdataset", "zarr-ts"}:
+            raise ValueError(f"invalid backend in global-metadata: {self.backend}")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "GlobalMetadataDocument":

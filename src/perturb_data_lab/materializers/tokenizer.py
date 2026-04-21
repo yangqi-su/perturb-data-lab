@@ -274,8 +274,16 @@ class CorpusTokenizer:
         Two compatibility checks are applied in order:
         1. Namespace match: ``append_namespace`` must equal this tokenizer's
            namespace.
-        2. No duplicate tokens: none of ``new_tokens`` may already exist
-           in this tokenizer's stoi.
+        2. Overlap is fine: tokens that already exist in the tokenizer will
+           simply reuse their existing token IDs during append — no conflict.
+
+        Duplicate label handling note:
+        - Overlapping labels between the existing vocabulary and the new
+          dataset are expected in multi-dataset corpus formation; they do NOT
+          cause rejection.
+        - Only namespace mismatch is a true incompatibility.
+        - ``append_tokens`` handles deduplication by skipping tokens already
+          present in the existing stoi.
 
         Parameters
         ----------
@@ -289,7 +297,7 @@ class CorpusTokenizer:
         tuple[bool, str]
             (True, "") if compatible; (False, reason) if incompatible.
         """
-        # Check 1: namespace match
+        # Check 1: namespace match — this is the only true incompatibility
         if append_namespace != self.namespace:
             return (
                 False,
@@ -298,15 +306,9 @@ class CorpusTokenizer:
                 f"'{self.namespace}'",
             )
 
-        # Check 2: no duplicate tokens
-        duplicate_tokens = [t for t in new_tokens if t in self._stoi]
-        if duplicate_tokens:
-            return (
-                False,
-                f"duplicate token labels in appending dataset: {duplicate_tokens[:5]}"
-                f"{' ...' if len(duplicate_tokens) > 5 else ''} — "
-                f"existing token IDs must be preserved and duplicates are not allowed",
-            )
+        # Check 2 removed: overlapping token labels are fine — they just reuse
+        # existing token IDs. This is the expected behavior for multi-dataset
+        # corpus formation where datasets share features.
 
         return True, ""
 
@@ -318,7 +320,9 @@ class CorpusTokenizer:
         """Return a new tokenizer with ``new_tokens`` appended.
 
         Existing token IDs are unchanged.  New regular tokens are appended
-        in sorted ascending order after the current max ID.
+        in sorted ascending order after the current max ID.  Tokens that
+        already exist in the vocabulary are skipped (no re-tokenization;
+        existing IDs are preserved).
 
         Parameters
         ----------
@@ -335,22 +339,21 @@ class CorpusTokenizer:
         Raises
         ------
         ValueError
-            If namespace mismatch or duplicate tokens are detected.
+            If namespace mismatch is detected.
         """
         compatible, reason = self.append_compatible(new_tokens, append_namespace)
         if not compatible:
             raise ValueError(reason)
 
-        # Remove duplicates from new_tokens and sort
-        unique_new = sorted(set(new_tokens))
+        # Remove duplicates from new_tokens (they already exist — skip them)
+        unique_new = sorted(set(new_tokens) - set(self._stoi.keys()))
 
-        # Build new stoi: copy existing, then add new tokens
+        # Build new stoi: copy existing, then add only novel tokens
         new_stoi = dict(self._stoi)
         next_id = self._max_id + 1
         for token in unique_new:
-            if token not in new_stoi:
-                new_stoi[token] = next_id
-                next_id += 1
+            new_stoi[token] = next_id
+            next_id += 1
 
         return CorpusTokenizer(
             corpus_id=self.corpus_id,
