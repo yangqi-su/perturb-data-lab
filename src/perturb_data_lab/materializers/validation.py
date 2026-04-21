@@ -123,6 +123,23 @@ def _validate_schema_readiness_object(
                 )
             )
 
+    # Gate 5: feature_tokenization namespace must be a real value, not "unknown" or "set-manually"
+    # A dataset cannot join any corpus unless its namespace is explicitly set
+    ns = schema.feature_tokenization.namespace
+    if ns in ("unknown", "set-manually", ""):
+        violations.append(
+            ReadinessViolation(
+                field="feature_tokenization.namespace",
+                section="feature_fields",
+                reason=(
+                    f"namespace is '{ns}' — "
+                    "this dataset cannot join a corpus with this namespace. "
+                    "Set feature_tokenization.namespace to the actual namespace "
+                    "(e.g., ensembl, gene_symbol) before materialization."
+                ),
+            )
+        )
+
     return SchemaReadinessResult(
         valid=len(violations) == 0,
         violations=tuple(violations),

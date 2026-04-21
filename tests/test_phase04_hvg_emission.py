@@ -180,6 +180,7 @@ class TestMaterializationManifestHVGPath:
             dataset_id="ds1",
             release_id="v0",
             route="create_new",
+            backend="arrow-hf",
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=OutputRoots(
                 metadata_root=str(tmp_path / "meta"),
@@ -404,6 +405,7 @@ class TestMaterializationRouteWithHVG:
             dataset_id="syn-ds",
             release_id="syn-v0",
             route="create_new",
+            backend="arrow-hf",
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=output_roots,
             provenance=ProvenanceSpec(

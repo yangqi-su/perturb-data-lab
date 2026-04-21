@@ -101,8 +101,104 @@ def _apply_transform(
         # be hit when applying a transform to a single value
         return value
 
+    if name == "coalesce_values":
+        # coalesce_values expects tuple[str, ...]; this path should not normally
+        # be hit in the single-value dispatch — it is handled as a special
+        # derivation case in resolve_field_entry
+        return value
+
+    if name == "split_on_delimiter":
+        delimiter = str(args.get("delimiter", ","))
+        part = int(args.get("part", 0))
+        return _split_on_delimiter(str(value), delimiter, part)
+
+    if name == "map_values":
+        mapping = {str(k): str(v) for k, v in args.get("mapping", {}).items()}
+        return mapping.get(str(value), str(value))
+
+    if name == "dose_parse":
+        return _dose_parse(str(value))
+
+    if name == "dose_unit":
+        return _dose_unit(str(value))
+
+    if name == "timepoint_parse":
+        return _timepoint_parse(str(value))
+
+    if name == "timepoint_unit":
+        return _timepoint_unit(str(value))
+
     # Unknown transform: pass through
     return value
+
+
+def _split_on_delimiter(value: str, delimiter: str, part: int) -> str:
+    parts = value.split(delimiter)
+    if part < 0 or part >= len(parts):
+        return MISSING_VALUE_LITERAL
+    result = parts[part].strip()
+    return result if result else MISSING_VALUE_LITERAL
+
+
+def _dose_parse(value: str) -> str:
+    import re
+
+    value = str(value).strip()
+    m = re.match(r"^([0-9.]+)\s*(nM|uM|μM|mM)\s*$", value, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.match(r"^([0-9.]+)\s*(mg/kg|μg/kg|ug/kg)\s*$", value, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    try:
+        float(value)
+        return value
+    except ValueError:
+        pass
+    return MISSING_VALUE_LITERAL
+
+
+def _dose_unit(value: str) -> str:
+    import re
+
+    value = str(value).strip()
+    m = re.match(r"^([0-9.]+)\s*(nM|uM|μM|mM|mg/kg|μg/kg|ug/kg)\s*$", value, re.IGNORECASE)
+    if m:
+        raw_unit = m.group(2).lower()
+        unit_map = {"nm": "nm", "um": "um", "μm": "um", "mm": "mm", "mg/kg": "mg/kg", "μg/kg": "mg/kg", "ug/kg": "mg/kg"}
+        return unit_map.get(raw_unit, raw_unit)
+    return MISSING_VALUE_LITERAL
+
+
+def _timepoint_parse(value: str) -> str:
+    import re
+
+    value = str(value).strip()
+    m = re.match(
+        r"^([0-9.]+)\s*(h|hr|hrs|d|day|days|m|min|mins)\s*$", value, re.IGNORECASE
+    )
+    if m:
+        return m.group(1)
+    try:
+        float(value)
+        return value
+    except ValueError:
+        pass
+    return MISSING_VALUE_LITERAL
+
+
+def _timepoint_unit(value: str) -> str:
+    import re
+
+    value = str(value).strip()
+    m = re.match(
+        r"^([0-9.]+)\s*(h|hr|hrs|d|day|days|m|min|mins)\s*$", value, re.IGNORECASE
+    )
+    if m:
+        raw_unit = m.group(2).lower()
+        unit_map = {"h": "h", "hr": "h", "hrs": "h", "d": "d", "day": "d", "days": "d", "m": "m", "min": "m", "mins": "m"}
+        return unit_map.get(raw_unit, raw_unit)
+    return MISSING_VALUE_LITERAL
 
 
 def _apply_transform_chain(
@@ -171,6 +267,14 @@ def _is_null_like(value: str | None) -> bool:
     if not lowered:
         return True
     return lowered in _NA_LITERALS
+
+
+def _coalesce_values(values: tuple[str, ...]) -> str:
+    """Return the first non-null-like value from a tuple, or NA if all are null-like."""
+    for value in values:
+        if not _is_null_like(value):
+            return value
+    return MISSING_VALUE_LITERAL
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +385,43 @@ def resolve_field_entry(
                     was_resolved=True,
                     source_values=tuple(source_values),
                 )
+
+        # Handle coalesce_values: multi-source first-non-null pick
+        has_coalesce = any(t.name == "coalesce_values" for t in entry.transforms)
+        if has_coalesce and len(source_values) > 1:
+            # Collect all source values and apply coalesce
+            coalesced = _coalesce_values(tuple(source_values))
+            remaining_transforms = tuple(
+                t for t in entry.transforms if t.name != "coalesce_values"
+            )
+            if remaining_transforms:
+                coalesced = _apply_transform_chain(coalesced, remaining_transforms)
+            return SchemaExecutionResult(
+                value=coalesced,
+                was_resolved=True,
+                source_values=tuple(source_values),
+            )
+
+        # Handle split_on_delimiter: split a single combined source value
+        for t in entry.transforms:
+            if t.name == "split_on_delimiter":
+                delimiter = str(t.args.get("delimiter", ","))
+                part = int(t.args.get("part", 0))
+                if source_values:
+                    first_val = source_values[0]
+                    split_result = _split_on_delimiter(first_val, delimiter, part)
+                    remaining_transforms = tuple(
+                        tt for tt in entry.transforms if tt.name != "split_on_delimiter"
+                    )
+                    if remaining_transforms:
+                        split_result = _apply_transform_chain(
+                            split_result, remaining_transforms
+                        )
+                    return SchemaExecutionResult(
+                        value=split_result,
+                        was_resolved=True,
+                        source_values=tuple(source_values),
+                    )
 
     # No source values collected → NA
     if not source_values:
@@ -439,8 +580,11 @@ def resolve_all_feature_rows(
     features: list[dict[str, str]] = []
 
     if isinstance(var_dataframe, pd.DataFrame):
-        for _, row in var_dataframe.iterrows():
-            feat = resolve_feature_row(schema, row.to_dict())
+        for idx, row in var_dataframe.iterrows():
+            row_dict = dict(row)
+            # Inject __var_index__ so schemas can use var.index as a feature identifier source
+            row_dict["__var_index__"] = str(idx)
+            feat = resolve_feature_row(schema, row_dict)
             features.append(feat)
     else:
         for key, row in var_dataframe.items():

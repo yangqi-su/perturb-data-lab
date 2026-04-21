@@ -399,40 +399,50 @@ class CorpusLoader:
         corpus_root = corpus_index_path.parent
         corpus_id = corpus_index.corpus_id
 
-        # Load global metadata — backend field is the authoritative corpus declaration
+        # Load global metadata — backend field is the authoritative corpus declaration.
+        # If backend is None (unset in older files), fall back to inferring from the
+        # first manifest for backward compat with older corpora.
         gmeta_path = corpus_root / "global-metadata.yaml"
         if gmeta_path.exists():
             gmeta = GlobalMetadataDocument.from_yaml_file(gmeta_path)
-            corpus_backend = gmeta.backend
+            corpus_backend = gmeta.backend if gmeta.backend is not None else None
         else:
-            # Legacy corpus without global-metadata: infer from first manifest
-            # (backwards compat path; new corpora must have global-metadata with backend)
-            if not corpus_index.datasets:
-                raise ValueError("corpus index has no datasets")
-            first_manifest_path = corpus_root / corpus_index.datasets[0].manifest_path
-            if first_manifest_path.exists():
-                first_manifest = MaterializationManifest.from_yaml_file(first_manifest_path)
-                corpus_backend = first_manifest.backend
-            else:
-                raise FileNotFoundError(
-                    f"corpus index references {first_manifest_path} which does not exist; "
-                    "cannot determine corpus backend"
-                )
+            gmeta = None
+            corpus_backend = None
 
-        # Validate: all manifests must declare the same backend as global-metadata
-        for ds_record in corpus_index.datasets:
-            manifest_path = corpus_root / ds_record.manifest_path
-            if manifest_path.exists():
-                manifest = MaterializationManifest.from_yaml_file(manifest_path)
-                if manifest.backend != corpus_backend:
-                    raise ValueError(
-                        f"backend mismatch: manifest {manifest_path} declares backend "
-                        f"'{manifest.backend}' but corpus declares backend '{corpus_backend}' — "
-                        "all datasets in a corpus must use the same backend"
+        # Infer backend from first manifest if not set in global-metadata
+        if corpus_backend is None:
+            # Legacy corpus without global-metadata or with unset backend:
+            # infer from the first manifest's backend field if available.
+            if corpus_index.datasets:
+                first_manifest_path = corpus_root / corpus_index.datasets[0].manifest_path
+                if first_manifest_path.exists():
+                    first_manifest = MaterializationManifest.from_yaml_file(first_manifest_path)
+                    corpus_backend = first_manifest.backend
+                else:
+                    raise FileNotFoundError(
+                        f"corpus index references {first_manifest_path} which does not exist; "
+                        "cannot determine corpus backend"
                     )
+            # If corpus_backend is still None (empty corpus with no datasets),
+            # leave it as None — the unsupported-backend check below will raise
+            # NotImplementedError if an unsupported backend is requested.
+
+        # Validate: all manifests must declare the same backend as the corpus
+        if corpus_backend is not None:
+            for ds_record in corpus_index.datasets:
+                manifest_path = corpus_root / ds_record.manifest_path
+                if manifest_path.exists():
+                    manifest = MaterializationManifest.from_yaml_file(manifest_path)
+                    if manifest.backend is not None and manifest.backend != corpus_backend:
+                        raise ValueError(
+                            f"backend mismatch: manifest {manifest_path} declares backend "
+                            f"'{manifest.backend}' but corpus declares backend '{corpus_backend}' — "
+                            "all datasets in a corpus must use the same backend"
+                        )
 
         # Dispatch reader by corpus backend (not by the deprecated caller-provided backend arg)
-        if corpus_backend not in AVAILABLE_READERS:
+        if corpus_backend is not None and corpus_backend not in AVAILABLE_READERS:
             raise NotImplementedError(
                 f"backend '{corpus_backend}' not yet supported; "
                 f"use one of {list(AVAILABLE_READERS)}"

@@ -505,6 +505,7 @@ class TestMaterializationManifestTokenizerPath:
             dataset_id="test_ds",
             release_id="v0.1",
             route="create_new",
+            backend="arrow-hf",
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             provenance=ProvenanceSpec(source_path="/data/test.h5ad", schema="/schema.yaml"),

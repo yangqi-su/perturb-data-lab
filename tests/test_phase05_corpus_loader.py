@@ -147,6 +147,7 @@ def _make_materialization_manifest(
     dataset_id: str,
     hvg_sidecar_path: str | None = "hvg_sidecar",
     feature_meta_paths: dict[str, str] | None = None,
+    backend: str = "arrow-hf",
 ):
     manifest = MaterializationManifest(
         kind="materialization-manifest",
@@ -154,6 +155,7 @@ def _make_materialization_manifest(
         dataset_id=dataset_id,
         release_id=release_id,
         route="create_new",
+        backend=backend,
         count_source=CountSourceSpec(selected=".X", integer_only=True),
         outputs=OutputRoots(metadata_root=str(meta_root), matrix_root=str(matrix_root)),
         provenance=ProvenanceSpec(source_path=f"/fake/{release_id}.h5ad", schema="/fake/schema.yaml"),
@@ -611,6 +613,7 @@ class TestCorpusLoaderErrors:
             feature_registry_id="",
             missing_value_literal="<missing>",
             raw_field_policy="preserve-unchanged",
+            backend="unsupported",
         )
         gmeta.write_yaml(corpus_root / "global-metadata.yaml")
 
