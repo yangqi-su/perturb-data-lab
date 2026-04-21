@@ -21,6 +21,8 @@ from .models import (
     ProvenanceSpec,
     SizeFactorEntry,
 )
+from .tokenizer import CorpusTokenizer
+from .emission_spec import CorpusEmissionSpec
 from .validation import validate_schema_readiness
 from .schema_execution import (
     SchemaExecutionResult,
@@ -38,6 +40,10 @@ __all__ = [
     "AppendRoutedRoute",
     "build_materialization_route",
     "update_corpus_index",
+    # Tokenizer
+    "CorpusTokenizer",
+    # Emission spec
+    "CorpusEmissionSpec",
     # Models
     "MaterializationManifest",
     "FeatureRegistryManifest",

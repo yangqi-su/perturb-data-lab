@@ -146,10 +146,13 @@ class CountSourceDecision:
     confidence: str
     recovery_policy: str
     rationale: str
+    uses_recovery: bool = False
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "CountSourceDecision":
-        return cls(**data)
+        return cls(
+            **{k: v for k, v in data.items() if k in cls.__annotations__},
+        )
 
 
 @dataclass(frozen=True)
@@ -159,7 +162,10 @@ class TransformCatalogEntry:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TransformCatalogEntry":
-        return cls(**data)
+        return cls(
+            name=str(data["name"]),
+            description=str(data.get("description", "")),
+        )
 
 
 @dataclass(frozen=True)
@@ -321,6 +327,16 @@ class FeatureTokenizationSpec:
             selected=str(data["selected"]),
             namespace=str(data.get("namespace", "unknown")),
         )
+
+    def is_compatible_for_append(self, corpus_namespace: str) -> bool:
+        """Return True when this spec's namespace matches the corpus namespace.
+
+        Per the Phase 1 append compatibility contract, namespace mismatch is a
+        hard rejection condition before any I/O or tokenization.
+        """
+        if not self.namespace or self.namespace in ("unknown", "set-manually"):
+            return False
+        return self.namespace == corpus_namespace
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,5 @@
 kind: materialization-manifest
-contract_version: 0.1.0
+contract_version: 0.2.0
 dataset_id: marson2025_k562
 release_id: marson2025_k562-v0
 route: create_new
@@ -12,3 +12,9 @@ outputs:
 provenance:
   source_path: /protected/read-only/source.h5ad
   schema: examples/contracts/schema.yaml
+tokenizer_path: tokenizer.json
+feature_meta_paths:
+  features_origin: examples/contracts/features-origin.parquet
+  features_token: examples/contracts/features-token.parquet
+hvg_sidecar_path: hvg_sidecar
+integer_verified: true

@@ -25,13 +25,12 @@ import pyarrow.parquet as pq
 import scipy.sparse as sp
 from scipy.sparse import csr_matrix, issparse
 
+from .backends import materialize_arrow_hf, materialize_webdataset, materialize_zarr
 from .models import (
     CellMetadataRecord,
     CorpusIndexDocument,
     CountSourceSpec,
     DatasetJoinRecord,
-    FeatureRegistryEntry,
-    FeatureRegistryManifest,
     GlobalMetadataDocument,
     MaterializationManifest,
     OutputRoots,
@@ -41,8 +40,9 @@ from .models import (
     SizeFactorEntry,
     SizeFactorManifest,
 )
-from .backends import materialize_arrow_hf, materialize_webdataset, materialize_zarr
 from .schema_execution import resolve_all_cell_rows, resolve_all_feature_rows
+from .tokenizer import CorpusTokenizer
+from .emission_spec import CorpusEmissionSpec
 from .validation import validate_schema_readiness
 from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
 from ..inspectors.models import SchemaDocument
@@ -105,7 +105,7 @@ class MaterializationRoute:
 
     A route encapsulates:
     - How to write the per-cell sparse data to a backend storage format
-    - How to update the feature registry (append-only, preserving existing IDs)
+    - How to build/update the corpus tokenizer (append-only, preserving existing IDs)
     - How to write per-dataset and corpus-level manifests
 
     Subclasses implement backend-specific write logic.
@@ -120,12 +120,25 @@ class MaterializationRoute:
         dataset_id: str,
         count_source: CountSourceSpec,
         integer_only: bool = True,
+        corpus_index_path: Path | None = None,
     ):
         self.output_roots = output_roots
         self.release_id = release_id
         self.dataset_id = dataset_id
         self.count_source = count_source
         self.integer_only = integer_only
+        self._corpus_index_path = corpus_index_path
+
+    @property
+    def _corpus_root(self) -> Path:
+        """Corpus-level root directory (where corpus-wide artifacts live).
+
+        For ``create_new`` this is the metadata_root itself.
+        For ``append_routed`` this is derived from the corpus index path.
+        """
+        if self._corpus_index_path is not None:
+            return self._corpus_index_path.parent
+        return Path(self.output_roots.metadata_root)
 
     def materialize(
         self,
@@ -189,15 +202,17 @@ class MaterializationRoute:
             matrix_root=matrix_root,
         )
 
-        # Build/update feature registry
-        feature_registry_path = meta_root / "feature-registry.yaml"
-        registry = self._build_feature_registry(
-            var_index=adata.var.index,
-            existing_registry_path=feature_registry_path
-            if self.route_name != "create_new"
-            else None,
+        # Resolve feature tokenization labels from schema (before tokenizer build)
+        var_mem = adata.var.to_memory() if hasattr(adata.var, "to_memory") else adata.var
+        feature_rows = resolve_all_feature_rows(schema, var_mem)
+
+        # Build/update corpus tokenizer (replaces feature-registry.yaml)
+        tokenizer = self._build_tokenizer(
+            schema=schema,
+            feature_rows=feature_rows,
         )
-        registry.write_yaml(feature_registry_path)
+        tokenizer_path = self._corpus_root / "tokenizer.json"
+        tokenizer.to_json(tokenizer_path)
 
         # Write size factor manifest
         sf_entries = [
@@ -226,7 +241,15 @@ class MaterializationRoute:
         feature_meta_paths = self._write_feature_metadata(
             adata=adata,
             schema=schema,
-            registry=registry,
+            tokenizer=tokenizer,
+            feature_rows=feature_rows,
+            meta_root=meta_root,
+        )
+
+        # Compute and write HVG/non-HVG arrays in original dataset feature indices
+        hvg_sidecar_path = self._compute_and_write_hvg_arrays(
+            count_matrix=count_matrix,
+            n_vars=n_vars,
             meta_root=meta_root,
         )
 
@@ -257,12 +280,13 @@ class MaterializationRoute:
                 source_path=str(source_h5ad),
                 schema=schema_path,
             ),
-            feature_manifest_path=str(feature_registry_path),
+            tokenizer_path=str(tokenizer_path),
             feature_meta_paths={
                 k: str(v) for k, v in feature_meta_paths.items()
             },
             size_factor_manifest_path=str(sf_path),
             qa_manifest_path=str(qa_path),
+            hvg_sidecar_path=str(hvg_sidecar_path),
             integer_verified=all_passed,
             notes=(f"materialized via {self.route_name} route",),
         )
@@ -326,62 +350,67 @@ class MaterializationRoute:
         """Write per-cell sparse data. Override in subclass."""
         raise NotImplementedError
 
-    def _build_feature_registry(
+    def _build_tokenizer(
         self,
-        var_index: Any,
-        existing_registry_path: Path | None = None,
-    ) -> FeatureRegistryManifest:
-        """Build append-only feature registry.
+        schema: SchemaDocument,
+        feature_rows: tuple[dict[str, str], ...],
+    ) -> CorpusTokenizer:
+        """Build or update the corpus tokenizer for this route.
 
-        If existing_registry_path is provided, load it and append new entries,
-        preserving existing token IDs.
+        For ``create_new``: creates a fresh tokenizer with all tokens from
+        the dataset's schema-resolved feature values.
+
+        For ``append_routed``: loads the existing corpus tokenizer,
+        validates namespace compatibility with the schema's feature_tokenization,
+        and appends only truly new tokens.
+
+        Parameters
+        ----------
+        schema : SchemaDocument
+            The reviewed schema document.
+        feature_rows : tuple[dict[str, str], ...]
+            Resolved feature rows from ``resolve_all_feature_rows`` in original
+            var order.
+
+        Returns
+        -------
+        CorpusTokenizer
         """
-        if existing_registry_path is not None and existing_registry_path.exists():
-            existing = FeatureRegistryManifest.from_yaml_file(existing_registry_path)
-            existing_ids = {entry.feature_id for entry in existing.entries}
-            start_token = max(e.token_id for e in existing.entries) + 1
-            namespace = existing.namespace
-            registry_id = existing.registry_id
+        # Resolve token labels from schema's feature_tokenization.selected field
+        token_label_key = schema.feature_tokenization.selected
+        namespace = schema.feature_tokenization.namespace
+        token_labels: list[str] = [
+            str(row.get(token_label_key, MISSING_VALUE_LITERAL))
+            for row in feature_rows
+        ]
+
+        if self.route_name == "create_new":
+            return CorpusTokenizer.create_new(
+                corpus_id=self.dataset_id,
+                namespace=namespace,
+                regular_tokens=token_labels,
+            )
         else:
-            existing_ids = set()
-            start_token = 0
-            namespace = "unknown"
-            registry_id = "feature-registry-v0"
-
-        entries = []
-        token_id = start_token
-        for gene_id in var_index:
-            if gene_id in existing_ids:
-                continue
-            gene_label = str(gene_id)
-            entries.append(
-                FeatureRegistryEntry(
-                    token_id=token_id,
-                    feature_id=str(gene_id),
-                    feature_label=gene_label,
-                    namespace=namespace,
+            # append_routed: load existing tokenizer, validate, append
+            tokenizer_path = self._corpus_root / "tokenizer.json"
+            if not tokenizer_path.exists():
+                raise FileNotFoundError(
+                    f"append_routed requires an existing tokenizer at "
+                    f"{tokenizer_path} — ensure corpus-index.yaml and "
+                    f"tokenizer.json exist before appending datasets"
                 )
-            )
-            token_id += 1
+            existing = CorpusTokenizer.from_json(tokenizer_path)
 
-        all_entries = []
-        if existing_registry_path is not None and existing_registry_path.exists():
-            all_entries = list(
-                FeatureRegistryManifest.from_yaml_file(existing_registry_path).entries
-            )
-        all_entries.extend(entries)
+            # Append compatibility gate: namespace must match
+            compatible, reason = existing.append_compatible(token_labels, namespace)
+            if not compatible:
+                raise ValueError(
+                    f"append incompatible: {reason} — "
+                    f"either use a dataset whose feature_tokenization namespace "
+                    f"matches the corpus, or onboard to a separate corpus"
+                )
 
-        return FeatureRegistryManifest(
-            kind="feature-registry",
-            contract_version=CONTRACT_VERSION,
-            registry_id=registry_id,
-            append_only=True,
-            namespace=namespace,
-            feature_id_field="gene_id",
-            feature_label_field="gene_symbol",
-            default_missing_value=MISSING_VALUE_LITERAL,
-            entries=tuple(all_entries),
-        )
+            return existing.append_tokens(token_labels, namespace)
 
     def _write_cell_metadata(
         self,
@@ -463,7 +492,8 @@ class MaterializationRoute:
         self,
         adata: ad.AnnData,
         schema: SchemaDocument,
-        registry: FeatureRegistryManifest,
+        tokenizer: CorpusTokenizer,
+        feature_rows: tuple[dict[str, str], ...],
         meta_root: Path,
     ) -> dict[str, Path]:
         """Write per-dataset canonical feature objects.
@@ -473,7 +503,7 @@ class MaterializationRoute:
            in original dataset feature order (var index order), resolved via
            schema execution.  One row per feature.
         2. ``{release_id}-features-token.parquet`` — tokenized companion mapping
-           each original feature index to its token ID from the feature registry.
+           each original feature index to its token ID from the corpus tokenizer.
            One row per feature in original order.
 
         Both objects are compact (one row per feature, not one per cell) and
@@ -481,12 +511,6 @@ class MaterializationRoute:
         to translate dataset-order sparse indices to token-space without
         re-tokenizing at load time.
         """
-        import json
-
-        # Resolve all feature rows via schema execution (one row per feature)
-        var_mem = adata.var.to_memory() if hasattr(adata.var, "to_memory") else adata.var
-        feature_rows = resolve_all_feature_rows(schema, var_mem)
-
         # Build origin-order feature table
         origin_path = meta_root / f"{self.release_id}-features-origin.parquet"
         origin_indices = list(range(adata.n_vars))
@@ -510,13 +534,10 @@ class MaterializationRoute:
 
         # Build tokenized companion: map original var index → token ID
         token_path = meta_root / f"{self.release_id}-features-token.parquet"
-        registry_map = {
-            str(entry.feature_id): entry.token_id
-            for entry in registry.entries
-        }
+        token_label_key = schema.feature_tokenization.selected
         token_ids = [
-            registry_map.get(str(adata.var.index[i]), -1)
-            for i in range(adata.n_vars)
+            tokenizer.to_id(str(row.get(token_label_key, MISSING_VALUE_LITERAL)))
+            for row in feature_rows
         ]
         token_table = pa.table(
             {
@@ -548,6 +569,92 @@ class MaterializationRoute:
         all_passed = all(m.passed() for m in metrics)
         return tuple(metrics), all_passed
 
+    def _compute_and_write_hvg_arrays(
+        self,
+        count_matrix: Any,
+        n_vars: int,
+        meta_root: Path,
+        n_hvg: int = 2000,
+    ) -> Path:
+        """Compute HVG/non-HVG index arrays from the count matrix and write them.
+
+        HVG selection uses top-N dispersion on log-normalized values:
+        dispersion = variance / mean for each feature across cells.
+        The selected indices are written in **original dataset feature index**
+        space (not token space) as ``hvg.npy`` and ``nonhvg.npy``.
+
+        Parameters
+        ----------
+        count_matrix : Any
+            The count matrix; must be log-normalized before calling this method.
+            This method applies ``log1p`` internally to compute dispersion.
+        n_vars : int
+            Total number of features (n_vars from adata).
+        meta_root : Path
+            Directory to write the sidecar files.
+        n_hvg : int
+            Number of top-dispersion genes to select as HVGs. Default 2000.
+
+        Returns
+        -------
+        Path
+            Path to the directory containing ``hvg.npy`` and ``nonhvg.npy``.
+        """
+        sidecar_dir = meta_root / "hvg_sidecar"
+        sidecar_dir.mkdir(parents=True, exist_ok=True)
+
+        # Compute mean and variance of log1p(count_matrix) per feature (column)
+        # We sample cells to keep memory bounded for large datasets.
+        from .backends.arrow_hf import _get_row_nonzero
+
+        n_obs = count_matrix.shape[0]
+        sample_cells = min(512, n_obs)
+        cell_indices = np.linspace(0, n_obs - 1, num=sample_cells, dtype=int)
+
+        log_expr = np.zeros((sample_cells, n_vars), dtype=np.float64)
+        for row_i, ci in enumerate(cell_indices):
+            indices, counts = _get_row_nonzero(count_matrix, ci)
+            # Place log1p(count) at the gene indices
+            for idx, cnt in zip(indices, counts):
+                log_expr[row_i, idx] = np.log1p(float(cnt))
+
+        # Compute per-feature mean and variance of log-normalized expression
+        # Use a clipped mean to avoid zero-mean artifacts
+        gene_means = np.zeros(n_vars, dtype=np.float64)
+        gene_vars = np.zeros(n_vars, dtype=np.float64)
+        for j in range(n_vars):
+            col = log_expr[:, j]
+            nonzero = col[col > 0]
+            if len(nonzero) > 0:
+                gene_means[j] = np.mean(nonzero)
+                gene_vars[j] = np.var(nonzero)
+            else:
+                gene_means[j] = 0.0
+                gene_vars[j] = 0.0
+
+        # Dispersion = variance / mean (with a small epsilon to avoid division by zero)
+        eps = 1e-10
+        dispersion = np.where(gene_means > eps, gene_vars / gene_means, 0.0)
+
+        # Select top-N HVG indices by dispersion
+        #.argsort() gives ascending; take last N for descending
+        sorted_indices = np.argsort(dispersion)
+        hvg_indices: np.ndarray = sorted_indices[-n_hvg:].astype(np.int32)
+        # Sort for consistent ordering
+        hvg_indices = np.sort(hvg_indices)
+
+        # Non-HVG = complement in original index space
+        hvg_set = set(hvg_indices)
+        nonhvg_indices = np.array(
+            [j for j in range(n_vars) if j not in hvg_set], dtype=np.int32
+        )
+
+        # Write artifacts
+        np.save(str(sidecar_dir / "hvg.npy"), hvg_indices, allow_pickle=False)
+        np.save(str(sidecar_dir / "nonhvg.npy"), nonhvg_indices, allow_pickle=False)
+
+        return sidecar_dir
+
 
 class CreateNewRoute(MaterializationRoute):
     """Materialization route: create a new standalone dataset release.
@@ -574,12 +681,26 @@ class AppendRoutedRoute(MaterializationRoute):
     """Materialization route: add a dataset to a growing indexed corpus.
 
     Each dataset is stored independently with its own manifest. A corpus index
-    maps dataset IDs to release IDs. The feature registry is appended with new
+    maps dataset IDs to release IDs. The corpus tokenizer is appended with new
     token IDs while preserving existing entries. This is the default path for
     corpora expected to grow with additional datasets.
+
+    ``corpus_index_path`` must be provided and must point to an existing
+    ``corpus-index.yaml`` so the route can locate the corpus tokenizer for
+    append compatibility checking.
     """
 
     route_name = "append_routed"
+
+    @property
+    def _corpus_root(self) -> Path:
+        """Corpus root is derived from the corpus index path for append routes."""
+        if self._corpus_index_path is None:
+            raise ValueError(
+                "append_routed requires corpus_index_path to be set so the "
+                "existing corpus tokenizer can be located"
+            )
+        return self._corpus_index_path.parent
 
     def _write_cells(
         self,
@@ -605,8 +726,17 @@ def build_materialization_route(
     dataset_id: str,
     count_source: CountSourceSpec,
     integer_only: bool = True,
+    corpus_index_path: Path | None = None,
 ) -> MaterializationRoute:
-    """Factory to build the correct materialization route by name."""
+    """Factory to build the correct materialization route by name.
+
+    Parameters
+    ----------
+    corpus_index_path : Path | None
+        Path to the corpus index YAML.  Used by ``append_routed`` to locate
+        the existing corpus tokenizer and corpus root.  Optional for
+        ``create_new``.
+    """
     routes = {
         "create_new": CreateNewRoute,
         "append_routed": AppendRoutedRoute,
@@ -619,6 +749,7 @@ def build_materialization_route(
         dataset_id=dataset_id,
         count_source=count_source,
         integer_only=integer_only,
+        corpus_index_path=corpus_index_path,
     )
 
 
@@ -631,11 +762,28 @@ def update_corpus_index(
     corpus_index_path: Path,
     new_dataset_record: DatasetJoinRecord,
     global_metadata: GlobalMetadataDocument | None = None,
+    tokenizer_path: str | None = None,
+    emission_spec_path: str | None = None,
 ) -> CorpusIndexDocument:
     """Load an existing corpus index, append the new dataset record, and save.
 
-    If corpus_index_path does not exist, create a new index.
+    If corpus_index_path does not exist, create a new index and also write
+    a new ``global-metadata.yaml`` next to the index.
+
     This function always appends; it does not overwrite existing dataset entries.
+
+    Parameters
+    ----------
+    corpus_index_path : Path
+        Path to the corpus index YAML file.
+    new_dataset_record : DatasetJoinRecord
+        The dataset join record for the new dataset.
+    global_metadata : GlobalMetadataDocument | None
+        Global metadata for new corpus creation.  Required when creating
+        a new corpus; ignored for existing corpora.
+    tokenizer_path : str | None
+        Relative path to ``tokenizer.json`` from the corpus root.
+        Written to ``global-metadata.yaml`` when creating a new corpus.
     """
     if corpus_index_path.exists():
         corpus = CorpusIndexDocument.from_yaml_file(corpus_index_path)
@@ -651,7 +799,22 @@ def update_corpus_index(
     else:
         datasets = [new_dataset_record]
         corpus_id = "perturb-data-lab-v0"
-        global_meta = global_metadata.to_dict() if global_metadata else {}
+        # Build global metadata dict for new corpus
+        gmeta_dict: dict[str, Any] = {
+            "kind": "global-metadata",
+            "contract_version": CONTRACT_VERSION,
+        }
+        if global_metadata is not None:
+            gmeta_dict = global_metadata.to_dict()
+        if tokenizer_path is not None:
+            gmeta_dict["tokenizer_path"] = tokenizer_path
+        if emission_spec_path is not None:
+            gmeta_dict["emission_spec_path"] = emission_spec_path
+        global_meta = gmeta_dict
+        # Write global-metadata.yaml only when we have meaningful content
+        if gmeta_dict:
+            global_meta_path = corpus_index_path.parent / "global-metadata.yaml"
+            GlobalMetadataDocument.from_dict(gmeta_dict).write_yaml(global_meta_path)
 
     updated = CorpusIndexDocument(
         kind="corpus-index",

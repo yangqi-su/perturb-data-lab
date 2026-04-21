@@ -151,7 +151,7 @@ class MaterializationManifest(YamlDocument):
     count_source: CountSourceSpec
     outputs: OutputRoots
     provenance: ProvenanceSpec
-    feature_manifest_path: str | None = None
+    tokenizer_path: str | None = None
     feature_meta_paths: dict[str, str] | None = None
     size_factor_manifest_path: str | None = None
     qa_manifest_path: str | None = None
@@ -178,7 +178,7 @@ class MaterializationManifest(YamlDocument):
             count_source=CountSourceSpec.from_dict(data["count_source"]),
             outputs=OutputRoots.from_dict(data["outputs"]),
             provenance=ProvenanceSpec.from_dict(data["provenance"]),
-            feature_manifest_path=data.get("feature_manifest_path"),
+            tokenizer_path=data.get("tokenizer_path"),
             feature_meta_paths={
                 k: str(v) for k, v in (data.get("feature_meta_paths") or {}).items()
             },
@@ -379,9 +379,11 @@ class GlobalMetadataDocument(YamlDocument):
     kind: str
     contract_version: str
     schema_version: str
-    feature_registry_id: str
+    feature_registry_id: str  # deprecated: replaced by tokenizer_path in contract 0.2.0
     missing_value_literal: str
     raw_field_policy: str
+    tokenizer_path: str | None = None  # relative path from corpus root to tokenizer.json
+    emission_spec_path: str | None = None  # relative path from corpus root to corpus-emission-spec.yaml
     notes: tuple[str, ...] = ()
 
     @classmethod
@@ -395,6 +397,8 @@ class GlobalMetadataDocument(YamlDocument):
                 data.get("missing_value_literal", MISSING_VALUE_LITERAL)
             ),
             raw_field_policy=str(data.get("raw_field_policy", "preserve-unchanged")),
+            tokenizer_path=data.get("tokenizer_path"),
+            emission_spec_path=data.get("emission_spec_path"),
             notes=tuple(str(item) for item in data.get("notes", [])),
         )
 

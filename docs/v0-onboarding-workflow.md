@@ -171,11 +171,14 @@ update_corpus_index(Path("/path/to/outputs/metadata/corpus-index.yaml"), corpus_
 - `{release_id}-cell-meta.sqlite` — SQLite-backed per-cell canonical metadata (canonical_perturbation, canonical_context, raw_obs as JSON columns)
 - `{release_id}-features-origin.parquet` — canonical feature metadata in original dataset feature order
 - `{release_id}-features-token.parquet` — tokenized companion mapping original indices to token IDs
-- `feature-registry.yaml` — append-only feature vocabulary (token IDs preserved across datasets)
+- `tokenizer.json` — corpus-level append-safe JSON tokenizer (replaces the old feature-registry.yaml approach)
+- `corpus-emission-spec.yaml` — corpus-level emission spec controlling which perturbation/context fields loaders emit
+- `hvg_sidecar/` — `hvg.npy` and `nonhvg.npy` in dataset-original feature indices (for `HVGRandomSampler`)
 - `size-factor-manifest.yaml` — per-cell size factors
 - `qa-manifest.yaml` — QA checks including integer verification
 - `materialization-manifest.yaml` — full provenance and configuration snapshot
 - `corpus-index.yaml` (for `append_routed`) — updated corpus membership
+- `global-metadata.yaml` (for `create_new`) — corpus defaults and pointers to tokenizer and emission spec
 
 **Validation checks**:
 - `integer_verified: true` in `materialization-manifest.yaml`
@@ -221,7 +224,30 @@ for batch in dataset:
     pass
 ```
 
-**Multi-dataset corpus loading**: Use `CorpusIndexDocument` to enumerate all member datasets, construct one `ArrowHFCellReader` per dataset, and iterate over them programmatically.
+**Multi-dataset corpus loading**: Use `CorpusLoader` to load a corpus by its index file:
+
+```python
+from perturb_data_lab.loaders.corpus import build_corpus_loader
+
+loader = build_corpus_loader(Path("/path/to/corpus/corpus-index.yaml"))
+
+# Iterate all cells across all datasets
+for cell in loader.iter_cells():
+    print(cell.cell_id, cell.dataset_id)
+
+# Direct index access (global corpus index)
+cell = loader.read_cell(42)
+
+# Per-dataset access with HVG token IDs
+entry = loader.dataset_reader("replogle_k562")
+state = SamplerState(
+    mode="hvg_random",
+    total_cells=len(entry.reader),
+    n_genes=entry.n_vars,
+    hvg_set=entry.token_hvg_set,  # token-ID space for HVGRandomSampler
+)
+sampler = HVGRandomSampler(state, np.random.default_rng(42))
+```
 
 **Sampler options** (all backend-agnostic):
 - `RandomContextSampler` — uniform random context from expressed genes

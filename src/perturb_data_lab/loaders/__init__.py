@@ -16,6 +16,7 @@ from .loaders import (
     AVAILABLE_READERS,
     build_cell_reader,
 )
+from .corpus import CorpusLoader, DatasetReaderEntry, build_corpus_loader
 
 __all__ = [
     "CellState",
@@ -32,4 +33,8 @@ __all__ = [
     "HVGRandomSampler",
     "PerturbDataLoader",
     "PerturbIterableDataset",
+    # Phase 5 corpus runtime loader
+    "CorpusLoader",
+    "DatasetReaderEntry",
+    "build_corpus_loader",
 ]

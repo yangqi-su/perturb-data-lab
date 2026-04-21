@@ -311,6 +311,10 @@ def _audit_matrix_candidate(
     if inferred_transform in {"transformed", "binned"}:
         notes.append(f"candidate name suggests {inferred_transform} data")
 
+    # Mark binned matrices as non-recoverable per Phase 1 contract
+    if inferred_transform == "binned":
+        notes.append("binned matrices are non-recoverable; exclude from reverse-normalization")
+
     return CountSourceCandidate(
         candidate=candidate_name,
         rank=0,
@@ -364,8 +368,146 @@ def _rank_candidates(
     return tuple(ranked)
 
 
+def _attempt_reverse_normalization(
+    candidate: CountSourceCandidate,
+    adata: ad.AnnData,
+) -> CountSourceCandidate | None:
+    """Attempt to recover integer counts via the approved reverse-normalization path.
+
+    The only approved path is ``expm1(expr) / size_factor`` on log-normalized data.
+    Recovery is only attempted when:
+    - ``candidate`` is the best available candidate but is not an integer source
+    - the candidate is log-normalized (inferred_transform is "transformed" or
+      the candidate name contains "log" or "norm")
+    - size factors can be computed from the raw integer count source (.X)
+
+    When the raw integer source is in .X, size factors are computed from .X
+    (sum-per-row, normalized by median), then expm1(expr) / size_factor is
+    applied to the candidate matrix to recover integer-like counts.
+
+    Returns an updated ``CountSourceCandidate`` with ``recovery_policy`` set to
+    ``"expm1_over_size_factor"`` on successful recovery, or ``None`` if recovery
+    cannot be performed. Does not modify the original candidate object.
+    """
+    import numpy as np
+
+    # Only recover from transformed/log-normalized candidates
+    inferred = candidate.inferred_transform
+    if inferred not in {"transformed", "raw"} and "log" not in candidate.candidate.lower():
+        return None
+
+    # Select the matrix reference for this candidate (the matrix to recover from)
+    if candidate.candidate == ".raw.X":
+        matrix_ref = adata.raw.X
+    elif candidate.candidate.startswith(".layers["):
+        layer_name = candidate.candidate[len(".layers[") : -1]
+        matrix_ref = adata.layers[layer_name]
+    elif candidate.candidate == ".X":
+        matrix_ref = adata.X
+    else:
+        return None
+
+    n_obs = adata.n_obs
+    sample_rows = min(DEFAULT_MATRIX_SAMPLE_ROWS, n_obs)
+    indices = _sample_row_indices(n_obs, sample_rows)
+
+    # Compute size factors from .X (the raw integer count source) when available.
+    # This matches the Phase 1 contract: misc._get_sf() sum method on raw counts.
+    # If .X is not an integer source, fall back to computing from the candidate
+    # matrix itself (handles the case where the log-norm candidate IS .X).
+    from ..materializers.backends.arrow_hf import _get_row_nonzero
+
+    try:
+        size_factors = np.zeros(n_obs, dtype=np.float64)
+        # Use .X as the source for size factor computation when it exists
+        count_for_sf = adata.X
+        for i in indices:
+            row_indices, row_counts = _get_row_nonzero(count_for_sf, i)
+            size_factors[i] = float(np.asarray(row_counts).sum())
+
+        total = size_factors.sum()
+        if total > 0:
+            size_factors = size_factors / (total / n_obs)
+        size_factors = np.where(size_factors <= 0, 1.0, size_factors)
+        size_factors = np.where(np.isnan(size_factors), 1.0, size_factors)
+    except Exception:
+        # Fall back: compute size factors from the candidate matrix itself
+        try:
+            size_factors = np.zeros(n_obs, dtype=np.float64)
+            for i in indices:
+                row_indices, row_counts = _get_row_nonzero(matrix_ref, i)
+                size_factors[i] = float(np.asarray(row_counts).sum())
+            total = size_factors.sum()
+            if total > 0:
+                size_factors = size_factors / (total / n_obs)
+            size_factors = np.where(size_factors <= 0, 1.0, size_factors)
+            size_factors = np.where(np.isnan(size_factors), 1.0, size_factors)
+        except Exception:
+            return None
+
+    # Apply expm1 / size_factor on sampled rows
+    recovered_values: list[np.ndarray] = []
+    for idx in indices:
+        row = matrix_ref[idx]
+        if hasattr(row, "toarray"):
+            row = np.asarray(row.toarray().ravel())
+        else:
+            row = np.asarray(row).ravel()
+        nonzero_mask = row != 0
+        if nonzero_mask.any():
+            sf = size_factors[idx]
+            if sf <= 0:
+                sf = 1.0
+            recovered = np.expm1(row[nonzero_mask]) * sf
+            recovered_values.append(recovered)
+
+    if not recovered_values:
+        return None
+
+    all_recovered = np.concatenate(recovered_values)
+    if all_recovered.size == 0:
+        return None
+
+    deviations = np.abs(all_recovered - np.rint(all_recovered))
+    max_deviation = float(np.max(deviations))
+    fraction_noninteger = float(np.mean(deviations > 1e-8))
+
+    # Integer threshold: max_abs_integer_deviation < 0.01
+    if max_deviation > 0.01:
+        return None
+
+    # Recovery succeeded — build updated candidate
+    status = "pass"
+    if fraction_noninteger > 0.0:
+        status = "needs-review"
+
+    notes = (
+        f"recovered via expm1/size_factor; "
+        f"max_deviation={max_deviation:.6f}; "
+        f"fraction_noninteger={fraction_noninteger:.6f}"
+    )
+    return CountSourceCandidate(
+        candidate=candidate.candidate,
+        rank=candidate.rank,
+        status=status,
+        storage=candidate.storage,
+        dtype=candidate.dtype,
+        shape=candidate.shape,
+        sampled_rows=candidate.sampled_rows,
+        sampled_nonzero_values=candidate.sampled_nonzero_values,
+        sampled_density=candidate.sampled_density,
+        fraction_noninteger_nonzero=fraction_noninteger,
+        max_abs_integer_deviation=max_deviation,
+        nonnegative=candidate.nonnegative,
+        inferred_transform="recovered-count",
+        recovery_policy="expm1_over_size_factor",
+        notes=(notes,),
+    )
+
+
 def _choose_count_source(
     candidates: tuple[CountSourceCandidate, ...],
+    adata: ad.AnnData | None = None,
 ) -> CountSourceDecision:
     if not candidates:
         return CountSourceDecision(
@@ -376,6 +518,15 @@ def _choose_count_source(
             rationale="No matrix candidates were available for audit.",
         )
     selected = candidates[0]
+    uses_recovery = False
+
+    # If no direct integer source is available, attempt reverse normalization
+    if selected.status != "pass" and adata is not None:
+        recovered = _attempt_reverse_normalization(selected, adata)
+        if recovered is not None:
+            selected = recovered
+            uses_recovery = True
+
     confidence = (
         "high"
         if selected.status == "pass"
@@ -387,12 +538,16 @@ def _choose_count_source(
         f"Selected {selected.candidate} because it is the highest-ranked candidate with "
         f"status {selected.status}."
     )
+    if uses_recovery:
+        rationale += " Counts were recovered via the approved expm1/size_factor path."
+
     return CountSourceDecision(
         selected_candidate=selected.candidate,
         status=selected.status,
         confidence=confidence,
         recovery_policy=selected.recovery_policy,
         rationale=rationale,
+        uses_recovery=uses_recovery,
     )
 
 
@@ -1022,7 +1177,7 @@ def inspect_target(target: InspectionTarget, output_root: Path) -> InspectionArt
             )
 
         ranked_candidates = _rank_candidates(candidates)
-        count_decision = _choose_count_source(ranked_candidates)
+        count_decision = _choose_count_source(ranked_candidates, adata)
         obs_columns = tuple(str(column) for column in adata.obs.columns.tolist())
 
         perturbation_fields, context_fields = _build_cell_field_sections(

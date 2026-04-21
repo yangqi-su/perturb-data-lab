@@ -1,12 +1,13 @@
 kind: corpus-index
-contract_version: 0.1.0
+contract_version: 0.2.0
 corpus_id: perturb-data-lab-v0
 global_metadata:
-  feature_registry_id: human-gene-v1
   missing_value_literal: NA
   raw_field_policy: preserve-unchanged
+  tokenizer_path: tokenizer.json
+  emission_spec_path: corpus-emission-spec.yaml
 datasets:
   - dataset_id: marson2025_k562
     release_id: marson2025_k562-v0
     join_mode: create_new
-    manifest: examples/contracts/materialization-manifest.yaml
+    manifest_path: examples/contracts/materialization-manifest.yaml

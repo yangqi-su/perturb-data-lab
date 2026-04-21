@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: perturb-data-lab
+Version: 0.1.0
+Summary: Phase 1 blueprint and contracts for perturb-seq data onboarding.
+Requires-Python: >=3.10
+Requires-Dist: anndata>=0.11
+Requires-Dist: numpy>=2.0
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: scipy>=1.14

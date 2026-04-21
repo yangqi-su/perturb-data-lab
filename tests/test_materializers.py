@@ -263,7 +263,7 @@ class TestMaterializationManifest:
     def test_manifest_round_trip(self):
         manifest = MaterializationManifest(
             kind="materialization-manifest",
-            contract_version="0.1.0",
+            contract_version="0.2.0",
             dataset_id="test_ds",
             release_id="v0.1",
             route="create_new",

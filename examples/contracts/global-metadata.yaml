@@ -1,9 +1,12 @@
 kind: global-metadata
-contract_version: 0.1.0
+contract_version: 0.2.0
 corpus_id: perturb-data-lab-v0
-feature_registry: examples/contracts/feature-registry.yaml
-default_missing_value_literal: NA
+feature_registry_id: ""  # deprecated: replaced by tokenizer_path in contract 0.2.0
+missing_value_literal: NA
 raw_field_policy: preserve-unchanged
-active_contracts:
-  perturbation_metadata: canonical-perturbation-metadata
-  context_metadata: canonical-context-metadata
+tokenizer_path: tokenizer.json
+emission_spec_path: corpus-emission-spec.yaml
+notes:
+  - tokenizer.json provides the authoritative append-safe token mapping
+  - corpus-emission-spec.yaml controls which fields loaders emit at runtime
+  - hvg_sidecar/ directory contains hvg.npy and nonhvg.npy per dataset
