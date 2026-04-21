@@ -33,8 +33,11 @@ def materialize_webdataset(
     release_id: str,
     matrix_root: Path,
     shard_size: int = 10000,
+    canonical_perturbation: tuple[dict[str, str], ...] | None = None,
+    canonical_context: tuple[dict[str, str], ...] | None = None,
+    raw_fields: tuple[dict[str, Any], ...] | None = None,
 ) -> dict[str, Path]:
-    """Write using WebDataset shard format."""
+    """Write using WebDataset shard format with canonical metadata parity."""
     return write_webdataset_shards(
         adata,
         count_matrix,
@@ -42,6 +45,9 @@ def materialize_webdataset(
         release_id,
         matrix_root,
         shard_size=shard_size,
+        canonical_perturbation=canonical_perturbation,
+        canonical_context=canonical_context,
+        raw_fields=raw_fields,
     )
 
 
@@ -52,8 +58,11 @@ def materialize_zarr(
     release_id: str,
     matrix_root: Path,
     chunk_cells: int = 1024,
+    canonical_perturbation: tuple[dict[str, str], ...] | None = None,
+    canonical_context: tuple[dict[str, str], ...] | None = None,
+    raw_fields: tuple[dict[str, Any], ...] | None = None,
 ) -> dict[str, Path]:
-    """Write using Zarr/TensorStore cell-chunked format."""
+    """Write using Zarr/TensorStore cell-chunked format with canonical metadata parity."""
     return write_zarr_sparse_cell_chunks(
         adata,
         count_matrix,
@@ -61,6 +70,9 @@ def materialize_zarr(
         release_id,
         matrix_root,
         chunk_cells=chunk_cells,
+        canonical_perturbation=canonical_perturbation,
+        canonical_context=canonical_context,
+        raw_fields=raw_fields,
     )
 
 

@@ -349,11 +349,13 @@ class WebDatasetCellReader(BackendCellReader):
         shard_paths: list[Path],
         meta_path: Path,
         feature_registry_path: Path | None = None,
+        dataset_id: str | None = None,
     ):
         super().__init__(release_id, corpus_index_path)
         self.shard_paths = shard_paths
         self.meta_path = meta_path
         self.feature_registry_path = feature_registry_path
+        self.dataset_id = dataset_id or release_id
         self._cell_index_to_shard: dict[int, tuple[int, int]] = {}
         self._build_index()
 
@@ -409,7 +411,7 @@ class WebDatasetCellReader(BackendCellReader):
 
         return CellState(
             cell_id=record["cell_id"],
-            dataset_id=self.release_id,  # WebDataset doesn't track dataset_id separately
+            dataset_id=self.dataset_id,
             dataset_release=self.release_id,
             expressed_gene_indices=tuple(
                 np.frombuffer(record["expressed_gene_indices"], dtype=np.int32)
@@ -418,9 +420,9 @@ class WebDatasetCellReader(BackendCellReader):
                 np.frombuffer(record["expression_counts"], dtype=np.int32)
             ),
             size_factor=record["size_factor"],
-            canonical_perturbation={},
-            canonical_context={},
-            raw_fields={},
+            canonical_perturbation=record.get("canonical_perturbation", {}),
+            canonical_context=record.get("canonical_context", {}),
+            raw_fields=record.get("raw_fields", {}),
         )
 
 
@@ -442,6 +444,7 @@ class ZarrCellReader(BackendCellReader):
         meta_path: Path,
         chunk_cells: int = 1024,
         feature_registry_path: Path | None = None,
+        dataset_id: str | None = None,
     ):
         super().__init__(release_id, corpus_index_path)
         self.indices_zarr_path = indices_zarr_path
@@ -450,18 +453,25 @@ class ZarrCellReader(BackendCellReader):
         self.meta_path = meta_path
         self.chunk_cells = chunk_cells
         self.feature_registry_path = feature_registry_path
+        self.dataset_id = dataset_id or release_id
         self._n_cells: int | None = None
         self._n_vars: int | None = None
+        self._meta_cache: list[dict[str, Any]] | None = None  # per-cell meta list
 
-    def __len__(self) -> int:
-        if self._n_cells is None:
+    def _load_meta(self) -> list[dict[str, Any]]:
+        """Load and cache the per-cell meta list from meta.json once."""
+        if self._meta_cache is None:
             import json
-
             with open(self.meta_path) as f:
                 meta = json.load(f)
+            self._meta_cache = meta["cells"]
             self._n_cells = meta["n_obs"]
             self._n_vars = meta["n_vars"]
-        return self._n_cells
+        return self._meta_cache
+
+    def __len__(self) -> int:
+        meta = self._load_meta()
+        return len(meta)
 
     @property
     def total_genes(self) -> int:
@@ -471,22 +481,16 @@ class ZarrCellReader(BackendCellReader):
 
             reg = FeatureRegistryManifest.from_yaml_file(self.feature_registry_path)
             return len(reg.entries)
-        # Fallback: use n_vars from Zarr metadata JSON
+        # Fallback: use cached n_vars from meta.json
         if self._n_vars is None:
-            import json
-
-            with open(self.meta_path) as f:
-                meta = json.load(f)
-            self._n_vars = meta["n_vars"]
-        return self._n_vars
+            self._load_meta()
+        return self._n_vars or 0
 
     def read_cell(self, cell_index: int) -> CellState:
-        import json
-
         import zarr
 
-        with open(self.meta_path) as f:
-            meta = json.load(f)
+        meta_list = self._load_meta()
+        cell_meta = meta_list[cell_index]
 
         chunk_idx = cell_index // self.chunk_cells
         local_i = cell_index % self.chunk_cells
@@ -504,15 +508,15 @@ class ZarrCellReader(BackendCellReader):
         expressed_counts = tuple(chunk_counts[nonzero_mask].tolist())
 
         return CellState(
-            cell_id=f"{self.release_id}_cell_{cell_index}",
-            dataset_id=self.release_id,
+            cell_id=cell_meta["cell_id"],
+            dataset_id=self.dataset_id,
             dataset_release=self.release_id,
             expressed_gene_indices=expressed_indices,
             expression_counts=expressed_counts,
             size_factor=float(sf),
-            canonical_perturbation={},
-            canonical_context={},
-            raw_fields={},
+            canonical_perturbation=cell_meta.get("canonical_perturbation", {}),
+            canonical_context=cell_meta.get("canonical_context", {}),
+            raw_fields=cell_meta.get("raw_fields", {}),
         )
 
 

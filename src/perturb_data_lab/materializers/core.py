@@ -675,7 +675,10 @@ class CreateNewRoute(MaterializationRoute):
         size_factors: np.ndarray,
         matrix_root: Path,
     ) -> dict[str, Path]:
-        return materialize_arrow_hf(
+        from .backends import build_backend_fn
+
+        backend_fn = build_backend_fn(self.backend)
+        return backend_fn(
             adata, count_matrix, size_factors, self.release_id, matrix_root
         )
 
@@ -712,7 +715,10 @@ class AppendRoutedRoute(MaterializationRoute):
         size_factors: np.ndarray,
         matrix_root: Path,
     ) -> dict[str, Path]:
-        return materialize_arrow_hf(
+        from .backends import build_backend_fn
+
+        backend_fn = build_backend_fn(self.backend)
+        return backend_fn(
             adata, count_matrix, size_factors, self.release_id, matrix_root
         )
 

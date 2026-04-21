@@ -18,6 +18,9 @@ def write_zarr_sparse_cell_chunks(
     release_id: str,
     matrix_root: Path,
     chunk_cells: int = 1024,
+    canonical_perturbation: tuple[dict[str, str], ...] | None = None,
+    canonical_context: tuple[dict[str, str], ...] | None = None,
+    raw_fields: tuple[dict[str, Any], ...] | None = None,
 ) -> dict[str, Path]:
     """Write sparse per-cell data in Zarr format with cell-chunked storage.
 
@@ -25,7 +28,11 @@ def write_zarr_sparse_cell_chunks(
     - <release_id>-indices.zarr: (n_cells, chunk_cells) sparse indices as int32
     - <release_id>-counts.zarr:   (n_cells, chunk_cells) sparse counts as int32
     - <release_id>-sf.zarr:       (n_cells,) size factors as float64
-    - <release_id>-meta.zarr:    cell metadata
+    - <release_id>-meta.json:    cell metadata + canonical fields
+
+    Canonical metadata (canonical_perturbation, canonical_context, raw_fields)
+    is written to the meta.json so the Zarr reader can return full CellState
+    parity with Arrow/HF backend.
 
     This format supports semi-random access at cell-chunk granularity while
     keeping sparse representation compact.
@@ -53,6 +60,11 @@ def write_zarr_sparse_cell_chunks(
 
     n_chunks = (n_obs + chunk_cells - 1) // chunk_cells
     max_nonzero_per_cell = n_vars  # worst-case
+
+    # Normalize metadata tuples
+    pert_tuple = canonical_perturbation or tuple([{}] * n_obs)
+    ctx_tuple = canonical_context or tuple([{}] * n_obs)
+    raw_tuple = raw_fields or tuple([{}] * n_obs)
 
     # Write size factors as a simple array
     sf_store.create_dataset("sf", data=size_factors, shape=(n_obs,), dtype="f8")
@@ -101,9 +113,19 @@ def write_zarr_sparse_cell_chunks(
             dtype="i4",
         )
 
-    # Write metadata as JSON
+    # Write metadata as JSON including canonical fields
     meta_path = matrix_root / f"{release_id}-meta.json"
     import json
+
+    # Build per-cell metadata list for JSON serialization
+    cell_meta_list = []
+    for i in range(n_obs):
+        cell_meta_list.append({
+            "cell_id": str(adata.obs.index[i]),
+            "canonical_perturbation": dict(pert_tuple[i]),
+            "canonical_context": dict(ctx_tuple[i]),
+            "raw_fields": dict(raw_tuple[i]),
+        })
 
     with open(meta_path, "w") as f:
         json.dump(
@@ -116,6 +138,7 @@ def write_zarr_sparse_cell_chunks(
                 "size_factor_path": str(sf_zarr_path),
                 "indices_path": str(indices_zarr_path),
                 "counts_path": str(counts_zarr_path),
+                "cells": cell_meta_list,
             },
             f,
             indent=2,

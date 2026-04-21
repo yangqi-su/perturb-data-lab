@@ -324,15 +324,16 @@ class CorpusLoader:
                 "feature_meta_paths": feature_meta_paths,
             }
         elif backend == "webdataset":
-            # WebDataset uses shard paths and metadata JSON
+            # WebDataset uses shard paths and tab-delimited meta.txt
             shard_dir = Path(manifest.outputs.matrix_root)
-            shard_paths = sorted(shard_dir.glob("*.tar"))
-            meta_path = meta_root / f"{manifest.release_id}-meta.json"
+            shard_paths = sorted(shard_dir.glob(f"{manifest.release_id}-*.tar"))
+            meta_path = meta_root / f"{manifest.release_id}-meta.txt"
             feature_registry_path = meta_root / "feature-registry.yaml"
             return {
                 "shard_paths": shard_paths,
                 "meta_path": meta_path,
                 "feature_registry_path": feature_registry_path,
+                "dataset_id": manifest.dataset_id,
             }
         elif backend == "zarr-ts":
             indices_zarr = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-indices.zarr"
@@ -346,6 +347,7 @@ class CorpusLoader:
                 "sf_zarr_path": sf_zarr,
                 "meta_path": meta_path,
                 "feature_registry_path": feature_registry_path,
+                "dataset_id": manifest.dataset_id,
             }
         else:
             raise ValueError(f"unknown backend: {backend}")

@@ -18,13 +18,21 @@ def write_webdataset_shards(
     release_id: str,
     matrix_root: Path,
     shard_size: int = 10000,
+    canonical_perturbation: tuple[dict[str, str], ...] | None = None,
+    canonical_context: tuple[dict[str, str], ...] | None = None,
+    raw_fields: tuple[dict[str, Any], ...] | None = None,
 ) -> dict[str, Path]:
     """Write sparse per-cell data in WebDataset shard format.
 
     Each shard is a .tar file containing per-cell .pt (pickle) files:
-    - cell_<index>.pt: dict with expressed_gene_indices, expression_counts, size_factor
+    - cell_<index>.pt: dict with expressed_gene_indices, expression_counts,
+      size_factor, canonical_perturbation, canonical_context, raw_fields
 
     WebDataset is optimal for sequential streaming in PyTorch training loops.
+
+    Canonical metadata (canonical_perturbation, canonical_context, raw_fields)
+    is written to per-cell .pt records so WebDataset reader can return full
+    CellState parity with Arrow/HF backend.
 
     Returns a dict with keys: "shard_paths", "meta".
     """
@@ -37,6 +45,11 @@ def write_webdataset_shards(
 
     shard_paths = []
     meta_rows = []
+
+    # Normalize metadata tuples to-safe form
+    pert_tuple = canonical_perturbation or tuple([{}] * n_obs)
+    ctx_tuple = canonical_context or tuple([{}] * n_obs)
+    raw_tuple = raw_fields or tuple([{}] * n_obs)
 
     for shard_idx in range(n_shards):
         start = shard_idx * shard_size
@@ -66,6 +79,9 @@ def write_webdataset_shards(
                     "expression_counts": counts.tobytes(),
                     "size_factor": float(size_factors[i]),
                     "cell_id": str(adata.obs.index[i]),
+                    "canonical_perturbation": dict(pert_tuple[i]),
+                    "canonical_context": dict(ctx_tuple[i]),
+                    "raw_fields": dict(raw_tuple[i]),
                 }
 
                 import io
