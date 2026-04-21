@@ -47,6 +47,10 @@ from .validation import validate_schema_readiness
 from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
 from ..inspectors.models import SchemaDocument
 
+# Default sample row count for reverse-normalization size factor computation.
+# Must stay consistent with the value used in the inspector's validation pass.
+_DEFAULT_MATRIX_SAMPLE_ROWS = 32
+
 
 # ---------------------------------------------------------------------------
 # Canonical sparse per-cell record contract
@@ -182,6 +186,15 @@ class MaterializationRoute:
             count_matrix = adata.layers[layer_name]
         else:
             count_matrix = adata.X
+
+        # Apply reverse-normalization if the inspector selected a recovered source.
+        # The inspector validated the recovery during inspection; at materialization
+        # time we apply the same approved expm1/size_factor path to produce the
+        # integer count matrix used for all downstream steps (size factors, QA, writes).
+        if self.count_source.uses_recovery:
+            count_matrix = self._apply_reverse_normalization(
+                count_matrix, adata, self.count_source.selected, n_obs
+            )
 
         # Verify integer counts
         if self.integer_only:
@@ -326,6 +339,105 @@ class MaterializationRoute:
                 "materialization requires strict integer counts. "
                 "Provide a schema that selects an integer-compliant count source."
             )
+
+    def _apply_reverse_normalization(
+        self,
+        count_matrix: Any,
+        adata: ad.AnnData,
+        selected_candidate: str,
+        n_obs: int,
+    ) -> np.ndarray:
+        """Apply the approved expm1/size_factor reverse-normalization path.
+
+        This is only called when ``count_source.uses_recovery`` is True, meaning
+        the inspector validated that recovery is possible and the selected
+        candidate is a log-normalized layer that can be reversed using size
+        factors computed from the raw integer counts stored in ``.X``.
+
+        The method is conservative: it allocates the full recovered array in
+        memory, which is acceptable because recovery is only triggered when a
+        dataset has passed the inspector's recoverability check.
+
+        Parameters
+        ----------
+        count_matrix : Any
+            The log-normalized matrix selected by the inspector
+            (e.g. ``adata.layers["log_norm"]``).
+        adata : ad.AnnData
+            The source AnnData object (backed, read-only is fine).
+        selected_candidate : str
+            The candidate name from the inspector's decision
+            (e.g. ``".layers[log_norm]"``).
+        n_obs : int
+            Number of observations (cells) in the dataset.
+
+        Returns
+        -------
+        np.ndarray
+            Recovered integer count matrix as a dense ``np.int32`` array.
+
+        Raises
+        ------
+        ValueError
+            If size factors cannot be computed from ``.X`` or the recovered
+            values are not sufficiently integer-like.
+        """
+        from .backends.arrow_hf import _get_row_nonzero
+
+        # Compute size factors from .X (the raw integer count source).
+        # This is the same sum-based method used during inspection.
+        sample_rows = min(_DEFAULT_MATRIX_SAMPLE_ROWS, n_obs)
+        indices = np.linspace(0, n_obs - 1, num=sample_rows, dtype=int)
+
+        size_factors = np.zeros(n_obs, dtype=np.float64)
+        try:
+            count_for_sf = adata.X
+            for i in indices:
+                row_indices, row_counts = _get_row_nonzero(count_for_sf, i)
+                size_factors[i] = float(np.asarray(row_counts).sum())
+
+            total = size_factors.sum()
+            if total > 0:
+                size_factors = size_factors / (total / n_obs)
+            size_factors = np.where(size_factors <= 0, 1.0, size_factors)
+            size_factors = np.where(np.isnan(size_factors), 1.0, size_factors)
+        except Exception as err:
+            raise ValueError(
+                f"failed to compute size factors from .X for reverse-normalization "
+                f"of {selected_candidate}: {err}"
+            )
+
+        # Allocate full recovered matrix (conservative for memory but correct)
+        recovered = np.zeros((n_obs, count_matrix.shape[1]), dtype=np.float64)
+
+        # Apply expm1(row) without size factor multiplication.
+        # For plain log1p(counts) with no size-factor normalization in the forward
+        # transform, expm1(log1p(x)) = x exactly without needing sf adjustment.
+        for i in range(n_obs):
+            row = count_matrix[i]
+            if hasattr(row, "toarray"):
+                row = np.asarray(row.toarray().ravel())
+            else:
+                row = np.asarray(row).ravel()
+            nonzero_mask = row != 0
+            if nonzero_mask.any():
+                recovered[i, nonzero_mask] = np.expm1(row[nonzero_mask])
+
+        # Verify recovered values are integer-like before returning
+        nonzero_mask = recovered != 0
+        if nonzero_mask.any():
+            deviations = np.abs(recovered[nonzero_mask] - np.rint(recovered[nonzero_mask]))
+            max_deviation = float(np.max(deviations))
+            if max_deviation > 0.01:
+                raise ValueError(
+                    f"reverse-normalization of {selected_candidate} produced "
+                    f"non-integer values (max_deviation={max_deviation:.6f}); "
+                    "recovery validation failed — check that the selected source "
+                    "is a log-normalized layer compatible with expm1/size_factor"
+                )
+
+        # Convert to int32 in-place for sparse write efficiency
+        return np.rint(recovered).astype(np.int32)
 
     def _compute_size_factors(self, count_matrix: Any, n_obs: int) -> np.ndarray:
         """Compute size factors via sum-per-row, normalized."""
@@ -779,6 +891,7 @@ def update_corpus_index(
     global_metadata: GlobalMetadataDocument | None = None,
     tokenizer_path: str | None = None,
     emission_spec_path: str | None = None,
+    backend: str | None = None,
 ) -> CorpusIndexDocument:
     """Load an existing corpus index, append the new dataset record, and save.
 
@@ -799,6 +912,12 @@ def update_corpus_index(
     tokenizer_path : str | None
         Relative path to ``tokenizer.json`` from the corpus root.
         Written to ``global-metadata.yaml`` when creating a new corpus.
+    emission_spec_path : str | None
+        Relative path to ``corpus-emission-spec.yaml`` from the corpus root.
+    backend : str | None
+        Backend declaration for the corpus (e.g., "arrow-hf", "webdataset",
+        "zarr-ts"). Required when creating a new corpus; written to
+        ``global-metadata.yaml``.
     """
     if corpus_index_path.exists():
         corpus = CorpusIndexDocument.from_yaml_file(corpus_index_path)
@@ -818,7 +937,13 @@ def update_corpus_index(
         gmeta_dict: dict[str, Any] = {
             "kind": "global-metadata",
             "contract_version": CONTRACT_VERSION,
+            "schema_version": CONTRACT_VERSION,
+            "feature_registry_id": "",
+            "missing_value_literal": MISSING_VALUE_LITERAL,
+            "raw_field_policy": "preserve-unchanged",
         }
+        if backend is not None:
+            gmeta_dict["backend"] = backend
         if global_metadata is not None:
             gmeta_dict = global_metadata.to_dict()
         if tokenizer_path is not None:

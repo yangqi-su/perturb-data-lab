@@ -458,7 +458,7 @@ def _attempt_reverse_normalization(
             sf = size_factors[idx]
             if sf <= 0:
                 sf = 1.0
-            recovered = np.expm1(row[nonzero_mask]) * sf
+            recovered = np.expm1(row[nonzero_mask])
             recovered_values.append(recovered)
 
     if not recovered_values:
@@ -1195,6 +1195,7 @@ def inspect_target(target: InspectionTarget, output_root: Path) -> InspectionArt
         count_source_spec = CountSourceSpec(
             selected=count_decision.selected_candidate,
             integer_only=(count_decision.status == "pass"),
+            uses_recovery=count_decision.uses_recovery,
         )
 
         # Build feature_tokenization spec: pick the best-ranked feature_id source
