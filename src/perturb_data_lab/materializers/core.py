@@ -1,9 +1,12 @@
-"""Phase 3 canonical materializer.
+"""Phase 3 canonical materializer (expression-first, tokenizer-free).
 
 This module implements the canonical materialization layer:
 - sparse per-cell storage contract
 - two join/mutation modes: create_new, append_routed
-- per-dataset manifest and feature registry append logic
+- per-dataset manifest and artifact persistence
+
+Tokenization is removed from the materialization flow. The corpus feature
+set is maintained separately via a pickle-backed set (written by canonicalize-meta).
 
 All materialization writes go to repo-local real directories only.
 Never write to protected symlink roots (data/, pertTF/, perturb/).
@@ -31,16 +34,18 @@ from .models import (
     CorpusIndexDocument,
     CountSourceSpec,
     DatasetJoinRecord,
+    DatasetMetadataSummary,
+    FeatureProvenanceSpec,
     GlobalMetadataDocument,
     MaterializationManifest,
     OutputRoots,
     ProvenanceSpec,
     QAManifest,
     QAMetric,
+    RawCellMetadataRecord,
+    RawFeatureMetadataRecord,
 )
 from .schema_execution import resolve_all_cell_rows, resolve_all_feature_rows
-from .tokenizer import CorpusTokenizer
-from .emission_spec import CorpusEmissionSpec
 from .validation import validate_schema_readiness
 from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
 from ..inspectors.models import SchemaDocument
@@ -147,6 +152,13 @@ class MaterializationRoute:
     ) -> MaterializationManifest:
         """Materialize a dataset using this route.
 
+        Expression-first: the integer count matrix is the primary output.
+        All other artifacts (raw metadata, accepted schema, summaries, provenance)
+        are dataset-local and required for later canonical metadata rebuild.
+
+        Tokenizer is NOT produced or consumed during materialization. The corpus
+        feature set is maintained separately by ``canonicalize-meta``.
+
         Returns a filled MaterializationManifest with paths to all written artifacts.
         Subclasses override _write_cells() for backend-specific storage.
 
@@ -173,15 +185,17 @@ class MaterializationRoute:
 
         # Determine which var reference to use based on selected count source.
         # When .raw.X wins, it may have a different feature dimension than .X,
-        # so feature-axis-dependent steps (HVG, tokenizer, feature metadata)
-        # must follow the winning source's feature space.
+        # so feature-axis-dependent steps (HVG, feature metadata) must follow
+        # the winning source's feature space.
         raw_is_selected = self.count_source.selected == ".raw.X"
         if raw_is_selected:
             n_vars = int(adata.raw.shape[1])
             var_ref = adata.raw.var
+            var_index = adata.raw.var.index
         else:
             n_vars = adata.n_vars
             var_ref = adata.var
+            var_index = adata.var.index
 
         # Select count matrix
         if self.count_source.selected == ".raw.X":
@@ -211,10 +225,54 @@ class MaterializationRoute:
         meta_root.mkdir(parents=True, exist_ok=True)
         matrix_root.mkdir(parents=True, exist_ok=True)
 
-        # Compute size factors (sum-based)
+        # --- Phase 3: Write accepted schema copy ---
+        # Persist the accepted schema alongside dataset artifacts for later
+        # canonicalize-meta reference. The schema_path may be a user-managed
+        # path; we write a dataset-local copy.
+        import shutil
+
+        accepted_schema_path = meta_root / f"{self.release_id}-accepted-schema.yaml"
+        shutil.copy2(schema_path, accepted_schema_path)
+
+        # --- Phase 3: Write raw cell metadata (no canonical mapping) ---
+        raw_cell_meta_sqlite_path = self._write_raw_cell_metadata(
+            adata=adata,
+            meta_root=meta_root,
+        )
+
+        # --- Phase 3: Write raw feature metadata (no canonical mapping) ---
+        # Load var into memory once for efficient per-row access
+        var_mem = var_ref.to_memory() if hasattr(var_ref, "to_memory") else var_ref
+        raw_feature_meta_parquet_path = self._write_raw_feature_metadata(
+            adata=adata,
+            var_mem=var_mem,
+            meta_root=meta_root,
+        )
+
+        # --- Phase 3: Write per-dataset metadata summary ---
+        metadata_summary_path = self._write_metadata_summary(
+            adata=adata,
+            var_mem=var_mem,
+            meta_root=meta_root,
+        )
+
+        # --- Phase 3: Compute size factors (sum-based, dataset-specific) ---
         size_factors = self._compute_size_factors(count_matrix, n_obs)
 
-        # Write backend-specific cell data
+        # --- Phase 3: Write feature provenance spec ---
+        # Build origin_index → feature_id mapping for canonicalize-meta
+        origin_index_to_feature_id: dict[int, str] = {
+            i: str(var_index[i]) for i in range(n_vars)
+        }
+        provenance_spec_path = self._write_feature_provenance(
+            source_h5ad=source_h5ad,
+            schema_path=accepted_schema_path,
+            n_vars=n_vars,
+            origin_index_to_feature_id=origin_index_to_feature_id,
+            meta_root=meta_root,
+        )
+
+        # --- Write backend-specific cell data ---
         backend_paths = self._write_cells(
             count_matrix=count_matrix,
             adata=adata,
@@ -222,39 +280,19 @@ class MaterializationRoute:
             matrix_root=matrix_root,
         )
 
-        # Resolve feature tokenization labels from schema (before tokenizer build)
-        # Use the winning source's var reference so feature-axis-dependent outputs
-        # follow the selected count source's feature space (.X vs .raw.X).
-        var_mem = var_ref.to_memory() if hasattr(var_ref, "to_memory") else var_ref
-        feature_rows = resolve_all_feature_rows(schema, var_mem)
-
-        # Build/update corpus tokenizer (replaces feature-registry.yaml)
-        tokenizer = self._build_tokenizer(
-            schema=schema,
-            feature_rows=feature_rows,
-        )
-        tokenizer_path = self._corpus_root / "tokenizer.json"
-        tokenizer.to_json(tokenizer_path)
-
-        # Write cell metadata table (parquet-backed via Arrow, or simple SQLite)
-        cell_meta_path = self._write_cell_metadata(
+        # --- Phase 3: Write canonical feature metadata (origin parquet) ---
+        # This is the canonical feature table in original dataset var order,
+        # resolved via schema execution. Token-space mapping is handled by
+        # canonicalize-meta (not during materialization).
+        feature_meta_paths = self._write_canonical_feature_metadata(
             adata=adata,
             schema=schema,
-            size_factors=size_factors,
-            meta_root=meta_root,
-        )
-
-        # Write per-dataset feature objects (original order + tokenized companion)
-        feature_meta_paths = self._write_feature_metadata(
-            adata=adata,
-            schema=schema,
-            tokenizer=tokenizer,
-            feature_rows=feature_rows,
+            var_mem=var_mem,
             meta_root=meta_root,
             n_vars=n_vars,
         )
 
-        # Compute and write HVG/non-HVG arrays in original dataset feature indices
+        # --- Compute and write HVG/non-HVG arrays in original dataset feature indices ---
         hvg_sidecar_path = self._compute_and_write_hvg_arrays(
             count_matrix=count_matrix,
             n_vars=n_vars,
@@ -275,7 +313,7 @@ class MaterializationRoute:
         qa_path = meta_root / "qa-manifest.yaml"
         qa_manifest.write_yaml(qa_path)
 
-        # Build final manifest
+        # Build final manifest (tokenizer_path removed in Phase 3)
         manifest = MaterializationManifest(
             kind="materialization-manifest",
             contract_version=CONTRACT_VERSION,
@@ -289,14 +327,21 @@ class MaterializationRoute:
                 source_path=str(source_h5ad),
                 schema=schema_path,
             ),
-            tokenizer_path=str(tokenizer_path),
+            # Phase 3 dataset-local artifact paths
+            raw_cell_meta_path=str(raw_cell_meta_sqlite_path),
+            raw_feature_meta_path=str(raw_feature_meta_parquet_path),
+            accepted_schema_path=str(accepted_schema_path),
+            metadata_summary_path=str(metadata_summary_path),
+            provenance_spec_path=str(provenance_spec_path),
+            # Remaining existing paths
             feature_meta_paths={
                 k: str(v) for k, v in feature_meta_paths.items()
             },
             qa_manifest_path=str(qa_path),
             hvg_sidecar_path=str(hvg_sidecar_path),
             integer_verified=all_passed,
-            notes=(f"materialized via {self.route_name} route",),
+            cell_count=n_obs,
+            notes=(f"materialized via {self.route_name} route (tokenizer-free)",),
         )
         manifest.validate()
 
@@ -442,108 +487,35 @@ class MaterializationRoute:
         """Write per-cell sparse data. Override in subclass."""
         raise NotImplementedError
 
-    def _build_tokenizer(
-        self,
-        schema: SchemaDocument,
-        feature_rows: tuple[dict[str, str], ...],
-    ) -> CorpusTokenizer:
-        """Build or update the corpus tokenizer for this route.
+    # ---------------------------------------------------------------------------
+    # Phase 3: New raw metadata writers (tokenizer-free)
+    # ---------------------------------------------------------------------------
 
-        For ``create_new``: creates a fresh tokenizer with all tokens from
-        the dataset's schema-resolved feature values.
-
-        For ``append_routed``: loads the existing corpus tokenizer,
-        validates namespace compatibility with the schema's feature_tokenization,
-        and appends only truly new tokens.
-
-        Parameters
-        ----------
-        schema : SchemaDocument
-            The reviewed schema document.
-        feature_rows : tuple[dict[str, str], ...]
-            Resolved feature rows from ``resolve_all_feature_rows`` in original
-            var order.
-
-        Returns
-        -------
-        CorpusTokenizer
-        """
-        # Resolve token labels from schema's feature_tokenization.selected field
-        token_label_key = schema.feature_tokenization.selected
-        namespace = schema.feature_tokenization.namespace
-        token_labels: list[str] = [
-            str(row.get(token_label_key, MISSING_VALUE_LITERAL))
-            for row in feature_rows
-        ]
-
-        if self.route_name == "create_new":
-            return CorpusTokenizer.create_new(
-                corpus_id=self.dataset_id,
-                namespace=namespace,
-                regular_tokens=token_labels,
-            )
-        else:
-            # append_routed: load existing tokenizer, validate, append
-            tokenizer_path = self._corpus_root / "tokenizer.json"
-            if not tokenizer_path.exists():
-                raise FileNotFoundError(
-                    f"append_routed requires an existing tokenizer at "
-                    f"{tokenizer_path} — ensure corpus-index.yaml and "
-                    f"tokenizer.json exist before appending datasets"
-                )
-            existing = CorpusTokenizer.from_json(tokenizer_path)
-
-            # Append compatibility gate: namespace must match
-            compatible, reason = existing.append_compatible(token_labels, namespace)
-            if not compatible:
-                raise ValueError(
-                    f"append incompatible: {reason} — "
-                    f"either use a dataset whose feature_tokenization namespace "
-                    f"matches the corpus, or onboard to a separate corpus"
-                )
-
-            return existing.append_tokens(token_labels, namespace)
-
-    def _write_cell_metadata(
+    def _write_raw_cell_metadata(
         self,
         adata: ad.AnnData,
-        schema: SchemaDocument,
-        size_factors: np.ndarray,
         meta_root: Path,
     ) -> Path:
-        """Write cell metadata as SQLite with full canonical cell metadata per cell.
+        """Write raw cell metadata as SQLite (no canonical mapping applied).
 
-        Canonical perturbation and context fields are resolved row-wise from the
-        schema. Raw obs fields not used as canonical sources are preserved as JSON.
+        Raw obs fields are preserved as-is from the h5ad. Each row records the
+        cell_id, dataset_id, dataset_release, and a JSON blob of all obs columns.
+        This is the authoritative source for canonical cell metadata rebuild
+        in ``canonicalize-meta``.
         """
         import json
 
-        db_path = meta_root / f"{self.release_id}-cell-meta.sqlite"
-
-        # Collect source field names used by the schema so we can exclude them
-        # from raw_obs preservation
-        source_columns: set[str] = set()
-        for entry in list(schema.perturbation_fields.values()) + list(
-            schema.context_fields.values()
-        ):
-            source_columns.update(entry.source_fields)
+        db_path = meta_root / f"{self.release_id}-raw-cell-meta.sqlite"
 
         # Load obs into memory once for efficient per-row access
-        # to_memory() exists on backed AnnData obs/var views; for non-backed
-        # or plain pandas objects, the DataFrame is already in memory
         obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
-
-        # Resolve canonical metadata for all cells via schema execution
-        perturbations, contexts = resolve_all_cell_rows(schema, obs_mem)
 
         conn = sqlite3.connect(str(db_path))
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS cell_meta "
-            "(cell_id TEXT, dataset_id TEXT, dataset_release TEXT, "
-            "size_factor REAL, canonical_perturbation TEXT, "
-            "canonical_context TEXT, raw_obs TEXT)"
+            "CREATE TABLE IF NOT EXISTS raw_cell_meta "
+            "(cell_id TEXT, dataset_id TEXT, dataset_release TEXT, raw_obs TEXT)"
         )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cell_id ON cell_meta(cell_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cell_id ON raw_cell_meta(cell_id)")
 
         batch_size = 256
         n_obs = adata.n_obs
@@ -552,104 +524,202 @@ class MaterializationRoute:
             batch = []
             for i in range(start, end):
                 cell_id = str(obs_mem.index[i])
-                pert = perturbations[i]
-                ctx = contexts[i]
-                # Preserve raw obs fields not used as schema sources
+                # Serialize all obs columns as JSON
                 raw: dict[str, Any] = {}
                 for col in obs_mem.columns:
-                    if col not in source_columns:
-                        val = obs_mem.loc[obs_mem.index[i], col]
-                        raw[str(col)] = None if pd.isna(val) else str(val)
+                    val = obs_mem.loc[obs_mem.index[i], col]
+                    raw[str(col)] = None if pd.isna(val) else str(val)
                 raw_json = json.dumps(raw) if raw else "{}"
                 batch.append(
                     (
                         cell_id,
                         self.dataset_id,
                         self.release_id,
-                        float(size_factors[i]),
-                        json.dumps(dict(pert)),
-                        json.dumps(dict(ctx)),
                         raw_json,
                     )
                 )
             conn.executemany(
-                "INSERT INTO cell_meta VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO raw_cell_meta VALUES (?, ?, ?, ?)",
                 batch,
             )
         conn.commit()
         conn.close()
         return db_path
 
-    def _write_feature_metadata(
+    def _write_raw_feature_metadata(
+        self,
+        adata: ad.AnnData,
+        var_mem: Any,
+        meta_root: Path,
+    ) -> Path:
+        """Write raw feature metadata as Parquet (no canonical mapping applied).
+
+        Raw var fields are preserved as-is from the h5ad. Each row records the
+        origin_index (original dataset var order), feature_id (var index value),
+        and a JSON blob of all var columns. This is the authoritative source for
+        canonical feature metadata rebuild in ``canonicalize-meta``.
+        """
+        import json
+
+        origin_path = meta_root / f"{self.release_id}-raw-feature-meta.parquet"
+
+        n_vars = var_mem.shape[0]
+        origin_indices = list(range(n_vars))
+        feature_ids = [str(var_mem.index[i]) for i in range(n_vars)]
+
+        # Serialize all var columns as a JSON string per feature
+        raw_var_list: list[str] = []
+        for i in range(n_vars):
+            raw: dict[str, Any] = {}
+            for col in var_mem.columns:
+                val = var_mem.loc[var_mem.index[i], col]
+                raw[str(col)] = None if pd.isna(val) else str(val)
+            raw_var_list.append(json.dumps(raw))
+
+        table = pa.table(
+            {
+                "origin_index": pa.array(origin_indices, type=pa.int32()),
+                "feature_id": pa.array(feature_ids, type=pa.string()),
+                "raw_var": pa.array(raw_var_list, type=pa.string()),
+            }
+        )
+        pq.write_table(table, origin_path)
+        return origin_path
+
+    def _write_metadata_summary(
+        self,
+        adata: ad.AnnData,
+        var_mem: Any,
+        meta_root: Path,
+    ) -> Path:
+        """Write per-dataset metadata summary (field coverage, null fractions).
+
+        This summary provides dataset-level statistics extracted from raw obs/var
+        before any canonical mapping. It can assist schema review when onboarding
+        new datasets. Written as YAML for human readability.
+        """
+        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
+        n_obs = obs_mem.shape[0]
+        n_vars = var_mem.shape[0]
+
+        # Compute null fractions per obs column
+        obs_null_fractions: dict[str, float] = {}
+        for col in obs_mem.columns:
+            null_count = int(obs_mem[col].isna().sum())
+            obs_null_fractions[str(col)] = float(null_count) / float(n_obs)
+
+        # Compute null fractions per var column
+        var_null_fractions: dict[str, float] = {}
+        for col in var_mem.columns:
+            null_count = int(var_mem[col].isna().sum())
+            var_null_fractions[str(col)] = float(null_count) / float(n_vars)
+
+        # Collect dtypes
+        obs_dtypes: dict[str, str] = {str(col): str(obs_mem[col].dtype) for col in obs_mem.columns}
+        var_dtypes: dict[str, str] = {str(col): str(var_mem[col].dtype) for col in var_mem.columns}
+
+        summary = DatasetMetadataSummary(
+            kind="dataset-metadata-summary",
+            contract_version=CONTRACT_VERSION,
+            dataset_id=self.dataset_id,
+            release_id=self.release_id,
+            source_path=str(Path(self.output_roots.metadata_root).parent / f"{self.release_id}.h5ad"),
+            obs_field_count=int(obs_mem.shape[1]),
+            var_field_count=int(var_mem.shape[1]),
+            obs_null_fractions=obs_null_fractions,
+            var_null_fractions=var_null_fractions,
+            obs_dtypes=obs_dtypes,
+            var_dtypes=var_dtypes,
+            obs_rows=n_obs,
+            var_rows=n_vars,
+            obs_index_name=str(obs_mem.index.name or "obs_index"),
+            var_index_name=str(var_mem.index.name or "var_index"),
+        )
+        summary_path = meta_root / f"{self.release_id}-metadata-summary.yaml"
+        summary.write_yaml(summary_path)
+        return summary_path
+
+    def _write_feature_provenance(
+        self,
+        source_h5ad: Path,
+        schema_path: Path,
+        n_vars: int,
+        origin_index_to_feature_id: dict[int, str],
+        meta_root: Path,
+    ) -> Path:
+        """Write feature-order/provenance artifact.
+
+        Records the per-dataset feature ordering and provenance needed by
+        ``canonicalize-meta`` to rebuild the corpus feature set without a tokenizer.
+        """
+        provenance = FeatureProvenanceSpec(
+            release_id=self.release_id,
+            feature_count=n_vars,
+            source_path=str(source_h5ad),
+            schema_path=str(schema_path),
+            count_source=self.count_source,
+            origin_index_to_feature_id=origin_index_to_feature_id,
+        )
+        provenance_path = meta_root / f"{self.release_id}-feature-provenance.yaml"
+        provenance.write_yaml(provenance_path)
+        return provenance_path
+
+    def _write_canonical_feature_metadata(
         self,
         adata: ad.AnnData,
         schema: SchemaDocument,
-        tokenizer: CorpusTokenizer,
-        feature_rows: tuple[dict[str, str], ...],
+        var_mem: Any,
         meta_root: Path,
-        n_vars: int | None = None,
+        n_vars: int,
     ) -> dict[str, Path]:
-        """Write per-dataset canonical feature objects.
+        """Write canonical feature metadata in original dataset var order.
 
-        Two objects are written per dataset:
-        1. ``{release_id}-features-origin.parquet`` — canonical feature metadata
-           in original dataset feature order (var index order), resolved via
-           schema execution.  One row per feature.
-        2. ``{release_id}-features-token.parquet`` — tokenized companion mapping
-           each original feature index to its token ID from the corpus tokenizer.
-           One row per feature in original order.
+        Writes one parquet file: ``{release_id}-features-origin.parquet``
+        containing origin_index and feature_id, with canonical fields resolved
+        via schema execution. Token-space mapping is NOT done here — it is
+        handled by ``canonicalize-meta`` which maintains the corpus feature set.
 
-        Both objects are compact (one row per feature, not one per cell) and
-        shared by all cells of the dataset.  The tokenized object enables loaders
-        to translate dataset-order sparse indices to token-space without
-        re-tokenizing at load time.
+        Returns dict with key "features_origin".
         """
-        # Build origin-order feature table
-        # n_vars tracks the winning source's feature count;
-        # use adata.raw.var when .raw.X won, otherwise adata.var
-        if n_vars is None:
-            n_vars = adata.n_vars
+        origin_path = meta_root / f"{self.release_id}-features-origin.parquet"
+        origin_indices = list(range(n_vars))
+
+        # Resolve canonical feature fields via schema execution
+        feature_rows = resolve_all_feature_rows(schema, var_mem)
+
+        # Build feature_id list from var index
         if self.count_source.selected == ".raw.X" and hasattr(adata.raw, "var"):
             var_index = adata.raw.var.index
         else:
             var_index = adata.var.index
-        origin_path = meta_root / f"{self.release_id}-features-origin.parquet"
-        origin_indices = list(range(n_vars))
         origin_feature_ids = [str(var_index[i]) for i in origin_indices]
 
+        # Build base table
         origin_table = pa.table(
             {
                 "origin_index": pa.array(origin_indices, type=pa.int32()),
                 "feature_id": pa.array(origin_feature_ids, type=pa.string()),
             }
         )
+
         # Attach resolved canonical feature fields as a struct column
         field_names = list(schema.feature_fields.keys())
-        canonical_struct = pa.struct([
-            (fname, pa.string()) for fname in field_names
-        ])
-        canonical_values = [[row.get(fname, MISSING_VALUE_LITERAL) for row in feature_rows] for fname in field_names]
-        canonical_array = pa.array([dict(zip(field_names, vals)) for vals in zip(*canonical_values)], type=canonical_struct)
-        origin_table = origin_table.append_column("canonical", canonical_array)
+        if field_names:
+            canonical_struct = pa.struct([
+                (fname, pa.string()) for fname in field_names
+            ])
+            canonical_values = [
+                [row.get(fname, MISSING_VALUE_LITERAL) for row in feature_rows]
+                for fname in field_names
+            ]
+            canonical_array = pa.array(
+                [dict(zip(field_names, vals)) for vals in zip(*canonical_values)],
+                type=canonical_struct,
+            )
+            origin_table = origin_table.append_column("canonical", canonical_array)
+
         pq.write_table(origin_table, origin_path)
-
-        # Build tokenized companion: map original var index → token ID
-        token_path = meta_root / f"{self.release_id}-features-token.parquet"
-        token_label_key = schema.feature_tokenization.selected
-        token_ids = [
-            tokenizer.to_id(str(row.get(token_label_key, MISSING_VALUE_LITERAL)))
-            for row in feature_rows
-        ]
-        token_table = pa.table(
-            {
-                "origin_index": pa.array(origin_indices, type=pa.int32()),
-                "feature_id": pa.array(origin_feature_ids, type=pa.string()),
-                "token_id": pa.array(token_ids, type=pa.int32()),
-            }
-        )
-        pq.write_table(token_table, token_path)
-
-        return {"features_origin": origin_path, "features_token": token_path}
+        return {"features_origin": origin_path}
 
     def _run_qa_checks(
         self,
@@ -846,8 +916,8 @@ def build_materialization_route(
         must match the corpus's declared backend. Defaults to ``arrow-hf``.
     corpus_index_path : Path | None
         Path to the corpus index YAML.  Used by ``append_routed`` to locate
-        the existing corpus tokenizer and corpus root.  Optional for
-        ``create_new``.
+        the corpus root for artifact writes.  Optional for ``create_new``.
+        Tokenizer is NOT required — corpus feature set is maintained separately.
     """
     routes = {
         "create_new": CreateNewRoute,
@@ -875,7 +945,6 @@ def update_corpus_index(
     corpus_index_path: Path,
     new_dataset_record: DatasetJoinRecord,
     global_metadata: GlobalMetadataDocument | None = None,
-    tokenizer_path: str | None = None,
     emission_spec_path: str | None = None,
     backend: str | None = None,
 ) -> CorpusIndexDocument:
@@ -886,18 +955,26 @@ def update_corpus_index(
 
     This function always appends; it does not overwrite existing dataset entries.
 
+    The new dataset record's ``global_start``/``global_end`` are computed
+    automatically from the existing corpus's total cell count, forming a
+    deterministic, contiguous, non-overlapping partition of corpus cells.
+    The ``cell_count`` field of ``new_dataset_record`` must be set to the
+    number of cells in the new dataset for range computation to be correct.
+
+    Tokenizer is NOT managed here — the corpus feature set is maintained separately
+    by ``canonicalize-meta``.
+
     Parameters
     ----------
     corpus_index_path : Path
         Path to the corpus index YAML file.
     new_dataset_record : DatasetJoinRecord
-        The dataset join record for the new dataset.
+        The dataset join record for the new dataset. Must have ``cell_count`` set.
+        ``global_start``/``global_end`` in the input are ignored; they are
+        recomputed from the existing corpus.
     global_metadata : GlobalMetadataDocument | None
         Global metadata for new corpus creation.  Required when creating
         a new corpus; ignored for existing corpora.
-    tokenizer_path : str | None
-        Relative path to ``tokenizer.json`` from the corpus root.
-        Written to ``global-metadata.yaml`` when creating a new corpus.
     emission_spec_path : str | None
         Relative path to ``corpus-emission-spec.yaml`` from the corpus root.
     backend : str | None
@@ -913,18 +990,42 @@ def update_corpus_index(
                 f"dataset {new_dataset_record.dataset_id} already exists in corpus index; "
                 "use a different release_id or dataset_id to avoid duplication."
             )
-        datasets = list(corpus.datasets) + [new_dataset_record]
+        # Compute total cells in existing corpus
+        total_existing_cells = sum(d.cell_count for d in corpus.datasets)
+        # Compute global range for the new dataset
+        new_global_start = total_existing_cells
+        new_global_end = total_existing_cells + new_dataset_record.cell_count
+        # Build updated record with computed global range
+        new_record = DatasetJoinRecord(
+            dataset_id=new_dataset_record.dataset_id,
+            release_id=new_dataset_record.release_id,
+            join_mode=new_dataset_record.join_mode,
+            manifest_path=new_dataset_record.manifest_path,
+            cell_count=new_dataset_record.cell_count,
+            global_start=new_global_start,
+            global_end=new_global_end,
+        )
+        datasets = list(corpus.datasets) + [new_record]
         corpus_id = corpus.corpus_id
         global_meta = corpus.global_metadata
     else:
-        datasets = [new_dataset_record]
+        # For new corpus, global range is [0, cell_count)
+        new_record = DatasetJoinRecord(
+            dataset_id=new_dataset_record.dataset_id,
+            release_id=new_dataset_record.release_id,
+            join_mode=new_dataset_record.join_mode,
+            manifest_path=new_dataset_record.manifest_path,
+            cell_count=new_dataset_record.cell_count,
+            global_start=0,
+            global_end=new_dataset_record.cell_count,
+        )
+        datasets = [new_record]
         corpus_id = "perturb-data-lab-v0"
         # Build global metadata dict for new corpus
         gmeta_dict: dict[str, Any] = {
             "kind": "global-metadata",
             "contract_version": CONTRACT_VERSION,
             "schema_version": CONTRACT_VERSION,
-            "feature_registry_id": "",
             "missing_value_literal": MISSING_VALUE_LITERAL,
             "raw_field_policy": "preserve-unchanged",
         }
@@ -932,8 +1033,6 @@ def update_corpus_index(
             gmeta_dict["backend"] = backend
         if global_metadata is not None:
             gmeta_dict = global_metadata.to_dict()
-        if tokenizer_path is not None:
-            gmeta_dict["tokenizer_path"] = tokenizer_path
         if emission_spec_path is not None:
             gmeta_dict["emission_spec_path"] = emission_spec_path
         global_meta = gmeta_dict

@@ -205,36 +205,48 @@ class TestCorpusIndexUpdate:
                 release_id="v0.1",
                 join_mode="create_new",
                 manifest_path="/tmp/meta/v0.1-manifest.yaml",
+                cell_count=1000,
             )
             updated = update_corpus_index(idx_path, record)
             assert updated.corpus_id == "perturb-data-lab-v0"
             assert len(updated.datasets) == 1
             assert updated.datasets[0].dataset_id == "ds_001"
+            # For new corpus, global range = [0, cell_count)
+            assert updated.datasets[0].cell_count == 1000
+            assert updated.datasets[0].global_start == 0
+            assert updated.datasets[0].global_end == 1000
 
     def test_existing_corpus_index_appends(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             idx_path = Path(tmpdir) / "corpus-index.yaml"
 
-            # Create initial index
+            # Create initial index with cell_count
             record1 = DatasetJoinRecord(
                 dataset_id="ds_001",
                 release_id="v0.1",
                 join_mode="create_new",
                 manifest_path="/tmp/v0.1.yaml",
+                cell_count=500,
             )
-            update_corpus_index(idx_path, record1)
+            updated1 = update_corpus_index(idx_path, record1)
+            assert updated1.datasets[0].global_start == 0
+            assert updated1.datasets[0].global_end == 500
 
-            # Append second dataset
+            # Append second dataset — global range is computed from existing total
             record2 = DatasetJoinRecord(
                 dataset_id="ds_002",
                 release_id="v0.2",
                 join_mode="append_routed",
                 manifest_path="/tmp/v0.2.yaml",
+                cell_count=300,
             )
-            updated = update_corpus_index(idx_path, record2)
+            updated2 = update_corpus_index(idx_path, record2)
 
-            assert len(updated.datasets) == 2
-            assert updated.datasets[1].dataset_id == "ds_002"
+            assert len(updated2.datasets) == 2
+            assert updated2.datasets[1].dataset_id == "ds_002"
+            # ds_002 starts where ds_001 ended
+            assert updated2.datasets[1].global_start == 500
+            assert updated2.datasets[1].global_end == 800  # 500 + 300
 
     def test_duplicate_dataset_id_raises(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -244,6 +256,7 @@ class TestCorpusIndexUpdate:
                 release_id="v0.1",
                 join_mode="create_new",
                 manifest_path="/tmp/v0.1.yaml",
+                cell_count=1000,
             )
             update_corpus_index(idx_path, record)
 
@@ -252,9 +265,36 @@ class TestCorpusIndexUpdate:
                 release_id="v0.2",
                 join_mode="append_routed",
                 manifest_path="/tmp/v0.2.yaml",
+                cell_count=500,
             )
             with pytest.raises(ValueError, match="already exists in corpus index"):
                 update_corpus_index(idx_path, duplicate)
+
+    def test_global_range_contiguous_no_overlap(self):
+        """Verify that appending multiple datasets produces contiguous non-overlapping ranges."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            idx_path = Path(tmpdir) / "corpus-index.yaml"
+            cell_counts = [1000, 500, 750, 200]
+            for i, cc in enumerate(cell_counts):
+                record = DatasetJoinRecord(
+                    dataset_id=f"ds_{i:03d}",
+                    release_id=f"v{i}",
+                    join_mode="create_new" if i == 0 else "append_routed",
+                    manifest_path=f"/tmp/v{i}.yaml",
+                    cell_count=cc,
+                )
+                update_corpus_index(idx_path, record)
+
+            # Reload and verify
+            from perturb_data_lab.materializers.models import CorpusIndexDocument
+
+            corpus = CorpusIndexDocument.from_yaml_file(idx_path)
+            running_end = 0
+            for ds in corpus.datasets:
+                assert ds.global_start == running_end
+                assert ds.global_end == running_end + ds.cell_count
+                assert ds.global_end - ds.global_start == ds.cell_count
+                running_end += ds.cell_count
 
 
 class TestMaterializationManifest:

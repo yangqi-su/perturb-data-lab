@@ -312,17 +312,19 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
     print(f"  backend     : {manifest.backend}")
     print(f"  count source: {manifest.count_source.selected}")
     print(f"  integer_verified: {manifest.integer_verified}")
-    print(f"  manifest    : {manifest_path}")
+    print(f"  manifest    : {Path(manifest.outputs.metadata_root) / 'materialization-manifest.yaml'}")
 
     # If create_new, also write initial corpus index and emission spec
     if route_name == "create_new":
         idx_path = Path(manifest.outputs.metadata_root) / "corpus-index.yaml"
         manifest_path = str(Path(manifest.outputs.metadata_root) / "materialization-manifest.yaml")
+        # n_obs is the cell count — needed for global range computation in the corpus index
         record = DatasetJoinRecord(
             dataset_id=args.dataset_id,
             release_id=args.release_id,
             join_mode="create_new",
             manifest_path=manifest_path,
+            cell_count=n_obs,
         )
         corpus_idx = update_corpus_index(idx_path, record, backend=args.backend)
         print(f"  corpus-index: {idx_path}")
@@ -341,6 +343,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
             release_id=args.release_id,
             join_mode="append_routed",
             manifest_path=str(Path(manifest.outputs.metadata_root) / "materialization-manifest.yaml"),
+            cell_count=manifest.cell_count,
         )
         updated = update_corpus_index(corpus_index_path, record, backend=args.backend)
         print(f"  corpus-index updated: {corpus_index_path}")
@@ -440,6 +443,7 @@ def _cmd_corpus_append(args: argparse.Namespace) -> None:
         release_id=manifest.release_id,
         join_mode="append_routed",
         manifest_path=str(manifest_path),
+        cell_count=manifest.cell_count,
     )
     updated = update_corpus_index(corpus_index_path, record)  # backend already set in corpus
     print(f"[corpus append] done")
@@ -503,13 +507,12 @@ def _cmd_corpus_validate(args: argparse.Namespace) -> None:
             except Exception as e:
                 violations.append(f"failed to load manifest for {ds.dataset_id}: {e}")
 
-    # Check tokenizer
+    # Check tokenizer (Phase 3: tokenizer is no longer required for corpus validation)
     corpus_root = corpus_index_path.parent
     tokenizer_path = corpus_root / "tokenizer.json"
     tokenizer_exists = tokenizer_path.exists()
-    print(f"\nTokenizer: {'✓' if tokenizer_exists else '✗ MISSING'} {tokenizer_path}")
-    if not tokenizer_exists:
-        violations.append("tokenizer.json not found")
+    print(f"\nTokenizer: {'✓' if tokenizer_exists else '✗ (optional since Phase 3)'} {tokenizer_path}")
+    # Tokenizer is optional — corpus feature set is now maintained by canonicalize-meta
 
     # Check emission spec
     emission_spec_path = corpus_root / "corpus-emission-spec.yaml"
@@ -523,6 +526,40 @@ def _cmd_corpus_validate(args: argparse.Namespace) -> None:
         sys.exit(1)
     else:
         print(f"\n[corpus validate] PASS")
+
+
+# ---------------------------------------------------------------------------
+# canonicalize-meta
+# ---------------------------------------------------------------------------
+
+
+def _add_canonicalize_meta_args(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "--corpus-index",
+        required=True,
+        help="Path to the corpus-index.yaml.",
+    )
+
+
+def _cmd_canonicalize_meta(args: argparse.Namespace) -> None:
+    from .materializers import run_canonicalize_meta
+
+    corpus_index_path = Path(args.corpus_index)
+    if not corpus_index_path.exists():
+        print(f"[error] corpus-index not found: {corpus_index_path}", file=sys.stderr)
+        sys.exit(1)
+
+    result = run_canonicalize_meta(corpus_index_path)
+
+    print(f"[canonicalize-meta] done — {result.corpus_id}")
+    print(f"  datasets      : {result.datasets}")
+    print(f"  total_cells   : {result.total_cells}")
+    print(f"  cell_ranges   : {len(result.cell_ranges)} datasets with global ranges")
+    for r in result.cell_ranges:
+        print(f"    {r.dataset_id}/{r.release_id}: [{r.global_start}, {r.global_end}) count={r.count}")
+    print(f"  corpus_cell_meta    : {result.corpus_cell_meta_path}")
+    print(f"  corpus_feature_meta : {result.corpus_feature_meta_path}")
+    print(f"  feature_set         : {result.feature_set_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +602,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_cv = sub.add_parser("corpus-validate", help="Validate a corpus for logical completeness.")
     _add_corpus_validate_args(p_cv)
 
+    # canonicalize-meta
+    p_cm = sub.add_parser("canonicalize-meta", help="Rebuild corpus canonical metadata from raw artifacts.")
+    _add_canonicalize_meta_args(p_cm)
+
     return parser
 
 
@@ -586,6 +627,8 @@ def main() -> None:
         _cmd_corpus_append(args)
     elif args.command == "corpus-validate":
         _cmd_corpus_validate(args)
+    elif args.command == "canonicalize-meta":
+        _cmd_canonicalize_meta(args)
     else:
         parser.print_help()
         sys.exit(1)

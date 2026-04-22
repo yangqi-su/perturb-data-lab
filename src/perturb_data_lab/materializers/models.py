@@ -112,6 +112,66 @@ class FeatureManifestEntry:
 
 
 @dataclass(frozen=True)
+class RawCellMetadataRecord:
+    """A single cell's raw metadata record — fields directly from h5ad obs, no canonical mapping applied.
+
+    This record preserves the full obs row as the user saw it in the source h5ad,
+    before any canonical field resolution. It is the authoritative source for
+    canonical cell metadata rebuild in ``canonicalize-meta``.
+    """
+
+    cell_id: str
+    dataset_id: str
+    dataset_release: str
+    raw_fields: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RawCellMetadataRecord":
+        return cls(
+            cell_id=str(data["cell_id"]),
+            dataset_id=str(data["dataset_id"]),
+            dataset_release=str(data["dataset_release"]),
+            raw_fields=dict(data.get("raw_fields", {})),
+        )
+
+
+@dataclass(frozen=True)
+class RawFeatureMetadataRecord:
+    """A single feature's raw metadata record — fields directly from h5ad var, no canonical mapping applied.
+
+    This record preserves the full var row as the user saw it in the source h5ad,
+    before any canonical field resolution. It is the authoritative source for
+    canonical feature metadata rebuild in ``canonicalize-meta``.
+    """
+
+    origin_index: int
+    feature_id: str
+    raw_fields: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RawFeatureMetadataRecord":
+        return cls(
+            origin_index=int(data["origin_index"]),
+            feature_id=str(data["feature_id"]),
+            raw_fields=dict(data.get("raw_fields", {})),
+        )
+
+    def write_yaml(self, output_path: Path) -> None:
+        """Serialize to YAML and write to output_path."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(self.to_yaml(), encoding="utf-8")
+
+    def to_yaml(self) -> str:
+        return yaml.safe_dump(self.to_dict(), sort_keys=False)
+
+
+@dataclass(frozen=True)
 class SizeFactorEntry:
     cell_id: str
     size_factor: float
@@ -149,17 +209,24 @@ class MaterializationManifest(YamlDocument):
     contract_version: str
     dataset_id: str
     release_id: str
-    route: str  # create_new | append_monolithic | append_routed
+    route: str  # create_new | append_routed
     backend: str  # arrow-hf | webdataset | zarr-ts — must match corpus declared backend
     count_source: CountSourceSpec
     outputs: OutputRoots
     provenance: ProvenanceSpec
-    tokenizer_path: str | None = None
-    feature_meta_paths: dict[str, str] | None = None
+    # New Phase 3 dataset-local artifact paths (tokenizer removed)
+    raw_cell_meta_path: str | None = None  # SQLite: raw cell metadata (no canonical mapping)
+    raw_feature_meta_path: str | None = None  # Parquet: raw feature metadata (no canonical mapping)
+    accepted_schema_path: str | None = None  # copy of accepted schema used for this materialization
+    metadata_summary_path: str | None = None  # per-dataset metadata summary (field coverage, null fractions)
+    provenance_spec_path: str | None = None  # feature-order/provenance artifact
+    # Existing paths
+    feature_meta_paths: dict[str, str] | None = None  # canonical feature metadata (origin + token parquet paths)
     size_factor_manifest_path: str | None = None
     qa_manifest_path: str | None = None
     hvg_sidecar_path: str | None = None
     integer_verified: bool = False
+    cell_count: int = 0  # number of cells materialized (set by materialize() for corpus index use)
     notes: tuple[str, ...] = ()
 
     def validate(self) -> None:
@@ -180,11 +247,15 @@ class MaterializationManifest(YamlDocument):
             dataset_id=str(data["dataset_id"]),
             release_id=str(data["release_id"]),
             route=str(data["route"]),
-            backend=str(data.get("backend", "arrow-hf")),  # default for backwards compat
+            backend=str(data.get("backend", "arrow-hf")),
             count_source=CountSourceSpec.from_dict(data["count_source"]),
             outputs=OutputRoots.from_dict(data["outputs"]),
             provenance=ProvenanceSpec.from_dict(data["provenance"]),
-            tokenizer_path=data.get("tokenizer_path"),
+            raw_cell_meta_path=data.get("raw_cell_meta_path"),
+            raw_feature_meta_path=data.get("raw_feature_meta_path"),
+            accepted_schema_path=data.get("accepted_schema_path"),
+            metadata_summary_path=data.get("metadata_summary_path"),
+            provenance_spec_path=data.get("provenance_spec_path"),
             feature_meta_paths={
                 k: str(v) for k, v in (data.get("feature_meta_paths") or {}).items()
             },
@@ -192,6 +263,7 @@ class MaterializationManifest(YamlDocument):
             qa_manifest_path=data.get("qa_manifest_path"),
             hvg_sidecar_path=data.get("hvg_sidecar_path"),
             integer_verified=bool(data.get("integer_verified", False)),
+            cell_count=int(data.get("cell_count", 0)),
             notes=tuple(str(item) for item in data.get("notes", [])),
         )
         document.validate()
@@ -313,6 +385,97 @@ class QAManifest(YamlDocument):
 
 
 @dataclass(frozen=True)
+class DatasetMetadataSummary(YamlDocument):
+    """Per-dataset metadata summary persisted during materialization for later schema review.
+
+    This summary provides field-level coverage statistics (null fractions,
+    dtype, unique value counts) extracted from the raw obs/var before any canonical
+    mapping. It is written as a dataset-local artifact alongside the accepted schema
+    and can be used to assist schema review when onboarding new datasets.
+    """
+
+    kind: str
+    contract_version: str
+    dataset_id: str
+    release_id: str
+    source_path: str
+    obs_field_count: int
+    var_field_count: int
+    obs_null_fractions: dict[str, float]
+    var_null_fractions: dict[str, float]
+    obs_dtypes: dict[str, str]
+    var_dtypes: dict[str, str]
+    obs_rows: int
+    var_rows: int
+    obs_index_name: str
+    var_index_name: str
+    notes: tuple[str, ...] = ()
+
+    def validate(self) -> None:
+        if self.kind != "dataset-metadata-summary":
+            raise ValueError("dataset metadata summary kind mismatch")
+        if self.contract_version != CONTRACT_VERSION:
+            raise ValueError("dataset metadata summary contract version mismatch")
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "DatasetMetadataSummary":
+        document = cls(
+            kind=str(data["kind"]),
+            contract_version=str(data["contract_version"]),
+            dataset_id=str(data["dataset_id"]),
+            release_id=str(data["release_id"]),
+            source_path=str(data["source_path"]),
+            obs_field_count=int(data.get("obs_field_count", 0)),
+            var_field_count=int(data.get("var_field_count", 0)),
+            obs_null_fractions=dict(data.get("obs_null_fractions", {})),
+            var_null_fractions=dict(data.get("var_null_fractions", {})),
+            obs_dtypes=dict(data.get("obs_dtypes", {})),
+            var_dtypes=dict(data.get("var_dtypes", {})),
+            obs_rows=int(data.get("obs_rows", 0)),
+            var_rows=int(data.get("var_rows", 0)),
+            obs_index_name=str(data.get("obs_index_name", "")),
+            var_index_name=str(data.get("var_index_name", "")),
+            notes=tuple(str(item) for item in data.get("notes", [])),
+        )
+        document.validate()
+        return document
+
+
+@dataclass(frozen=True)
+class FeatureProvenanceSpec(YamlDocument):
+    """Feature-order and provenance artifact written during materialization.
+
+    Records the per-dataset feature ordering (origin_index in original dataset
+    var order) and the provenance of each feature (source h5ad, source var index,
+    accepted schema used). Used by ``canonicalize-meta`` to rebuild the corpus
+    feature set without requiring a tokenizer.
+    """
+
+    release_id: str
+    feature_count: int
+    source_path: str
+    schema_path: str
+    count_source: CountSourceSpec
+    origin_index_to_feature_id: dict[int, str]
+    notes: tuple[str, ...] = ()
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "FeatureProvenanceSpec":
+        return cls(
+            release_id=str(data["release_id"]),
+            feature_count=int(data.get("feature_count", 0)),
+            source_path=str(data.get("source_path", "")),
+            schema_path=str(data.get("schema_path", "")),
+            count_source=CountSourceSpec.from_dict(data.get("count_source", {})),
+            origin_index_to_feature_id=dict(data.get("origin_index_to_feature_id", {})),
+            notes=tuple(str(item) for item in data.get("notes", [])),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+
+@dataclass(frozen=True)
 class CellMetadataRecord:
     cell_id: str
     dataset_id: str
@@ -340,10 +503,56 @@ class CellMetadataRecord:
 
 @dataclass(frozen=True)
 class DatasetJoinRecord:
+    """A single dataset's entry in the corpus index.
+
+    This record is the authoritative source for dataset membership, append
+    order, and global cell routing within the Arrow/HF-only plan scope.
+
+    Fields required for correct routing:
+    - ``dataset_id`` — stable dataset identifier
+    - ``release_id`` — immutable processed release identifier
+    - ``join_mode`` — ``create_new`` or ``append_routed``
+    - ``manifest_path`` — relative path from corpus root to the dataset's manifest
+    - ``cell_count`` — number of cells in this dataset (used for global range computation)
+    - ``global_start`` — inclusive start of this dataset's cell range in the corpus
+    - ``global_end`` — exclusive end of this dataset's cell range in the corpus
+
+    The ``global_start``/``global_end`` fields form a deterministic, contiguous,
+    non-overlapping partition of the corpus and are the sole authority for
+    global-index-to-dataset routing. They are set by ``update_corpus_index`` when
+    appending a new dataset to the corpus, based on the total cell count before
+    the new dataset is added.
+
+    Deferred (out of plan scope):
+    - Tokenizer and token-id semantics are handled separately.
+    - Unified in-memory canonical metadata is handled separately.
+    - ``canonicalize-meta`` is explicitly deferred.
+    """
+
     dataset_id: str
     release_id: str
     join_mode: str
     manifest_path: str
+    cell_count: int = 0  # number of cells in this dataset
+    global_start: int = 0  # inclusive start of global cell range for this dataset
+    global_end: int = 0  # exclusive end of global cell range for this dataset
+
+    def validate(self) -> None:
+        if self.join_mode not in {"create_new", "append_routed"}:
+            raise ValueError(f"invalid join_mode: {self.join_mode}")
+        if self.cell_count < 0:
+            raise ValueError(f"cell_count must be non-negative: {self.cell_count}")
+        if self.global_start < 0:
+            raise ValueError(f"global_start must be non-negative: {self.global_start}")
+        if self.global_end < self.global_start:
+            raise ValueError(
+                f"global_end ({self.global_end}) must be >= global_start ({self.global_start})"
+            )
+        if self.global_end - self.global_start != self.cell_count:
+            raise ValueError(
+                f"global range [{self.global_start}, {self.global_end}) length "
+                f"({self.global_end - self.global_start}) does not match cell_count ({self.cell_count})"
+            )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DatasetJoinRecord":
@@ -352,6 +561,9 @@ class DatasetJoinRecord:
             release_id=str(data["release_id"]),
             join_mode=str(data["join_mode"]),
             manifest_path=str(data["manifest_path"]),
+            cell_count=int(data.get("cell_count", 0)),
+            global_start=int(data.get("global_start", 0)),
+            global_end=int(data.get("global_end", 0)),
         )
 
 
