@@ -147,6 +147,7 @@ class CountSourceDecision:
     recovery_policy: str
     rationale: str
     uses_recovery: bool = False
+    pass_mode: str | None = None  # "direct" | "recovered" | None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "CountSourceDecision":

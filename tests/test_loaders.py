@@ -139,7 +139,6 @@ class TestExpressedZerosSampler:
         cells_path, meta_path, sqlite_path = _make_synthetic_arrow_parquet(tmp_path)
         corpus_index = tmp_path / "corpus-index.yaml"
         feature_reg = tmp_path / "feature-registry.yaml"
-        size_factor_path = tmp_path / "size-factor-manifest.yaml"
 
         from perturb_data_lab.materializers.models import (
             FeatureRegistryEntry,
@@ -168,24 +167,6 @@ class TestExpressedZerosSampler:
         )
         reg.write_yaml(feature_reg)
 
-        from perturb_data_lab.materializers.models import (
-            SizeFactorEntry,
-            SizeFactorManifest,
-        )
-
-        sf_entries = [
-            SizeFactorEntry(cell_id=f"syn_cell_{i}", size_factor=float(i + 1))
-            for i in range(20)
-        ]
-        sf_manifest = SizeFactorManifest(
-            kind="size-factor-manifest",
-            contract_version=CONTRACT_VERSION,
-            release_id="syn-v0",
-            method="sum",
-            entries=tuple(sf_entries),
-        )
-        sf_manifest.write_yaml(size_factor_path)
-
         reader = ArrowHFCellReader(
             release_id="syn-v0",
             corpus_index_path=corpus_index,
@@ -193,7 +174,6 @@ class TestExpressedZerosSampler:
             meta_parquet_path=meta_path,
             cell_meta_sqlite_path=sqlite_path,
             feature_registry_path=feature_reg,
-            size_factor_manifest_path=size_factor_path,
         )
 
         state = SamplerState(mode="expressed_zeros", total_cells=100, n_genes=50)
@@ -316,7 +296,6 @@ class TestArrowHFCellReader:
         cells_path, meta_path, sqlite_path = _make_synthetic_arrow_parquet(tmp_path)
         corpus_index = tmp_path / "corpus-index.yaml"
         feature_reg = tmp_path / "feature-registry.yaml"
-        size_factor_path = tmp_path / "size-factor-manifest.yaml"
 
         # Write minimal feature registry
         from perturb_data_lab.materializers.models import (
@@ -346,25 +325,6 @@ class TestArrowHFCellReader:
         )
         reg.write_yaml(feature_reg)
 
-        # Write minimal size factor manifest
-        from perturb_data_lab.materializers.models import (
-            SizeFactorEntry,
-            SizeFactorManifest,
-        )
-
-        sf_entries = [
-            SizeFactorEntry(cell_id=f"syn_cell_{i}", size_factor=float(i + 1))
-            for i in range(20)
-        ]
-        sf_manifest = SizeFactorManifest(
-            kind="size-factor-manifest",
-            contract_version=CONTRACT_VERSION,
-            release_id="syn-v0",
-            method="sum",
-            entries=tuple(sf_entries),
-        )
-        sf_manifest.write_yaml(size_factor_path)
-
         reader = ArrowHFCellReader(
             release_id="syn-v0",
             corpus_index_path=corpus_index,
@@ -372,7 +332,6 @@ class TestArrowHFCellReader:
             meta_parquet_path=meta_path,
             cell_meta_sqlite_path=sqlite_path,
             feature_registry_path=feature_reg,
-            size_factor_manifest_path=size_factor_path,
         )
 
         assert len(reader) == 20
@@ -390,7 +349,6 @@ class TestArrowHFCellReader:
         cells_path, meta_path, sqlite_path = _make_synthetic_arrow_parquet(tmp_path)
         corpus_index = tmp_path / "corpus-index.yaml"
         feature_reg = tmp_path / "feature-registry.yaml"
-        size_factor_path = tmp_path / "size-factor-manifest.yaml"
 
         from perturb_data_lab.materializers.models import (
             FeatureRegistryEntry,
@@ -419,24 +377,6 @@ class TestArrowHFCellReader:
         )
         reg.write_yaml(feature_reg)
 
-        from perturb_data_lab.materializers.models import (
-            SizeFactorEntry,
-            SizeFactorManifest,
-        )
-
-        sf_entries = [
-            SizeFactorEntry(cell_id=f"syn_cell_{i}", size_factor=float(i + 1))
-            for i in range(20)
-        ]
-        sf_manifest = SizeFactorManifest(
-            kind="size-factor-manifest",
-            contract_version=CONTRACT_VERSION,
-            release_id="syn-v0",
-            method="sum",
-            entries=tuple(sf_entries),
-        )
-        sf_manifest.write_yaml(size_factor_path)
-
         reader = ArrowHFCellReader(
             release_id="syn-v0",
             corpus_index_path=corpus_index,
@@ -444,7 +384,6 @@ class TestArrowHFCellReader:
             meta_parquet_path=meta_path,
             cell_meta_sqlite_path=sqlite_path,
             feature_registry_path=feature_reg,
-            size_factor_manifest_path=size_factor_path,
         )
 
         cells = reader.read_cells([0, 1, 2])
@@ -457,7 +396,6 @@ class TestPerturbDataLoader:
         cells_path, meta_path, sqlite_path = _make_synthetic_arrow_parquet(tmp_path)
         corpus_index = tmp_path / "corpus-index.yaml"
         feature_reg = tmp_path / "feature-registry.yaml"
-        size_factor_path = tmp_path / "size-factor-manifest.yaml"
 
         from perturb_data_lab.materializers.models import (
             FeatureRegistryEntry,
@@ -486,24 +424,6 @@ class TestPerturbDataLoader:
         )
         reg.write_yaml(feature_reg)
 
-        from perturb_data_lab.materializers.models import (
-            SizeFactorEntry,
-            SizeFactorManifest,
-        )
-
-        sf_entries = [
-            SizeFactorEntry(cell_id=f"syn_cell_{i}", size_factor=float(i + 1))
-            for i in range(20)
-        ]
-        sf_manifest = SizeFactorManifest(
-            kind="size-factor-manifest",
-            contract_version=CONTRACT_VERSION,
-            release_id="syn-v0",
-            method="sum",
-            entries=tuple(sf_entries),
-        )
-        sf_manifest.write_yaml(size_factor_path)
-
         reader = ArrowHFCellReader(
             release_id="syn-v0",
             corpus_index_path=corpus_index,
@@ -511,7 +431,6 @@ class TestPerturbDataLoader:
             meta_parquet_path=meta_path,
             cell_meta_sqlite_path=sqlite_path,
             feature_registry_path=feature_reg,
-            size_factor_manifest_path=size_factor_path,
         )
 
         loader = PerturbDataLoader(
@@ -536,7 +455,6 @@ class TestPerturbIterableDataset:
         cells_path, meta_path, sqlite_path = _make_synthetic_arrow_parquet(tmp_path)
         corpus_index = tmp_path / "corpus-index.yaml"
         feature_reg = tmp_path / "feature-registry.yaml"
-        size_factor_path = tmp_path / "size-factor-manifest.yaml"
 
         from perturb_data_lab.materializers.models import (
             FeatureRegistryEntry,
@@ -565,24 +483,6 @@ class TestPerturbIterableDataset:
         )
         reg.write_yaml(feature_reg)
 
-        from perturb_data_lab.materializers.models import (
-            SizeFactorEntry,
-            SizeFactorManifest,
-        )
-
-        sf_entries = [
-            SizeFactorEntry(cell_id=f"syn_cell_{i}", size_factor=float(i + 1))
-            for i in range(20)
-        ]
-        sf_manifest = SizeFactorManifest(
-            kind="size-factor-manifest",
-            contract_version=CONTRACT_VERSION,
-            release_id="syn-v0",
-            method="sum",
-            entries=tuple(sf_entries),
-        )
-        sf_manifest.write_yaml(size_factor_path)
-
         reader = ArrowHFCellReader(
             release_id="syn-v0",
             corpus_index_path=corpus_index,
@@ -590,7 +490,6 @@ class TestPerturbIterableDataset:
             meta_parquet_path=meta_path,
             cell_meta_sqlite_path=sqlite_path,
             feature_registry_path=feature_reg,
-            size_factor_manifest_path=size_factor_path,
         )
 
         dataset = PerturbIterableDataset(
@@ -900,25 +799,6 @@ class TestSamplerParityAcrossBackends:
         feature_reg = _make_synthetic_feature_registry(tmp_path)
         corpus_index = tmp_path / "corpus-index.yaml"
 
-        from perturb_data_lab.materializers.models import (
-            SizeFactorEntry,
-            SizeFactorManifest,
-        )
-        from perturb_data_lab.contracts import CONTRACT_VERSION
-
-        sf_entries = [
-            SizeFactorEntry(cell_id=f"syn_cell_{i}", size_factor=1.0) for i in range(20)
-        ]
-        sf_manifest = SizeFactorManifest(
-            kind="size-factor-manifest",
-            contract_version=CONTRACT_VERSION,
-            release_id="syn-v0",
-            method="sum",
-            entries=tuple(sf_entries),
-        )
-        sf_path = tmp_path / "size-factor-manifest.yaml"
-        sf_manifest.write_yaml(sf_path)
-
         return ArrowHFCellReader(
             release_id="syn-v0",
             corpus_index_path=corpus_index,
@@ -926,7 +806,6 @@ class TestSamplerParityAcrossBackends:
             meta_parquet_path=meta_path,
             cell_meta_sqlite_path=sqlite_path,
             feature_registry_path=feature_reg,
-            size_factor_manifest_path=sf_path,
         )
 
     @pytest.fixture

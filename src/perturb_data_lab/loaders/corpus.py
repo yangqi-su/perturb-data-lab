@@ -308,7 +308,6 @@ class CorpusLoader:
             cell_meta_sqlite = meta_root / f"{manifest.release_id}-cell-meta.sqlite"
             cells_parquet = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-cells.parquet"
             meta_parquet = meta_root / f"{manifest.release_id}-meta.parquet"
-            size_factor_manifest = meta_root / "size-factor-manifest.yaml"
             feature_meta_paths: dict[str, Path] | None = None
             if manifest.feature_meta_paths:
                 feature_meta_paths = {
@@ -319,7 +318,6 @@ class CorpusLoader:
                 "meta_parquet_path": meta_parquet,
                 "cell_meta_sqlite_path": cell_meta_sqlite,
                 "feature_registry_path": meta_root / "feature-registry.yaml",  # legacy fallback
-                "size_factor_manifest_path": size_factor_manifest,
                 "feature_meta_paths": feature_meta_paths,
             }
         elif backend == "webdataset":

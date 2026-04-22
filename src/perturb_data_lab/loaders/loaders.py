@@ -221,7 +221,7 @@ class ArrowHFCellReader(BackendCellReader):
         meta_parquet_path: Path,
         cell_meta_sqlite_path: Path,
         feature_registry_path: Path,
-        size_factor_manifest_path: Path,
+        size_factor_manifest_path: Path | None = None,
         feature_meta_paths: dict[str, Path] | None = None,
     ):
         """
@@ -240,8 +240,9 @@ class ArrowHFCellReader(BackendCellReader):
             (written by Phase 6 `_write_cell_metadata`).
         feature_registry_path : Path
             Path to the feature registry YAML.
-        size_factor_manifest_path : Path
-            Path to the size factor manifest YAML.
+        size_factor_manifest_path : Path | None
+            Deprecated; size factors are read from the cells parquet.
+            No longer required or used. Kept for backwards compatibility.
         feature_meta_paths : dict[str, Path] | None
             Optional dict with keys ``features_origin`` and ``features_token``
             pointing to the per-dataset feature parquet files written by

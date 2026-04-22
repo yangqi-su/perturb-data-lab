@@ -4,7 +4,16 @@ Tests cover:
 - Reverse-normalization recovery via expm1/size_factor path
 - CountSourceDecision.uses_recovery flag
 - FeatureTokenizationSpec.is_compatible_for_append() namespace check
-- Binned matrices marked as non-recoverable
+- Bin-named sources are included in both direct and recovery checks
+- Largest-passing-source selection with direct-vs-recovered tie-breaking
+- Source-order tie-breaking when size and pass mode are equal
+
+New contract (Phase 2):
+- Every source receives both direct integer check and reverse-normalized check
+- Bin-named sources are NOT excluded from recovery attempts
+- Among passing sources, largest feature dimension wins
+- Direct integer beats recovered when otherwise tied
+- Existing source order resolves remaining ties
 """
 
 from __future__ import annotations
@@ -86,15 +95,26 @@ def test_reverse_normalization_not_attempted_on_direct_integer():
     assert recovered is None
 
 
-def test_reverse_normalization_not_attempted_on_binned():
-    """Binned matrices are non-recoverable and recovery returns None."""
+def test_binned_source_included_in_recovery_attempts():
+    """Bin-named sources are included in both direct and recovery checks.
+
+    Under the new contract, bin-named sources are NOT excluded from recovery.
+    Recovery is attempted on all non-pass candidates including bin-named ones.
+    The values [0.7, 0.35] per row in a 2-column sparse matrix fail recovery
+    because expm1 ratios produce max_abs_integer_deviation ~0.42 > 0.01.
+    The single-nonzero-per-row pattern used previously accidentally passes
+    recovery (each single nonzero becomes 1.0 by definition); the multi-nonzero
+    pattern is genuinely non-recoverable.
+    """
     obs = pd.DataFrame(index=["cell-1", "cell-2"])
     var = pd.DataFrame(index=["gene-a", "gene-b"])
-    # Simulate binned data — float values that are NOT log-normalized counts
-    binned = csr_matrix(np.array([[0.1, 0.0], [0.0, 0.2]], dtype=np.float32))
-    adata = ad.AnnData(X=binned, obs=obs, var=var)
+    # Row 0: [0.7, 0.35], Row 1: [0.3, 0.85] — both rows have two nonzeros
+    # with expm1 ratios that fail the integer threshold
+    binned = csr_matrix(np.array([[0.7, 0.35], [0.3, 0.85]], dtype=np.float32))
+    adata = ad.AnnData(X=np.array([[1, 0], [0, 1]], dtype=np.int32), obs=obs, var=var)
     adata.layers["binned"] = binned
 
+    # Candidate name contains "bin" so _infer_transform_family returns "binned"
     candidate = _audit_matrix_candidate(
         ".layers[binned]",
         adata.layers["binned"],
@@ -103,39 +123,117 @@ def test_reverse_normalization_not_attempted_on_binned():
         sample_rows=2,
     )
 
+    # Direct check: binned fails (non-integer)
+    assert candidate.status == "fail"
     assert candidate.inferred_transform == "binned"
-    assert "non-recoverable" in " ".join(candidate.notes)
+    assert candidate.recovery_policy == "disallowed"
+
+    # Recovery is attempted but fails for non-log-norm data
     recovered = _attempt_reverse_normalization(candidate, adata)
     assert recovered is None
 
 
-def test_choose_count_source_sets_uses_recovery_flag():
-    """_choose_count_source reports uses_recovery=True when recovery was used."""
-    obs = pd.DataFrame(index=["cell-1", "cell-2", "cell-3"])
-    var = pd.DataFrame(index=["gene-a", "gene-b", "gene-c"])
-    raw_counts = csr_matrix(np.array([[1, 0, 3], [0, 2, 0], [4, 0, 1]], dtype=np.int32))
-    adata = ad.AnnData(X=raw_counts, obs=obs, var=var)
-    adata.layers["log_norm"] = np.log1p(raw_counts.toarray()).astype(np.float32)
+def test_choose_count_source_prefers_largest_passing_source():
+    """Among passing sources, the one with the largest feature dimension wins.
 
-    candidates = _rank_candidates(
-        [
-            _audit_matrix_candidate(".X", adata.X, 3, 3, 3),
-            _audit_matrix_candidate(".layers[log_norm]", adata.layers["log_norm"], 3, 3, 3),
-        ]
+    When .raw.X has more features than .X and both pass (or recover), .raw.X wins.
+    """
+    obs = pd.DataFrame(index=["cell-1", "cell-2", "cell-3"])
+    # .X: 3 features
+    raw_counts = np.array([[1, 0, 3], [0, 2, 0], [4, 0, 1]], dtype=np.int32)
+    adata = ad.AnnData(X=csr_matrix(raw_counts), obs=obs, var=pd.DataFrame(index=["g-a", "g-b", "g-c"]))
+    adata.layers["log_norm"] = np.log1p(raw_counts).astype(np.float32)
+
+    # Set up .raw.X with 4 features (larger)
+    adata.raw = ad.AnnData(
+        X=csr_matrix(np.array([
+            [1, 0, 3, 2],
+            [0, 2, 0, 1],
+            [4, 0, 1, 0],
+        ], dtype=np.int32)),
+        var=pd.DataFrame(index=["g-a", "g-b", "g-c", "g-d"]),
     )
+
+    candidates = _rank_candidates([
+        _audit_matrix_candidate(".X", adata.X, 3, 3, 3),
+        _audit_matrix_candidate(".raw.X", adata.raw.X, 3, 4, 3),
+        _audit_matrix_candidate(".layers[log_norm]", adata.layers["log_norm"], 3, 3, 3),
+    ])
 
     decision = _choose_count_source(candidates, adata)
 
-    # Integer .X should be selected directly without recovery
+    # .raw.X has 4 features (largest) and is integer direct → wins
+    assert decision.selected_candidate == ".raw.X"
     assert decision.uses_recovery is False
 
 
-def test_choose_count_source_skips_recovery_when_no_size_factor_source():
-    """When no integer count source exists for size factors, recovery is not attempted.
+def test_choose_count_source_direct_integer_beats_recovered():
+    """When two sources are equally sized, direct integer beats recovered.
 
-    If .X is the only candidate and is non-integer with no .raw.X, then size
-    factors cannot be computed and recovery correctly returns None. The dataset
-    should fail materialization readiness rather than using unverified data.
+    An integer .X should be selected over a log-norm layer that requires recovery,
+    even when both have the same feature count.
+    """
+    obs = pd.DataFrame(index=["cell-1", "cell-2", "cell-3"])
+    var = pd.DataFrame(index=["gene-a", "gene-b", "gene-c"])
+    raw_counts = np.array([[1, 0, 3], [0, 2, 0], [4, 0, 1]], dtype=np.int32)
+    adata = ad.AnnData(X=csr_matrix(raw_counts), obs=obs, var=var)
+    adata.layers["log_norm"] = np.log1p(raw_counts).astype(np.float32)
+
+    candidates = _rank_candidates([
+        _audit_matrix_candidate(".layers[log_norm]", adata.layers["log_norm"], 3, 3, 3),
+        _audit_matrix_candidate(".X", adata.X, 3, 3, 3),
+    ])
+
+    decision = _choose_count_source(candidates, adata)
+
+    # .X is integer direct, log_norm requires recovery → .X wins (same size, direct beats recovered)
+    assert decision.selected_candidate == ".X"
+    assert decision.uses_recovery is False
+    assert decision.status == "pass"
+
+
+def test_choose_count_source_source_order_resolves_tie():
+    """When size and pass mode are equal, existing source order breaks the tie.
+
+    The source_order map is built from the ranked candidate list, with lower indices
+    assigned to higher-ranked candidates. When two candidates have equal key tuples
+    after (-features, pass_mode), the one with the lower source_order index wins.
+
+    This test uses two layers with identical naming patterns so they receive the
+    same _source_priority score; their relative order in the ranked list therefore
+    reflects the source-order tie-break. The layer that appears first in the ranked
+    list (same score) wins because it has the lower source_order index.
+    """
+    obs = pd.DataFrame(index=["cell-1", "cell-2", "cell-3"])
+    var = pd.DataFrame(index=["gene-a", "gene-b", "gene-c"])
+    raw_counts = np.array([[1, 0, 3], [0, 2, 0], [4, 0, 1]], dtype=np.int32)
+    adata = ad.AnnData(X=np.zeros((3, 3), dtype=np.int32), obs=obs, var=var)
+    # Both layers have identical naming pattern → same priority score
+    adata.layers["norm_a"] = np.log1p(raw_counts).astype(np.float32)
+    adata.layers["norm_b"] = np.log1p(raw_counts).astype(np.float32)
+
+    # Both are non-integer so both need recovery; since they have identical
+    # scores they get the same rank. The one appearing first in the ranked list
+    # (norm_a) will have the lower source_order index and should win.
+    candidates = [
+        _audit_matrix_candidate(".layers[norm_a]", adata.layers["norm_a"], 3, 3, 3),
+        _audit_matrix_candidate(".layers[norm_b]", adata.layers["norm_b"], 3, 3, 3),
+    ]
+    ranked = _rank_candidates(candidates)
+    decision = _choose_count_source(ranked, adata)
+
+    # Both have same size (3 features), both would be recovered (or fail),
+    # but the tie-break via source_order should prefer the first in ranked list.
+    # Since both have identical priority scores and same status, source_order
+    # (built from ranked list order) determines the winner.
+    assert decision.selected_candidate == ".layers[norm_a]"
+
+
+def test_choose_count_source_log_norm_recovers():
+    """When only log-normalized source exists and it can be recovered, uses_recovery=True.
+
+    Under the new contract, every source gets both checks. If .X is log-norm and
+    passes reverse-normalized recovery, uses_recovery is True.
     """
     obs = pd.DataFrame(index=["cell-1", "cell-2", "cell-3"])
     var = pd.DataFrame(index=["gene-a", "gene-b", "gene-c"])
@@ -143,15 +241,43 @@ def test_choose_count_source_skips_recovery_when_no_size_factor_source():
     log_norm = np.log1p(np.array([[1, 0, 3], [0, 2, 0], [4, 0, 1]], dtype=np.float32))
     adata = ad.AnnData(X=log_norm, obs=obs, var=var)
 
-    candidates = _rank_candidates(
-        [_audit_matrix_candidate(".X", adata.X, 3, 3, 3)]
-    )
+    candidates = _rank_candidates([
+        _audit_matrix_candidate(".X", adata.X, 3, 3, 3)
+    ])
 
     decision = _choose_count_source(candidates, adata)
 
-    # No integer source means no size factor source — recovery is not attempted
-    # and the dataset fails materialization readiness
-    assert decision.uses_recovery is False
+    # No integer source found; recovery succeeds on log-norm data
+    assert decision.uses_recovery is True
+    assert decision.status == "pass"
+
+
+def test_choose_count_source_genuinely_non_recoverable_fails():
+    """When every source fails both checks, decision status is 'fail'.
+
+    Truly non-recoverable data (e.g., arbitrary floats that are not log-normalized
+    counts) should fail recovery. Since single-nonzero-per-row matrices can
+    accidentally pass recovery (each row's single nonzero becomes 1.0), we use
+    rows with multiple nonzero values whose expm1 ratios are not near-integer,
+    which fails the integer-deviation threshold.
+    """
+    obs = pd.DataFrame(index=["cell-1", "cell-2"])
+    var = pd.DataFrame(index=["gene-a", "gene-b", "gene-c"])
+    # Row 0: [0.1, 0.35] expm1 ratios not near-integer → fails recovery
+    # Row 1: [0.1, 0.3] expm1 ratios not near-integer → fails recovery
+    adata = ad.AnnData(
+        X=np.array([[0.1, 0.35, 0.0], [0.0, 0.1, 0.3]], dtype=np.float32),
+        obs=obs,
+        var=var,
+    )
+
+    candidates = _rank_candidates([
+        _audit_matrix_candidate(".X", adata.X, 2, 3, 2),
+    ])
+
+    decision = _choose_count_source(candidates, adata)
+
+    # No integer source found; recovery attempted but fails (non-integer deviations)
     assert decision.status == "fail"
 
 
@@ -211,12 +337,16 @@ def test_feature_tokenization_is_compatible_for_append_unknown_namespace():
 
 
 # ---------------------------------------------------------------------------
-# Binned matrix non-recoverable annotation test
+# Binned matrix recovery disallowed test
 # ---------------------------------------------------------------------------
 
 
-def test_binned_candidate_marked_non_recoverable():
-    """Binned candidate is annotated with non-recoverable note."""
+def test_binned_candidate_recovery_policy_is_disallowed():
+    """Binned candidate has recovery_policy='disallowed' under the new contract.
+
+    Bin-named sources are included in recovery attempts but the binned transform
+    family means recovery is not applicable (not log-normalized data).
+    """
     obs = pd.DataFrame(index=["cell-1"])
     var = pd.DataFrame(index=["gene-a"])
     binned = csr_matrix(np.array([[0.1]], dtype=np.float32))
@@ -232,7 +362,7 @@ def test_binned_candidate_marked_non_recoverable():
     )
 
     assert candidate.inferred_transform == "binned"
-    assert any("non-recoverable" in str(n) for n in candidate.notes)
+    assert candidate.recovery_policy == "disallowed"
 
 
 # ---------------------------------------------------------------------------

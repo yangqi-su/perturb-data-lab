@@ -161,7 +161,6 @@ def _make_materialization_manifest(
         provenance=ProvenanceSpec(source_path=f"/fake/{release_id}.h5ad", schema="/fake/schema.yaml"),
         tokenizer_path="tokenizer.json",
         feature_meta_paths=feature_meta_paths,
-        size_factor_manifest_path="size-factor-manifest.yaml",
         qa_manifest_path="qa-manifest.yaml",
         hvg_sidecar_path=hvg_sidecar_path,
     )

@@ -37,8 +37,6 @@ from .models import (
     ProvenanceSpec,
     QAManifest,
     QAMetric,
-    SizeFactorEntry,
-    SizeFactorManifest,
 )
 from .schema_execution import resolve_all_cell_rows, resolve_all_feature_rows
 from .tokenizer import CorpusTokenizer
@@ -46,10 +44,6 @@ from .emission_spec import CorpusEmissionSpec
 from .validation import validate_schema_readiness
 from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
 from ..inspectors.models import SchemaDocument
-
-# Default sample row count for reverse-normalization size factor computation.
-# Must stay consistent with the value used in the inspector's validation pass.
-_DEFAULT_MATRIX_SAMPLE_ROWS = 32
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +170,18 @@ class MaterializationRoute:
         # Read backed anndata
         adata = ad.read_h5ad(str(source_h5ad), backed="r")
         n_obs = adata.n_obs
-        n_vars = adata.n_vars
+
+        # Determine which var reference to use based on selected count source.
+        # When .raw.X wins, it may have a different feature dimension than .X,
+        # so feature-axis-dependent steps (HVG, tokenizer, feature metadata)
+        # must follow the winning source's feature space.
+        raw_is_selected = self.count_source.selected == ".raw.X"
+        if raw_is_selected:
+            n_vars = int(adata.raw.shape[1])
+            var_ref = adata.raw.var
+        else:
+            n_vars = adata.n_vars
+            var_ref = adata.var
 
         # Select count matrix
         if self.count_source.selected == ".raw.X":
@@ -218,7 +223,9 @@ class MaterializationRoute:
         )
 
         # Resolve feature tokenization labels from schema (before tokenizer build)
-        var_mem = adata.var.to_memory() if hasattr(adata.var, "to_memory") else adata.var
+        # Use the winning source's var reference so feature-axis-dependent outputs
+        # follow the selected count source's feature space (.X vs .raw.X).
+        var_mem = var_ref.to_memory() if hasattr(var_ref, "to_memory") else var_ref
         feature_rows = resolve_all_feature_rows(schema, var_mem)
 
         # Build/update corpus tokenizer (replaces feature-registry.yaml)
@@ -228,21 +235,6 @@ class MaterializationRoute:
         )
         tokenizer_path = self._corpus_root / "tokenizer.json"
         tokenizer.to_json(tokenizer_path)
-
-        # Write size factor manifest
-        sf_entries = [
-            SizeFactorEntry(cell_id=str(adata.obs.index[i]), size_factor=float(sf))
-            for i, sf in enumerate(size_factors)
-        ]
-        sf_manifest = SizeFactorManifest(
-            kind="size-factor-manifest",
-            contract_version=CONTRACT_VERSION,
-            release_id=self.release_id,
-            method="sum",
-            entries=tuple(sf_entries),
-        )
-        sf_path = meta_root / "size-factor-manifest.yaml"
-        sf_manifest.write_yaml(sf_path)
 
         # Write cell metadata table (parquet-backed via Arrow, or simple SQLite)
         cell_meta_path = self._write_cell_metadata(
@@ -259,6 +251,7 @@ class MaterializationRoute:
             tokenizer=tokenizer,
             feature_rows=feature_rows,
             meta_root=meta_root,
+            n_vars=n_vars,
         )
 
         # Compute and write HVG/non-HVG arrays in original dataset feature indices
@@ -300,7 +293,6 @@ class MaterializationRoute:
             feature_meta_paths={
                 k: str(v) for k, v in feature_meta_paths.items()
             },
-            size_factor_manifest_path=str(sf_path),
             qa_manifest_path=str(qa_path),
             hvg_sidecar_path=str(hvg_sidecar_path),
             integer_verified=all_passed,
@@ -351,12 +343,14 @@ class MaterializationRoute:
 
         This is only called when ``count_source.uses_recovery`` is True, meaning
         the inspector validated that recovery is possible and the selected
-        candidate is a log-normalized layer that can be reversed using size
-        factors computed from the raw integer counts stored in ``.X``.
+        candidate is a log-normalized layer that can be reversed.
 
-        The method is conservative: it allocates the full recovered array in
-        memory, which is acceptable because recovery is only triggered when a
-        dataset has passed the inspector's recoverability check.
+        Recovery is transient: per-row scale factors are recomputed during
+        materialization from the log-normalized source itself and are NOT
+        persisted. The final integer count matrix is what is stored.
+
+        Per-row scale_factor = smallest nonzero value in expm1(source_row).
+        Recovery formula: recovered = expm1(source_row) / scale_factor.
 
         Parameters
         ----------
@@ -379,40 +373,11 @@ class MaterializationRoute:
         Raises
         ------
         ValueError
-            If size factors cannot be computed from ``.X`` or the recovered
-            values are not sufficiently integer-like.
+            If the recovered values are not sufficiently integer-like.
         """
-        from .backends.arrow_hf import _get_row_nonzero
-
-        # Compute size factors from .X (the raw integer count source).
-        # This is the same sum-based method used during inspection.
-        sample_rows = min(_DEFAULT_MATRIX_SAMPLE_ROWS, n_obs)
-        indices = np.linspace(0, n_obs - 1, num=sample_rows, dtype=int)
-
-        size_factors = np.zeros(n_obs, dtype=np.float64)
-        try:
-            count_for_sf = adata.X
-            for i in indices:
-                row_indices, row_counts = _get_row_nonzero(count_for_sf, i)
-                size_factors[i] = float(np.asarray(row_counts).sum())
-
-            total = size_factors.sum()
-            if total > 0:
-                size_factors = size_factors / (total / n_obs)
-            size_factors = np.where(size_factors <= 0, 1.0, size_factors)
-            size_factors = np.where(np.isnan(size_factors), 1.0, size_factors)
-        except Exception as err:
-            raise ValueError(
-                f"failed to compute size factors from .X for reverse-normalization "
-                f"of {selected_candidate}: {err}"
-            )
-
         # Allocate full recovered matrix (conservative for memory but correct)
         recovered = np.zeros((n_obs, count_matrix.shape[1]), dtype=np.float64)
 
-        # Apply expm1(row) without size factor multiplication.
-        # For plain log1p(counts) with no size-factor normalization in the forward
-        # transform, expm1(log1p(x)) = x exactly without needing sf adjustment.
         for i in range(n_obs):
             row = count_matrix[i]
             if hasattr(row, "toarray"):
@@ -421,7 +386,14 @@ class MaterializationRoute:
                 row = np.asarray(row).ravel()
             nonzero_mask = row != 0
             if nonzero_mask.any():
-                recovered[i, nonzero_mask] = np.expm1(row[nonzero_mask])
+                # expm1 of the log-normalized values
+                expm1_vals = np.expm1(row[nonzero_mask])
+                # Per-row scale factor = smallest nonzero expm1 value
+                min_nonzero = float(np.min(expm1_vals))
+                if min_nonzero <= 0:
+                    min_nonzero = 1.0  # fallback for degenerate rows
+                # Recover: divide by per-row scale factor
+                recovered[i, nonzero_mask] = expm1_vals / min_nonzero
 
         # Verify recovered values are integer-like before returning
         nonzero_mask = recovered != 0
@@ -436,20 +408,25 @@ class MaterializationRoute:
                     "is a log-normalized layer compatible with expm1/size_factor"
                 )
 
-        # Convert to int32 in-place for sparse write efficiency
+        # Convert to int32 for sparse write efficiency
         return np.rint(recovered).astype(np.int32)
 
     def _compute_size_factors(self, count_matrix: Any, n_obs: int) -> np.ndarray:
-        """Compute size factors via sum-per-row, normalized."""
+        """Compute size factors as row_sum / median(row_sum).
+
+        Dataset size factors are derived from final processed count sums
+        (post-recovery when applicable) using median normalization.
+        """
         from .backends.arrow_hf import _get_row_nonzero
 
         factors = np.zeros(n_obs, dtype=np.float64)
         for i in range(n_obs):
             indices, counts = _get_row_nonzero(count_matrix, i)
             factors[i] = float(counts.sum())
-        total = factors.sum()
-        if total > 0:
-            factors = factors / (total / n_obs)
+
+        row_median = float(np.median(factors))
+        if row_median > 0:
+            factors = factors / row_median
         # Replace zero or NaN with 1.0
         factors = np.where(factors <= 0, 1.0, factors)
         factors = np.where(np.isnan(factors), 1.0, factors)
@@ -610,6 +587,7 @@ class MaterializationRoute:
         tokenizer: CorpusTokenizer,
         feature_rows: tuple[dict[str, str], ...],
         meta_root: Path,
+        n_vars: int | None = None,
     ) -> dict[str, Path]:
         """Write per-dataset canonical feature objects.
 
@@ -627,9 +605,17 @@ class MaterializationRoute:
         re-tokenizing at load time.
         """
         # Build origin-order feature table
+        # n_vars tracks the winning source's feature count;
+        # use adata.raw.var when .raw.X won, otherwise adata.var
+        if n_vars is None:
+            n_vars = adata.n_vars
+        if self.count_source.selected == ".raw.X" and hasattr(adata.raw, "var"):
+            var_index = adata.raw.var.index
+        else:
+            var_index = adata.var.index
         origin_path = meta_root / f"{self.release_id}-features-origin.parquet"
-        origin_indices = list(range(adata.n_vars))
-        origin_feature_ids = [str(adata.var.index[i]) for i in origin_indices]
+        origin_indices = list(range(n_vars))
+        origin_feature_ids = [str(var_index[i]) for i in origin_indices]
 
         origin_table = pa.table(
             {

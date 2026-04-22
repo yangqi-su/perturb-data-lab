@@ -311,10 +311,6 @@ def _audit_matrix_candidate(
     if inferred_transform in {"transformed", "binned"}:
         notes.append(f"candidate name suggests {inferred_transform} data")
 
-    # Mark binned matrices as non-recoverable per Phase 1 contract
-    if inferred_transform == "binned":
-        notes.append("binned matrices are non-recoverable; exclude from reverse-normalization")
-
     return CountSourceCandidate(
         candidate=candidate_name,
         rank=0,
@@ -374,16 +370,19 @@ def _attempt_reverse_normalization(
 ) -> CountSourceCandidate | None:
     """Attempt to recover integer counts via the approved reverse-normalization path.
 
-    The only approved path is ``expm1(expr) / size_factor`` on log-normalized data.
-    Recovery is only attempted when:
-    - ``candidate`` is the best available candidate but is not an integer source
-    - the candidate is log-normalized (inferred_transform is "transformed" or
-      the candidate name contains "log" or "norm")
-    - size factors can be computed from the raw integer count source (.X)
+    The only approved path is ``expm1(expr) / size_factor`` on log-normalized data,
+    where ``size_factor`` is the minimum nonzero value of ``expm1(expr)`` computed
+    per-row across all candidate expression sources.
 
-    When the raw integer source is in .X, size factors are computed from .X
-    (sum-per-row, normalized by median), then expm1(expr) / size_factor is
-    applied to the candidate matrix to recover integer-like counts.
+    Recovery is attempted when:
+    - ``candidate`` is not a direct integer source (status != "pass")
+    - the adata object is available so raw matrix access is possible
+
+    When no direct integer source exists anywhere in the adata, the candidate
+    matrix itself is the recovery source. Per-row scale factors are derived from
+    ``expm1(nonzero values)`` in each row — specifically the minimum nonzero
+    recovered value per row. This represents the "unit" count that the forward
+    log-normalization used as a reference.
 
     Returns an updated ``CountSourceCandidate`` with ``recovery_policy`` set to
     ``"expm1_over_size_factor"`` on successful recovery, or ``None`` if recovery
@@ -391,12 +390,11 @@ def _attempt_reverse_normalization(
     """
     import numpy as np
 
-    # Only recover from transformed/log-normalized candidates
-    inferred = candidate.inferred_transform
-    if inferred not in {"transformed", "raw"} and "log" not in candidate.candidate.lower():
+    # Only recover when candidate is not already integer
+    if candidate.status == "pass":
         return None
 
-    # Select the matrix reference for this candidate (the matrix to recover from)
+    # Determine which matrix to recover from
     if candidate.candidate == ".raw.X":
         matrix_ref = adata.raw.X
     elif candidate.candidate.startswith(".layers["):
@@ -411,41 +409,9 @@ def _attempt_reverse_normalization(
     sample_rows = min(DEFAULT_MATRIX_SAMPLE_ROWS, n_obs)
     indices = _sample_row_indices(n_obs, sample_rows)
 
-    # Compute size factors from .X (the raw integer count source) when available.
-    # This matches the Phase 1 contract: misc._get_sf() sum method on raw counts.
-    # If .X is not an integer source, fall back to computing from the candidate
-    # matrix itself (handles the case where the log-norm candidate IS .X).
-    from ..materializers.backends.arrow_hf import _get_row_nonzero
-
-    try:
-        size_factors = np.zeros(n_obs, dtype=np.float64)
-        # Use .X as the source for size factor computation when it exists
-        count_for_sf = adata.X
-        for i in indices:
-            row_indices, row_counts = _get_row_nonzero(count_for_sf, i)
-            size_factors[i] = float(np.asarray(row_counts).sum())
-
-        total = size_factors.sum()
-        if total > 0:
-            size_factors = size_factors / (total / n_obs)
-        size_factors = np.where(size_factors <= 0, 1.0, size_factors)
-        size_factors = np.where(np.isnan(size_factors), 1.0, size_factors)
-    except Exception:
-        # Fall back: compute size factors from the candidate matrix itself
-        try:
-            size_factors = np.zeros(n_obs, dtype=np.float64)
-            for i in indices:
-                row_indices, row_counts = _get_row_nonzero(matrix_ref, i)
-                size_factors[i] = float(np.asarray(row_counts).sum())
-            total = size_factors.sum()
-            if total > 0:
-                size_factors = size_factors / (total / n_obs)
-            size_factors = np.where(size_factors <= 0, 1.0, size_factors)
-            size_factors = np.where(np.isnan(size_factors), 1.0, size_factors)
-        except Exception:
-            return None
-
-    # Apply expm1 / size_factor on sampled rows
+    # Apply expm1 / size_factor on sampled rows.
+    # Scale factor per row = minimum nonzero value of expm1(row).
+    # This represents the unit the forward log-normalization preserved.
     recovered_values: list[np.ndarray] = []
     for idx in indices:
         row = matrix_ref[idx]
@@ -453,13 +419,21 @@ def _attempt_reverse_normalization(
             row = np.asarray(row.toarray().ravel())
         else:
             row = np.asarray(row).ravel()
+
+        # expm1 on nonzero entries
         nonzero_mask = row != 0
-        if nonzero_mask.any():
-            sf = size_factors[idx]
-            if sf <= 0:
-                sf = 1.0
-            recovered = np.expm1(row[nonzero_mask])
-            recovered_values.append(recovered)
+        if not nonzero_mask.any():
+            continue
+
+        expm1_row = np.expm1(row[nonzero_mask])
+
+        # Per-row scale factor = minimum nonzero recovered value
+        sf = float(np.min(expm1_row))
+        if sf <= 0:
+            continue
+
+        recovered = expm1_row / sf
+        recovered_values.append(recovered)
 
     if not recovered_values:
         return None
@@ -482,7 +456,7 @@ def _attempt_reverse_normalization(
         status = "needs-review"
 
     notes = (
-        f"recovered via expm1/size_factor; "
+        f"recovered via expm1/size_factor (scale=min_nonzero_expm1); "
         f"max_deviation={max_deviation:.6f}; "
         f"fraction_noninteger={fraction_noninteger:.6f}"
     )
@@ -509,6 +483,17 @@ def _choose_count_source(
     candidates: tuple[CountSourceCandidate, ...],
     adata: ad.AnnData | None = None,
 ) -> CountSourceDecision:
+    """Choose the winning count source under the Phase 2 contract.
+
+    Precedence (in order):
+    1. Largest feature dimension (columns) among all passing sources.
+    2. Among equally-sized passing sources, direct integer beats recovered.
+    3. If still tied, preserve existing source enumeration order.
+
+    Every candidate receives both a direct check (from _audit_matrix_candidate) and,
+    if needed, a reverse-normalized check via _attempt_reverse_normalization.
+    Bin-named sources are included in both checks.
+    """
     if not candidates:
         return CountSourceDecision(
             selected_candidate="none",
@@ -516,38 +501,67 @@ def _choose_count_source(
             confidence="low",
             recovery_policy="disallowed",
             rationale="No matrix candidates were available for audit.",
+            uses_recovery=False,
+            pass_mode=None,
         )
-    selected = candidates[0]
-    uses_recovery = False
 
-    # If no direct integer source is available, attempt reverse normalization
-    if selected.status != "pass" and adata is not None:
-        recovered = _attempt_reverse_normalization(selected, adata)
-        if recovered is not None:
-            selected = recovered
-            uses_recovery = True
+    passing: list[tuple[CountSourceCandidate, str]] = []  # (candidate, pass_mode)
+
+    for candidate in candidates:
+        if candidate.status == "pass":
+            # Direct integer pass
+            passing.append((candidate, "direct"))
+        elif adata is not None:
+            # Attempt reverse-normalization recovery
+            recovered = _attempt_reverse_normalization(candidate, adata)
+            if recovered is not None:
+                passing.append((recovered, "recovered"))
+
+    if not passing:
+        return CountSourceDecision(
+            selected_candidate="none",
+            status="fail",
+            confidence="low",
+            recovery_policy="disallowed",
+            rationale="No passing count source found among candidates.",
+            uses_recovery=False,
+            pass_mode=None,
+        )
+
+    # Sort: (1) feature count desc, (2) pass_mode direct before recovered, (3) source order
+    source_order = {c.candidate: idx for idx, c in enumerate(candidates)}
+    passing.sort(
+        key=lambda item: (
+            -item[0].shape[1],  # largest feature count first
+            0 if item[1] == "direct" else 1,  # direct before recovered
+            source_order.get(item[0].candidate, 10**9),  # existing source order
+        )
+    )
+
+    selected_candidate, pass_mode = passing[0]
+    uses_recovery = pass_mode == "recovered"
 
     confidence = (
         "high"
-        if selected.status == "pass"
+        if selected_candidate.status == "pass"
         else "medium"
-        if selected.status == "needs-review"
+        if selected_candidate.status == "needs-review"
         else "low"
     )
+    pass_mode_str = "direct integer" if pass_mode == "direct" else "recovered via expm1/size_factor"
     rationale = (
-        f"Selected {selected.candidate} because it is the highest-ranked candidate with "
-        f"status {selected.status}."
+        f"Selected {selected_candidate.candidate} because it is the largest passing source "
+        f"({selected_candidate.shape[1]} features) with {pass_mode_str}."
     )
-    if uses_recovery:
-        rationale += " Counts were recovered via the approved expm1/size_factor path."
 
     return CountSourceDecision(
-        selected_candidate=selected.candidate,
-        status=selected.status,
+        selected_candidate=selected_candidate.candidate,
+        status=selected_candidate.status,
         confidence=confidence,
-        recovery_policy=selected.recovery_policy,
+        recovery_policy=selected_candidate.recovery_policy,
         rationale=rationale,
         uses_recovery=uses_recovery,
+        pass_mode=pass_mode,
     )
 
 
