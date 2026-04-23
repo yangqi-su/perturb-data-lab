@@ -680,6 +680,10 @@ def _make_synthetic_zarr(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             dtype="i4",
         )
 
+    cells_data = [
+            {"cell_id": f"syn-v0_cell_{i}", "dataset_id": "syn-v0", "dataset_release": "syn-v0"}
+            for i in range(n_cells)
+        ]
     with open(meta_path, "w") as f:
         json.dump(
             {
@@ -688,6 +692,7 @@ def _make_synthetic_zarr(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                 "n_vars": n_genes,
                 "chunk_cells": chunk_cells,
                 "n_chunks": n_chunks,
+                "cells": cells_data,
             },
             f,
         )

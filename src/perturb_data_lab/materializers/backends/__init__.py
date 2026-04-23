@@ -19,10 +19,18 @@ def materialize_arrow_hf(
     size_factors: np.ndarray,
     release_id: str,
     matrix_root: Path,
+    canonical_perturbation: tuple[dict[str, str], ...] | None = None,
+    canonical_context: tuple[dict[str, str], ...] | None = None,
+    raw_fields: tuple[dict[str, Any], ...] | None = None,
+    dataset_id: str = "",
 ) -> dict[str, Path]:
     """Write using Arrow/HF backend (primary, hardened first)."""
     return write_arrow_hf_sparse(
-        adata, count_matrix, size_factors, release_id, matrix_root
+        adata, count_matrix, size_factors, release_id, matrix_root,
+        canonical_perturbation=canonical_perturbation,
+        canonical_context=canonical_context,
+        raw_fields=raw_fields,
+        dataset_id=dataset_id,
     )
 
 

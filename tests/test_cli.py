@@ -286,8 +286,7 @@ class TestCorpusValidateCmd:
         }
         manifest_path.write_text(yaml.safe_dump(manifest_data), encoding="utf-8")
 
-        # Create tokenizer.json
-        (tmp_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+        # Tokenizer is optional for corpus-validate (tokenizer-free architecture)
 
         idx_data = {
             "kind": "corpus-index",

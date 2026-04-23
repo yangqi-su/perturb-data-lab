@@ -123,19 +123,20 @@ def _validate_schema_readiness_object(
                 )
             )
 
-    # Gate 5: feature_tokenization namespace must be a real value, not "unknown" or "set-manually"
-    # A dataset cannot join any corpus unless its namespace is explicitly set
+    # Gate 5 (Phase 3 deferred): feature_tokenization namespace must be a real value
+    # During Phase 3, namespaces "unknown" and "set-manually" are allowed for smoke
+    # testing. Canonicalize-meta will resolve these to real values later.
     ns = schema.feature_tokenization.namespace
-    if ns in ("unknown", "set-manually", ""):
+    if ns in ("",):
         violations.append(
             ReadinessViolation(
                 field="feature_tokenization.namespace",
                 section="feature_fields",
                 reason=(
-                    f"namespace is '{ns}' — "
-                    "this dataset cannot join a corpus with this namespace. "
-                    "Set feature_tokenization.namespace to the actual namespace "
-                    "(e.g., ensembl, gene_symbol) before materialization."
+                    f"namespace is empty — "
+                    "set feature_tokenization.namespace to a real namespace "
+                    "(e.g., gene_symbol, ensembl) or use 'unknown' / 'set-manually' "
+                    "as a placeholder during Phase 3 smoke testing."
                 ),
             )
         )

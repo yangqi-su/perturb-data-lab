@@ -1,4 +1,8 @@
-"""Phase 3 materializer: canonical materialization layer, manifests, join modes."""
+"""Phase 3 materializer: canonical materialization layer, manifests, join modes.
+
+Tokenization is removed from the materialization flow. The corpus feature set
+is maintained separately via a pickle-backed set written by ``canonicalize-meta``.
+"""
 
 from .core import (
     CanonicalCellRecord,
@@ -20,6 +24,17 @@ from .models import (
     OutputRoots,
     ProvenanceSpec,
     SizeFactorEntry,
+    # Phase 3 new artifacts
+    RawCellMetadataRecord,
+    RawFeatureMetadataRecord,
+    DatasetMetadataSummary,
+    FeatureProvenanceSpec,
+)
+from .canonicalize_meta import (
+    CanonicalizeMetaRoute,
+    CorpusCellIndexRange,
+    CanonicalizeMetaResult,
+    run_canonicalize_meta,
 )
 from .tokenizer import CorpusTokenizer
 from .emission_spec import CorpusEmissionSpec
@@ -40,7 +55,7 @@ __all__ = [
     "AppendRoutedRoute",
     "build_materialization_route",
     "update_corpus_index",
-    # Tokenizer
+    # Tokenizer (available but NOT used during materialization)
     "CorpusTokenizer",
     # Emission spec
     "CorpusEmissionSpec",
@@ -57,6 +72,16 @@ __all__ = [
     "OutputRoots",
     "ProvenanceSpec",
     "SizeFactorEntry",
+    # Phase 3 new artifacts
+    "RawCellMetadataRecord",
+    "RawFeatureMetadataRecord",
+    "DatasetMetadataSummary",
+    "FeatureProvenanceSpec",
+    # Phase 4 canonicalize-meta
+    "CanonicalizeMetaRoute",
+    "CorpusCellIndexRange",
+    "CanonicalizeMetaResult",
+    "run_canonicalize_meta",
     # Validation
     "validate_schema_readiness",
     # Schema execution

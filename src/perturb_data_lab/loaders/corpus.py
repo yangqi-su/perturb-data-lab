@@ -49,12 +49,22 @@ class DatasetReaderEntry:
     HVG arrays are stored in dataset-original feature index space (int32).
     Use ``token_hvg_set`` / ``token_nonhvg_set`` to get token-ID versions
     compatible with ``HVGRandomSampler``.
+
+    ``global_start`` and ``global_end`` are the authoritative global cell range
+    for this dataset, as written by ``update_corpus_index`` into the corpus index.
+    The ``CorpusLoader`` uses these values for global-index routing, making the
+    corpus index the single source of truth for cell ownership rather than
+    recomputing ranges from reader lengths.
     """
 
     dataset_id: str
     release_id: str
     manifest_path: Path
     reader: BackendCellReader  # any backend-specific reader
+
+    # Authoritative global cell range for this dataset (from corpus index)
+    global_start: int = 0  # inclusive start of this dataset's cells in the corpus
+    global_end: int = 0    # exclusive end of this dataset's cells in the corpus
 
     # HVG arrays in dataset-original feature index space (int32)
     hvg_indices: tuple[int, ...] = ()
@@ -160,7 +170,7 @@ class CorpusLoader:
         self,
         corpus_id: str,
         corpus_root: Path,
-        tokenizer: CorpusTokenizer,
+        tokenizer: "CorpusTokenizer | None",
         emission_spec: CorpusEmissionSpec,
         dataset_entries: tuple[DatasetReaderEntry, ...],
     ):
@@ -171,8 +181,9 @@ class CorpusLoader:
             Corpus identifier.
         corpus_root : Path
             Root directory of the corpus (where corpus-index.yaml lives).
-        tokenizer : CorpusTokenizer
+        tokenizer : CorpusTokenizer | None
             The corpus-level tokenizer (loaded once from corpus root).
+            Optional since Phase 3 (tokenizer-free architecture); may be None.
         emission_spec : CorpusEmissionSpec
             The corpus-level emission spec controlling which fields loaders emit.
         dataset_entries : tuple[DatasetReaderEntry, ...]
@@ -189,13 +200,10 @@ class CorpusLoader:
             entry.dataset_id: idx for idx, entry in enumerate(dataset_entries)
         }
 
-        # Build per-dataset cumulative cell offsets for global index routing
-        self._cumulative_offsets: list[int] = []
-        offset = 0
-        for entry in dataset_entries:
-            self._cumulative_offsets.append(offset)
-            offset += len(entry.reader)
-        self._total_cells = offset
+        # Build per-dataset cumulative cell offsets for global index routing.
+        # Phase 4: total_cells and offsets are derived from the authoritative
+        # global_start/global_end fields in the corpus index, not from reader lengths.
+        self._total_cells = max((entry.global_end for entry in dataset_entries), default=0)
 
     # -------------------------------------------------------------------------
     # Corpus-level access
@@ -222,8 +230,8 @@ class CorpusLoader:
     def read_cell(self, corpus_global_index: int) -> CellState:
         """Read a single cell by its corpus-global index.
 
-        Routing is O(log n_datasets) via binary search on cumulative offsets.
-        The returned CellState carries dataset-order indices (not token IDs).
+        Routing is O(log n_datasets) via binary search on authoritative global_end values
+        from the corpus index. The returned CellState carries dataset-order indices (not token IDs).
         """
         if corpus_global_index < 0 or corpus_global_index >= self._total_cells:
             raise IndexError(
@@ -232,8 +240,8 @@ class CorpusLoader:
 
         # Binary search for the dataset that owns this global index
         dataset_idx = self._find_dataset_idx(corpus_global_index)
-        local_index = corpus_global_index - self._cumulative_offsets[dataset_idx]
         entry = self._dataset_entries[dataset_idx]
+        local_index = corpus_global_index - entry.global_start
         return entry.reader.read_cell(local_index)
 
     def iter_cells(self):
@@ -247,11 +255,15 @@ class CorpusLoader:
                 yield reader.read_cell(local_idx)
 
     def _find_dataset_idx(self, global_index: int) -> int:
-        """Binary search for the dataset index owning global_index."""
+        """Binary search for the dataset index owning global_index.
+
+        Uses the authoritative global_end field from each entry (written by
+        update_corpus_index) rather than recomputing from reader lengths.
+        """
         lo, hi = 0, len(self._dataset_entries) - 1
         while lo < hi:
             mid = (lo + hi) // 2
-            if self._cumulative_offsets[mid + 1] <= global_index:
+            if self._dataset_entries[mid].global_end <= global_index:
                 lo = mid + 1
             else:
                 hi = mid
@@ -298,26 +310,65 @@ class CorpusLoader:
         manifest: "MaterializationManifest",
         meta_root: Path,
         backend: str,
+        corpus_root: Path | None = None,
+        manifest_path: Path | None = None,
     ) -> dict[str, Any]:
         """Build backend-specific kwargs for build_cell_reader.
 
         Each backend reader has a different constructor signature. This method
         bridges the manifest's declared paths to the reader's expected kwargs.
+
+        Parameters
+        ----------
+        manifest : MaterializationManifest
+            The dataset's materialization manifest.
+        meta_root : Path
+            Directory containing the manifest. For Arrow/HF, used only for
+            HVG sidecar resolution (they are in meta/, not matrix/).
+        backend : str
+            Storage backend identifier.
+        corpus_root : Path | None
+            The corpus root directory (where corpus-index.yaml lives).
+            Used for resolving Arrow/HF matrix paths when manifest_path is relative.
+        manifest_path : Path | None
+            The join record's manifest_path (relative to corpus_root or absolute).
+            Used to determine whether Arrow/HF artifacts are inside or outside corpus_root.
         """
         if backend == "arrow-hf":
-            cell_meta_sqlite = meta_root / f"{manifest.release_id}-cell-meta.sqlite"
-            cells_parquet = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-cells.parquet"
-            meta_parquet = meta_root / f"{manifest.release_id}-meta.parquet"
+            # Arrow/HF runtime artifacts (cells parquet, canonical SQLite, meta parquet)
+            # are written into matrix_root, not meta_root.  For relative manifest_path
+            # (stored relative to corpus_root), compute matrix_root from corpus_root.
+            # For absolute manifest_path (outside corpus_root), use manifest.outputs.matrix_root.
+            if manifest_path is not None and corpus_root is not None:
+                # Try to resolve relative to corpus_root first
+                try:
+                    manifest_rel = Path(manifest_path).relative_to(corpus_root)
+                    # manifest is inside corpus_root
+                    arrow_meta_root = corpus_root / Path(manifest_path).parent
+                    arrow_matrix_root = corpus_root / "matrix"
+                except ValueError:
+                    # manifest is outside corpus_root — use manifest.outputs.matrix_root
+                    arrow_meta_root = Path(manifest_path).parent
+                    arrow_matrix_root = Path(manifest.outputs.matrix_root)
+            else:
+                # Fallback: derive from meta_root (original behavior for backward compat)
+                arrow_meta_root = meta_root
+                arrow_matrix_root = meta_root.parent / "matrix"
+
+            cell_meta_sqlite = arrow_matrix_root / f"{manifest.release_id}-cell-meta.sqlite"
+            cells_parquet = arrow_matrix_root / f"{manifest.release_id}-cells.parquet"
+            meta_parquet = arrow_matrix_root / f"{manifest.release_id}-meta.parquet"
             feature_meta_paths: dict[str, Path] | None = None
             if manifest.feature_meta_paths:
                 feature_meta_paths = {
-                    k: meta_root / v for k, v in manifest.feature_meta_paths.items()
+                    k: arrow_matrix_root / v
+                    for k, v in manifest.feature_meta_paths.items()
                 }
             return {
                 "cells_parquet_path": cells_parquet,
                 "meta_parquet_path": meta_parquet,
                 "cell_meta_sqlite_path": cell_meta_sqlite,
-                "feature_registry_path": meta_root / "feature-registry.yaml",  # legacy fallback
+                "feature_registry_path": arrow_meta_root / "feature-registry.yaml",  # legacy fallback
                 "feature_meta_paths": feature_meta_paths,
             }
         elif backend == "webdataset":
@@ -446,12 +497,17 @@ class CorpusLoader:
                 f"use one of {list(AVAILABLE_READERS)}"
             )
 
-        # Load tokenizer (required for all backends)
+        # Load tokenizer if present in corpus root.
+        # The tokenizer is optional since Phase 3 (tokenizer-free architecture).
+        # If not present, set tokenizer to None; the loader operates without it.
+        tokenizer: "CorpusTokenizer | None" = None
         tokenizer_path_str = (
-            gmeta.tokenizer_path if gmeta and gmeta.tokenizer_path else "tokenizer.json"
+            gmeta.tokenizer_path if gmeta and gmeta.tokenizer_path else None
         )
-        tokenizer_path = corpus_root / tokenizer_path_str
-        tokenizer = CorpusTokenizer.from_json(tokenizer_path)
+        if tokenizer_path_str:
+            tokenizer_path = corpus_root / tokenizer_path_str
+            if tokenizer_path.exists():
+                tokenizer = CorpusTokenizer.from_json(tokenizer_path)
 
         # Load emission spec
         emission_spec_path_str = (
@@ -495,14 +551,30 @@ class CorpusLoader:
                 backend=corpus_backend,
                 release_id=manifest.release_id,
                 corpus_index_path=corpus_index_path,
-                **cls._reader_kwargs(manifest, meta_root, corpus_backend),
+                **cls._reader_kwargs(manifest, meta_root, corpus_backend, corpus_root, ds_record.manifest_path),
             )
 
-            # Determine n_vars from features_origin parquet
+            # Determine n_vars from features_origin parquet.
+            # Use matrix_root for Arrow/HF since the writer stores feature parquet
+            # alongside expression data in matrix_root (not meta_root).
             entry_n_vars = 0
             if manifest.feature_meta_paths and "features_origin" in manifest.feature_meta_paths:
                 import pyarrow.parquet as pq
-                origin_path = meta_root / manifest.feature_meta_paths["features_origin"]
+
+                if corpus_backend == "arrow-hf":
+                    # Resolve from matrix_root (same convention as _reader_kwargs)
+                    if manifest_path is not None and corpus_root is not None:
+                        try:
+                            _ = Path(manifest_path).relative_to(corpus_root)
+                            arrow_matrix_root = corpus_root / "matrix"
+                        except ValueError:
+                            arrow_matrix_root = Path(manifest.outputs.matrix_root)
+                    else:
+                        arrow_matrix_root = meta_root.parent / "matrix"
+                    origin_path = arrow_matrix_root / manifest.feature_meta_paths["features_origin"]
+                else:
+                    origin_path = meta_root / manifest.feature_meta_paths["features_origin"]
+
                 if origin_path.exists():
                     tbl = pq.read_table(str(origin_path))
                     entry_n_vars = tbl.num_rows
@@ -512,6 +584,8 @@ class CorpusLoader:
                 release_id=manifest.release_id,
                 manifest_path=manifest_path,
                 reader=reader,
+                global_start=ds_record.global_start,
+                global_end=ds_record.global_end,
                 hvg_indices=hvg_indices,
                 nonhvg_indices=nonhvg_indices,
                 n_vars=entry_n_vars,

@@ -359,7 +359,6 @@ class TestUpdateCorpusIndexWithEmissionSpec:
         update_corpus_index(
             corpus_index_path=corpus_index,
             new_dataset_record=dataset_record,
-            tokenizer_path="tokenizer.json",
             emission_spec_path="corpus-emission-spec.yaml",
         )
         # Verify global-metadata.yaml was written
@@ -368,8 +367,9 @@ class TestUpdateCorpusIndexWithEmissionSpec:
         import yaml
 
         meta = yaml.safe_load(global_meta_path.read_text())
-        assert meta["tokenizer_path"] == "tokenizer.json"
         assert meta["emission_spec_path"] == "corpus-emission-spec.yaml"
+        # tokenizer_path is None in Phase 3 (tokenizer-free architecture)
+        assert meta.get("tokenizer_path") is None
 
 
 # ---------------------------------------------------------------------------

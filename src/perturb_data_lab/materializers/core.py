@@ -44,6 +44,8 @@ from .models import (
     QAMetric,
     RawCellMetadataRecord,
     RawFeatureMetadataRecord,
+    SizeFactorManifest,
+    SizeFactorEntry,
 )
 from .schema_execution import resolve_all_cell_rows, resolve_all_feature_rows
 from .validation import validate_schema_readiness
@@ -259,6 +261,13 @@ class MaterializationRoute:
         # --- Phase 3: Compute size factors (sum-based, dataset-specific) ---
         size_factors = self._compute_size_factors(count_matrix, n_obs)
 
+        # --- Phase 3: Write size-factor artifact for later reuse ---
+        size_factor_manifest_path = self._write_size_factor_manifest(
+            adata=adata,
+            size_factors=size_factors,
+            meta_root=meta_root,
+        )
+
         # --- Phase 3: Write feature provenance spec ---
         # Build origin_index → feature_id mapping for canonicalize-meta
         origin_index_to_feature_id: dict[int, str] = {
@@ -272,12 +281,32 @@ class MaterializationRoute:
             meta_root=meta_root,
         )
 
+        # --- Resolve canonical cell metadata from schema (for backend write pass-through) ---
+        # Phase 3: resolved canonical perturbation/context tuples are passed to the
+        # backend writer so Arrow/HF can write the canonical cell SQLite atomically.
+        # This avoids a second-pass scan of obs after the fact.
+        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
+        perturbations, contexts = resolve_all_cell_rows(schema, obs_mem)
+        canonical_perturbation: tuple[dict[str, str], ...] = tuple(perturbations)
+        canonical_context: tuple[dict[str, str], ...] = tuple(contexts)
+        raw_cell_tuples: tuple[dict[str, Any], ...] = tuple(
+            {col: (None if pd.isna(obs_mem.loc[obs_mem.index[i], col]) else str(obs_mem.loc[obs_mem.index[i], col]))
+             for col in obs_mem.columns}
+            for i in range(n_obs)
+        )
+
         # --- Write backend-specific cell data ---
+        # Phase 3: canonical_perturbation, canonical_context, and raw_fields are
+        # passed so the Arrow/HF backend can write the canonical cell SQLite.
+        # WebDataset/Zarr backends accept these but write metadata into their own formats.
         backend_paths = self._write_cells(
             count_matrix=count_matrix,
             adata=adata,
             size_factors=size_factors,
             matrix_root=matrix_root,
+            canonical_perturbation=canonical_perturbation,
+            canonical_context=canonical_context,
+            raw_fields=raw_cell_tuples,
         )
 
         # --- Phase 3: Write canonical feature metadata (origin parquet) ---
@@ -337,6 +366,7 @@ class MaterializationRoute:
             feature_meta_paths={
                 k: str(v) for k, v in feature_meta_paths.items()
             },
+            size_factor_manifest_path=str(size_factor_manifest_path),
             qa_manifest_path=str(qa_path),
             hvg_sidecar_path=str(hvg_sidecar_path),
             integer_verified=all_passed,
@@ -476,6 +506,35 @@ class MaterializationRoute:
         factors = np.where(factors <= 0, 1.0, factors)
         factors = np.where(np.isnan(factors), 1.0, factors)
         return factors
+
+    def _write_size_factor_manifest(
+        self,
+        adata: ad.AnnData,
+        size_factors: np.ndarray,
+        meta_root: Path,
+    ) -> Path:
+        """Write size-factor artifact for later reuse.
+
+        Persists the per-cell size factors computed during materialization so they
+        can be reused by later metadata rebuild steps without recomputing from counts.
+        Written as a SizeFactorManifest YAML containing one entry per cell.
+        """
+        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
+        n_obs = adata.n_obs
+        entries = []
+        for i in range(n_obs):
+            cell_id = str(obs_mem.index[i])
+            entries.append(SizeFactorEntry(cell_id=cell_id, size_factor=float(size_factors[i])))
+        manifest = SizeFactorManifest(
+            kind="size-factor-manifest",
+            contract_version=CONTRACT_VERSION,
+            release_id=self.release_id,
+            method="sum",
+            entries=tuple(entries),
+        )
+        sf_path = meta_root / f"{self.release_id}-size-factors.yaml"
+        manifest.write_yaml(sf_path)
+        return sf_path
 
     def _write_cells(
         self,
@@ -842,12 +901,19 @@ class CreateNewRoute(MaterializationRoute):
         adata: ad.AnnData,
         size_factors: np.ndarray,
         matrix_root: Path,
+        canonical_perturbation: tuple[dict[str, str], ...] | None = None,
+        canonical_context: tuple[dict[str, str], ...] | None = None,
+        raw_fields: tuple[dict[str, Any], ...] | None = None,
     ) -> dict[str, Path]:
         from .backends import build_backend_fn
 
         backend_fn = build_backend_fn(self.backend)
         return backend_fn(
-            adata, count_matrix, size_factors, self.release_id, matrix_root
+            adata, count_matrix, size_factors, self.release_id, matrix_root,
+            canonical_perturbation=canonical_perturbation,
+            canonical_context=canonical_context,
+            raw_fields=raw_fields,
+            dataset_id=self.dataset_id,
         )
 
 
@@ -882,12 +948,19 @@ class AppendRoutedRoute(MaterializationRoute):
         adata: ad.AnnData,
         size_factors: np.ndarray,
         matrix_root: Path,
+        canonical_perturbation: tuple[dict[str, str], ...] | None = None,
+        canonical_context: tuple[dict[str, str], ...] | None = None,
+        raw_fields: tuple[dict[str, Any], ...] | None = None,
     ) -> dict[str, Path]:
         from .backends import build_backend_fn
 
         backend_fn = build_backend_fn(self.backend)
         return backend_fn(
-            adata, count_matrix, size_factors, self.release_id, matrix_root
+            adata, count_matrix, size_factors, self.release_id, matrix_root,
+            canonical_perturbation=canonical_perturbation,
+            canonical_context=canonical_context,
+            raw_fields=raw_fields,
+            dataset_id=self.dataset_id,
         )
 
 
@@ -982,6 +1055,17 @@ def update_corpus_index(
         "zarr-ts"). Required when creating a new corpus; written to
         ``global-metadata.yaml``.
     """
+    corpus_root = corpus_index_path.parent
+
+    # Convert manifest_path to relative to corpus_root for portability.
+    # If the manifest is outside corpus_root, store the absolute path as fallback.
+    manifest_path_input = Path(new_dataset_record.manifest_path)
+    try:
+        manifest_path_relative = manifest_path_input.relative_to(corpus_root)
+    except ValueError:
+        # Manifest is outside corpus_root — store absolute path
+        manifest_path_relative = manifest_path_input
+
     if corpus_index_path.exists():
         corpus = CorpusIndexDocument.from_yaml_file(corpus_index_path)
         existing_ids = {d.dataset_id for d in corpus.datasets}
@@ -1000,7 +1084,7 @@ def update_corpus_index(
             dataset_id=new_dataset_record.dataset_id,
             release_id=new_dataset_record.release_id,
             join_mode=new_dataset_record.join_mode,
-            manifest_path=new_dataset_record.manifest_path,
+            manifest_path=str(manifest_path_relative),
             cell_count=new_dataset_record.cell_count,
             global_start=new_global_start,
             global_end=new_global_end,
@@ -1014,7 +1098,7 @@ def update_corpus_index(
             dataset_id=new_dataset_record.dataset_id,
             release_id=new_dataset_record.release_id,
             join_mode=new_dataset_record.join_mode,
-            manifest_path=new_dataset_record.manifest_path,
+            manifest_path=str(manifest_path_relative),
             cell_count=new_dataset_record.cell_count,
             global_start=0,
             global_end=new_dataset_record.cell_count,

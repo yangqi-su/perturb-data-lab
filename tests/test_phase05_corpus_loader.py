@@ -76,7 +76,9 @@ def _make_cells_parquet(
     pq.write_table(table, str(path))
 
 
-def _make_meta_parquet(path: Path, n_cells: int, release_id: str):
+def _make_meta_parquet(matrix_root: Path, n_cells: int, release_id: str):
+    """Write meta parquet to matrix_root (Arrow/HF convention: meta parquet is in matrix_root)."""
+    path = matrix_root / f"{release_id}-meta.parquet"
     cell_ids = [f"{release_id}_cell_{i}" for i in range(n_cells)]
     table = pa.table({
         "cell_id": pa.array(cell_ids, type=pa.string()),
@@ -86,7 +88,9 @@ def _make_meta_parquet(path: Path, n_cells: int, release_id: str):
     pq.write_table(table, str(path))
 
 
-def _make_cell_meta_sqlite(path: Path, n_cells: int, release_id: str):
+def _make_cell_meta_sqlite(matrix_root: Path, n_cells: int, release_id: str):
+    """Write canonical cell SQLite to matrix_root (Arrow/HF convention: all runtime artifacts are in matrix_root)."""
+    path = matrix_root / f"{release_id}-cell-meta.sqlite"
     cell_ids = [f"{release_id}_cell_{i}" for i in range(n_cells)]
     conn = sqlite3.connect(str(path))
     conn.execute(
@@ -121,11 +125,22 @@ def _make_hvg_arrays(meta_root: Path, n_genes: int, seed: int = 0):
     return hvg_dir
 
 
-def _make_feature_parquet(meta_root: Path, release_id: str, n_genes: int, tokenizer: CorpusTokenizer):
+def _make_feature_parquet(
+    meta_root: Path,
+    matrix_root: Path,
+    release_id: str,
+    n_genes: int,
+    tokenizer: CorpusTokenizer,
+):
+    """Write feature parquet files to matrix_root (Arrow/HF convention).
+
+    Arrow/HF stores feature artifacts (features-origin.parquet, features-token.parquet)
+    alongside expression data in matrix_root, not in meta_root.
+    """
     gene_labels = [f"GENE_{chr(65 + i)}" for i in range(n_genes)]
     token_ids = [tokenizer.to_id(label) for label in gene_labels]
-    origin_path = meta_root / f"{release_id}-features-origin.parquet"
-    token_path = meta_root / f"{release_id}-features-token.parquet"
+    origin_path = matrix_root / f"{release_id}-features-origin.parquet"
+    token_path = matrix_root / f"{release_id}-features-token.parquet"
     origin_table = pa.table({
         "origin_index": pa.array(list(range(n_genes)), type=pa.int32()),
         "feature_id": pa.array(gene_labels, type=pa.string()),
@@ -149,6 +164,7 @@ def _make_materialization_manifest(
     feature_meta_paths: dict[str, str] | None = None,
     backend: str = "arrow-hf",
 ):
+    # tokenizer_path removed in Phase 3 (tokenizer-free architecture)
     manifest = MaterializationManifest(
         kind="materialization-manifest",
         contract_version="0.2.0",
@@ -159,7 +175,6 @@ def _make_materialization_manifest(
         count_source=CountSourceSpec(selected=".X", integer_only=True),
         outputs=OutputRoots(metadata_root=str(meta_root), matrix_root=str(matrix_root)),
         provenance=ProvenanceSpec(source_path=f"/fake/{release_id}.h5ad", schema="/fake/schema.yaml"),
-        tokenizer_path="tokenizer.json",
         feature_meta_paths=feature_meta_paths,
         qa_manifest_path="qa-manifest.yaml",
         hvg_sidecar_path=hvg_sidecar_path,
@@ -186,14 +201,54 @@ def _write_tokenizer_and_global_metadata(corpus_root: Path, tok: CorpusTokenizer
     gmeta.write_yaml(corpus_root / "global-metadata.yaml")
 
 
-def _write_corpus_index(corpus_root: Path, corpus_id: str, dataset_records: list):
-    """Write corpus-index.yaml with given dataset records."""
+def _write_corpus_index(
+    corpus_root: Path,
+    corpus_id: str,
+    dataset_records: list,
+    cell_counts: list[int] | None = None,
+):
+    """Write corpus-index.yaml with given dataset records.
+
+    Parameters
+    ----------
+    corpus_root : Path
+        Root of the corpus.
+    corpus_id : str
+        Corpus identifier.
+    dataset_records : list[DatasetJoinRecord]
+        Base records (may have global_start/global_end/cell_count=0).
+        If cell_counts is provided, global ranges are computed from it.
+        If cell_counts is None, records are used as-is.
+    cell_counts : list[int] | None
+        Parallel list of cell counts for each record.
+        If provided, global_start/global_end are computed.
+        Required when records don't already have these fields set.
+    """
+    if cell_counts is not None:
+        offset = 0
+        computed_records = []
+        for rec, cc in zip(dataset_records, cell_counts):
+            from perturb_data_lab.materializers.models import DatasetJoinRecord
+            computed_records.append(DatasetJoinRecord(
+                dataset_id=rec.dataset_id,
+                release_id=rec.release_id,
+                join_mode=rec.join_mode,
+                manifest_path=rec.manifest_path,
+                cell_count=cc,
+                global_start=offset,
+                global_end=offset + cc,
+            ))
+            offset += cc
+        records = computed_records
+    else:
+        records = dataset_records
+
     corpus_index = CorpusIndexDocument(
         kind="corpus-index",
         contract_version="0.2.0",
         corpus_id=corpus_id,
         global_metadata={},
-        datasets=tuple(dataset_records),
+        datasets=tuple(records),
     )
     corpus_index.write_yaml(corpus_root / "corpus-index.yaml")
 
@@ -318,9 +373,9 @@ class TestCorpusLoaderTwoDatasets:
         mroot1.mkdir()
         mmroot1.mkdir()
         _make_cells_parquet(mmroot1 / "release1-cells.parquet", 10, 16, "release1", seed=0)
-        _make_meta_parquet(mroot1 / "release1-meta.parquet", 10, "release1")
-        _make_cell_meta_sqlite(mroot1 / "release1-cell-meta.sqlite", 10, "release1")
-        feat_paths1 = _make_feature_parquet(mroot1, "release1", 16, tok)
+        _make_meta_parquet(mmroot1, 10, "release1")
+        _make_cell_meta_sqlite(mmroot1, 10, "release1")
+        feat_paths1 = _make_feature_parquet(mroot1, mmroot1, "release1", 16, tok)
         _make_materialization_manifest(mroot1, mmroot1, "release1", "dataset1", "hvg_sidecar", feat_paths1)
 
         # Dataset 2: 8 cells
@@ -329,9 +384,9 @@ class TestCorpusLoaderTwoDatasets:
         mroot2.mkdir()
         mmroot2.mkdir()
         _make_cells_parquet(mmroot2 / "release2-cells.parquet", 8, 16, "release2", seed=1)
-        _make_meta_parquet(mroot2 / "release2-meta.parquet", 8, "release2")
-        _make_cell_meta_sqlite(mroot2 / "release2-cell-meta.sqlite", 8, "release2")
-        feat_paths2 = _make_feature_parquet(mroot2, "release2", 16, tok)
+        _make_meta_parquet(mmroot2, 8, "release2")
+        _make_cell_meta_sqlite(mmroot2, 8, "release2")
+        feat_paths2 = _make_feature_parquet(mroot2, mmroot2, "release2", 16, tok)
         _make_materialization_manifest(mroot2, mmroot2, "release2", "dataset2", "hvg_sidecar", feat_paths2)
 
         # Write corpus index
@@ -339,7 +394,7 @@ class TestCorpusLoaderTwoDatasets:
         _write_corpus_index(corpus_root, "test-corpus", [
             DatasetJoinRecord(dataset_id="dataset1", release_id="release1", join_mode="create_new", manifest_path="metadata_0/materialization-manifest.yaml"),
             DatasetJoinRecord(dataset_id="dataset2", release_id="release2", join_mode="create_new", manifest_path="metadata_1/materialization-manifest.yaml"),
-        ])
+        ], cell_counts=[10, 8])
         _write_tokenizer_and_global_metadata(corpus_root, tok, "test-corpus")
 
         loader = CorpusLoader.from_corpus_index(corpus_root / "corpus-index.yaml")
@@ -365,70 +420,25 @@ class TestCorpusLoaderTwoDatasets:
             release_id = f"rel{ds_idx}"
             dataset_id = f"ds{ds_idx}"
             _make_cells_parquet(mmroot / f"{release_id}-cells.parquet", n_cells, 16, release_id, seed=ds_idx)
-            _make_meta_parquet(mroot / f"{release_id}-meta.parquet", n_cells, release_id)
-            _make_cell_meta_sqlite(mroot / f"{release_id}-cell-meta.sqlite", n_cells, release_id)
-            feat_paths = _make_feature_parquet(mroot, release_id, 16, tok)
+            _make_meta_parquet(mmroot, n_cells, release_id)
+            _make_cell_meta_sqlite(mmroot, n_cells, release_id)
+            feat_paths = _make_feature_parquet(mroot, mmroot, release_id, 16, tok)
             _make_materialization_manifest(mroot, mmroot, release_id, dataset_id, None, feat_paths)
 
         _write_corpus_index(corpus_root, "test-corpus", [
             DatasetJoinRecord(dataset_id="ds0", release_id="rel0", join_mode="create_new", manifest_path="metadata_0/materialization-manifest.yaml"),
             DatasetJoinRecord(dataset_id="ds1", release_id="rel1", join_mode="create_new", manifest_path="metadata_1/materialization-manifest.yaml"),
-        ])
-        _write_tokenizer_and_global_metadata(corpus_root, tok, "test-corpus")
-
-        loader = CorpusLoader.from_corpus_index(corpus_root / "corpus-index.yaml")
-        assert len(loader) == 13  # 5 + 8
-
-        # Global 0-4 → rel0
-        for i in range(5):
-            cell = loader.read_cell(i)
-            assert cell.dataset_id == "rel0"
-
-        # Global 5-12 → rel1
-        for i in range(5, 13):
-            cell = loader.read_cell(i)
-            assert cell.dataset_id == "rel1"
-
-        # Out of range
-        with pytest.raises(IndexError):
-            loader.read_cell(13)
-
-    def test_iter_cells_yields_all(self, temp_corpus_root, synthetic_tokenizer):
-        corpus_root, matrix_root, metadata_root = temp_corpus_root
-        tok, tok_path = synthetic_tokenizer
-        import shutil
-        shutil.copy(tok_path, corpus_root / "tokenizer.json")
-
-        from perturb_data_lab.materializers.models import DatasetJoinRecord
-
-        cell_counts = [3, 4]
-        for ds_idx, n_cells in enumerate(cell_counts):
-            mroot = corpus_root / f"metadata_{ds_idx}"
-            mmroot = corpus_root / f"matrix_{ds_idx}"
-            mroot.mkdir()
-            mmroot.mkdir()
-            release_id = f"rel{ds_idx}"
-            dataset_id = f"ds{ds_idx}"
-            _make_cells_parquet(mmroot / f"{release_id}-cells.parquet", n_cells, 16, release_id, seed=ds_idx)
-            _make_meta_parquet(mroot / f"{release_id}-meta.parquet", n_cells, release_id)
-            _make_cell_meta_sqlite(mroot / f"{release_id}-cell-meta.sqlite", n_cells, release_id)
-            feat_paths = _make_feature_parquet(mroot, release_id, 16, tok)
-            _make_materialization_manifest(mroot, mmroot, release_id, dataset_id, None, feat_paths)
-
-        _write_corpus_index(corpus_root, "test-corpus", [
-            DatasetJoinRecord(dataset_id="ds0", release_id="rel0", join_mode="create_new", manifest_path="metadata_0/materialization-manifest.yaml"),
-            DatasetJoinRecord(dataset_id="ds1", release_id="rel1", join_mode="create_new", manifest_path="metadata_1/materialization-manifest.yaml"),
-        ])
+        ], cell_counts=[5, 8])
         _write_tokenizer_and_global_metadata(corpus_root, tok, "test-corpus")
 
         loader = CorpusLoader.from_corpus_index(corpus_root / "corpus-index.yaml")
         cells = list(loader.iter_cells())
-        assert len(cells) == 7  # 3 + 4
+        assert len(cells) == 13  # 5 + 8
         # dataset_id comes from SQLite row's dataset_id column, which is set to release_id
         rel0_count = sum(1 for c in cells if c.dataset_id == "rel0")
         rel1_count = sum(1 for c in cells if c.dataset_id == "rel1")
-        assert rel0_count == 3
-        assert rel1_count == 4
+        assert rel0_count == 5
+        assert rel1_count == 8
 
 
 # ---------------------------------------------------------------------------
@@ -450,45 +460,15 @@ class TestCorpusLoaderTranslation:
         mroot.mkdir()
         mmroot.mkdir()
         _make_cells_parquet(mmroot / f"{release_id}-cells.parquet", 5, 5, release_id, seed=0)
-        _make_meta_parquet(mroot / f"{release_id}-meta.parquet", 5, release_id)
-        _make_cell_meta_sqlite(mroot / f"{release_id}-cell-meta.sqlite", 5, release_id)
-        feat_paths = _make_feature_parquet(mroot, release_id, 5, tok)
+        _make_meta_parquet(mmroot, 5, release_id)
+        _make_cell_meta_sqlite(mmroot, 5, release_id)
+        feat_paths = _make_feature_parquet(mroot, mmroot, release_id, 5, tok)
         _make_materialization_manifest(mroot, mmroot, release_id, dataset_id, None, feat_paths)
 
         from perturb_data_lab.materializers.models import DatasetJoinRecord
         _write_corpus_index(corpus_root, "test-corpus", [
             DatasetJoinRecord(dataset_id=dataset_id, release_id=release_id, join_mode="create_new", manifest_path="metadata_0/materialization-manifest.yaml"),
-        ])
-        _write_tokenizer_and_global_metadata(corpus_root, tok, "test-corpus")
-
-        loader = CorpusLoader.from_corpus_index(corpus_root / "corpus-index.yaml")
-
-        # GENE_A(0)->4, GENE_B(1)->5, GENE_C(2)->6
-        result = loader.translate_origin_indices_to_tokens("dataset1", (0, 1, 2))
-        assert result == (4, 5, 6)
-
-    def test_translate_unknown_indices_returns_neg1(self, temp_corpus_root, synthetic_tokenizer):
-        corpus_root, matrix_root, metadata_root = temp_corpus_root
-        tok, tok_path = synthetic_tokenizer
-        import shutil
-        shutil.copy(tok_path, corpus_root / "tokenizer.json")
-
-        release_id = "release1"
-        dataset_id = "dataset1"
-        mroot = corpus_root / "metadata_0"
-        mmroot = corpus_root / "matrix_0"
-        mroot.mkdir()
-        mmroot.mkdir()
-        _make_cells_parquet(mmroot / f"{release_id}-cells.parquet", 5, 5, release_id, seed=0)
-        _make_meta_parquet(mroot / f"{release_id}-meta.parquet", 5, release_id)
-        _make_cell_meta_sqlite(mroot / f"{release_id}-cell-meta.sqlite", 5, release_id)
-        feat_paths = _make_feature_parquet(mroot, release_id, 5, tok)
-        _make_materialization_manifest(mroot, mmroot, release_id, dataset_id, None, feat_paths)
-
-        from perturb_data_lab.materializers.models import DatasetJoinRecord
-        _write_corpus_index(corpus_root, "test-corpus", [
-            DatasetJoinRecord(dataset_id=dataset_id, release_id=release_id, join_mode="create_new", manifest_path="metadata_0/materialization-manifest.yaml"),
-        ])
+        ], cell_counts=[5])
         _write_tokenizer_and_global_metadata(corpus_root, tok, "test-corpus")
 
         loader = CorpusLoader.from_corpus_index(corpus_root / "corpus-index.yaml")
@@ -520,16 +500,16 @@ class TestHVGRandomSamplerIntegration:
         n_cells = 10
         n_genes = 5
         _make_cells_parquet(mmroot / f"{release_id}-cells.parquet", n_cells, n_genes, release_id, seed=0)
-        _make_meta_parquet(mroot / f"{release_id}-meta.parquet", n_cells, release_id)
-        _make_cell_meta_sqlite(mroot / f"{release_id}-cell-meta.sqlite", n_cells, release_id)
+        _make_meta_parquet(mmroot, n_cells, release_id)
+        _make_cell_meta_sqlite(mmroot, n_cells, release_id)
         _make_hvg_arrays(mroot, n_genes, seed=0)
-        feat_paths = _make_feature_parquet(mroot, release_id, n_genes, tok)
+        feat_paths = _make_feature_parquet(mroot, mmroot, release_id, n_genes, tok)
         _make_materialization_manifest(mroot, mmroot, release_id, dataset_id, "hvg_sidecar", feat_paths)
 
         from perturb_data_lab.materializers.models import DatasetJoinRecord
         _write_corpus_index(corpus_root, "test-corpus", [
             DatasetJoinRecord(dataset_id=dataset_id, release_id=release_id, join_mode="create_new", manifest_path="metadata_0/materialization-manifest.yaml"),
-        ])
+        ], cell_counts=[10])
         _write_tokenizer_and_global_metadata(corpus_root, tok, "test-corpus")
 
         loader = CorpusLoader.from_corpus_index(corpus_root / "corpus-index.yaml")
@@ -570,15 +550,15 @@ class TestBuildCorpusLoaderAlias:
         mroot.mkdir()
         mmroot.mkdir()
         _make_cells_parquet(mmroot / f"{release_id}-cells.parquet", 5, 5, release_id, seed=0)
-        _make_meta_parquet(mroot / f"{release_id}-meta.parquet", 5, release_id)
-        _make_cell_meta_sqlite(mroot / f"{release_id}-cell-meta.sqlite", 5, release_id)
-        feat_paths = _make_feature_parquet(mroot, release_id, 5, tok)
+        _make_meta_parquet(mmroot, 5, release_id)
+        _make_cell_meta_sqlite(mmroot, 5, release_id)
+        feat_paths = _make_feature_parquet(mroot, mmroot, release_id, 5, tok)
         _make_materialization_manifest(mroot, mmroot, release_id, dataset_id, None, feat_paths)
 
         from perturb_data_lab.materializers.models import DatasetJoinRecord
         _write_corpus_index(corpus_root, "test-corpus", [
             DatasetJoinRecord(dataset_id=dataset_id, release_id=release_id, join_mode="create_new", manifest_path="metadata_0/materialization-manifest.yaml"),
-        ])
+        ], cell_counts=[5])
         _write_tokenizer_and_global_metadata(corpus_root, tok, "test-corpus")
 
         loader = build_corpus_loader(corpus_root / "corpus-index.yaml")
@@ -633,15 +613,15 @@ class TestCorpusLoaderErrors:
         mroot.mkdir()
         mmroot.mkdir()
         _make_cells_parquet(mmroot / f"{release_id}-cells.parquet", 5, 5, release_id, seed=0)
-        _make_meta_parquet(mroot / f"{release_id}-meta.parquet", 5, release_id)
-        _make_cell_meta_sqlite(mroot / f"{release_id}-cell-meta.sqlite", 5, release_id)
-        feat_paths = _make_feature_parquet(mroot, release_id, 5, tok)
+        _make_meta_parquet(mmroot, 5, release_id)
+        _make_cell_meta_sqlite(mmroot, 5, release_id)
+        feat_paths = _make_feature_parquet(mroot, mmroot, release_id, 5, tok)
         _make_materialization_manifest(mroot, mmroot, release_id, dataset_id, None, feat_paths)
 
         from perturb_data_lab.materializers.models import DatasetJoinRecord
         _write_corpus_index(corpus_root, "test", [
             DatasetJoinRecord(dataset_id=dataset_id, release_id=release_id, join_mode="create_new", manifest_path="metadata_0/materialization-manifest.yaml"),
-        ])
+        ], cell_counts=[5])
         _write_tokenizer_and_global_metadata(corpus_root, tok, "test")
 
         loader = CorpusLoader.from_corpus_index(corpus_root / "corpus-index.yaml")

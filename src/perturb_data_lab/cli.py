@@ -316,15 +316,17 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
 
     # If create_new, also write initial corpus index and emission spec
     if route_name == "create_new":
-        idx_path = Path(manifest.outputs.metadata_root) / "corpus-index.yaml"
-        manifest_path = str(Path(manifest.outputs.metadata_root) / "materialization-manifest.yaml")
+        corpus_root = Path(manifest.outputs.metadata_root).parent
+        idx_path = corpus_root / "corpus-index.yaml"
+        # Store manifest_path relative to corpus_root for portability
+        manifest_rel_path = Path(manifest.outputs.metadata_root).relative_to(corpus_root) / "materialization-manifest.yaml"
         # n_obs is the cell count — needed for global range computation in the corpus index
         record = DatasetJoinRecord(
             dataset_id=args.dataset_id,
             release_id=args.release_id,
             join_mode="create_new",
-            manifest_path=manifest_path,
-            cell_count=n_obs,
+            manifest_path=str(manifest_rel_path),
+            cell_count=manifest.cell_count,
         )
         corpus_idx = update_corpus_index(idx_path, record, backend=args.backend)
         print(f"  corpus-index: {idx_path}")
@@ -338,11 +340,19 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
 
     # If append_routed, update corpus index
     if route_name == "append_routed" and corpus_index_path:
+        corpus_root = corpus_index_path.parent
+        manifest_abs = Path(manifest.outputs.metadata_root)
+        # Store manifest_path relative to corpus_root when possible (portable).
+        # If manifest is outside corpus_root, store the absolute path.
+        try:
+            manifest_rel = manifest_abs.relative_to(corpus_root)
+        except ValueError:
+            manifest_rel = manifest_abs
         record = DatasetJoinRecord(
             dataset_id=args.dataset_id,
             release_id=args.release_id,
             join_mode="append_routed",
-            manifest_path=str(Path(manifest.outputs.metadata_root) / "materialization-manifest.yaml"),
+            manifest_path=str(manifest_rel / "materialization-manifest.yaml"),
             cell_count=manifest.cell_count,
         )
         updated = update_corpus_index(corpus_index_path, record, backend=args.backend)
@@ -385,18 +395,35 @@ def _cmd_corpus_create(args: argparse.Namespace) -> None:
         print(f"[error] corpus-index already exists: {output_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Create the corpus with a placeholder dataset join record
-    # (will be updated when first dataset is materialized)
-    record = DatasetJoinRecord(
-        dataset_id="__placeholder__",
-        release_id="__placeholder__",
-        join_mode="create_new",
-        manifest_path="/dev/null",
+    # Create an empty corpus index (no placeholder records).
+    # The first real dataset is added via `materialize --corpus-index` in create_new mode.
+    # An empty index still records the corpus backend declaration.
+    corpus_id = args.corpus_id or "perturb-data-lab-v0"
+    updated = update_corpus_index(
+        output_path,
+        DatasetJoinRecord(
+            dataset_id="__placeholder__must_materialize_first__",
+            release_id="__placeholder__",
+            join_mode="create_new",
+            manifest_path="/dev/null",
+            cell_count=0,
+        ),
+        backend=args.backend,
     )
-    corpus_idx = update_corpus_index(output_path, record, backend=args.backend)
-    corpus_id = args.corpus_id or corpus_idx.corpus_id
+    # Immediately overwrite with a clean empty index (no placeholder record)
+    from .materializers.models import CorpusIndexDocument
+    empty = CorpusIndexDocument(
+        kind="corpus-index",
+        contract_version=CONTRACT_VERSION,
+        corpus_id=corpus_id,
+        global_metadata={"backend": args.backend},
+        datasets=(),
+    )
+    empty.write_yaml(output_path)
+
     print(f"[corpus create] {corpus_id} backend={args.backend}")
     print(f"  corpus-index: {output_path}")
+    print(f"  note: no datasets yet — run 'materialize --corpus-index {output_path}' to add the first dataset")
 
     # Write initial emission spec
     emission_spec = CorpusEmissionSpec(corpus_id=corpus_id)

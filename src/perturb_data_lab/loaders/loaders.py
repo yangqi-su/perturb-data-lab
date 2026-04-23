@@ -244,11 +244,14 @@ class ArrowHFCellReader(BackendCellReader):
             Deprecated; size factors are read from the cells parquet.
             No longer required or used. Kept for backwards compatibility.
         feature_meta_paths : dict[str, Path] | None
-            Optional dict with keys ``features_origin`` and ``features_token``
+            Optional dict with keys ``features_origin`` and optionally ``features_token``
             pointing to the per-dataset feature parquet files written by
-            Phase 7 `_write_feature_metadata`.  When provided, feature
-            objects are preloaded once at reader construction and used to
-            translate dataset-order indices to global token IDs.
+            Phase 7 `_write_feature_metadata`.  When ``features_origin`` is provided,
+            feature objects are preloaded at reader construction for origin-index
+            translation.  ``features_token`` is optional — if absent, the reader
+            falls back to identity translation (original dataset-order indices as tokens).
+            This allows Phase 3 (tokenizer-deferred) materializations to load without
+            requiring a token-sidecar that has not yet been generated.
         """
         super().__init__(release_id, corpus_index_path)
         self.cells_parquet_path = cells_parquet_path
@@ -259,13 +262,22 @@ class ArrowHFCellReader(BackendCellReader):
         self._feature_meta_paths = feature_meta_paths
         self.__cells_table = None
         self.__meta_table = None
+        # Preload feature objects only when both features_origin AND features_token
+        # are available.  When features_token is absent (Phase 3 tokenizer-deferred),
+        # token-space translation is not yet possible — translate_to_token_ids
+        # falls back to identity translation.
+        _has_token = (
+            feature_meta_paths is not None
+            and "features_origin" in feature_meta_paths
+            and "features_token" in feature_meta_paths
+        )
         self.__preloaded_features: PreloadedFeatureObjects | None = (
             PreloadedFeatureObjects(
                 release_id=release_id,
                 features_origin_path=feature_meta_paths["features_origin"],
                 features_token_path=feature_meta_paths["features_token"],
             )
-            if feature_meta_paths
+            if _has_token
             else None
         )
 

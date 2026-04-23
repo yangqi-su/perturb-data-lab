@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 import anndata as ad
 import numpy as np
@@ -46,10 +48,14 @@ def _get_row_nonzero(count_matrix: Any, i: int) -> tuple[np.ndarray, np.ndarray]
 
 def write_arrow_hf_sparse(
     adata: ad.AnnData,
-    count_matrix: any,
+    count_matrix: Any,
     size_factors: np.ndarray,
     release_id: str,
     matrix_root: Path,
+    canonical_perturbation: tuple[dict[str, str], ...] | None = None,
+    canonical_context: tuple[dict[str, str], ...] | None = None,
+    raw_fields: tuple[dict[str, Any], ...] | None = None,
+    dataset_id: str = "",
 ) -> dict[str, Path]:
     """Write sparse per-cell data in Arrow + Parquet format.
 
@@ -58,15 +64,19 @@ def write_arrow_hf_sparse(
     - expression_counts: LIST<INT>
     - size_factor: DOUBLE
 
-    Metadata (canonical + raw obs fields) is stored separately as Parquet.
+    Canonical cell metadata (canonical_perturbation, canonical_context, raw_fields)
+    is stored in a SQLite file at ``{release_id}-cell-meta.sqlite`` alongside the
+    parquet files. The ArrowHFCellReader reads this SQLite to provide full
+    CellState at load time.
 
     This avoids densifying the sparse matrix and keeps per-cell access cheap.
 
-    Returns a dict with keys: "cells", "metadata", "feature_lengths".
+    Returns a dict with keys: "cells", "metadata", "cell_meta_sqlite".
     """
     matrix_root.mkdir(parents=True, exist_ok=True)
     cell_path = matrix_root / f"{release_id}-cells.parquet"
     meta_path = matrix_root / f"{release_id}-meta.parquet"
+    cell_meta_sqlite_path = matrix_root / f"{release_id}-cell-meta.sqlite"
 
     n_obs = adata.n_obs
     batch_size = 256
@@ -111,7 +121,46 @@ def write_arrow_hf_sparse(
     )
     pq.write_table(meta_table, meta_path)
 
-    return {"cells": cell_path, "metadata": meta_path}
+    # Write canonical cell metadata SQLite (ArrowHFCellReader reads this)
+    import sqlite3
+
+    pert_tuple = canonical_perturbation or tuple([{}] * n_obs)
+    ctx_tuple = canonical_context or tuple([{}] * n_obs)
+    raw_tuple = raw_fields or tuple([{}] * n_obs)
+
+    conn = sqlite3.connect(str(cell_meta_sqlite_path))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cell_meta "
+        "(cell_id TEXT, dataset_id TEXT, dataset_release TEXT, "
+        "canonical_perturbation TEXT, canonical_context TEXT, raw_obs TEXT)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cell_id ON cell_meta(cell_id)")
+
+    batch_size_sqlite = 256
+    for start in range(0, n_obs, batch_size_sqlite):
+        end = min(start + batch_size_sqlite, n_obs)
+        sql_batch = []
+        for i in range(start, end):
+            sql_batch.append((
+                str(adata.obs.index[i]),
+                dataset_id,
+                release_id,
+                json.dumps(dict(pert_tuple[i])),
+                json.dumps(dict(ctx_tuple[i])),
+                json.dumps(dict(raw_tuple[i])),
+            ))
+        conn.executemany(
+            "INSERT INTO cell_meta VALUES (?, ?, ?, ?, ?, ?)",
+            sql_batch,
+        )
+    conn.commit()
+    conn.close()
+
+    return {
+        "cells": cell_path,
+        "metadata": meta_path,
+        "cell_meta_sqlite": cell_meta_sqlite_path,
+    }
 
 
 def read_arrow_hf_sparse_cell(

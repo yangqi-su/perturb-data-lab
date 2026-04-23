@@ -436,11 +436,20 @@ class TestUpdateCorpusIndexWithTokenizer:
                 join_mode="create_new",
                 manifest_path="/meta/v0.1-manifest.yaml",
             )
+            # tokenizer_path is set via GlobalMetadataDocument in Phase 3 architecture
+            global_meta_with_tokenizer = GlobalMetadataDocument(
+                kind="global-metadata",
+                contract_version="0.2.0",
+                schema_version="0.1.0",
+                feature_registry_id="",
+                missing_value_literal="NA",
+                raw_field_policy="preserve-unchanged",
+                tokenizer_path="tokenizer.json",
+            )
             update_corpus_index(
                 idx_path,
                 record,
-                global_metadata=global_meta,
-                tokenizer_path="tokenizer.json",
+                global_metadata=global_meta_with_tokenizer,
             )
 
             # global-metadata.yaml was written
@@ -497,8 +506,10 @@ class TestUpdateCorpusIndexWithTokenizer:
 
 
 class TestMaterializationManifestTokenizerPath:
-    def test_manifest_records_tokenizer_path(self):
-        """MaterializationManifest.to_dict includes tokenizer_path."""
+    """Tokenization is removed from MaterializationManifest in Phase 3."""
+
+    def test_manifest_does_not_record_tokenizer_path(self):
+        """MaterializationManifest.to_dict does not include tokenizer_path (Phase 3)."""
         manifest = MaterializationManifest(
             kind="materialization-manifest",
             contract_version="0.2.0",
@@ -509,23 +520,7 @@ class TestMaterializationManifestTokenizerPath:
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             provenance=ProvenanceSpec(source_path="/data/test.h5ad", schema="/schema.yaml"),
-            tokenizer_path="/meta/tokenizer.json",
         )
         d = manifest.to_dict()
-        assert d["tokenizer_path"] == "/meta/tokenizer.json"
-
-    def test_manifest_from_dict_accepts_tokenizer_path(self):
-        """MaterializationManifest.from_dict loads tokenizer_path."""
-        data = {
-            "kind": "materialization-manifest",
-            "contract_version": "0.2.0",
-            "dataset_id": "test_ds",
-            "release_id": "v0.1",
-            "route": "create_new",
-            "count_source": {"selected": ".X", "integer_only": True},
-            "outputs": {"metadata_root": "/meta", "matrix_root": "/matrix"},
-            "provenance": {"source_path": "/data/test.h5ad", "schema": "/schema.yaml"},
-            "tokenizer_path": "/meta/tokenizer.json",
-        }
-        manifest = MaterializationManifest.from_dict(data)
-        assert manifest.tokenizer_path == "/meta/tokenizer.json"
+        # tokenizer_path is not produced by the manifest in Phase 3 (tokenizer-free)
+        assert "tokenizer_path" not in d
