@@ -325,7 +325,8 @@ class TestEmissionSpecLoaderIntegration:
         sf_manifest.write_yaml(size_factor_path)
 
         reader = ArrowHFCellReader(
-            release_id="v0",
+            dataset_id="syn_ds",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             cells_parquet_path=cells_path,
             meta_parquet_path=meta_path,

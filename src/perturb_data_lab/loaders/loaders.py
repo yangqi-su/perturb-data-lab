@@ -16,12 +16,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
 __all__ = [
     "CellState",
+    "CellIdentity",
+    "DatasetContextKey",
+    "MetadataTable",
     "PreloadedFeatureObjects",
     "BackendCellReader",
     "ArrowHFCellReader",
@@ -29,6 +32,15 @@ __all__ = [
     "ZarrCellReader",
     "build_cell_reader",
     "AVAILABLE_READERS",
+    "SparseBatchPayload",
+    "ResolvedSparseBatch",
+    "GlobalFeatureResolver",
+    "SparseBatchCollator",
+    "CorpusRandomBatchSampler",
+    "DatasetBatchSampler",
+    "DatasetContextBatchSampler",
+    "CPUDenseRuntimePath",
+    "GPUSparseRuntimePath",
     "RandomContextSampler",
     "ExpressedZerosSampler",
     "HVGRandomSampler",
@@ -44,7 +56,7 @@ __all__ = [
 
 @dataclass(frozen=True)
 class PreloadedFeatureObjects:
-    """Preloaded per-dataset feature objects for a single dataset release.
+    """Preloaded per-dataset feature objects for a single dataset.
 
     These objects are small (one row per feature, not per cell) and are shared
     across all cells of the dataset.  Preloading them once at loader startup
@@ -63,8 +75,8 @@ class PreloadedFeatureObjects:
     during the materialization phase (Phase 7).
     """
 
-    # Release this object belongs to
-    release_id: str
+    # Dataset this object belongs to
+    dataset_id: str
 
     # Parquet path for the origin feature object (canonical metadata in var order)
     features_origin_path: Path
@@ -123,6 +135,138 @@ class PreloadedFeatureObjects:
         return tuple(self.origin_index_to_token_id(int(i)) for i in origin_indices)
 
 
+@dataclass(frozen=True)
+class CellIdentity:
+    """Runtime-facing row identity detached from release_id hot-path routing."""
+
+    global_row_index: int
+    dataset_index: int
+    dataset_id: str
+    local_row_index: int
+
+
+@dataclass(frozen=True)
+class MetadataTable:
+    """RAM-resident metadata table keyed by global_row_index."""
+
+    global_row_index: tuple[int, ...]
+    cell_id: tuple[str, ...]
+    dataset_id: tuple[str, ...]
+    dataset_index: tuple[int, ...]
+    local_row_index: tuple[int, ...]
+    canonical_perturbation: tuple[dict[str, str], ...]
+    canonical_context: tuple[dict[str, str], ...]
+    raw_fields: tuple[dict[str, Any], ...]
+    size_factor: tuple[float, ...]
+    _dataset_row_index_cache: dict[int, tuple[int, ...]] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _dataset_context_row_index_cache: dict[
+        str,
+        dict["DatasetContextKey", tuple[int, ...]],
+    ] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __len__(self) -> int:
+        return len(self.global_row_index)
+
+    def row(self, global_row_index: int) -> dict[str, Any]:
+        if global_row_index < 0 or global_row_index >= len(self):
+            raise IndexError(f"global_row_index {global_row_index} out of range")
+        return {
+            "global_row_index": int(self.global_row_index[global_row_index]),
+            "cell_id": self.cell_id[global_row_index],
+            "dataset_id": self.dataset_id[global_row_index],
+            "dataset_index": int(self.dataset_index[global_row_index]),
+            "local_row_index": int(self.local_row_index[global_row_index]),
+            "canonical_perturbation": dict(self.canonical_perturbation[global_row_index]),
+            "canonical_context": dict(self.canonical_context[global_row_index]),
+            "raw_fields": dict(self.raw_fields[global_row_index]),
+            "size_factor": float(self.size_factor[global_row_index]),
+        }
+
+    def rows(self, global_row_indices: list[int]) -> list[dict[str, Any]]:
+        return [self.row(int(idx)) for idx in global_row_indices]
+
+    def dataset_row_indices(self, dataset_index: int) -> tuple[int, ...]:
+        cache = self._dataset_row_index_cache
+        if cache is None:
+            grouped: dict[int, list[int]] = {}
+            for global_row_index, row_dataset_index in enumerate(self.dataset_index):
+                grouped.setdefault(int(row_dataset_index), []).append(global_row_index)
+            cache = {
+                int(row_dataset_index): tuple(indices)
+                for row_dataset_index, indices in grouped.items()
+            }
+            object.__setattr__(self, "_dataset_row_index_cache", cache)
+        return cache.get(int(dataset_index), ())
+
+    def dataset_context_keys(
+        self,
+        *,
+        context_field: str = "cell_context",
+        min_batch_size: int | None = None,
+    ) -> list["DatasetContextKey"]:
+        cache = self._dataset_context_rows(context_field)
+        keys = sorted(
+            cache,
+            key=lambda item: (item.dataset_index, item.context_value, item.dataset_id),
+        )
+        if min_batch_size is None:
+            return keys
+        return [key for key in keys if len(cache[key]) >= int(min_batch_size)]
+
+    def dataset_context_row_indices(
+        self,
+        key: "DatasetContextKey",
+        *,
+        context_field: str = "cell_context",
+    ) -> tuple[int, ...]:
+        return self._dataset_context_rows(context_field).get(key, ())
+
+    def _dataset_context_rows(
+        self,
+        context_field: str,
+    ) -> dict["DatasetContextKey", tuple[int, ...]]:
+        caches = self._dataset_context_row_index_cache
+        if caches is None:
+            caches = {}
+            object.__setattr__(self, "_dataset_context_row_index_cache", caches)
+        if context_field in caches:
+            return caches[context_field]
+
+        grouped: dict[DatasetContextKey, list[int]] = {}
+        for global_row_index, (dataset_index, dataset_id, canonical_context) in enumerate(
+            zip(self.dataset_index, self.dataset_id, self.canonical_context)
+        ):
+            key = DatasetContextKey(
+                dataset_index=int(dataset_index),
+                dataset_id=str(dataset_id),
+                context_value=str(canonical_context.get(context_field, "")),
+            )
+            grouped.setdefault(key, []).append(global_row_index)
+
+        finalized = {key: tuple(indices) for key, indices in grouped.items()}
+        caches[context_field] = finalized
+        return finalized
+
+
+@dataclass(frozen=True)
+class DatasetContextKey:
+    """Dataset-aware batch grouping key built from RAM metadata."""
+
+    dataset_index: int
+    dataset_id: str
+    context_value: str
+
+
 # ---------------------------------------------------------------------------
 # Common cell state — what a sampler sees from any backend
 # ---------------------------------------------------------------------------
@@ -135,15 +279,30 @@ class CellState:
     Backend-agnostic; returned by every reader regardless of storage format.
     """
 
+    identity: CellIdentity
     cell_id: str
-    dataset_id: str
-    dataset_release: str
     expressed_gene_indices: tuple[int, ...]  # dataset-order indices
     expression_counts: tuple[int, ...]
     size_factor: float
     canonical_perturbation: dict[str, str]
     canonical_context: dict[str, str]
     raw_fields: dict[str, Any]
+
+    @property
+    def global_row_index(self) -> int:
+        return self.identity.global_row_index
+
+    @property
+    def dataset_id(self) -> str:
+        return self.identity.dataset_id
+
+    @property
+    def dataset_index(self) -> int:
+        return self.identity.dataset_index
+
+    @property
+    def local_row_index(self) -> int:
+        return self.identity.local_row_index
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +321,9 @@ class BackendCellReader:
     (identity by default) so token-space translation is available uniformly.
     """
 
-    def __init__(self, release_id: str, corpus_index_path: Path):
-        self.release_id = release_id
+    def __init__(self, dataset_id: str, dataset_index: int, corpus_index_path: Path):
+        self.dataset_id = dataset_id
+        self.dataset_index = dataset_index
         self.corpus_index_path = corpus_index_path
 
     def read_cell(self, cell_index: int) -> CellState:
@@ -173,6 +333,14 @@ class BackendCellReader:
     def read_cells(self, cell_indices: list[int]) -> list[CellState]:
         """Read multiple cells by index position."""
         return [self.read_cell(i) for i in cell_indices]
+
+    def read_rows(self, row_indices: list[int]) -> list[dict[str, Any]]:
+        """Read heavy payloads only for multiple local rows."""
+        return [self.read_row(i) for i in row_indices]
+
+    def read_row(self, row_index: int) -> dict[str, Any]:
+        """Read heavy payload only for a single local row."""
+        raise NotImplementedError
 
     def __len__(self) -> int:
         raise NotImplementedError
@@ -215,20 +383,25 @@ class ArrowHFCellReader(BackendCellReader):
 
     def __init__(
         self,
-        release_id: str,
+        dataset_id: str,
+        dataset_index: int,
         corpus_index_path: Path,
         cells_parquet_path: Path,
         meta_parquet_path: Path,
         cell_meta_sqlite_path: Path,
         feature_registry_path: Path,
+        metadata_table: MetadataTable | None = None,
+        global_row_offset: int = 0,
         size_factor_manifest_path: Path | None = None,
         feature_meta_paths: dict[str, Path] | None = None,
     ):
         """
         Parameters
         ----------
-        release_id : str
-            The dataset release identifier.
+        dataset_id : str
+            Stable dataset identifier for runtime routing.
+        dataset_index : int
+            Corpus-level dataset index for runtime routing.
         corpus_index_path : Path
             Path to the corpus index YAML file.
         cells_parquet_path : Path
@@ -253,11 +426,13 @@ class ArrowHFCellReader(BackendCellReader):
             This allows Phase 3 (tokenizer-deferred) materializations to load without
             requiring a token-sidecar that has not yet been generated.
         """
-        super().__init__(release_id, corpus_index_path)
+        super().__init__(dataset_id, dataset_index, corpus_index_path)
         self.cells_parquet_path = cells_parquet_path
         self.meta_parquet_path = meta_parquet_path
         self.cell_meta_sqlite_path = cell_meta_sqlite_path
         self.feature_registry_path = feature_registry_path
+        self.metadata_table = metadata_table
+        self.global_row_offset = global_row_offset
         self.size_factor_manifest_path = size_factor_manifest_path
         self._feature_meta_paths = feature_meta_paths
         self.__cells_table = None
@@ -273,7 +448,7 @@ class ArrowHFCellReader(BackendCellReader):
         )
         self.__preloaded_features: PreloadedFeatureObjects | None = (
             PreloadedFeatureObjects(
-                release_id=release_id,
+                dataset_id=dataset_id,
                 features_origin_path=feature_meta_paths["features_origin"],
                 features_token_path=feature_meta_paths["features_token"],
             )
@@ -317,6 +492,46 @@ class ArrowHFCellReader(BackendCellReader):
     def __len__(self) -> int:
         return self._cells_table().num_rows
 
+    def read_row(self, row_index: int) -> dict[str, Any]:
+        table = self._cells_table()
+        indices = table["expressed_gene_indices"][row_index].as_py()
+        counts = table["expression_counts"][row_index].as_py()
+        sf = table["size_factor"][row_index].as_py()
+        return {
+            "global_row_index": self.global_row_offset + row_index,
+            "dataset_index": self.dataset_index,
+            "dataset_id": self.dataset_id,
+            "local_row_index": row_index,
+            "expressed_gene_indices": tuple(int(i) for i in indices),
+            "expression_counts": tuple(int(c) for c in counts),
+            "size_factor": float(sf),
+        }
+
+    def read_rows(self, row_indices: list[int]) -> list[dict[str, Any]]:
+        if not row_indices:
+            return []
+        import pyarrow as pa
+
+        table = self._cells_table().take(pa.array(row_indices, type=pa.int64()))
+        result: list[dict[str, Any]] = []
+        for local_position, row_index in enumerate(row_indices):
+            result.append(
+                {
+                    "global_row_index": self.global_row_offset + row_index,
+                    "dataset_index": self.dataset_index,
+                    "dataset_id": self.dataset_id,
+                    "local_row_index": row_index,
+                    "expressed_gene_indices": tuple(
+                        int(i) for i in table["expressed_gene_indices"][local_position].as_py()
+                    ),
+                    "expression_counts": tuple(
+                        int(c) for c in table["expression_counts"][local_position].as_py()
+                    ),
+                    "size_factor": float(table["size_factor"][local_position].as_py()),
+                }
+            )
+        return result
+
     @property
     def total_genes(self) -> int:
         from ..materializers.models import FeatureRegistryManifest
@@ -325,15 +540,28 @@ class ArrowHFCellReader(BackendCellReader):
         return len(reg.entries)
 
     def read_cell(self, cell_index: int) -> CellState:
-        import pyarrow.parquet as pq
-
         import json
         import sqlite3
+        heavy_row = self.read_row(cell_index)
+        global_row_index = heavy_row["global_row_index"]
 
-        table = self._cells_table()
-        indices = table["expressed_gene_indices"][cell_index].as_py()
-        counts = table["expression_counts"][cell_index].as_py()
-        sf = table["size_factor"][cell_index].as_py()
+        if self.metadata_table is not None:
+            metadata = self.metadata_table.row(global_row_index)
+            return CellState(
+                identity=CellIdentity(
+                    global_row_index=global_row_index,
+                    dataset_index=int(metadata["dataset_index"]),
+                    dataset_id=str(metadata["dataset_id"]),
+                    local_row_index=int(metadata["local_row_index"]),
+                ),
+                cell_id=str(metadata["cell_id"]),
+                expressed_gene_indices=tuple(heavy_row["expressed_gene_indices"]),
+                expression_counts=tuple(heavy_row["expression_counts"]),
+                size_factor=float(metadata["size_factor"]),
+                canonical_perturbation=dict(metadata["canonical_perturbation"]),
+                canonical_context=dict(metadata["canonical_context"]),
+                raw_fields=dict(metadata["raw_fields"]),
+            )
 
         # Load full canonical cell metadata from the materialized SQLite file.
         # This was written by _write_cell_metadata() during Phase 6 materialization
@@ -343,27 +571,35 @@ class ArrowHFCellReader(BackendCellReader):
         conn = sqlite3.connect(str(self.cell_meta_sqlite_path))
         conn.row_factory = sqlite3.Row
         cur = conn.execute("SELECT * FROM cell_meta WHERE rowid = ?", (cell_index + 1,))
-        row = cur.fetchone()
+        metadata_row = cur.fetchone()
         conn.close()
 
-        if row is None:
+        if metadata_row is None:
             raise IndexError(f"cell_index {cell_index} out of range")
 
-        canonical_perturbation = json.loads(row["canonical_perturbation"])
-        canonical_context = json.loads(row["canonical_context"])
-        raw_fields = json.loads(row["raw_obs"])
+        canonical_perturbation = json.loads(metadata_row["canonical_perturbation"])
+        canonical_context = json.loads(metadata_row["canonical_context"])
+        raw_fields = json.loads(metadata_row["raw_obs"])
 
         return CellState(
-            cell_id=str(row["cell_id"]),
-            dataset_id=str(row["dataset_id"]),
-            dataset_release=str(row["dataset_release"]),
-            expressed_gene_indices=tuple(int(i) for i in indices),
-            expression_counts=tuple(int(c) for c in counts),
-            size_factor=float(sf),
+            identity=CellIdentity(
+                global_row_index=global_row_index,
+                dataset_index=self.dataset_index,
+                dataset_id=str(metadata_row["dataset_id"]),
+                local_row_index=cell_index,
+            ),
+            cell_id=str(metadata_row["cell_id"]),
+            expressed_gene_indices=tuple(heavy_row["expressed_gene_indices"]),
+            expression_counts=tuple(heavy_row["expression_counts"]),
+            size_factor=float(heavy_row["size_factor"]),
             canonical_perturbation=canonical_perturbation,
             canonical_context=canonical_context,
             raw_fields=raw_fields,
         )
+
+
+class LanceDBAggregatedCellReader(ArrowHFCellReader):
+    """Temporary Phase 5 aggregated-Lance reader using Arrow/HF storage semantics."""
 
 
 # ---------------------------------------------------------------------------
@@ -376,18 +612,21 @@ class WebDatasetCellReader(BackendCellReader):
 
     def __init__(
         self,
-        release_id: str,
+        dataset_id: str,
+        dataset_index: int,
         corpus_index_path: Path,
         shard_paths: list[Path],
         meta_path: Path,
         feature_registry_path: Path | None = None,
-        dataset_id: str | None = None,
+        metadata_table: MetadataTable | None = None,
+        global_row_offset: int = 0,
     ):
-        super().__init__(release_id, corpus_index_path)
+        super().__init__(dataset_id, dataset_index, corpus_index_path)
         self.shard_paths = shard_paths
         self.meta_path = meta_path
         self.feature_registry_path = feature_registry_path
-        self.dataset_id = dataset_id or release_id
+        self.metadata_table = metadata_table
+        self.global_row_offset = global_row_offset
         self._cell_index_to_shard: dict[int, tuple[int, int]] = {}
         self._build_index()
 
@@ -428,6 +667,43 @@ class WebDatasetCellReader(BackendCellReader):
         return max_idx + 1
 
     def read_cell(self, cell_index: int) -> CellState:
+        row = self.read_row(cell_index)
+        global_row_index = row["global_row_index"]
+        if self.metadata_table is not None:
+            metadata = self.metadata_table.row(global_row_index)
+            return CellState(
+                identity=CellIdentity(
+                    global_row_index=global_row_index,
+                    dataset_index=int(metadata["dataset_index"]),
+                    dataset_id=str(metadata["dataset_id"]),
+                    local_row_index=int(metadata["local_row_index"]),
+                ),
+                cell_id=str(metadata["cell_id"]),
+                expressed_gene_indices=tuple(row["expressed_gene_indices"]),
+                expression_counts=tuple(row["expression_counts"]),
+                size_factor=float(metadata["size_factor"]),
+                canonical_perturbation=dict(metadata["canonical_perturbation"]),
+                canonical_context=dict(metadata["canonical_context"]),
+                raw_fields=dict(metadata["raw_fields"]),
+            )
+
+        return CellState(
+            identity=CellIdentity(
+                global_row_index=global_row_index,
+                dataset_index=self.dataset_index,
+                dataset_id=self.dataset_id,
+                local_row_index=cell_index,
+            ),
+            cell_id=str(row["cell_id"]),
+            expressed_gene_indices=tuple(row["expressed_gene_indices"]),
+            expression_counts=tuple(row["expression_counts"]),
+            size_factor=float(row["size_factor"]),
+            canonical_perturbation=dict(row["canonical_perturbation"]),
+            canonical_context=dict(row["canonical_context"]),
+            raw_fields=dict(row["raw_fields"]),
+        )
+
+    def read_row(self, cell_index: int) -> dict[str, Any]:
         import pickle
         import tarfile
 
@@ -441,21 +717,23 @@ class WebDatasetCellReader(BackendCellReader):
                 raise RuntimeError(f"Failed to extract {member.name}")
             record = pickle.loads(f.read())
 
-        return CellState(
-            cell_id=record["cell_id"],
-            dataset_id=self.dataset_id,
-            dataset_release=self.release_id,
-            expressed_gene_indices=tuple(
+        return {
+            "global_row_index": self.global_row_offset + cell_index,
+            "dataset_index": self.dataset_index,
+            "dataset_id": self.dataset_id,
+            "local_row_index": cell_index,
+            "cell_id": record["cell_id"],
+            "expressed_gene_indices": tuple(
                 np.frombuffer(record["expressed_gene_indices"], dtype=np.int32)
             ),
-            expression_counts=tuple(
+            "expression_counts": tuple(
                 np.frombuffer(record["expression_counts"], dtype=np.int32)
             ),
-            size_factor=record["size_factor"],
-            canonical_perturbation=record.get("canonical_perturbation", {}),
-            canonical_context=record.get("canonical_context", {}),
-            raw_fields=record.get("raw_fields", {}),
-        )
+            "size_factor": float(record["size_factor"]),
+            "canonical_perturbation": dict(record.get("canonical_perturbation", {})),
+            "canonical_context": dict(record.get("canonical_context", {})),
+            "raw_fields": dict(record.get("raw_fields", {})),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +746,8 @@ class ZarrCellReader(BackendCellReader):
 
     def __init__(
         self,
-        release_id: str,
+        dataset_id: str,
+        dataset_index: int,
         corpus_index_path: Path,
         indices_zarr_path: Path,
         counts_zarr_path: Path,
@@ -476,19 +755,34 @@ class ZarrCellReader(BackendCellReader):
         meta_path: Path,
         chunk_cells: int = 1024,
         feature_registry_path: Path | None = None,
-        dataset_id: str | None = None,
+        feature_meta_paths: dict[str, Path] | None = None,
+        metadata_table: MetadataTable | None = None,
+        global_row_offset: int = 0,
     ):
-        super().__init__(release_id, corpus_index_path)
+        super().__init__(dataset_id, dataset_index, corpus_index_path)
         self.indices_zarr_path = indices_zarr_path
         self.counts_zarr_path = counts_zarr_path
         self.sf_zarr_path = sf_zarr_path
         self.meta_path = meta_path
         self.chunk_cells = chunk_cells
         self.feature_registry_path = feature_registry_path
-        self.dataset_id = dataset_id or release_id
+        self._feature_meta_paths = feature_meta_paths
+        self.metadata_table = metadata_table
+        self.global_row_offset = global_row_offset
         self._n_cells: int | None = None
         self._n_vars: int | None = None
         self._meta_cache: list[dict[str, Any]] | None = None  # per-cell meta list
+        self.__preloaded_features: PreloadedFeatureObjects | None = None
+        if (
+            feature_meta_paths is not None
+            and "features_origin" in feature_meta_paths
+            and "features_token" in feature_meta_paths
+        ):
+            self.__preloaded_features = PreloadedFeatureObjects(
+                dataset_id=dataset_id,
+                features_origin_path=feature_meta_paths["features_origin"],
+                features_token_path=feature_meta_paths["features_token"],
+            )
 
     def _load_meta(self) -> list[dict[str, Any]]:
         """Load and cache the per-cell meta list from meta.json once."""
@@ -518,7 +812,55 @@ class ZarrCellReader(BackendCellReader):
             self._load_meta()
         return self._n_vars or 0
 
+    @property
+    def preloaded_features(self) -> PreloadedFeatureObjects | None:
+        return self.__preloaded_features
+
+    def translate_to_token_ids(
+        self, origin_indices: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        if self.__preloaded_features is None:
+            return origin_indices
+        return self.__preloaded_features.translate_indices(origin_indices)
+
     def read_cell(self, cell_index: int) -> CellState:
+        row = self.read_row(cell_index)
+        global_row_index = row["global_row_index"]
+        if self.metadata_table is not None:
+            metadata = self.metadata_table.row(global_row_index)
+            return CellState(
+                identity=CellIdentity(
+                    global_row_index=global_row_index,
+                    dataset_index=int(metadata["dataset_index"]),
+                    dataset_id=str(metadata["dataset_id"]),
+                    local_row_index=int(metadata["local_row_index"]),
+                ),
+                cell_id=str(metadata["cell_id"]),
+                expressed_gene_indices=tuple(row["expressed_gene_indices"]),
+                expression_counts=tuple(row["expression_counts"]),
+                size_factor=float(metadata["size_factor"]),
+                canonical_perturbation=dict(metadata["canonical_perturbation"]),
+                canonical_context=dict(metadata["canonical_context"]),
+                raw_fields=dict(metadata["raw_fields"]),
+            )
+
+        return CellState(
+            identity=CellIdentity(
+                global_row_index=global_row_index,
+                dataset_index=self.dataset_index,
+                dataset_id=self.dataset_id,
+                local_row_index=cell_index,
+            ),
+            cell_id=str(row["cell_id"]),
+            expressed_gene_indices=tuple(row["expressed_gene_indices"]),
+            expression_counts=tuple(row["expression_counts"]),
+            size_factor=float(row["size_factor"]),
+            canonical_perturbation=dict(row["canonical_perturbation"]),
+            canonical_context=dict(row["canonical_context"]),
+            raw_fields=dict(row["raw_fields"]),
+        )
+
+    def read_row(self, cell_index: int) -> dict[str, Any]:
         import zarr
 
         meta_list = self._load_meta()
@@ -539,17 +881,19 @@ class ZarrCellReader(BackendCellReader):
         expressed_indices = tuple(chunk_indices[nonzero_mask].tolist())
         expressed_counts = tuple(chunk_counts[nonzero_mask].tolist())
 
-        return CellState(
-            cell_id=cell_meta["cell_id"],
-            dataset_id=self.dataset_id,
-            dataset_release=self.release_id,
-            expressed_gene_indices=expressed_indices,
-            expression_counts=expressed_counts,
-            size_factor=float(sf),
-            canonical_perturbation=cell_meta.get("canonical_perturbation", {}),
-            canonical_context=cell_meta.get("canonical_context", {}),
-            raw_fields=cell_meta.get("raw_fields", {}),
-        )
+        return {
+            "global_row_index": self.global_row_offset + cell_index,
+            "dataset_index": self.dataset_index,
+            "dataset_id": self.dataset_id,
+            "local_row_index": cell_index,
+            "cell_id": cell_meta["cell_id"],
+            "expressed_gene_indices": expressed_indices,
+            "expression_counts": expressed_counts,
+            "size_factor": float(sf),
+            "canonical_perturbation": dict(cell_meta.get("canonical_perturbation", {})),
+            "canonical_context": dict(cell_meta.get("canonical_context", {})),
+            "raw_fields": dict(cell_meta.get("raw_fields", {})),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -561,12 +905,15 @@ AVAILABLE_READERS = {
     "arrow-hf": ArrowHFCellReader,
     "webdataset": WebDatasetCellReader,
     "zarr-ts": ZarrCellReader,
+    "lancedb-aggregated": LanceDBAggregatedCellReader,
+    "zarr-aggregated": ZarrCellReader,
 }
 
 
 def build_cell_reader(
     backend: str,
-    release_id: str,
+    dataset_id: str,
+    dataset_index: int,
     corpus_index_path: Path,
     **backend_kwargs,
 ) -> BackendCellReader:
@@ -575,7 +922,474 @@ def build_cell_reader(
         raise ValueError(
             f"unknown backend reader: {backend}; available: {list(AVAILABLE_READERS)}"
         )
-    return AVAILABLE_READERS[backend](release_id, corpus_index_path, **backend_kwargs)
+    return AVAILABLE_READERS[backend](dataset_id, dataset_index, corpus_index_path, **backend_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Dataset-aware batch helpers and runtime-path payloads
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SparseBatchPayload:
+    """Flat sparse payload plus offsets for runtime-hot-path batch handling."""
+
+    batch_size: int
+    global_row_index: np.ndarray
+    dataset_index: np.ndarray
+    local_row_index: np.ndarray
+    row_offsets: np.ndarray
+    expressed_gene_indices: np.ndarray
+    expression_counts: np.ndarray
+    size_factor: np.ndarray
+    dataset_id: tuple[str, ...]
+    cell_id: tuple[str, ...]
+    canonical_perturbation: tuple[dict[str, str], ...]
+    canonical_context: tuple[dict[str, str], ...]
+
+    def row_slice(self, row_position: int) -> slice:
+        start = int(self.row_offsets[row_position])
+        stop = int(self.row_offsets[row_position + 1])
+        return slice(start, stop)
+
+    def row_gene_indices(self, row_position: int) -> np.ndarray:
+        return self.expressed_gene_indices[self.row_slice(row_position)]
+
+    def row_counts(self, row_position: int) -> np.ndarray:
+        return self.expression_counts[self.row_slice(row_position)]
+
+
+@dataclass(frozen=True)
+class ResolvedSparseBatch:
+    """Sparse batch resolved into global feature identity without densification."""
+
+    batch_size: int
+    global_row_index: np.ndarray
+    dataset_index: np.ndarray
+    local_row_index: np.ndarray
+    row_offsets: np.ndarray
+    global_feature_ids: np.ndarray
+    expression_counts: np.ndarray
+    size_factor: np.ndarray
+    dataset_id: tuple[str, ...]
+    cell_id: tuple[str, ...]
+    canonical_perturbation: tuple[dict[str, str], ...]
+    canonical_context: tuple[dict[str, str], ...]
+    unresolved_local_features: int = 0
+
+    def row_slice(self, row_position: int) -> slice:
+        start = int(self.row_offsets[row_position])
+        stop = int(self.row_offsets[row_position + 1])
+        return slice(start, stop)
+
+    def row_feature_ids(self, row_position: int) -> np.ndarray:
+        return self.global_feature_ids[self.row_slice(row_position)]
+
+    def row_counts(self, row_position: int) -> np.ndarray:
+        return self.expression_counts[self.row_slice(row_position)]
+
+
+class SparseBatchCollator:
+    """Collate `CellState` rows into flat sparse payloads plus offsets."""
+
+    def __call__(self, cells: Sequence[CellState]) -> SparseBatchPayload:
+        row_offsets = [0]
+        flat_gene_indices: list[np.ndarray] = []
+        flat_counts: list[np.ndarray] = []
+        for cell in cells:
+            gene_indices = np.asarray(cell.expressed_gene_indices, dtype=np.int32)
+            counts = np.asarray(cell.expression_counts, dtype=np.int32)
+            if gene_indices.shape != counts.shape:
+                raise ValueError("cell sparse payload has mismatched gene/count lengths")
+            flat_gene_indices.append(gene_indices)
+            flat_counts.append(counts)
+            row_offsets.append(row_offsets[-1] + int(gene_indices.size))
+
+        return SparseBatchPayload(
+            batch_size=len(cells),
+            global_row_index=np.asarray([cell.global_row_index for cell in cells], dtype=np.int64),
+            dataset_index=np.asarray([cell.dataset_index for cell in cells], dtype=np.int32),
+            local_row_index=np.asarray([cell.local_row_index for cell in cells], dtype=np.int64),
+            row_offsets=np.asarray(row_offsets, dtype=np.int64),
+            expressed_gene_indices=(
+                np.concatenate(flat_gene_indices).astype(np.int32, copy=False)
+                if flat_gene_indices
+                else np.asarray([], dtype=np.int32)
+            ),
+            expression_counts=(
+                np.concatenate(flat_counts).astype(np.int32, copy=False)
+                if flat_counts
+                else np.asarray([], dtype=np.int32)
+            ),
+            size_factor=np.asarray([cell.size_factor for cell in cells], dtype=np.float32),
+            dataset_id=tuple(cell.dataset_id for cell in cells),
+            cell_id=tuple(cell.cell_id for cell in cells),
+            canonical_perturbation=tuple(dict(cell.canonical_perturbation) for cell in cells),
+            canonical_context=tuple(dict(cell.canonical_context) for cell in cells),
+        )
+
+
+@dataclass(frozen=True)
+class GlobalFeatureResolver:
+    """Post-canonicalization resolver from dataset-local indices to global ids."""
+
+    dataset_feature_mappings: dict[int, np.ndarray]
+    total_features: int
+    unknown_feature_id: int = -1
+
+    @classmethod
+    def from_dataset_mappings(
+        cls,
+        dataset_feature_mappings: dict[int, Sequence[int] | np.ndarray],
+        *,
+        total_features: int | None = None,
+        unknown_feature_id: int = -1,
+    ) -> "GlobalFeatureResolver":
+        normalized: dict[int, np.ndarray] = {}
+        inferred_max = -1
+        for dataset_index, mapping in dataset_feature_mappings.items():
+            array = np.asarray(mapping, dtype=np.int32)
+            normalized[int(dataset_index)] = array
+            valid = array[array >= 0]
+            if valid.size:
+                inferred_max = max(inferred_max, int(valid.max()))
+        if total_features is None:
+            total_features = inferred_max + 1 if inferred_max >= 0 else 0
+        return cls(
+            dataset_feature_mappings=normalized,
+            total_features=int(total_features),
+            unknown_feature_id=int(unknown_feature_id),
+        )
+
+    def resolve_local_indices(
+        self,
+        dataset_index: int,
+        local_feature_indices: Sequence[int] | np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if int(dataset_index) not in self.dataset_feature_mappings:
+            raise KeyError(f"no global feature mapping registered for dataset_index {dataset_index}")
+
+        mapping = self.dataset_feature_mappings[int(dataset_index)]
+        local_indices = np.asarray(local_feature_indices, dtype=np.int64)
+        resolved = np.full(local_indices.shape, self.unknown_feature_id, dtype=np.int32)
+        within_bounds = (local_indices >= 0) & (local_indices < mapping.shape[0])
+        if np.any(within_bounds):
+            resolved[within_bounds] = mapping[local_indices[within_bounds]]
+        valid = within_bounds & (resolved != self.unknown_feature_id)
+        return resolved, valid
+
+    def resolve_batch(
+        self,
+        payload: SparseBatchPayload,
+        *,
+        sort_by_global_feature: bool = True,
+        drop_unresolved: bool = True,
+    ) -> ResolvedSparseBatch:
+        row_offsets = [0]
+        resolved_gene_ids: list[np.ndarray] = []
+        resolved_counts: list[np.ndarray] = []
+        unresolved_total = 0
+
+        for row_position in range(payload.batch_size):
+            dataset_index = int(payload.dataset_index[row_position])
+            local_indices = payload.row_gene_indices(row_position)
+            counts = payload.row_counts(row_position)
+            resolved_ids, valid_mask = self.resolve_local_indices(dataset_index, local_indices)
+            unresolved_total += int(valid_mask.size - valid_mask.sum())
+
+            if drop_unresolved:
+                resolved_ids = resolved_ids[valid_mask]
+                counts = counts[valid_mask]
+
+            if sort_by_global_feature and resolved_ids.size:
+                order = np.argsort(resolved_ids, kind="stable")
+                resolved_ids = resolved_ids[order]
+                counts = counts[order]
+
+            resolved_gene_ids.append(resolved_ids.astype(np.int32, copy=False))
+            resolved_counts.append(counts.astype(np.int32, copy=False))
+            row_offsets.append(row_offsets[-1] + int(resolved_ids.size))
+
+        return ResolvedSparseBatch(
+            batch_size=payload.batch_size,
+            global_row_index=payload.global_row_index.copy(),
+            dataset_index=payload.dataset_index.copy(),
+            local_row_index=payload.local_row_index.copy(),
+            row_offsets=np.asarray(row_offsets, dtype=np.int64),
+            global_feature_ids=(
+                np.concatenate(resolved_gene_ids).astype(np.int32, copy=False)
+                if resolved_gene_ids
+                else np.asarray([], dtype=np.int32)
+            ),
+            expression_counts=(
+                np.concatenate(resolved_counts).astype(np.int32, copy=False)
+                if resolved_counts
+                else np.asarray([], dtype=np.int32)
+            ),
+            size_factor=payload.size_factor.copy(),
+            dataset_id=tuple(payload.dataset_id),
+            cell_id=tuple(payload.cell_id),
+            canonical_perturbation=tuple(dict(item) for item in payload.canonical_perturbation),
+            canonical_context=tuple(dict(item) for item in payload.canonical_context),
+            unresolved_local_features=unresolved_total,
+        )
+
+
+class CorpusRandomBatchSampler:
+    """Yield shuffled corpus-global batches keyed by `global_row_index`."""
+
+    def __init__(
+        self,
+        *,
+        total_rows: int,
+        batch_size: int,
+        drop_last: bool = True,
+        seed: int = 0,
+    ):
+        if total_rows <= 0:
+            raise ValueError("total_rows must be positive")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.total_rows = int(total_rows)
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return self.total_rows // self.batch_size
+        return (self.total_rows + self.batch_size - 1) // self.batch_size
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        indices = rng.permutation(self.total_rows)
+        for start in range(0, self.total_rows, self.batch_size):
+            batch = indices[start : start + self.batch_size].tolist()
+            if len(batch) < self.batch_size and self.drop_last:
+                continue
+            yield [int(idx) for idx in batch]
+
+
+class DatasetBatchSampler:
+    """Yield corpus-global batches restricted to a single dataset."""
+
+    def __init__(
+        self,
+        *,
+        metadata_table: MetadataTable,
+        dataset_index: int,
+        batch_size: int,
+        drop_last: bool = True,
+        shuffle: bool = True,
+        seed: int = 0,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.metadata_table = metadata_table
+        self.dataset_index = int(dataset_index)
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+        self._row_indices = np.asarray(
+            metadata_table.dataset_row_indices(self.dataset_index),
+            dtype=np.int64,
+        )
+        if self._row_indices.size == 0:
+            raise ValueError(f"dataset_index {self.dataset_index} has no rows")
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return int(self._row_indices.size // self.batch_size)
+        return int((self._row_indices.size + self.batch_size - 1) // self.batch_size)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        row_indices = self._row_indices.copy()
+        if self.shuffle:
+            row_indices = row_indices[rng.permutation(row_indices.size)]
+        for start in range(0, row_indices.size, self.batch_size):
+            batch = row_indices[start : start + self.batch_size]
+            if batch.size < self.batch_size and self.drop_last:
+                continue
+            yield batch.astype(np.int64, copy=False).tolist()
+
+
+class DatasetContextBatchSampler:
+    """Yield dataset-aware grouped batches from the RAM metadata table."""
+
+    def __init__(
+        self,
+        *,
+        metadata_table: MetadataTable,
+        batch_size: int,
+        context_field: str = "cell_context",
+        dataset_index: int | None = None,
+        drop_last: bool = True,
+        shuffle: bool = True,
+        seed: int = 0,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.metadata_table = metadata_table
+        self.batch_size = int(batch_size)
+        self.context_field = context_field
+        self.dataset_index = int(dataset_index) if dataset_index is not None else None
+        self.drop_last = bool(drop_last)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+        keys = metadata_table.dataset_context_keys(
+            context_field=context_field,
+            min_batch_size=batch_size if drop_last else None,
+        )
+        if self.dataset_index is not None:
+            keys = [key for key in keys if key.dataset_index == self.dataset_index]
+        self._eligible_keys = tuple(keys)
+        if not self._eligible_keys:
+            raise ValueError("no dataset/context groups can support the requested batch size")
+
+    def __len__(self) -> int:
+        total_batches = 0
+        for key in self._eligible_keys:
+            row_count = len(
+                self.metadata_table.dataset_context_row_indices(
+                    key,
+                    context_field=self.context_field,
+                )
+            )
+            if self.drop_last:
+                total_batches += row_count // self.batch_size
+            else:
+                total_batches += (row_count + self.batch_size - 1) // self.batch_size
+        return total_batches
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        batches: list[list[int]] = []
+        keys = list(self._eligible_keys)
+        if self.shuffle:
+            rng.shuffle(keys)
+        for key in keys:
+            row_indices = np.asarray(
+                self.metadata_table.dataset_context_row_indices(
+                    key,
+                    context_field=self.context_field,
+                ),
+                dtype=np.int64,
+            )
+            if self.shuffle and row_indices.size:
+                row_indices = row_indices[rng.permutation(row_indices.size)]
+            for start in range(0, row_indices.size, self.batch_size):
+                batch = row_indices[start : start + self.batch_size]
+                if batch.size < self.batch_size and self.drop_last:
+                    continue
+                batches.append(batch.astype(np.int64, copy=False).tolist())
+        if self.shuffle:
+            rng.shuffle(batches)
+        yield from batches
+
+
+class CPUDenseRuntimePath:
+    """Baseline runtime path that resolves sparse rows, then densifies on CPU."""
+
+    def __init__(self, resolver: GlobalFeatureResolver, *, total_features: int | None = None):
+        self.resolver = resolver
+        self.total_features = int(
+            resolver.total_features if total_features is None else total_features
+        )
+        if self.total_features <= 0:
+            raise ValueError("CPUDenseRuntimePath requires a positive total_features")
+
+    def resolve_batch(self, payload: SparseBatchPayload) -> ResolvedSparseBatch:
+        return self.resolver.resolve_batch(payload)
+
+    def densify(self, batch: SparseBatchPayload | ResolvedSparseBatch) -> dict[str, Any]:
+        resolved = batch if isinstance(batch, ResolvedSparseBatch) else self.resolve_batch(batch)
+        dense_counts = np.zeros((resolved.batch_size, self.total_features), dtype=np.float32)
+        for row_position in range(resolved.batch_size):
+            feature_ids = resolved.row_feature_ids(row_position)
+            if feature_ids.size == 0:
+                continue
+            counts = resolved.row_counts(row_position).astype(np.float32, copy=False)
+            np.add.at(dense_counts[row_position], feature_ids, counts)
+        return {
+            "batch_size": resolved.batch_size,
+            "global_row_index": resolved.global_row_index.copy(),
+            "dataset_index": resolved.dataset_index.copy(),
+            "local_row_index": resolved.local_row_index.copy(),
+            "size_factor": resolved.size_factor.copy(),
+            "dense_counts": dense_counts,
+            "dataset_id": tuple(resolved.dataset_id),
+            "cell_id": tuple(resolved.cell_id),
+            "canonical_perturbation": tuple(dict(item) for item in resolved.canonical_perturbation),
+            "canonical_context": tuple(dict(item) for item in resolved.canonical_context),
+            "unresolved_local_features": resolved.unresolved_local_features,
+        }
+
+    def gather_sampled_counts(
+        self,
+        batch: SparseBatchPayload | ResolvedSparseBatch,
+        sampled_feature_ids: Sequence[int] | np.ndarray,
+    ) -> np.ndarray:
+        dense_batch = self.densify(batch)
+        dense_counts = dense_batch["dense_counts"]
+        sampled = np.asarray(sampled_feature_ids, dtype=np.int64)
+        if sampled.ndim == 1:
+            sampled = np.broadcast_to(sampled, (dense_counts.shape[0], sampled.shape[0]))
+        if sampled.shape[0] != dense_counts.shape[0]:
+            raise ValueError("sampled_feature_ids batch dimension does not match dense batch")
+        return dense_counts[np.arange(dense_counts.shape[0])[:, None], sampled]
+
+
+class GPUSparseRuntimePath:
+    """Sparse runtime path that keeps flat payloads plus offsets in the hot path."""
+
+    def __init__(self, resolver: GlobalFeatureResolver):
+        self.resolver = resolver
+
+    def resolve_batch(self, payload: SparseBatchPayload) -> ResolvedSparseBatch:
+        return self.resolver.resolve_batch(payload)
+
+    def gather_sampled_counts(
+        self,
+        batch: SparseBatchPayload | ResolvedSparseBatch,
+        sampled_feature_ids: Sequence[int] | np.ndarray,
+    ) -> np.ndarray:
+        resolved = batch if isinstance(batch, ResolvedSparseBatch) else self.resolve_batch(batch)
+        sampled = np.asarray(sampled_feature_ids, dtype=np.int64)
+        if sampled.ndim == 1:
+            sampled = np.broadcast_to(sampled, (resolved.batch_size, sampled.shape[0]))
+        if sampled.shape[0] != resolved.batch_size:
+            raise ValueError("sampled_feature_ids batch dimension does not match sparse batch")
+
+        gathered = np.zeros(sampled.shape, dtype=np.float32)
+        for row_position in range(resolved.batch_size):
+            row_feature_ids = resolved.row_feature_ids(row_position)
+            if row_feature_ids.size == 0:
+                continue
+            row_counts = resolved.row_counts(row_position).astype(np.float32, copy=False)
+            row_targets = sampled[row_position]
+            positions = np.searchsorted(row_feature_ids, row_targets, side="left")
+            in_bounds = positions < row_feature_ids.size
+            if not np.any(in_bounds):
+                continue
+            clamped = np.clip(positions, 0, row_feature_ids.size - 1)
+            exact = in_bounds & (row_feature_ids[clamped] == row_targets)
+            if np.any(exact):
+                gathered[row_position, exact] = row_counts[clamped[exact]]
+        return gathered
 
 
 # ---------------------------------------------------------------------------
@@ -809,7 +1623,9 @@ class PerturbIterableDataset:
             result = {
                 "cell_id": cell.cell_id,
                 "dataset_id": cell.dataset_id,
-                "dataset_release": cell.dataset_release,
+                "dataset_index": cell.dataset_index,
+                "global_row_index": cell.global_row_index,
+                "local_row_index": cell.local_row_index,
                 "expressed_gene_indices": np.array(
                     cell.expressed_gene_indices, dtype=np.int32
                 ),
@@ -907,7 +1723,9 @@ class PerturbDataLoader:
         result = {
             "cell_id": cell.cell_id,
             "dataset_id": cell.dataset_id,
-            "dataset_release": cell.dataset_release,
+            "dataset_index": cell.dataset_index,
+            "global_row_index": cell.global_row_index,
+            "local_row_index": cell.local_row_index,
             "expressed_gene_indices": np.array(
                 cell.expressed_gene_indices, dtype=np.int32
             ),

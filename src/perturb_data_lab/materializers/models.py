@@ -210,7 +210,7 @@ class MaterializationManifest(YamlDocument):
     dataset_id: str
     release_id: str
     route: str  # create_new | append_routed
-    backend: str  # arrow-hf | webdataset | zarr-ts — must match corpus declared backend
+    backend: str  # arrow-hf | webdataset | zarr-ts | lancedb-aggregated | zarr-aggregated
     count_source: CountSourceSpec
     outputs: OutputRoots
     provenance: ProvenanceSpec
@@ -236,7 +236,13 @@ class MaterializationManifest(YamlDocument):
             raise ValueError("materialization manifest contract version mismatch")
         if self.route not in {"create_new", "append_routed"}:
             raise ValueError(f"invalid route: {self.route}")
-        if self.backend not in {"arrow-hf", "webdataset", "zarr-ts"}:
+        if self.backend not in {
+            "arrow-hf",
+            "webdataset",
+            "zarr-ts",
+            "lancedb-aggregated",
+            "zarr-aggregated",
+        }:
             raise ValueError(f"invalid backend: {self.backend}")
 
     @classmethod
@@ -533,11 +539,14 @@ class DatasetJoinRecord:
     release_id: str
     join_mode: str
     manifest_path: str
+    dataset_index: int = 0
     cell_count: int = 0  # number of cells in this dataset
     global_start: int = 0  # inclusive start of global cell range for this dataset
     global_end: int = 0  # exclusive end of global cell range for this dataset
 
     def validate(self) -> None:
+        if self.dataset_index < 0:
+            raise ValueError(f"dataset_index must be non-negative: {self.dataset_index}")
         if self.join_mode not in {"create_new", "append_routed"}:
             raise ValueError(f"invalid join_mode: {self.join_mode}")
         if self.cell_count < 0:
@@ -558,6 +567,7 @@ class DatasetJoinRecord:
     def from_dict(cls, data: Mapping[str, Any]) -> "DatasetJoinRecord":
         return cls(
             dataset_id=str(data["dataset_id"]),
+            dataset_index=int(data.get("dataset_index", 0)),
             release_id=str(data["release_id"]),
             join_mode=str(data["join_mode"]),
             manifest_path=str(data["manifest_path"]),
@@ -577,13 +587,18 @@ class CorpusIndexDocument(YamlDocument):
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "CorpusIndexDocument":
+        dataset_payloads = []
+        for idx, item in enumerate(data.get("datasets", [])):
+            payload = dict(item)
+            payload.setdefault("dataset_index", idx)
+            dataset_payloads.append(payload)
         return cls(
             kind=str(data["kind"]),
             contract_version=str(data["contract_version"]),
             corpus_id=str(data["corpus_id"]),
             global_metadata=dict(data.get("global_metadata", {})),
             datasets=tuple(
-                DatasetJoinRecord.from_dict(d) for d in data.get("datasets", [])
+                DatasetJoinRecord.from_dict(d) for d in dataset_payloads
             ),
         )
 
@@ -600,13 +615,19 @@ class GlobalMetadataDocument(YamlDocument):
     feature_registry_id: str  # deprecated: replaced by tokenizer_path in contract 0.2.0
     missing_value_literal: str
     raw_field_policy: str
-    backend: str | None = None  # arrow-hf | webdataset | zarr-ts — declared corpus backend; None for backward compat with older files
+    backend: str | None = None  # arrow-hf | webdataset | zarr-ts | lancedb-aggregated | zarr-aggregated
     tokenizer_path: str | None = None  # relative path from corpus root to tokenizer.json
     emission_spec_path: str | None = None  # relative path from corpus root to corpus-emission-spec.yaml
     notes: tuple[str, ...] = ()
 
     def validate(self) -> None:
-        if self.backend is not None and self.backend not in {"arrow-hf", "webdataset", "zarr-ts"}:
+        if self.backend is not None and self.backend not in {
+            "arrow-hf",
+            "webdataset",
+            "zarr-ts",
+            "lancedb-aggregated",
+            "zarr-aggregated",
+        }:
             raise ValueError(f"invalid backend in global-metadata: {self.backend}")
 
     @classmethod

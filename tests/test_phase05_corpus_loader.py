@@ -26,8 +26,10 @@ import pytest
 from perturb_data_lab.loaders import (
     ArrowHFCellReader,
     CellState,
+    CPUDenseRuntimePath,
     CorpusLoader,
     DatasetReaderEntry,
+    GPUSparseRuntimePath,
     HVGRandomSampler,
     SamplerState,
     build_corpus_loader,
@@ -234,6 +236,7 @@ def _write_corpus_index(
                 release_id=rec.release_id,
                 join_mode=rec.join_mode,
                 manifest_path=rec.manifest_path,
+                dataset_index=len(computed_records),
                 cell_count=cc,
                 global_start=offset,
                 global_end=offset + cc,
@@ -291,6 +294,7 @@ class TestDatasetReaderEntry:
     def test_hvg_indices_property_returns_original(self, tmp_path):
         entry = DatasetReaderEntry(
             dataset_id="ds1",
+            dataset_index=0,
             release_id="ds1-release",
             manifest_path=tmp_path / "manifest.yaml",
             reader=None,
@@ -303,6 +307,7 @@ class TestDatasetReaderEntry:
     def test_nonhvg_indices_property(self, tmp_path):
         entry = DatasetReaderEntry(
             dataset_id="ds1",
+            dataset_index=0,
             release_id="ds1-release",
             manifest_path=tmp_path / "manifest.yaml",
             reader=None,
@@ -316,6 +321,7 @@ class TestDatasetReaderEntry:
     def test_token_hvg_set_falls_back_when_no_preloader(self, tmp_path):
         entry = DatasetReaderEntry(
             dataset_id="ds1",
+            dataset_index=0,
             release_id="ds1-release",
             manifest_path=tmp_path / "manifest.yaml",
             reader=None,
@@ -342,6 +348,7 @@ class TestDatasetReaderEntry:
 
         entry = DatasetReaderEntry(
             dataset_id="ds1",
+            dataset_index=0,
             release_id="ds1-release",
             manifest_path=tmp_path / "manifest.yaml",
             reader=FakeReader,
@@ -402,6 +409,8 @@ class TestCorpusLoaderTwoDatasets:
         assert loader.corpus_id == "test-corpus"
         assert len(loader) == 18  # 10 + 8
         assert loader.dataset_ids == ("dataset1", "dataset2")
+        assert loader.metadata_table is not None
+        assert len(loader.metadata_table) == 18
 
     def test_read_cell_routing_binary_search(self, temp_corpus_root, synthetic_tokenizer):
         corpus_root, matrix_root, metadata_root = temp_corpus_root
@@ -434,11 +443,123 @@ class TestCorpusLoaderTwoDatasets:
         loader = CorpusLoader.from_corpus_index(corpus_root / "corpus-index.yaml")
         cells = list(loader.iter_cells())
         assert len(cells) == 13  # 5 + 8
-        # dataset_id comes from SQLite row's dataset_id column, which is set to release_id
-        rel0_count = sum(1 for c in cells if c.dataset_id == "rel0")
-        rel1_count = sum(1 for c in cells if c.dataset_id == "rel1")
-        assert rel0_count == 5
-        assert rel1_count == 8
+        assert [cell.global_row_index for cell in cells] == list(range(13))
+        assert cells[0].dataset_index == 0
+        assert cells[5].dataset_index == 1
+
+    def test_read_cells_groups_global_rows_through_metadata_table(self, temp_corpus_root, synthetic_tokenizer):
+        corpus_root, matrix_root, metadata_root = temp_corpus_root
+        tok, tok_path = synthetic_tokenizer
+        import shutil
+        shutil.copy(tok_path, corpus_root / "tokenizer.json")
+
+        from perturb_data_lab.materializers.models import DatasetJoinRecord
+
+        for ds_idx, n_cells in enumerate([4, 4]):
+            mroot = corpus_root / f"metadata_{ds_idx}"
+            mmroot = corpus_root / f"matrix_{ds_idx}"
+            mroot.mkdir()
+            mmroot.mkdir()
+            release_id = f"rel{ds_idx}"
+            dataset_id = f"ds{ds_idx}"
+            _make_cells_parquet(mmroot / f"{release_id}-cells.parquet", n_cells, 8, release_id, seed=ds_idx)
+            _make_meta_parquet(mmroot, n_cells, release_id)
+            _make_cell_meta_sqlite(mmroot, n_cells, release_id)
+            feat_paths = _make_feature_parquet(mroot, mmroot, release_id, 8, tok)
+            _make_materialization_manifest(mroot, mmroot, release_id, dataset_id, None, feat_paths)
+
+        _write_corpus_index(corpus_root, "test-corpus", [
+            DatasetJoinRecord(dataset_id="ds0", release_id="rel0", join_mode="create_new", manifest_path="metadata_0/materialization-manifest.yaml"),
+            DatasetJoinRecord(dataset_id="ds1", release_id="rel1", join_mode="create_new", manifest_path="metadata_1/materialization-manifest.yaml"),
+        ], cell_counts=[4, 4])
+        _write_tokenizer_and_global_metadata(corpus_root, tok, "test-corpus")
+
+        loader = CorpusLoader.from_corpus_index(corpus_root / "corpus-index.yaml")
+        cells = loader.read_cells([5, 1, 6])
+        assert [cell.global_row_index for cell in cells] == [5, 1, 6]
+        assert [cell.dataset_index for cell in cells] == [1, 0, 1]
+
+    def test_sparse_batch_and_runtime_paths(self, temp_corpus_root, synthetic_tokenizer):
+        corpus_root, matrix_root, metadata_root = temp_corpus_root
+        tok, tok_path = synthetic_tokenizer
+        import shutil
+        shutil.copy(tok_path, corpus_root / "tokenizer.json")
+
+        from perturb_data_lab.materializers.models import DatasetJoinRecord
+
+        for ds_idx, n_cells in enumerate([3, 3]):
+            mroot = corpus_root / f"metadata_{ds_idx}"
+            mmroot = corpus_root / f"matrix_{ds_idx}"
+            mroot.mkdir()
+            mmroot.mkdir()
+            release_id = f"rel{ds_idx}"
+            dataset_id = f"ds{ds_idx}"
+            _make_cells_parquet(mmroot / f"{release_id}-cells.parquet", n_cells, 5, release_id, seed=ds_idx)
+            _make_meta_parquet(mmroot, n_cells, release_id)
+            _make_cell_meta_sqlite(mmroot, n_cells, release_id)
+            feat_paths = _make_feature_parquet(mroot, mmroot, release_id, 5, tok)
+            _make_materialization_manifest(mroot, mmroot, release_id, dataset_id, None, feat_paths)
+
+        _write_corpus_index(corpus_root, "test-corpus", [
+            DatasetJoinRecord(dataset_id="ds0", release_id="rel0", join_mode="create_new", manifest_path="metadata_0/materialization-manifest.yaml"),
+            DatasetJoinRecord(dataset_id="ds1", release_id="rel1", join_mode="create_new", manifest_path="metadata_1/materialization-manifest.yaml"),
+        ], cell_counts=[3, 3])
+        _write_tokenizer_and_global_metadata(corpus_root, tok, "test-corpus")
+
+        loader = CorpusLoader.from_corpus_index(corpus_root / "corpus-index.yaml")
+        batch = loader.collate_sparse_batch([0, 3, 4])
+        resolver = loader.build_global_feature_resolver()
+
+        cpu_path = loader.cpu_dense_runtime_path(resolver)
+        gpu_path = loader.gpu_sparse_runtime_path(resolver)
+
+        dense = cpu_path.densify(batch)
+        resolved = gpu_path.resolve_batch(batch)
+        sampled = resolved.global_feature_ids[: min(2, resolved.global_feature_ids.shape[0])]
+        if sampled.size:
+            sampled = np.broadcast_to(sampled, (resolved.batch_size, sampled.shape[0]))
+            gathered = gpu_path.gather_sampled_counts(resolved, sampled)
+            assert gathered.shape[0] == resolved.batch_size
+
+        assert isinstance(cpu_path, CPUDenseRuntimePath)
+        assert isinstance(gpu_path, GPUSparseRuntimePath)
+        assert batch.batch_size == 3
+        assert dense["dense_counts"].shape[0] == 3
+        assert resolved.batch_size == 3
+
+    def test_dataset_aware_batch_samplers(self, temp_corpus_root, synthetic_tokenizer):
+        corpus_root, matrix_root, metadata_root = temp_corpus_root
+        tok, tok_path = synthetic_tokenizer
+        import shutil
+        shutil.copy(tok_path, corpus_root / "tokenizer.json")
+
+        release_id = "release1"
+        dataset_id = "dataset1"
+        mroot = corpus_root / "metadata_0"
+        mmroot = corpus_root / "matrix_0"
+        mroot.mkdir()
+        mmroot.mkdir()
+        _make_cells_parquet(mmroot / f"{release_id}-cells.parquet", 5, 5, release_id, seed=0)
+        _make_meta_parquet(mmroot, 5, release_id)
+        _make_cell_meta_sqlite(mmroot, 5, release_id)
+        _make_hvg_arrays(mroot, 5, seed=0)
+        feat_paths = _make_feature_parquet(mroot, mmroot, release_id, 5, tok)
+        _make_materialization_manifest(mroot, mmroot, release_id, dataset_id, "hvg_sidecar", feat_paths)
+
+        from perturb_data_lab.materializers.models import DatasetJoinRecord
+        _write_corpus_index(corpus_root, "test-corpus", [
+            DatasetJoinRecord(dataset_id=dataset_id, release_id=release_id, join_mode="create_new", manifest_path="metadata_0/materialization-manifest.yaml"),
+        ], cell_counts=[5])
+        _write_tokenizer_and_global_metadata(corpus_root, tok, "test-corpus")
+
+        loader = CorpusLoader.from_corpus_index(corpus_root / "corpus-index.yaml")
+        dataset_batches = list(loader.dataset_batch_sampler(dataset_id="dataset1", batch_size=2, shuffle=False, drop_last=False))
+        context_batches = list(loader.dataset_context_batch_sampler(batch_size=2, dataset_id="dataset1", shuffle=False, drop_last=False))
+        corpus_batches = list(loader.corpus_random_batch_sampler(batch_size=2, seed=7))
+
+        assert dataset_batches[0] == [0, 1]
+        assert context_batches
+        assert sum(len(batch) for batch in corpus_batches) == 4
 
 
 # ---------------------------------------------------------------------------

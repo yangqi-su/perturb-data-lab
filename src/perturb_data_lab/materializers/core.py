@@ -1082,6 +1082,7 @@ def update_corpus_index(
         # Build updated record with computed global range
         new_record = DatasetJoinRecord(
             dataset_id=new_dataset_record.dataset_id,
+            dataset_index=len(corpus.datasets),
             release_id=new_dataset_record.release_id,
             join_mode=new_dataset_record.join_mode,
             manifest_path=str(manifest_path_relative),
@@ -1096,6 +1097,7 @@ def update_corpus_index(
         # For new corpus, global range is [0, cell_count)
         new_record = DatasetJoinRecord(
             dataset_id=new_dataset_record.dataset_id,
+            dataset_index=0,
             release_id=new_dataset_record.release_id,
             join_mode=new_dataset_record.join_mode,
             manifest_path=str(manifest_path_relative),

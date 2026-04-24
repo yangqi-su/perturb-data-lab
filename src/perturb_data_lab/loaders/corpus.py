@@ -13,6 +13,7 @@ Dataset-level per-cell data is read lazily through the per-dataset reader.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,9 +29,19 @@ from ..materializers.tokenizer import CorpusTokenizer
 from ..materializers.emission_spec import CorpusEmissionSpec
 from .loaders import (
     BackendCellReader,
+    CellIdentity,
     CellState,
+    CPUDenseRuntimePath,
+    CorpusRandomBatchSampler,
+    DatasetBatchSampler,
+    DatasetContextBatchSampler,
+    GlobalFeatureResolver,
+    GPUSparseRuntimePath,
     HVGRandomSampler,
+    MetadataTable,
     SamplerState,
+    SparseBatchCollator,
+    SparseBatchPayload,
     AVAILABLE_READERS,
     build_cell_reader,
 )
@@ -58,6 +69,7 @@ class DatasetReaderEntry:
     """
 
     dataset_id: str
+    dataset_index: int
     release_id: str
     manifest_path: Path
     reader: BackendCellReader  # any backend-specific reader
@@ -173,6 +185,7 @@ class CorpusLoader:
         tokenizer: "CorpusTokenizer | None",
         emission_spec: CorpusEmissionSpec,
         dataset_entries: tuple[DatasetReaderEntry, ...],
+        metadata_table: MetadataTable | None = None,
     ):
         """
         Parameters
@@ -194,6 +207,8 @@ class CorpusLoader:
         self.tokenizer = tokenizer
         self.emission_spec = emission_spec
         self._dataset_entries = dataset_entries
+        self._metadata_table = metadata_table
+        self._sparse_batch_collator = SparseBatchCollator()
 
         # Build dataset_id → entry index map for O(1) lookup
         self._dataset_id_to_idx: dict[str, int] = {
@@ -242,7 +257,113 @@ class CorpusLoader:
         dataset_idx = self._find_dataset_idx(corpus_global_index)
         entry = self._dataset_entries[dataset_idx]
         local_index = corpus_global_index - entry.global_start
-        return entry.reader.read_cell(local_index)
+        if self._metadata_table is None:
+            return entry.reader.read_cell(local_index)
+        heavy_row = entry.reader.read_row(local_index)
+        metadata = self._metadata_table.row(corpus_global_index)
+        return self._compose_cell_state(metadata, heavy_row)
+
+    def read_cells(self, corpus_global_indices: list[int]) -> list[CellState]:
+        """Read multiple corpus-global rows with dataset-grouped heavy reads."""
+        if not corpus_global_indices:
+            return []
+
+        normalized = [int(idx) for idx in corpus_global_indices]
+        for idx in normalized:
+            if idx < 0 or idx >= self._total_cells:
+                raise IndexError(
+                    f"corpus_global_index {idx} out of range [0, {self._total_cells})"
+                )
+
+        if self._metadata_table is None:
+            return [self.read_cell(idx) for idx in normalized]
+
+        grouped: dict[int, list[tuple[int, int, int]]] = {}
+        for output_position, global_index in enumerate(normalized):
+            dataset_idx = self._find_dataset_idx(global_index)
+            entry = self._dataset_entries[dataset_idx]
+            local_index = global_index - entry.global_start
+            grouped.setdefault(dataset_idx, []).append(
+                (output_position, global_index, local_index)
+            )
+
+        result: list[CellState | None] = [None] * len(normalized)
+        for dataset_idx, selections in grouped.items():
+            entry = self._dataset_entries[dataset_idx]
+            heavy_rows = entry.reader.read_rows([local for _, _, local in selections])
+            metadata_rows = self._metadata_table.rows(
+                [global_index for _, global_index, _ in selections]
+            )
+            for (output_position, _global_index, _local_index), metadata, heavy_row in zip(
+                selections, metadata_rows, heavy_rows
+            ):
+                result[output_position] = self._compose_cell_state(metadata, heavy_row)
+
+        return [cell for cell in result if cell is not None]
+
+    def collate_sparse_batch(self, corpus_global_indices: list[int]) -> SparseBatchPayload:
+        """Read and collate a dataset-aware sparse batch keyed by global rows."""
+        return self._sparse_batch_collator(self.read_cells(corpus_global_indices))
+
+    def dataset_batch_sampler(
+        self,
+        *,
+        dataset_id: str,
+        batch_size: int,
+        drop_last: bool = True,
+        shuffle: bool = True,
+        seed: int = 0,
+    ) -> DatasetBatchSampler:
+        if self._metadata_table is None:
+            raise ValueError("dataset batch sampling requires a RAM-resident metadata table")
+        entry = self.dataset_reader(dataset_id)
+        return DatasetBatchSampler(
+            metadata_table=self._metadata_table,
+            dataset_index=entry.dataset_index,
+            batch_size=batch_size,
+            drop_last=drop_last,
+            shuffle=shuffle,
+            seed=seed,
+        )
+
+    def dataset_context_batch_sampler(
+        self,
+        *,
+        batch_size: int,
+        context_field: str = "cell_context",
+        dataset_id: str | None = None,
+        drop_last: bool = True,
+        shuffle: bool = True,
+        seed: int = 0,
+    ) -> DatasetContextBatchSampler:
+        if self._metadata_table is None:
+            raise ValueError("dataset-context batch sampling requires a RAM-resident metadata table")
+        dataset_index = None
+        if dataset_id is not None:
+            dataset_index = self.dataset_reader(dataset_id).dataset_index
+        return DatasetContextBatchSampler(
+            metadata_table=self._metadata_table,
+            batch_size=batch_size,
+            context_field=context_field,
+            dataset_index=dataset_index,
+            drop_last=drop_last,
+            shuffle=shuffle,
+            seed=seed,
+        )
+
+    def corpus_random_batch_sampler(
+        self,
+        *,
+        batch_size: int,
+        drop_last: bool = True,
+        seed: int = 0,
+    ) -> CorpusRandomBatchSampler:
+        return CorpusRandomBatchSampler(
+            total_rows=len(self),
+            batch_size=batch_size,
+            drop_last=drop_last,
+            seed=seed,
+        )
 
     def iter_cells(self):
         """Yield all cells across all datasets in corpus order.
@@ -252,7 +373,12 @@ class CorpusLoader:
         for entry in self._dataset_entries:
             reader = entry.reader
             for local_idx in range(len(reader)):
-                yield reader.read_cell(local_idx)
+                yield self.read_cell(entry.global_start + local_idx)
+
+    @property
+    def metadata_table(self) -> MetadataTable | None:
+        """Shared RAM-resident metadata table when available."""
+        return self._metadata_table
 
     def _find_dataset_idx(self, global_index: int) -> int:
         """Binary search for the dataset index owning global_index.
@@ -268,6 +394,32 @@ class CorpusLoader:
             else:
                 hi = mid
         return lo
+
+    def _compose_cell_state(
+        self,
+        metadata: dict[str, Any],
+        heavy_row: dict[str, Any],
+    ) -> CellState:
+        if int(metadata["global_row_index"]) != int(heavy_row["global_row_index"]):
+            raise ValueError(
+                "metadata/heavy row mismatch for global_row_index: "
+                f"{metadata['global_row_index']} != {heavy_row['global_row_index']}"
+            )
+        return CellState(
+            identity=CellIdentity(
+                global_row_index=int(metadata["global_row_index"]),
+                dataset_index=int(metadata["dataset_index"]),
+                dataset_id=str(metadata["dataset_id"]),
+                local_row_index=int(metadata["local_row_index"]),
+            ),
+            cell_id=str(metadata["cell_id"]),
+            expressed_gene_indices=tuple(int(i) for i in heavy_row["expressed_gene_indices"]),
+            expression_counts=tuple(int(c) for c in heavy_row["expression_counts"]),
+            size_factor=float(metadata["size_factor"]),
+            canonical_perturbation=dict(metadata["canonical_perturbation"]),
+            canonical_context=dict(metadata["canonical_context"]),
+            raw_fields=dict(metadata["raw_fields"]),
+        )
 
     # -------------------------------------------------------------------------
     # Token-space translation
@@ -300,6 +452,50 @@ class CorpusLoader:
         if reader.preloaded_features is not None:
             return reader.translate_to_token_ids(origin_indices)
         return origin_indices
+
+    def build_global_feature_resolver(self) -> GlobalFeatureResolver:
+        """Build a post-canonicalization dataset-local → global feature resolver."""
+        dataset_mappings: dict[int, np.ndarray] = {}
+        total_features = 0
+        for entry in self._dataset_entries:
+            if entry.reader.preloaded_features is None:
+                raise ValueError(
+                    "post-canonicalization global feature resolution is unavailable for "
+                    f"dataset_id={entry.dataset_id}; provide an explicit resolver table "
+                    "or materialized token mapping before using CPU-dense/GPU-sparse runtime paths"
+                )
+            if entry.n_vars <= 0:
+                raise ValueError(
+                    f"dataset_id={entry.dataset_id} does not expose n_vars needed to build a resolver"
+                )
+            mapping = np.asarray(
+                entry.reader.translate_to_token_ids(tuple(range(entry.n_vars))),
+                dtype=np.int32,
+            )
+            dataset_mappings[int(entry.dataset_index)] = mapping
+            valid = mapping[mapping >= 0]
+            if valid.size:
+                total_features = max(total_features, int(valid.max()) + 1)
+        return GlobalFeatureResolver.from_dataset_mappings(
+            dataset_mappings,
+            total_features=total_features,
+        )
+
+    def cpu_dense_runtime_path(
+        self,
+        resolver: GlobalFeatureResolver | None = None,
+    ) -> CPUDenseRuntimePath:
+        if resolver is None:
+            resolver = self.build_global_feature_resolver()
+        return CPUDenseRuntimePath(resolver)
+
+    def gpu_sparse_runtime_path(
+        self,
+        resolver: GlobalFeatureResolver | None = None,
+    ) -> GPUSparseRuntimePath:
+        if resolver is None:
+            resolver = self.build_global_feature_resolver()
+        return GPUSparseRuntimePath(resolver)
 
     # -------------------------------------------------------------------------
     # Factory
@@ -334,7 +530,7 @@ class CorpusLoader:
             The join record's manifest_path (relative to corpus_root or absolute).
             Used to determine whether Arrow/HF artifacts are inside or outside corpus_root.
         """
-        if backend == "arrow-hf":
+        if backend in {"arrow-hf", "lancedb-aggregated"}:
             # Arrow/HF runtime artifacts (cells parquet, canonical SQLite, meta parquet)
             # are written into matrix_root, not meta_root.  For relative manifest_path
             # (stored relative to corpus_root), compute matrix_root from corpus_root.
@@ -381,24 +577,154 @@ class CorpusLoader:
                 "shard_paths": shard_paths,
                 "meta_path": meta_path,
                 "feature_registry_path": feature_registry_path,
-                "dataset_id": manifest.dataset_id,
             }
-        elif backend == "zarr-ts":
+        elif backend in {"zarr-ts", "zarr-aggregated"}:
             indices_zarr = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-indices.zarr"
             counts_zarr = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-counts.zarr"
             sf_zarr = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-sf.zarr"
             meta_path = meta_root / f"{manifest.release_id}-meta.json"
             feature_registry_path = meta_root / "feature-registry.yaml"
+            feature_meta_paths: dict[str, Path] | None = None
+            if manifest.feature_meta_paths:
+                feature_meta_paths = {
+                    k: meta_root / v
+                    for k, v in manifest.feature_meta_paths.items()
+                }
             return {
                 "indices_zarr_path": indices_zarr,
                 "counts_zarr_path": counts_zarr,
                 "sf_zarr_path": sf_zarr,
                 "meta_path": meta_path,
                 "feature_registry_path": feature_registry_path,
-                "dataset_id": manifest.dataset_id,
+                "feature_meta_paths": feature_meta_paths,
             }
         else:
             raise ValueError(f"unknown backend: {backend}")
+
+    @staticmethod
+    def _build_metadata_table(
+        corpus_backend: str | None,
+        corpus_root: Path,
+        corpus_index: CorpusIndexDocument,
+    ) -> MetadataTable | None:
+        if corpus_backend not in {"arrow-hf", "zarr-ts", "lancedb-aggregated", "zarr-aggregated"}:
+            return None
+
+        from ..materializers.models import MaterializationManifest
+
+        rows: list[dict[str, Any]] = []
+        for ds_record in corpus_index.datasets:
+            manifest_path = corpus_root / ds_record.manifest_path
+            manifest = MaterializationManifest.from_yaml_file(manifest_path)
+            meta_root = manifest_path.parent
+            if corpus_backend in {"arrow-hf", "lancedb-aggregated"}:
+                rows.extend(
+                    CorpusLoader._metadata_rows_from_arrow_sqlite(
+                        manifest=manifest,
+                        meta_root=meta_root,
+                        corpus_root=corpus_root,
+                        manifest_path=ds_record.manifest_path,
+                        ds_record=ds_record,
+                    )
+                )
+            elif corpus_backend in {"zarr-ts", "zarr-aggregated"}:
+                rows.extend(
+                    CorpusLoader._metadata_rows_from_zarr_meta(
+                        manifest=manifest,
+                        meta_root=meta_root,
+                        ds_record=ds_record,
+                    )
+                )
+
+        rows.sort(key=lambda item: int(item["global_row_index"]))
+        if any(int(row["global_row_index"]) != idx for idx, row in enumerate(rows)):
+            raise ValueError("metadata table rows must form a contiguous global_row_index range")
+
+        return MetadataTable(
+            global_row_index=tuple(int(row["global_row_index"]) for row in rows),
+            cell_id=tuple(str(row["cell_id"]) for row in rows),
+            dataset_id=tuple(str(row["dataset_id"]) for row in rows),
+            dataset_index=tuple(int(row["dataset_index"]) for row in rows),
+            local_row_index=tuple(int(row["local_row_index"]) for row in rows),
+            canonical_perturbation=tuple(dict(row["canonical_perturbation"]) for row in rows),
+            canonical_context=tuple(dict(row["canonical_context"]) for row in rows),
+            raw_fields=tuple(dict(row["raw_fields"]) for row in rows),
+            size_factor=tuple(float(row["size_factor"]) for row in rows),
+        )
+
+    @staticmethod
+    def _metadata_rows_from_arrow_sqlite(
+        manifest: "MaterializationManifest",
+        meta_root: Path,
+        corpus_root: Path,
+        manifest_path: str,
+        ds_record: DatasetJoinRecord,
+    ) -> list[dict[str, Any]]:
+        import sqlite3
+
+        reader_kwargs = CorpusLoader._reader_kwargs(
+            manifest,
+            meta_root,
+            "arrow-hf",
+            corpus_root,
+            manifest_path,
+        )
+        sqlite_path = reader_kwargs["cell_meta_sqlite_path"]
+        conn = sqlite3.connect(str(sqlite_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT rowid, cell_id, dataset_id, size_factor, canonical_perturbation, canonical_context, raw_obs "
+            "FROM cell_meta ORDER BY rowid"
+        ).fetchall()
+        conn.close()
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            local_row_index = int(row["rowid"]) - 1
+            result.append(
+                {
+                    "global_row_index": ds_record.global_start + local_row_index,
+                    "cell_id": str(row["cell_id"]),
+                    "dataset_id": str(row["dataset_id"]),
+                    "dataset_index": ds_record.dataset_index,
+                    "local_row_index": local_row_index,
+                    "canonical_perturbation": json.loads(row["canonical_perturbation"]),
+                    "canonical_context": json.loads(row["canonical_context"]),
+                    "raw_fields": json.loads(row["raw_obs"]),
+                    "size_factor": float(row["size_factor"]),
+                }
+            )
+        return result
+
+    @staticmethod
+    def _metadata_rows_from_zarr_meta(
+        manifest: "MaterializationManifest",
+        meta_root: Path,
+        ds_record: DatasetJoinRecord,
+    ) -> list[dict[str, Any]]:
+        import zarr
+
+        meta_path = meta_root / f"{manifest.release_id}-meta.json"
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        sf_path = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-sf.zarr"
+        sf_store = zarr.open(str(sf_path), mode="r")
+        size_factors = sf_store["sf"]
+        result: list[dict[str, Any]] = []
+        for local_row_index, row in enumerate(payload["cells"]):
+            result.append(
+                {
+                    "global_row_index": ds_record.global_start + local_row_index,
+                    "cell_id": str(row["cell_id"]),
+                    "dataset_id": str(row.get("dataset_id", ds_record.dataset_id)),
+                    "dataset_index": ds_record.dataset_index,
+                    "local_row_index": local_row_index,
+                    "canonical_perturbation": dict(row.get("canonical_perturbation", {})),
+                    "canonical_context": dict(row.get("canonical_context", {})),
+                    "raw_fields": dict(row.get("raw_fields", {})),
+                    "size_factor": float(size_factors[local_row_index]),
+                }
+            )
+        return result
 
     @classmethod
     def from_corpus_index(
@@ -497,6 +823,8 @@ class CorpusLoader:
                 f"use one of {list(AVAILABLE_READERS)}"
             )
 
+        metadata_table = cls._build_metadata_table(corpus_backend, corpus_root, corpus_index)
+
         # Load tokenizer if present in corpus root.
         # The tokenizer is optional since Phase 3 (tokenizer-free architecture).
         # If not present, set tokenizer to None; the loader operates without it.
@@ -549,8 +877,11 @@ class CorpusLoader:
             # Each backend has its own reader class and constructor signature
             reader = build_cell_reader(
                 backend=corpus_backend,
-                release_id=manifest.release_id,
+                dataset_id=manifest.dataset_id,
+                dataset_index=ds_record.dataset_index,
                 corpus_index_path=corpus_index_path,
+                metadata_table=metadata_table,
+                global_row_offset=ds_record.global_start,
                 **cls._reader_kwargs(manifest, meta_root, corpus_backend, corpus_root, ds_record.manifest_path),
             )
 
@@ -561,7 +892,7 @@ class CorpusLoader:
             if manifest.feature_meta_paths and "features_origin" in manifest.feature_meta_paths:
                 import pyarrow.parquet as pq
 
-                if corpus_backend == "arrow-hf":
+                if corpus_backend in {"arrow-hf", "lancedb-aggregated"}:
                     # Resolve from matrix_root (same convention as _reader_kwargs)
                     if manifest_path is not None and corpus_root is not None:
                         try:
@@ -581,6 +912,7 @@ class CorpusLoader:
 
             entry = DatasetReaderEntry(
                 dataset_id=manifest.dataset_id,
+                dataset_index=ds_record.dataset_index,
                 release_id=manifest.release_id,
                 manifest_path=manifest_path,
                 reader=reader,
@@ -599,6 +931,7 @@ class CorpusLoader:
             tokenizer=tokenizer,
             emission_spec=emission_spec,
             dataset_entries=tuple(dataset_entries),
+            metadata_table=metadata_table,
         )
 
 

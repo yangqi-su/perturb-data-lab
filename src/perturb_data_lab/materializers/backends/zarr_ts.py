@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import anndata as ad
 import numpy as np
@@ -13,7 +14,7 @@ from ..models import OutputRoots
 
 def write_zarr_sparse_cell_chunks(
     adata: ad.AnnData,
-    count_matrix: any,
+    count_matrix: Any,
     size_factors: np.ndarray,
     release_id: str,
     matrix_root: Path,
@@ -21,6 +22,7 @@ def write_zarr_sparse_cell_chunks(
     canonical_perturbation: tuple[dict[str, str], ...] | None = None,
     canonical_context: tuple[dict[str, str], ...] | None = None,
     raw_fields: tuple[dict[str, Any], ...] | None = None,
+    dataset_id: str = "",
 ) -> dict[str, Path]:
     """Write sparse per-cell data in Zarr format with cell-chunked storage.
 
@@ -122,6 +124,8 @@ def write_zarr_sparse_cell_chunks(
     for i in range(n_obs):
         cell_meta_list.append({
             "cell_id": str(adata.obs.index[i]),
+            "dataset_id": dataset_id,
+            "dataset_release": release_id,
             "canonical_perturbation": dict(pert_tuple[i]),
             "canonical_context": dict(ctx_tuple[i]),
             "raw_fields": dict(raw_tuple[i]),

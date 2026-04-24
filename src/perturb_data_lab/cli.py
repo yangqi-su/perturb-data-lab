@@ -224,7 +224,7 @@ def _add_materialize_args(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
         "--backend",
         required=True,
-        choices=["arrow-hf", "webdataset", "zarr-ts"],
+        choices=["arrow-hf", "webdataset", "zarr-ts", "lancedb-aggregated", "zarr-aggregated"],
         help="Storage backend for this materialization.",
     )
     sub.add_argument(
@@ -369,7 +369,7 @@ def _add_corpus_create_args(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
         "--backend",
         required=True,
-        choices=["arrow-hf", "webdataset", "zarr-ts"],
+        choices=["arrow-hf", "webdataset", "zarr-ts", "lancedb-aggregated", "zarr-aggregated"],
         help="Backend for this corpus.",
     )
     sub.add_argument(
@@ -491,7 +491,7 @@ def _add_corpus_validate_args(sub: argparse.ArgumentParser) -> None:
     )
     sub.add_argument(
         "--backend",
-        choices=["arrow-hf", "webdataset", "zarr-ts"],
+        choices=["arrow-hf", "webdataset", "zarr-ts", "lancedb-aggregated", "zarr-aggregated"],
         help="Optional: verify the corpus backend matches this value.",
     )
 

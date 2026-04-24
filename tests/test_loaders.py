@@ -12,12 +12,22 @@ import pytest
 
 from perturb_data_lab.loaders import (
     ArrowHFCellReader,
+    CellIdentity,
     CellState,
+    CPUDenseRuntimePath,
+    CorpusRandomBatchSampler,
+    DatasetBatchSampler,
+    DatasetContextBatchSampler,
+    DatasetContextKey,
     ExpressedZerosSampler,
+    GlobalFeatureResolver,
+    GPUSparseRuntimePath,
     HVGRandomSampler,
+    MetadataTable,
     PerturbDataLoader,
     PerturbIterableDataset,
     RandomContextSampler,
+    SparseBatchCollator,
     SamplerState,
     WebDatasetCellReader,
     ZarrCellReader,
@@ -28,9 +38,8 @@ from perturb_data_lab.loaders import (
 class TestCellState:
     def test_cell_state_fields(self):
         cs = CellState(
+            identity=CellIdentity(global_row_index=0, dataset_index=0, dataset_id="ds_1", local_row_index=0),
             cell_id="cell_1",
-            dataset_id="ds_1",
-            dataset_release="v0",
             expressed_gene_indices=(0, 2, 5),
             expression_counts=(3, 1, 2),
             size_factor=1.0,
@@ -39,6 +48,8 @@ class TestCellState:
             raw_fields={"orig_label": "cell_1"},
         )
         assert cs.cell_id == "cell_1"
+        assert cs.dataset_id == "ds_1"
+        assert cs.global_row_index == 0
         assert cs.expressed_gene_indices == (0, 2, 5)
         assert cs.expression_counts == (3, 1, 2)
         assert cs.size_factor == 1.0
@@ -46,9 +57,8 @@ class TestCellState:
 
     def test_is_integer_sparse(self):
         cs = CellState(
+            identity=CellIdentity(global_row_index=1, dataset_index=0, dataset_id="ds", local_row_index=1),
             cell_id="c1",
-            dataset_id="ds",
-            dataset_release="v0",
             expressed_gene_indices=(1, 3),
             expression_counts=(2, 4),
             size_factor=1.0,
@@ -70,15 +80,158 @@ class TestSamplerState:
             SamplerState(mode="invalid", total_cells=100, n_genes=200)
 
 
+class TestMetadataTableBatchHelpers:
+    def test_dataset_row_and_context_indices(self):
+        table = MetadataTable(
+            global_row_index=(0, 1, 2, 3),
+            cell_id=("c0", "c1", "c2", "c3"),
+            dataset_id=("ds0", "ds0", "ds1", "ds1"),
+            dataset_index=(0, 0, 1, 1),
+            local_row_index=(0, 1, 0, 1),
+            canonical_perturbation=({}, {}, {}, {}),
+            canonical_context=(
+                {"cell_context": "ctrl"},
+                {"cell_context": "treat"},
+                {"cell_context": "ctrl"},
+                {"cell_context": "ctrl"},
+            ),
+            raw_fields=({}, {}, {}, {}),
+            size_factor=(1.0, 1.0, 1.0, 1.0),
+        )
+
+        assert table.dataset_row_indices(0) == (0, 1)
+        keys = table.dataset_context_keys(min_batch_size=1)
+        assert DatasetContextKey(dataset_index=0, dataset_id="ds0", context_value="ctrl") in keys
+        assert table.dataset_context_row_indices(
+            DatasetContextKey(dataset_index=1, dataset_id="ds1", context_value="ctrl")
+        ) == (2, 3)
+
+
+class TestSparseRuntimePaths:
+    def _cells(self) -> list[CellState]:
+        return [
+            CellState(
+                identity=CellIdentity(global_row_index=0, dataset_index=0, dataset_id="ds0", local_row_index=0),
+                cell_id="c0",
+                expressed_gene_indices=(0, 2),
+                expression_counts=(4, 6),
+                size_factor=1.0,
+                canonical_perturbation={"perturbation_label": "ctrl"},
+                canonical_context={"cell_context": "ctrl"},
+                raw_fields={},
+            ),
+            CellState(
+                identity=CellIdentity(global_row_index=1, dataset_index=1, dataset_id="ds1", local_row_index=0),
+                cell_id="c1",
+                expressed_gene_indices=(1, 3),
+                expression_counts=(5, 7),
+                size_factor=2.0,
+                canonical_perturbation={"perturbation_label": "treat"},
+                canonical_context={"cell_context": "treat"},
+                raw_fields={},
+            ),
+        ]
+
+    def test_sparse_batch_collator_flattens_rows(self):
+        batch = SparseBatchCollator()(self._cells())
+        np.testing.assert_array_equal(batch.row_offsets, np.array([0, 2, 4], dtype=np.int64))
+        np.testing.assert_array_equal(batch.expressed_gene_indices, np.array([0, 2, 1, 3], dtype=np.int32))
+        np.testing.assert_array_equal(batch.expression_counts, np.array([4, 6, 5, 7], dtype=np.int32))
+
+    def test_cpu_dense_runtime_resolves_then_densifies(self):
+        batch = SparseBatchCollator()(self._cells())
+        resolver = GlobalFeatureResolver.from_dataset_mappings(
+            {
+                0: np.array([10, 11, 12], dtype=np.int32),
+                1: np.array([20, 21, 22, 23], dtype=np.int32),
+            },
+            total_features=24,
+        )
+        runtime = CPUDenseRuntimePath(resolver)
+        dense = runtime.densify(batch)
+
+        assert dense["dense_counts"].shape == (2, 24)
+        assert dense["dense_counts"][0, 10] == 4
+        assert dense["dense_counts"][0, 12] == 6
+        assert dense["dense_counts"][1, 21] == 5
+        assert dense["dense_counts"][1, 23] == 7
+
+    def test_gpu_sparse_runtime_uses_offsets_without_densifying(self):
+        batch = SparseBatchCollator()(self._cells())
+        resolver = GlobalFeatureResolver.from_dataset_mappings(
+            {
+                0: np.array([10, 11, 12], dtype=np.int32),
+                1: np.array([20, 21, 22, 23], dtype=np.int32),
+            },
+            total_features=24,
+        )
+        runtime = GPUSparseRuntimePath(resolver)
+        resolved = runtime.resolve_batch(batch)
+        sampled = np.array([[10, 12, 13], [20, 21, 23]], dtype=np.int64)
+        gathered = runtime.gather_sampled_counts(resolved, sampled)
+
+        np.testing.assert_array_equal(resolved.row_offsets, np.array([0, 2, 4], dtype=np.int64))
+        np.testing.assert_array_equal(resolved.global_feature_ids, np.array([10, 12, 21, 23], dtype=np.int32))
+        np.testing.assert_array_equal(gathered, np.array([[4.0, 6.0, 0.0], [0.0, 5.0, 7.0]], dtype=np.float32))
+
+
+class TestBatchSamplers:
+    def _metadata_table(self) -> MetadataTable:
+        return MetadataTable(
+            global_row_index=(0, 1, 2, 3, 4, 5),
+            cell_id=("c0", "c1", "c2", "c3", "c4", "c5"),
+            dataset_id=("ds0", "ds0", "ds0", "ds1", "ds1", "ds1"),
+            dataset_index=(0, 0, 0, 1, 1, 1),
+            local_row_index=(0, 1, 2, 0, 1, 2),
+            canonical_perturbation=({}, {}, {}, {}, {}, {}),
+            canonical_context=(
+                {"cell_context": "ctrl"},
+                {"cell_context": "ctrl"},
+                {"cell_context": "treat"},
+                {"cell_context": "ctrl"},
+                {"cell_context": "ctrl"},
+                {"cell_context": "treat"},
+            ),
+            raw_fields=({}, {}, {}, {}, {}, {}),
+            size_factor=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+        )
+
+    def test_corpus_random_batch_sampler(self):
+        sampler = CorpusRandomBatchSampler(total_rows=6, batch_size=2, seed=5)
+        batches = list(sampler)
+        assert len(batches) == 3
+        assert sorted(sum(batches, [])) == [0, 1, 2, 3, 4, 5]
+
+    def test_dataset_batch_sampler(self):
+        sampler = DatasetBatchSampler(
+            metadata_table=self._metadata_table(),
+            dataset_index=1,
+            batch_size=2,
+            shuffle=False,
+            drop_last=False,
+        )
+        assert list(sampler) == [[3, 4], [5]]
+
+    def test_dataset_context_batch_sampler(self):
+        sampler = DatasetContextBatchSampler(
+            metadata_table=self._metadata_table(),
+            batch_size=2,
+            context_field="cell_context",
+            dataset_index=0,
+            shuffle=False,
+            drop_last=False,
+        )
+        assert list(sampler) == [[0, 1], [2]]
+
+
 class TestRandomContextSampler:
     def test_sample_indices(self):
         state = SamplerState(mode="random_context", total_cells=100, n_genes=50)
         rng = np.random.default_rng(42)
         sampler = RandomContextSampler(state, rng)
         cell = CellState(
+            identity=CellIdentity(global_row_index=2, dataset_index=0, dataset_id="ds", local_row_index=2),
             cell_id="c1",
-            dataset_id="ds",
-            dataset_release="v0",
             expressed_gene_indices=(0, 10, 20),
             expression_counts=(1, 2, 3),
             size_factor=1.0,
@@ -96,9 +249,8 @@ class TestRandomContextSampler:
         rng = np.random.default_rng(42)
         sampler = RandomContextSampler(state, rng)
         cell = CellState(
+            identity=CellIdentity(global_row_index=3, dataset_index=0, dataset_id="ds", local_row_index=3),
             cell_id="c1",
-            dataset_id="ds",
-            dataset_release="v0",
             expressed_gene_indices=(0, 10, 20),
             expression_counts=(1, 2, 3),
             size_factor=1.0,
@@ -117,9 +269,8 @@ class TestExpressedZerosSampler:
         rng = np.random.default_rng(42)
         sampler = ExpressedZerosSampler(state, rng)
         cell = CellState(
+            identity=CellIdentity(global_row_index=4, dataset_index=0, dataset_id="ds", local_row_index=4),
             cell_id="c1",
-            dataset_id="ds",
-            dataset_release="v0",
             expressed_gene_indices=(5, 10, 15),
             expression_counts=(3, 2, 1),
             size_factor=1.0,
@@ -168,7 +319,8 @@ class TestExpressedZerosSampler:
         reg.write_yaml(feature_reg)
 
         reader = ArrowHFCellReader(
-            release_id="syn-v0",
+            dataset_id="synthetic_ds",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             cells_parquet_path=cells_path,
             meta_parquet_path=meta_path,
@@ -193,9 +345,8 @@ class TestHVGRandomSampler:
         rng = np.random.default_rng(42)
         sampler = HVGRandomSampler(state, rng)
         cell = CellState(
+            identity=CellIdentity(global_row_index=5, dataset_index=0, dataset_id="ds", local_row_index=5),
             cell_id="c1",
-            dataset_id="ds",
-            dataset_release="v0",
             expressed_gene_indices=(0, 5, 30),
             expression_counts=(3, 2, 1),
             size_factor=1.0,
@@ -326,7 +477,8 @@ class TestArrowHFCellReader:
         reg.write_yaml(feature_reg)
 
         reader = ArrowHFCellReader(
-            release_id="syn-v0",
+            dataset_id="synthetic_ds",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             cells_parquet_path=cells_path,
             meta_parquet_path=meta_path,
@@ -378,7 +530,8 @@ class TestArrowHFCellReader:
         reg.write_yaml(feature_reg)
 
         reader = ArrowHFCellReader(
-            release_id="syn-v0",
+            dataset_id="synthetic_ds",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             cells_parquet_path=cells_path,
             meta_parquet_path=meta_path,
@@ -389,6 +542,7 @@ class TestArrowHFCellReader:
         cells = reader.read_cells([0, 1, 2])
         assert len(cells) == 3
         assert all(isinstance(c, CellState) for c in cells)
+        assert [c.global_row_index for c in cells] == [0, 1, 2]
 
 
 class TestPerturbDataLoader:
@@ -425,7 +579,8 @@ class TestPerturbDataLoader:
         reg.write_yaml(feature_reg)
 
         reader = ArrowHFCellReader(
-            release_id="syn-v0",
+            dataset_id="synthetic_ds",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             cells_parquet_path=cells_path,
             meta_parquet_path=meta_path,
@@ -444,6 +599,8 @@ class TestPerturbDataLoader:
         assert len(loader) == 20
         item = loader[0]
         assert "cell_id" in item
+        assert item["dataset_index"] == 0
+        assert item["global_row_index"] == 0
         assert "expressed_gene_indices" in item
         assert "expression_counts" in item
         assert "context_indices" in item
@@ -484,7 +641,8 @@ class TestPerturbIterableDataset:
         reg.write_yaml(feature_reg)
 
         reader = ArrowHFCellReader(
-            release_id="syn-v0",
+            dataset_id="synthetic_ds",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             cells_parquet_path=cells_path,
             meta_parquet_path=meta_path,
@@ -504,6 +662,8 @@ class TestPerturbIterableDataset:
         assert len(items) == 20
         item = items[0]
         assert "cell_id" in item
+        assert item["dataset_index"] == 0
+        assert item["global_row_index"] == 0
         assert "context_indices" in item
         assert len(item["context_indices"]) == 10
 
@@ -513,7 +673,8 @@ class TestBuildCellReader:
         with pytest.raises(ValueError, match="unknown backend reader"):
             build_cell_reader(
                 backend="unknown",
-                release_id="v0",
+                dataset_id="ds",
+                dataset_index=0,
                 corpus_index_path=tmp_path / "corpus-index.yaml",
             )
 
@@ -579,7 +740,8 @@ class TestWebDatasetCellReader:
         corpus_index = tmp_path / "corpus-index.yaml"
 
         reader = WebDatasetCellReader(
-            release_id="syn-v0",
+            dataset_id="syn-v0",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             shard_paths=shard_paths,
             meta_path=meta_path,
@@ -589,7 +751,7 @@ class TestWebDatasetCellReader:
         cell = reader.read_cell(0)
         assert isinstance(cell, CellState)
         assert cell.cell_id == "syn_cell_0"
-        assert cell.dataset_release == "syn-v0"
+        assert cell.dataset_id == "syn-v0"
         assert isinstance(cell.expressed_gene_indices, tuple)
         assert isinstance(cell.expression_counts, tuple)
         assert cell.size_factor > 0
@@ -600,7 +762,8 @@ class TestWebDatasetCellReader:
         corpus_index = tmp_path / "corpus-index.yaml"
 
         reader = WebDatasetCellReader(
-            release_id="syn-v0",
+            dataset_id="syn-v0",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             shard_paths=shard_paths,
             meta_path=meta_path,
@@ -616,7 +779,8 @@ class TestWebDatasetCellReader:
         corpus_index = tmp_path / "corpus-index.yaml"
 
         reader = WebDatasetCellReader(
-            release_id="syn-v0",
+            dataset_id="syn-v0",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             shard_paths=shard_paths,
             meta_path=meta_path,
@@ -706,7 +870,8 @@ class TestZarrCellReader:
         corpus_index = tmp_path / "corpus-index.yaml"
 
         reader = ZarrCellReader(
-            release_id="syn-v0",
+            dataset_id="syn-v0",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             indices_zarr_path=indices_path,
             counts_zarr_path=counts_path,
@@ -718,7 +883,7 @@ class TestZarrCellReader:
         assert len(reader) == 20
         cell = reader.read_cell(0)
         assert isinstance(cell, CellState)
-        assert cell.dataset_release == "syn-v0"
+        assert cell.dataset_id == "syn-v0"
         assert isinstance(cell.expressed_gene_indices, tuple)
         assert isinstance(cell.expression_counts, tuple)
         assert cell.size_factor > 0
@@ -728,7 +893,8 @@ class TestZarrCellReader:
         corpus_index = tmp_path / "corpus-index.yaml"
 
         reader = ZarrCellReader(
-            release_id="syn-v0",
+            dataset_id="syn-v0",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             indices_zarr_path=indices_path,
             counts_zarr_path=counts_path,
@@ -746,7 +912,8 @@ class TestZarrCellReader:
         corpus_index = tmp_path / "corpus-index.yaml"
 
         reader = ZarrCellReader(
-            release_id="syn-v0",
+            dataset_id="syn-v0",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             indices_zarr_path=indices_path,
             counts_zarr_path=counts_path,
@@ -805,7 +972,8 @@ class TestSamplerParityAcrossBackends:
         corpus_index = tmp_path / "corpus-index.yaml"
 
         return ArrowHFCellReader(
-            release_id="syn-v0",
+            dataset_id="synthetic_ds",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             cells_parquet_path=cells_path,
             meta_parquet_path=meta_path,
@@ -821,7 +989,8 @@ class TestSamplerParityAcrossBackends:
         corpus_index = tmp_path / "corpus-index.yaml"
 
         return WebDatasetCellReader(
-            release_id="syn-v0",
+            dataset_id="syn-v0",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             shard_paths=shard_paths,
             meta_path=meta_path,
@@ -835,7 +1004,8 @@ class TestSamplerParityAcrossBackends:
         corpus_index = tmp_path / "corpus-index.yaml"
 
         return ZarrCellReader(
-            release_id="syn-v0",
+            dataset_id="syn-v0",
+            dataset_index=0,
             corpus_index_path=corpus_index,
             indices_zarr_path=indices_path,
             counts_zarr_path=counts_path,
