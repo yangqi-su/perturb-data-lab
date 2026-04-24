@@ -598,8 +598,168 @@ class ArrowHFCellReader(BackendCellReader):
         )
 
 
-class LanceDBAggregatedCellReader(ArrowHFCellReader):
-    """Temporary Phase 5 aggregated-Lance reader using Arrow/HF storage semantics."""
+class LanceDBAggregatedCellReader(BackendCellReader):
+    """Reader for corpus-scoped true Lance heavy storage."""
+
+    def __init__(
+        self,
+        dataset_id: str,
+        dataset_index: int,
+        corpus_index_path: Path,
+        lance_dataset_path: Path,
+        meta_parquet_path: Path,
+        cell_meta_sqlite_path: Path,
+        feature_registry_path: Path | None = None,
+        metadata_table: MetadataTable | None = None,
+        global_row_offset: int = 0,
+        feature_meta_paths: dict[str, Path] | None = None,
+    ):
+        super().__init__(dataset_id, dataset_index, corpus_index_path)
+        self.lance_dataset_path = lance_dataset_path
+        self.meta_parquet_path = meta_parquet_path
+        self.cell_meta_sqlite_path = cell_meta_sqlite_path
+        self.feature_registry_path = feature_registry_path
+        self.metadata_table = metadata_table
+        self.global_row_offset = global_row_offset
+        self._feature_meta_paths = feature_meta_paths
+        self.__dataset = None
+        self.__preloaded_features: PreloadedFeatureObjects | None = None
+        if (
+            feature_meta_paths is not None
+            and "features_origin" in feature_meta_paths
+            and "features_token" in feature_meta_paths
+        ):
+            self.__preloaded_features = PreloadedFeatureObjects(
+                dataset_id=dataset_id,
+                features_origin_path=feature_meta_paths["features_origin"],
+                features_token_path=feature_meta_paths["features_token"],
+            )
+
+    def _dataset(self):
+        if self.__dataset is None:
+            import lance
+
+            self.__dataset = lance.dataset(self.lance_dataset_path)
+        return self.__dataset
+
+    @property
+    def preloaded_features(self) -> PreloadedFeatureObjects | None:
+        return self.__preloaded_features
+
+    def translate_to_token_ids(
+        self, origin_indices: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        if self.__preloaded_features is None:
+            return origin_indices
+        return self.__preloaded_features.translate_indices(origin_indices)
+
+    def __len__(self) -> int:
+        if self.metadata_table is not None:
+            return len(self.metadata_table.dataset_row_indices(self.dataset_index))
+        import sqlite3
+
+        conn = sqlite3.connect(str(self.cell_meta_sqlite_path))
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM cell_meta").fetchone()
+        finally:
+            conn.close()
+        return int(row[0]) if row is not None else 0
+
+    @property
+    def total_genes(self) -> int:
+        if self.feature_registry_path is not None and self.feature_registry_path.exists():
+            from ..materializers.models import FeatureRegistryManifest
+
+            reg = FeatureRegistryManifest.from_yaml_file(self.feature_registry_path)
+            return len(reg.entries)
+        if self._feature_meta_paths and "features_origin" in self._feature_meta_paths:
+            import pyarrow.parquet as pq
+
+            return pq.read_table(self._feature_meta_paths["features_origin"]).num_rows
+        return 0
+
+    def read_row(self, row_index: int) -> dict[str, Any]:
+        return self.read_rows([row_index])[0]
+
+    def read_rows(self, row_indices: list[int]) -> list[dict[str, Any]]:
+        if not row_indices:
+            return []
+        positions = [self.global_row_offset + int(row_index) for row_index in row_indices]
+        table = self._dataset().take(positions)
+        rows = table.to_pylist()
+        result: list[dict[str, Any]] = []
+        for requested_row_index, row in zip(row_indices, rows):
+            parsed = {
+                "global_row_index": int(row["global_row_index"]),
+                "dataset_index": int(row["dataset_index"]),
+                "dataset_id": self.dataset_id,
+                "local_row_index": int(row["local_row_index"]),
+                "expressed_gene_indices": tuple(int(i) for i in row["expressed_gene_indices"]),
+                "expression_counts": tuple(int(c) for c in row["expression_counts"]),
+                "size_factor": float(row["size_factor"]),
+            }
+            if parsed["dataset_index"] != self.dataset_index:
+                raise ValueError(
+                    "Lance row dataset_index mismatch: "
+                    f"expected {self.dataset_index}, observed {parsed['dataset_index']}"
+                )
+            expected_global_row_index = self.global_row_offset + int(requested_row_index)
+            if parsed["global_row_index"] != expected_global_row_index:
+                raise ValueError(
+                    "Lance row global_row_index mismatch: "
+                    f"expected {expected_global_row_index}, observed {parsed['global_row_index']}"
+                )
+            result.append(parsed)
+        return result
+
+    def read_cell(self, cell_index: int) -> CellState:
+        import json
+        import sqlite3
+
+        heavy_row = self.read_row(cell_index)
+        global_row_index = heavy_row["global_row_index"]
+
+        if self.metadata_table is not None:
+            metadata = self.metadata_table.row(global_row_index)
+            return CellState(
+                identity=CellIdentity(
+                    global_row_index=global_row_index,
+                    dataset_index=int(metadata["dataset_index"]),
+                    dataset_id=str(metadata["dataset_id"]),
+                    local_row_index=int(metadata["local_row_index"]),
+                ),
+                cell_id=str(metadata["cell_id"]),
+                expressed_gene_indices=tuple(heavy_row["expressed_gene_indices"]),
+                expression_counts=tuple(heavy_row["expression_counts"]),
+                size_factor=float(metadata["size_factor"]),
+                canonical_perturbation=dict(metadata["canonical_perturbation"]),
+                canonical_context=dict(metadata["canonical_context"]),
+                raw_fields=dict(metadata["raw_fields"]),
+            )
+
+        conn = sqlite3.connect(str(self.cell_meta_sqlite_path))
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute("SELECT * FROM cell_meta WHERE rowid = ?", (cell_index + 1,))
+        metadata_row = cur.fetchone()
+        conn.close()
+        if metadata_row is None:
+            raise IndexError(f"cell_index {cell_index} out of range")
+
+        return CellState(
+            identity=CellIdentity(
+                global_row_index=global_row_index,
+                dataset_index=self.dataset_index,
+                dataset_id=str(metadata_row["dataset_id"]),
+                local_row_index=cell_index,
+            ),
+            cell_id=str(metadata_row["cell_id"]),
+            expressed_gene_indices=tuple(heavy_row["expressed_gene_indices"]),
+            expression_counts=tuple(heavy_row["expression_counts"]),
+            size_factor=float(metadata_row["size_factor"]),
+            canonical_perturbation=json.loads(metadata_row["canonical_perturbation"]),
+            canonical_context=json.loads(metadata_row["canonical_context"]),
+            raw_fields=json.loads(metadata_row["raw_obs"]),
+        )
 
 
 # ---------------------------------------------------------------------------

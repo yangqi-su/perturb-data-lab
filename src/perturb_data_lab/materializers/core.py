@@ -29,6 +29,7 @@ import scipy.sparse as sp
 from scipy.sparse import csr_matrix, issparse
 
 from .backends import materialize_arrow_hf, materialize_webdataset, materialize_zarr
+from .backends.lancedb_aggregated import mark_lance_append_committed
 from .models import (
     CellMetadataRecord,
     CorpusIndexDocument,
@@ -146,6 +147,10 @@ class MaterializationRoute:
         if self._corpus_index_path is not None:
             return self._corpus_index_path.parent
         return Path(self.output_roots.metadata_root)
+
+    @property
+    def _matrix_root(self) -> Path:
+        return Path(self.output_roots.matrix_root)
 
     def materialize(
         self,
@@ -908,12 +913,17 @@ class CreateNewRoute(MaterializationRoute):
         from .backends import build_backend_fn
 
         backend_fn = build_backend_fn(self.backend)
+        kwargs: dict[str, Any] = {
+            "canonical_perturbation": canonical_perturbation,
+            "canonical_context": canonical_context,
+            "raw_fields": raw_fields,
+            "dataset_id": self.dataset_id,
+        }
+        if self.backend == "lancedb-aggregated":
+            kwargs["corpus_index_path"] = self._corpus_index_path
         return backend_fn(
             adata, count_matrix, size_factors, self.release_id, matrix_root,
-            canonical_perturbation=canonical_perturbation,
-            canonical_context=canonical_context,
-            raw_fields=raw_fields,
-            dataset_id=self.dataset_id,
+            **kwargs,
         )
 
 
@@ -955,12 +965,17 @@ class AppendRoutedRoute(MaterializationRoute):
         from .backends import build_backend_fn
 
         backend_fn = build_backend_fn(self.backend)
+        kwargs: dict[str, Any] = {
+            "canonical_perturbation": canonical_perturbation,
+            "canonical_context": canonical_context,
+            "raw_fields": raw_fields,
+            "dataset_id": self.dataset_id,
+        }
+        if self.backend == "lancedb-aggregated":
+            kwargs["corpus_index_path"] = self._corpus_index_path
         return backend_fn(
             adata, count_matrix, size_factors, self.release_id, matrix_root,
-            canonical_perturbation=canonical_perturbation,
-            canonical_context=canonical_context,
-            raw_fields=raw_fields,
-            dataset_id=self.dataset_id,
+            **kwargs,
         )
 
 
@@ -998,7 +1013,7 @@ def build_materialization_route(
     }
     if route not in routes:
         raise ValueError(f"unknown route: {route}; expected one of {list(routes)}")
-    return routes[route](
+        return routes[route](
         output_roots=output_roots,
         release_id=release_id,
         dataset_id=dataset_id,
@@ -1135,4 +1150,6 @@ def update_corpus_index(
         datasets=tuple(datasets),
     )
     updated.write_yaml(corpus_index_path)
+    if backend == "lancedb-aggregated":
+        mark_lance_append_committed(corpus_index_path, new_record)
     return updated

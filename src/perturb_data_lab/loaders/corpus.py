@@ -531,37 +531,52 @@ class CorpusLoader:
             Used to determine whether Arrow/HF artifacts are inside or outside corpus_root.
         """
         if backend in {"arrow-hf", "lancedb-aggregated"}:
-            # Arrow/HF runtime artifacts (cells parquet, canonical SQLite, meta parquet)
-            # are written into matrix_root, not meta_root.  For relative manifest_path
-            # (stored relative to corpus_root), compute matrix_root from corpus_root.
-            # For absolute manifest_path (outside corpus_root), use manifest.outputs.matrix_root.
-            if manifest_path is not None and corpus_root is not None:
-                # Try to resolve relative to corpus_root first
-                try:
-                    manifest_rel = Path(manifest_path).relative_to(corpus_root)
-                    # manifest is inside corpus_root
-                    arrow_meta_root = corpus_root / Path(manifest_path).parent
-                    arrow_matrix_root = corpus_root / "matrix"
-                except ValueError:
-                    # manifest is outside corpus_root — use manifest.outputs.matrix_root
-                    arrow_meta_root = Path(manifest_path).parent
-                    arrow_matrix_root = Path(manifest.outputs.matrix_root)
-            else:
-                # Fallback: derive from meta_root (original behavior for backward compat)
+            if backend == "lancedb-aggregated":
                 arrow_meta_root = meta_root
-                arrow_matrix_root = meta_root.parent / "matrix"
+                if corpus_root is None:
+                    raise ValueError("lancedb-aggregated reader resolution requires corpus_root")
+                arrow_matrix_root = corpus_root / "matrix"
+                cells_artifact = arrow_matrix_root / "aggregated-corpus.lance"
+            else:
+                # Arrow/HF runtime artifacts (cells parquet, canonical SQLite, meta parquet)
+                # are written into matrix_root, not meta_root.  For relative manifest_path
+                # (stored relative to corpus_root), compute matrix_root from corpus_root.
+                # For absolute manifest_path (outside corpus_root), use manifest.outputs.matrix_root.
+                if manifest_path is not None and corpus_root is not None:
+                    # Try to resolve relative to corpus_root first
+                    try:
+                        manifest_rel = Path(manifest_path).relative_to(corpus_root)
+                        # manifest is inside corpus_root
+                        arrow_meta_root = corpus_root / Path(manifest_path).parent
+                        arrow_matrix_root = corpus_root / "matrix"
+                    except ValueError:
+                        # manifest is outside corpus_root — use manifest.outputs.matrix_root
+                        arrow_meta_root = Path(manifest_path).parent
+                        arrow_matrix_root = Path(manifest.outputs.matrix_root)
+                else:
+                    # Fallback: derive from meta_root (original behavior for backward compat)
+                    arrow_meta_root = meta_root
+                    arrow_matrix_root = meta_root.parent / "matrix"
+                cells_artifact = arrow_matrix_root / f"{manifest.release_id}-cells.parquet"
 
-            cell_meta_sqlite = arrow_matrix_root / f"{manifest.release_id}-cell-meta.sqlite"
-            cells_parquet = arrow_matrix_root / f"{manifest.release_id}-cells.parquet"
-            meta_parquet = arrow_matrix_root / f"{manifest.release_id}-meta.parquet"
+            cell_meta_sqlite = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-cell-meta.sqlite"
+            meta_parquet = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-meta.parquet"
             feature_meta_paths: dict[str, Path] | None = None
             if manifest.feature_meta_paths:
                 feature_meta_paths = {
-                    k: arrow_matrix_root / v
+                    k: Path(manifest.outputs.matrix_root) / v
                     for k, v in manifest.feature_meta_paths.items()
                 }
+            if backend == "lancedb-aggregated":
+                return {
+                    "lance_dataset_path": cells_artifact,
+                    "meta_parquet_path": meta_parquet,
+                    "cell_meta_sqlite_path": cell_meta_sqlite,
+                    "feature_registry_path": arrow_meta_root / "feature-registry.yaml",
+                    "feature_meta_paths": feature_meta_paths,
+                }
             return {
-                "cells_parquet_path": cells_parquet,
+                "cells_parquet_path": cells_artifact,
                 "meta_parquet_path": meta_parquet,
                 "cell_meta_sqlite_path": cell_meta_sqlite,
                 "feature_registry_path": arrow_meta_root / "feature-registry.yaml",  # legacy fallback
@@ -622,6 +637,7 @@ class CorpusLoader:
                     CorpusLoader._metadata_rows_from_arrow_sqlite(
                         manifest=manifest,
                         meta_root=meta_root,
+                        backend=corpus_backend,
                         corpus_root=corpus_root,
                         manifest_path=ds_record.manifest_path,
                         ds_record=ds_record,
@@ -656,6 +672,7 @@ class CorpusLoader:
     def _metadata_rows_from_arrow_sqlite(
         manifest: "MaterializationManifest",
         meta_root: Path,
+        backend: str,
         corpus_root: Path,
         manifest_path: str,
         ds_record: DatasetJoinRecord,
@@ -665,7 +682,7 @@ class CorpusLoader:
         reader_kwargs = CorpusLoader._reader_kwargs(
             manifest,
             meta_root,
-            "arrow-hf",
+            backend,
             corpus_root,
             manifest_path,
         )
@@ -892,7 +909,7 @@ class CorpusLoader:
             if manifest.feature_meta_paths and "features_origin" in manifest.feature_meta_paths:
                 import pyarrow.parquet as pq
 
-                if corpus_backend in {"arrow-hf", "lancedb-aggregated"}:
+                if corpus_backend == "arrow-hf":
                     # Resolve from matrix_root (same convention as _reader_kwargs)
                     if manifest_path is not None and corpus_root is not None:
                         try:
@@ -903,6 +920,8 @@ class CorpusLoader:
                     else:
                         arrow_matrix_root = meta_root.parent / "matrix"
                     origin_path = arrow_matrix_root / manifest.feature_meta_paths["features_origin"]
+                elif corpus_backend == "lancedb-aggregated":
+                    origin_path = Path(manifest.outputs.matrix_root) / manifest.feature_meta_paths["features_origin"]
                 else:
                     origin_path = meta_root / manifest.feature_meta_paths["features_origin"]
 

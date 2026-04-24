@@ -34,6 +34,8 @@ from perturb_data_lab.loaders import (
     build_cell_reader,
 )
 
+from perturb_data_lab.loaders.loaders import LanceDBAggregatedCellReader
+
 
 class TestCellState:
     def test_cell_state_fields(self):
@@ -543,6 +545,84 @@ class TestArrowHFCellReader:
         assert len(cells) == 3
         assert all(isinstance(c, CellState) for c in cells)
         assert [c.global_row_index for c in cells] == [0, 1, 2]
+
+
+class TestLanceDBAggregatedCellReader:
+    def test_read_rows_and_cells_from_true_lance(self, tmp_path: Path):
+        lance = pytest.importorskip("lance")
+        _ = pytest.importorskip("lancedb")
+
+        dataset_uri = tmp_path / "matrix" / "aggregated-corpus.lance"
+        dataset_uri.parent.mkdir(parents=True, exist_ok=True)
+        table = pa.table(
+            {
+                "global_row_index": pa.array([0, 1, 2], type=pa.int64()),
+                "dataset_index": pa.array([0, 0, 0], type=pa.int32()),
+                "local_row_index": pa.array([0, 1, 2], type=pa.int64()),
+                "expressed_gene_indices": pa.array([[1, 3], [2], [0, 4]], type=pa.list_(pa.int32())),
+                "expression_counts": pa.array([[7, 2], [5], [9, 1]], type=pa.list_(pa.int32())),
+                "size_factor": pa.array([1.0, 1.5, 2.0], type=pa.float64()),
+            }
+        )
+        lance.write_dataset(table, dataset_uri, mode="create")
+
+        meta_path = tmp_path / "dataset-release-meta.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "cell_id": pa.array(["c0", "c1", "c2"], type=pa.string()),
+                    "size_factor": pa.array([1.0, 1.5, 2.0], type=pa.float64()),
+                    "raw_obs": pa.array(["", "", ""], type=pa.string()),
+                }
+            ),
+            meta_path,
+        )
+
+        import sqlite3
+        import json
+
+        sqlite_path = tmp_path / "dataset-release-cell-meta.sqlite"
+        conn = sqlite3.connect(str(sqlite_path))
+        conn.execute(
+            "CREATE TABLE cell_meta "
+            "(cell_id TEXT, dataset_id TEXT, dataset_release TEXT, size_factor REAL, "
+            "canonical_perturbation TEXT, canonical_context TEXT, raw_obs TEXT)"
+        )
+        for idx in range(3):
+            conn.execute(
+                "INSERT INTO cell_meta VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"c{idx}",
+                    "ds0",
+                    "dataset-release",
+                    [1.0, 1.5, 2.0][idx],
+                    json.dumps({"perturbation_label": f"p{idx}"}),
+                    json.dumps({"cell_context": "ctx"}),
+                    json.dumps({"raw_field": f"r{idx}"}),
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+        reader = LanceDBAggregatedCellReader(
+            dataset_id="ds0",
+            dataset_index=0,
+            corpus_index_path=tmp_path / "corpus-index.yaml",
+            lance_dataset_path=dataset_uri,
+            meta_parquet_path=meta_path,
+            cell_meta_sqlite_path=sqlite_path,
+            global_row_offset=0,
+        )
+
+        rows = reader.read_rows([2, 0])
+        assert [row["global_row_index"] for row in rows] == [2, 0]
+        assert [row["dataset_index"] for row in rows] == [0, 0]
+        assert rows[0]["local_row_index"] == 2
+
+        cells = reader.read_cells([1, 2])
+        assert [cell.global_row_index for cell in cells] == [1, 2]
+        assert [cell.dataset_index for cell in cells] == [0, 0]
+        assert cells[0].canonical_perturbation["perturbation_label"] == "p1"
 
 
 class TestPerturbDataLoader:

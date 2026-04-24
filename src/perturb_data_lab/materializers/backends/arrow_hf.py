@@ -46,6 +46,74 @@ def _get_row_nonzero(count_matrix: Any, i: int) -> tuple[np.ndarray, np.ndarray]
         return indices, counts
 
 
+def write_arrow_hf_metadata_artifacts(
+    adata: ad.AnnData,
+    size_factors: np.ndarray,
+    release_id: str,
+    matrix_root: Path,
+    canonical_perturbation: tuple[dict[str, str], ...] | None = None,
+    canonical_context: tuple[dict[str, str], ...] | None = None,
+    raw_fields: tuple[dict[str, Any], ...] | None = None,
+    dataset_id: str = "",
+) -> dict[str, Path]:
+    """Write Arrow/HF-compatible metadata sidecars without a heavy parquet payload."""
+    matrix_root.mkdir(parents=True, exist_ok=True)
+    meta_path = matrix_root / f"{release_id}-meta.parquet"
+    cell_meta_sqlite_path = matrix_root / f"{release_id}-cell-meta.sqlite"
+
+    n_obs = adata.n_obs
+    cell_ids = [str(adata.obs.index[i]) for i in range(n_obs)]
+    sf_vals = [float(size_factors[i]) for i in range(n_obs)]
+    meta_table = pa.table(
+        {
+            "cell_id": pa.array(cell_ids, type=pa.string()),
+            "size_factor": pa.array(sf_vals, type=pa.float64()),
+            "raw_obs": pa.array([""] * n_obs, type=pa.string()),
+        }
+    )
+    pq.write_table(meta_table, meta_path)
+
+    import sqlite3
+
+    pert_tuple = canonical_perturbation or tuple([{}] * n_obs)
+    ctx_tuple = canonical_context or tuple([{}] * n_obs)
+    raw_tuple = raw_fields or tuple([{}] * n_obs)
+
+    conn = sqlite3.connect(str(cell_meta_sqlite_path))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cell_meta "
+        "(cell_id TEXT, dataset_id TEXT, dataset_release TEXT, "
+        "size_factor REAL, canonical_perturbation TEXT, canonical_context TEXT, raw_obs TEXT)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cell_id ON cell_meta(cell_id)")
+
+    batch_size_sqlite = 256
+    for start in range(0, n_obs, batch_size_sqlite):
+        end = min(start + batch_size_sqlite, n_obs)
+        sql_batch = []
+        for i in range(start, end):
+            sql_batch.append((
+                str(adata.obs.index[i]),
+                dataset_id,
+                release_id,
+                float(size_factors[i]),
+                json.dumps(dict(pert_tuple[i])),
+                json.dumps(dict(ctx_tuple[i])),
+                json.dumps(dict(raw_tuple[i])),
+            ))
+        conn.executemany(
+            "INSERT INTO cell_meta VALUES (?, ?, ?, ?, ?, ?, ?)",
+            sql_batch,
+        )
+    conn.commit()
+    conn.close()
+
+    return {
+        "metadata": meta_path,
+        "cell_meta_sqlite": cell_meta_sqlite_path,
+    }
+
+
 def write_arrow_hf_sparse(
     adata: ad.AnnData,
     count_matrix: Any,
@@ -75,9 +143,6 @@ def write_arrow_hf_sparse(
     """
     matrix_root.mkdir(parents=True, exist_ok=True)
     cell_path = matrix_root / f"{release_id}-cells.parquet"
-    meta_path = matrix_root / f"{release_id}-meta.parquet"
-    cell_meta_sqlite_path = matrix_root / f"{release_id}-cell-meta.sqlite"
-
     n_obs = adata.n_obs
     batch_size = 256
 
@@ -108,58 +173,20 @@ def write_arrow_hf_sparse(
     full_cells = pa.concat_tables(cell_chunks)
     pq.write_table(full_cells, cell_path)
 
-    # Write metadata (canonical + raw obs)
-    # Use index-based access for backed AnnData, not iloc
-    cell_ids = [str(adata.obs.index[i]) for i in range(n_obs)]
-    sf_vals = [float(size_factors[i]) for i in range(n_obs)]
-    meta_table = pa.table(
-        {
-            "cell_id": pa.array(cell_ids, type=pa.string()),
-            "size_factor": pa.array(sf_vals, type=pa.float64()),
-            "raw_obs": pa.array([""] * n_obs, type=pa.string()),
-        }
+    metadata_paths = write_arrow_hf_metadata_artifacts(
+        adata=adata,
+        size_factors=size_factors,
+        release_id=release_id,
+        matrix_root=matrix_root,
+        canonical_perturbation=canonical_perturbation,
+        canonical_context=canonical_context,
+        raw_fields=raw_fields,
+        dataset_id=dataset_id,
     )
-    pq.write_table(meta_table, meta_path)
-
-    # Write canonical cell metadata SQLite (ArrowHFCellReader reads this)
-    import sqlite3
-
-    pert_tuple = canonical_perturbation or tuple([{}] * n_obs)
-    ctx_tuple = canonical_context or tuple([{}] * n_obs)
-    raw_tuple = raw_fields or tuple([{}] * n_obs)
-
-    conn = sqlite3.connect(str(cell_meta_sqlite_path))
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS cell_meta "
-        "(cell_id TEXT, dataset_id TEXT, dataset_release TEXT, "
-        "canonical_perturbation TEXT, canonical_context TEXT, raw_obs TEXT)"
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_cell_id ON cell_meta(cell_id)")
-
-    batch_size_sqlite = 256
-    for start in range(0, n_obs, batch_size_sqlite):
-        end = min(start + batch_size_sqlite, n_obs)
-        sql_batch = []
-        for i in range(start, end):
-            sql_batch.append((
-                str(adata.obs.index[i]),
-                dataset_id,
-                release_id,
-                json.dumps(dict(pert_tuple[i])),
-                json.dumps(dict(ctx_tuple[i])),
-                json.dumps(dict(raw_tuple[i])),
-            ))
-        conn.executemany(
-            "INSERT INTO cell_meta VALUES (?, ?, ?, ?, ?, ?)",
-            sql_batch,
-        )
-    conn.commit()
-    conn.close()
 
     return {
         "cells": cell_path,
-        "metadata": meta_path,
-        "cell_meta_sqlite": cell_meta_sqlite_path,
+        **metadata_paths,
     }
 
 

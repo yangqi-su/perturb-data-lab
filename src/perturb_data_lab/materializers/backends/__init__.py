@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from .arrow_hf import write_arrow_hf_sparse
+from .lancedb_aggregated import write_lancedb_aggregated
 from .webdataset import write_webdataset_shards
 from .zarr_ts import write_zarr_sparse_cell_chunks
 from ..models import OutputRoots
@@ -23,16 +24,10 @@ def materialize_lancedb_aggregated(
     canonical_context: tuple[dict[str, str], ...] | None = None,
     raw_fields: tuple[dict[str, Any], ...] | None = None,
     dataset_id: str = "",
+    corpus_index_path: Path | None = None,
 ) -> dict[str, Path]:
-    """Phase 5 bounded alias while true Lance materialization is pending.
-
-    The Phase 2 contract locks `lancedb-aggregated` as a distinct backend name,
-    but the heavy-row semantics needed for Phase 5 smoke are currently the same
-    mixed-dataset sparse-row contract already exercised through Arrow/HF.
-    Reuse the Arrow/HF writer as the temporary aggregated smoke adapter so the
-    backend can be registered and validated without broadening scope beyond Phase 5.
-    """
-    return write_arrow_hf_sparse(
+    """Write into the true corpus-scoped Lance aggregated store."""
+    return write_lancedb_aggregated(
         adata,
         count_matrix,
         size_factors,
@@ -42,6 +37,7 @@ def materialize_lancedb_aggregated(
         canonical_context=canonical_context,
         raw_fields=raw_fields,
         dataset_id=dataset_id,
+        corpus_index_path=corpus_index_path,
     )
 
 

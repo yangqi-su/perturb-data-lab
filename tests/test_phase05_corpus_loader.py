@@ -186,6 +186,25 @@ def _make_materialization_manifest(
     return manifest_path
 
 
+def _make_lance_append_sidecar(corpus_root: Path):
+    sidecar_path = corpus_root / "matrix" / "aggregated-corpus-append-log.json"
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "backend": "lancedb-aggregated",
+                "table_name": "aggregated-corpus",
+                "dataset_uri": str(corpus_root / "matrix" / "aggregated-corpus.lance"),
+                "db_root": str(corpus_root / "matrix"),
+                "entries": [],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return sidecar_path
+
+
 def _write_tokenizer_and_global_metadata(corpus_root: Path, tok: CorpusTokenizer, corpus_id: str):
     """Write tokenizer.json and global-metadata.yaml to corpus root."""
     import shutil
@@ -560,6 +579,80 @@ class TestCorpusLoaderTwoDatasets:
         assert dataset_batches[0] == [0, 1]
         assert context_batches
         assert sum(len(batch) for batch in corpus_batches) == 4
+
+    def test_lancedb_aggregated_routes_to_shared_corpus_store(self, temp_corpus_root, synthetic_tokenizer):
+        lance = pytest.importorskip("lance")
+        _ = pytest.importorskip("lancedb")
+
+        corpus_root, matrix_root, metadata_root = temp_corpus_root
+        tok, tok_path = synthetic_tokenizer
+        import shutil
+
+        shutil.copy(tok_path, corpus_root / "tokenizer.json")
+        shared_lance_path = corpus_root / "matrix" / "aggregated-corpus.lance"
+        shared_lance_path.parent.mkdir(parents=True, exist_ok=True)
+        _make_lance_append_sidecar(corpus_root)
+
+        lance.write_dataset(
+            pa.table(
+                {
+                    "global_row_index": pa.array([0, 1, 2, 3], type=pa.int64()),
+                    "dataset_index": pa.array([0, 0, 1, 1], type=pa.int32()),
+                    "local_row_index": pa.array([0, 1, 0, 1], type=pa.int64()),
+                    "expressed_gene_indices": pa.array([[0, 1], [2], [1], [0, 2]], type=pa.list_(pa.int32())),
+                    "expression_counts": pa.array([[5, 3], [7], [4], [6, 1]], type=pa.list_(pa.int32())),
+                    "size_factor": pa.array([1.0, 1.1, 1.2, 1.3], type=pa.float64()),
+                }
+            ),
+            shared_lance_path,
+            mode="create",
+        )
+
+        from perturb_data_lab.materializers.models import DatasetJoinRecord, GlobalMetadataDocument
+
+        for ds_idx, dataset_id in enumerate(["ds0", "ds1"]):
+            release_id = f"rel{ds_idx}"
+            mroot = corpus_root / f"metadata_{ds_idx}"
+            mmroot = corpus_root / f"matrix_{ds_idx}"
+            mroot.mkdir()
+            mmroot.mkdir()
+            _make_meta_parquet(mmroot, 2, release_id)
+            _make_cell_meta_sqlite(mmroot, 2, release_id)
+            feat_paths = _make_feature_parquet(mroot, mmroot, release_id, 3, tok)
+            _make_materialization_manifest(
+                mroot,
+                mmroot,
+                release_id,
+                dataset_id,
+                None,
+                feat_paths,
+                backend="lancedb-aggregated",
+            )
+
+        _write_corpus_index(corpus_root, "test-corpus", [
+            DatasetJoinRecord(dataset_id="ds0", release_id="rel0", join_mode="create_new", manifest_path="metadata_0/materialization-manifest.yaml"),
+            DatasetJoinRecord(dataset_id="ds1", release_id="rel1", join_mode="append_routed", manifest_path="metadata_1/materialization-manifest.yaml"),
+        ], cell_counts=[2, 2])
+        gmeta = GlobalMetadataDocument(
+            kind="global-metadata",
+            contract_version="0.2.0",
+            schema_version="0.1.0",
+            feature_registry_id="",
+            missing_value_literal="<missing>",
+            raw_field_policy="preserve-unchanged",
+            backend="lancedb-aggregated",
+            tokenizer_path="tokenizer.json",
+        )
+        gmeta.write_yaml(corpus_root / "global-metadata.yaml")
+
+        loader = CorpusLoader.from_corpus_index(corpus_root / "corpus-index.yaml")
+        assert loader.dataset_reader("ds0").reader.lance_dataset_path == shared_lance_path
+        assert loader.dataset_reader("ds1").reader.lance_dataset_path == shared_lance_path
+
+        cells = loader.read_cells([3, 0, 2])
+        assert [cell.global_row_index for cell in cells] == [3, 0, 2]
+        assert [cell.dataset_index for cell in cells] == [1, 0, 1]
+        assert [cell.local_row_index for cell in cells] == [1, 0, 0]
 
 
 # ---------------------------------------------------------------------------
