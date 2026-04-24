@@ -84,13 +84,15 @@ class OutputRoots:
 @dataclass(frozen=True)
 class ProvenanceSpec:
     source_path: str
-    schema: str  # single unified schema artifact path
+    review_bundle: str  # Stage 1 dataset-summary.yaml path (the gating artifact)
+    accepted_schema_copy: str | None = None  # optional audit copy, NOT read back
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ProvenanceSpec":
         return cls(
             source_path=str(data["source_path"]),
-            schema=str(data["schema"]),
+            review_bundle=str(data.get("review_bundle", "")),
+            accepted_schema_copy=data.get("accepted_schema_copy"),
         )
 
 
@@ -210,14 +212,15 @@ class MaterializationManifest(YamlDocument):
     dataset_id: str
     release_id: str
     route: str  # create_new | append_routed
-    backend: str  # arrow-hf | webdataset | zarr-ts | lancedb-aggregated | zarr-aggregated
+    backend: str  # arrow-hf | webdataset | zarr | lance (legacy names normalized on read)
+    topology: str  # federated | aggregate (Stage 2 contract: backend and topology are separate)
     count_source: CountSourceSpec
     outputs: OutputRoots
     provenance: ProvenanceSpec
     # New Phase 3 dataset-local artifact paths (tokenizer removed)
-    raw_cell_meta_path: str | None = None  # SQLite: raw cell metadata (no canonical mapping)
+    raw_cell_meta_path: str | None = None  # Parquet: raw cell metadata (no canonical mapping); SQLite deprecated
     raw_feature_meta_path: str | None = None  # Parquet: raw feature metadata (no canonical mapping)
-    accepted_schema_path: str | None = None  # copy of accepted schema used for this materialization
+    accepted_schema_path: str | None = None  # optional audit copy of accepted schema; NOT read back
     metadata_summary_path: str | None = None  # per-dataset metadata summary (field coverage, null fractions)
     provenance_spec_path: str | None = None  # feature-order/provenance artifact
     # Existing paths
@@ -227,6 +230,7 @@ class MaterializationManifest(YamlDocument):
     hvg_sidecar_path: str | None = None
     integer_verified: bool = False
     cell_count: int = 0  # number of cells materialized (set by materialize() for corpus index use)
+    feature_count: int = 0  # number of features in dataset-local feature space
     notes: tuple[str, ...] = ()
 
     def validate(self) -> None:
@@ -239,21 +243,46 @@ class MaterializationManifest(YamlDocument):
         if self.backend not in {
             "arrow-hf",
             "webdataset",
-            "zarr-ts",
-            "lancedb-aggregated",
-            "zarr-aggregated",
+            "zarr",
+            "lance",
         }:
             raise ValueError(f"invalid backend: {self.backend}")
+        if self.topology not in {"federated", "aggregate"}:
+            raise ValueError(f"invalid topology: {self.topology}")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "MaterializationManifest":
+        backend_raw = data.get("backend", "arrow-hf")
+        # Normalize legacy backend names to the contract's clean names
+        _LEGACY_BACKEND_MAP = {
+            "zarr-ts": "zarr",
+            "lancedb-aggregated": "lance",
+            "zarr-aggregated": "zarr",
+        }
+        backend_normalized = _LEGACY_BACKEND_MAP.get(backend_raw, backend_raw)
+        # Normalize legacy route names to contract names
+        route_raw = data.get("route", "create_new")
+        if route_raw == "create_new":
+            route_normalized = "create_new"
+        elif route_raw in ("append_routed", "append"):
+            route_normalized = "append_routed"
+        else:
+            route_normalized = route_raw
+        # Normalize topology: legacy routes had topology baked in
+        # "lancedb-aggregated" implies topology="aggregate"; others are federated
+        topo_raw = data.get("topology")
+        if topo_raw is None:
+            topo_normalized = "aggregate" if backend_normalized == "lance" else "federated"
+        else:
+            topo_normalized = str(topo_raw)
         document = cls(
             kind=str(data["kind"]),
             contract_version=str(data["contract_version"]),
             dataset_id=str(data["dataset_id"]),
             release_id=str(data["release_id"]),
-            route=str(data["route"]),
-            backend=str(data.get("backend", "arrow-hf")),
+            route=route_normalized,
+            backend=backend_normalized,
+            topology=topo_normalized,
             count_source=CountSourceSpec.from_dict(data["count_source"]),
             outputs=OutputRoots.from_dict(data["outputs"]),
             provenance=ProvenanceSpec.from_dict(data["provenance"]),
@@ -270,6 +299,7 @@ class MaterializationManifest(YamlDocument):
             hvg_sidecar_path=data.get("hvg_sidecar_path"),
             integer_verified=bool(data.get("integer_verified", False)),
             cell_count=int(data.get("cell_count", 0)),
+            feature_count=int(data.get("feature_count", 0)),
             notes=tuple(str(item) for item in data.get("notes", [])),
         )
         document.validate()
@@ -615,7 +645,8 @@ class GlobalMetadataDocument(YamlDocument):
     feature_registry_id: str  # deprecated: replaced by tokenizer_path in contract 0.2.0
     missing_value_literal: str
     raw_field_policy: str
-    backend: str | None = None  # arrow-hf | webdataset | zarr-ts | lancedb-aggregated | zarr-aggregated
+    backend: str | None = None  # arrow-hf | webdataset | zarr | lance (legacy names normalized on read)
+    topology: str | None = None  # federated | aggregate (Stage 2 contract: separate from backend)
     tokenizer_path: str | None = None  # relative path from corpus root to tokenizer.json
     emission_spec_path: str | None = None  # relative path from corpus root to corpus-emission-spec.yaml
     notes: tuple[str, ...] = ()
@@ -624,11 +655,12 @@ class GlobalMetadataDocument(YamlDocument):
         if self.backend is not None and self.backend not in {
             "arrow-hf",
             "webdataset",
-            "zarr-ts",
-            "lancedb-aggregated",
-            "zarr-aggregated",
+            "zarr",
+            "lance",
         }:
             raise ValueError(f"invalid backend in global-metadata: {self.backend}")
+        if self.topology is not None and self.topology not in {"federated", "aggregate"}:
+            raise ValueError(f"invalid topology in global-metadata: {self.topology}")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "GlobalMetadataDocument":

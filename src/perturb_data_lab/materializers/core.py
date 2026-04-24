@@ -1,12 +1,13 @@
-"""Phase 3 canonical materializer (expression-first, tokenizer-free).
+"""Stage 2 materializer — schema-independent, Stage-1-gated, count-first.
 
-This module implements the canonical materialization layer:
-- sparse per-cell storage contract
-- two join/mutation modes: create_new, append_routed
-- per-dataset manifest and artifact persistence
+Phase 3 canonical materializer (expression-first, tokenizer-free) is preserved
+as the legacy schema-first path. Stage 2 adds:
 
-Tokenization is removed from the materialization flow. The corpus feature
-set is maintained separately via a pickle-backed set (written by canonicalize-meta).
+- ``Stage2Materializer``: schema-independent materialization entry that accepts
+  a Stage 1 ``dataset-summary.yaml`` as the only gating artifact (no schema.yaml)
+- Count-first path driven by the Stage 1 approved count source decision
+- Parquet raw metadata sidecars (SQLite deprecated for new artifacts)
+- Backend/topology separation in all interfaces
 
 All materialization writes go to repo-local real directories only.
 Never write to protected symlink roots (data/, pertTF/, perturb/).
@@ -51,11 +52,639 @@ from .models import (
 from .schema_execution import resolve_all_cell_rows, resolve_all_feature_rows
 from .validation import validate_schema_readiness
 from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
-from ..inspectors.models import SchemaDocument
+from ..inspectors.models import DatasetSummaryDocument, SchemaDocument
 
 
 # ---------------------------------------------------------------------------
-# Canonical sparse per-cell record contract
+# Stage 2 Materializer — schema-independent, Stage-1-gated, count-first
+# ---------------------------------------------------------------------------
+
+
+class Stage2Materializer:
+    """Schema-independent materialization entry point for Stage 2.
+
+    This class replaces the schema-first ``MaterializationRoute.materialize()``
+    entry point with a Stage-1-gated, count-first path.
+
+    Inputs
+    ------
+    source_path : str
+        Absolute path to the source h5ad file.
+    review_bundle_path : str
+        Path to the Stage 1 ``dataset-summary.yaml`` that gates this materialization.
+        This is the only required gating artifact; no ``schema.yaml`` is accepted.
+    output_roots : OutputRoots
+        ``metadata_root`` and ``matrix_root`` for this dataset's outputs.
+    release_id : str
+        Immutable release identifier for this dataset version.
+    dataset_id : str
+        Stable dataset identifier.
+    backend : str
+        Storage backend: ``arrow-hf`` (default), ``webdataset``, ``zarr``.
+    topology : str
+        Corpus topology: ``federated`` (default) or ``aggregate``.
+    rerun_stage1 : bool, default False
+        If True, reruns Stage 1 inspection before materialization as a preflight
+        step. The resulting ``dataset-summary.yaml`` replaces ``review_bundle_path``
+        as the gating artifact.
+    n_hvg : int, default 2000
+        Number of top-dispersion genes to select as HVGs.
+
+    Contract
+    --------
+    This materializer does NOT accept ``schema_path``. Canonical metadata mapping
+    is deferred to a later stage. The count path is driven exclusively by the
+    Stage 1 ``count_source_decision`` in the review bundle. Integer verification
+    occurs after any approved recovery step. Raw ``obs`` and ``var`` are preserved
+    in Parquet sidecars. SQLite is not produced for new artifacts.
+
+    Backend-Topology Separation
+    ---------------------------
+    ``backend`` names the storage format only. ``topology`` names the corpus
+    organization only. The combination determines the supported subset per
+    STAGE2_CONTRACT.md Section 10. The minimum supported combination is
+    ``arrow-hf`` × ``federated``.
+    """
+
+    def __init__(
+        self,
+        source_path: str,
+        review_bundle_path: str,
+        output_roots: OutputRoots,
+        release_id: str,
+        dataset_id: str,
+        backend: str = "arrow-hf",
+        topology: str = "federated",
+        rerun_stage1: bool = False,
+        n_hvg: int = 2000,
+    ):
+        self.source_path = source_path
+        self.review_bundle_path = review_bundle_path
+        self.output_roots = output_roots
+        self.release_id = release_id
+        self.dataset_id = dataset_id
+        self.backend = backend
+        self.topology = topology
+        self.rerun_stage1 = rerun_stage1
+        self.n_hvg = n_hvg
+
+    def materialize(self) -> MaterializationManifest:
+        """Run Stage 2 materialization gated by Stage 1 review bundle."""
+        # --- Stage 1 gate: resolve review bundle path ---
+        if self.rerun_stage1:
+            summary_path = self._rerun_stage1_preflight()
+        else:
+            summary_path = Path(self.review_bundle_path)
+            if not summary_path.exists():
+                raise FileNotFoundError(
+                    f"review bundle not found: {summary_path}; "
+                    "pass rerun_stage1=True to run Stage 1 as preflight"
+                )
+
+        # --- Load and validate Stage 1 summary ---
+        summary = DatasetSummaryDocument.from_yaml_file(summary_path)
+
+        if summary.materialization_readiness != "pass":
+            raise ValueError(
+                f"materialization_readiness is '{summary.materialization_readiness}' "
+                f"(expected 'pass') for dataset {self.dataset_id}; "
+                f"gate review bundle: {summary_path}"
+            )
+
+        # --- Extract approved count-source decision ---
+        decision = summary.count_source_decision
+        # Map Stage 1 field names to CountSourceSpec fields
+        count_source = CountSourceSpec(
+            selected=decision.selected_candidate,
+            integer_only=(decision.status == "pass"),
+            uses_recovery=decision.uses_recovery,
+        )
+
+        # --- Load source h5ad ---
+        source_h5ad = Path(self.source_path)
+        if not source_h5ad.exists():
+            raise FileNotFoundError(f"source h5ad not found: {source_h5ad}")
+        adata = ad.read_h5ad(str(source_h5ad), backed="r")
+        try:
+            n_obs = adata.n_obs
+
+            # Determine var space for the selected count source
+            if count_source.selected == ".raw.X":
+                n_vars = int(adata.raw.shape[1])
+                var_ref = adata.raw.var
+                var_index = adata.raw.var.index
+            else:
+                n_vars = adata.n_vars
+                var_ref = adata.var
+                var_index = adata.var.index
+
+            # --- Select count matrix ---
+            if count_source.selected == ".raw.X":
+                count_matrix = adata.raw.X
+            elif count_source.selected.startswith(".layers["):
+                layer_name = count_source.selected[len(".layers[") : -1]
+                count_matrix = adata.layers[layer_name]
+            else:
+                count_matrix = adata.X
+
+            # --- Apply approved recovery ---
+            if count_source.uses_recovery:
+                count_matrix = self._apply_reverse_normalization(
+                    count_matrix, adata, count_source.selected, n_obs
+                )
+
+            # --- Integer verification (post-recovery) ---
+            self._verify_integer(count_matrix, source_h5ad.name)
+
+            # --- Ensure output directories exist ---
+            meta_root = Path(self.output_roots.metadata_root)
+            matrix_root = Path(self.output_roots.matrix_root)
+            meta_root.mkdir(parents=True, exist_ok=True)
+            matrix_root.mkdir(parents=True, exist_ok=True)
+
+            # --- Write raw cell metadata (Parquet, not SQLite) ---
+            raw_cell_meta_parquet_path = self._write_raw_cell_metadata_parquet(
+                adata=adata,
+                meta_root=meta_root,
+            )
+
+            # --- Write raw feature metadata (Parquet) ---
+            var_mem = var_ref.to_memory() if hasattr(var_ref, "to_memory") else var_ref
+            raw_feature_meta_parquet_path = self._write_raw_feature_metadata_parquet(
+                var_mem=var_mem,
+                meta_root=meta_root,
+            )
+
+            # --- Write per-dataset metadata summary ---
+            metadata_summary_path = self._write_metadata_summary(
+                adata=adata,
+                var_mem=var_mem,
+                meta_root=meta_root,
+            )
+
+            # --- Compute and write size factors ---
+            size_factors = self._compute_size_factors(count_matrix, n_obs)
+            size_factor_manifest_path = self._write_size_factor_manifest(
+                adata=adata,
+                size_factors=size_factors,
+                meta_root=meta_root,
+            )
+
+            # --- Write feature provenance Parquet ---
+            provenance_spec_path = self._write_feature_provenance_parquet(
+                var_index=var_index,
+                n_vars=n_vars,
+                meta_root=meta_root,
+                count_source_selected=count_source.selected,
+                source_path=str(source_h5ad),
+            )
+
+            # --- Write backend-specific sparse cell data ---
+            backend_paths = self._write_cells(
+                count_matrix=count_matrix,
+                adata=adata,
+                size_factors=size_factors,
+                matrix_root=matrix_root,
+            )
+
+            # --- Compute and write HVG arrays ---
+            hvg_sidecar_path = self._compute_and_write_hvg_arrays(
+                count_matrix=count_matrix,
+                n_vars=n_vars,
+                meta_root=meta_root,
+                n_hvg=self.n_hvg,
+            )
+
+            # --- Run QA checks ---
+            qa_metrics, all_passed = self._run_qa_checks(backend_paths, count_matrix)
+            qa_manifest = QAManifest(
+                kind="qa-manifest",
+                contract_version=CONTRACT_VERSION,
+                release_id=self.release_id,
+                metrics=qa_metrics,
+                all_passed=all_passed,
+            )
+            qa_path = meta_root / "qa-manifest.yaml"
+            qa_manifest.write_yaml(qa_path)
+
+            # --- Build final manifest ---
+            manifest = MaterializationManifest(
+                kind="materialization-manifest",
+                contract_version=CONTRACT_VERSION,
+                dataset_id=self.dataset_id,
+                release_id=self.release_id,
+                route="create_new",
+                backend=self.backend,
+                topology=self.topology,
+                count_source=count_source,
+                outputs=self.output_roots,
+                provenance=ProvenanceSpec(
+                    source_path=str(source_h5ad),
+                    review_bundle=str(summary_path),
+                ),
+                raw_cell_meta_path=str(raw_cell_meta_parquet_path),
+                raw_feature_meta_path=str(raw_feature_meta_parquet_path),
+                metadata_summary_path=str(metadata_summary_path),
+                provenance_spec_path=str(provenance_spec_path),
+                size_factor_manifest_path=str(size_factor_manifest_path),
+                qa_manifest_path=str(qa_path),
+                hvg_sidecar_path=str(hvg_sidecar_path),
+                integer_verified=all_passed,
+                cell_count=n_obs,
+                feature_count=n_vars,
+                notes=(
+                    f"materialized via Stage2Materializer (schema-independent, count-first)",
+                    f"topology={self.topology}",
+                ),
+            )
+            manifest.validate()
+
+            manifest_path = meta_root / "materialization-manifest.yaml"
+            manifest.write_yaml(manifest_path)
+
+            return manifest
+
+        finally:
+            if getattr(adata, "file", None) is not None:
+                adata.file.close()
+
+    def _rerun_stage1_preflight(self) -> Path:
+        """Re-run Stage 1 inspection as preflight and return the summary path."""
+        from ..inspectors.workflow import inspect_target, InspectionTarget
+        from ..inspectors.models import InspectionBatchConfig
+
+        # Stage 1 writes to the same parent directory as the review bundle's dataset folder
+        review_bundle = Path(self.review_bundle_path)
+        output_root = review_bundle.parent.parent  # go up to dataset dir, then to run dir
+        dataset_id = review_bundle.parent.name  # dataset dir name
+
+        # Construct a temporary InspectionTarget for the rerun
+        source_h5ad = Path(self.source_path)
+        source_release = self.release_id
+
+        target = InspectionTarget(
+            dataset_id=dataset_id,
+            source_path=str(source_h5ad),
+            source_release=source_release,
+        )
+
+        # Run inspection; it writes dataset-summary.yaml into output_root/dataset_id/
+        artifacts = inspect_target(target, Path(output_root))
+
+        # Return the path to the newly written summary
+        return artifacts.review_bundle
+
+    def _select_count_matrix(self, adata: ad.AnnData, selected: str) -> Any:
+        """Select the count matrix from the AnnData based on the approved candidate."""
+        if selected == ".raw.X":
+            return adata.raw.X
+        elif selected.startswith(".layers["):
+            layer_name = selected[len(".layers[") : -1]
+            if layer_name not in adata.layers:
+                raise KeyError(
+                    f"layer '{layer_name}' not found in adata.layers; "
+                    f"available layers: {list(adata.layers.keys())}"
+                )
+            return adata.layers[layer_name]
+        else:
+            return adata.X
+
+    def _apply_reverse_normalization(
+        self,
+        count_matrix: Any,
+        adata: ad.AnnData,
+        selected_candidate: str,
+        n_obs: int,
+    ) -> np.ndarray:
+        """Apply the approved expm1/size_factor reverse-normalization path.
+
+        Recovery is only called when the Stage 1 decision set ``uses_recovery=True``.
+        The approved path is: recovered = expm1(source_row) / min_nonzero_expm1(source_row)
+        per row.
+        """
+        recovered = np.zeros((n_obs, count_matrix.shape[1]), dtype=np.float64)
+
+        for i in range(n_obs):
+            row = count_matrix[i]
+            if hasattr(row, "toarray"):
+                row = np.asarray(row.toarray().ravel())
+            else:
+                row = np.asarray(row).ravel()
+            nonzero_mask = row != 0
+            if nonzero_mask.any():
+                expm1_vals = np.expm1(row[nonzero_mask])
+                min_nonzero = float(np.min(expm1_vals))
+                if min_nonzero <= 0:
+                    min_nonzero = 1.0
+                recovered[i, nonzero_mask] = expm1_vals / min_nonzero
+
+        nonzero_mask = recovered != 0
+        if nonzero_mask.any():
+            deviations = np.abs(recovered[nonzero_mask] - np.rint(recovered[nonzero_mask]))
+            max_deviation = float(np.max(deviations))
+            if max_deviation > 0.01:
+                raise ValueError(
+                    f"reverse-normalization of {selected_candidate} produced "
+                    f"non-integer values (max_deviation={max_deviation:.6f}); "
+                    "recovery validation failed"
+                )
+
+        return np.rint(recovered).astype(np.int32)
+
+    def _verify_integer(self, count_matrix: Any, source_name: str) -> None:
+        """Fail hard if count matrix is not integer-like (max deviation > 1e-6)."""
+        sample_rows = min(32, count_matrix.shape[0])
+        indices = np.linspace(0, count_matrix.shape[0] - 1, num=sample_rows, dtype=int)
+        nonzero_values = []
+        for idx in indices:
+            row = count_matrix[idx]
+            if hasattr(row, "toarray"):
+                row = np.asarray(row.toarray().ravel())
+            else:
+                row = np.asarray(row).ravel()
+            nonzero_values.append(row[row != 0])
+        if not nonzero_values:
+            return
+        nonzero = np.concatenate(nonzero_values)
+        if nonzero.size == 0:
+            return
+        deviations = np.abs(nonzero - np.rint(nonzero))
+        if np.any(deviations > 1e-6):
+            raise ValueError(
+                f"count matrix in {source_name} contains non-integer values "
+                f"(max deviation {float(np.max(deviations)):.6f}); "
+                "materialization requires strict integer counts from the Stage 1 approved source."
+            )
+
+    def _compute_size_factors(self, count_matrix: Any, n_obs: int) -> np.ndarray:
+        """Compute size factors as row_sum / median(row_sum)."""
+        from .backends.arrow_hf import _get_row_nonzero
+
+        factors = np.zeros(n_obs, dtype=np.float64)
+        for i in range(n_obs):
+            indices, counts = _get_row_nonzero(count_matrix, i)
+            factors[i] = float(counts.sum())
+
+        row_median = float(np.median(factors))
+        if row_median > 0:
+            factors = factors / row_median
+        factors = np.where(factors <= 0, 1.0, factors)
+        factors = np.where(np.isnan(factors), 1.0, factors)
+        return factors
+
+    def _write_size_factor_manifest(
+        self,
+        adata: ad.AnnData,
+        size_factors: np.ndarray,
+        meta_root: Path,
+    ) -> Path:
+        """Write per-cell size factors as a SizeFactorManifest YAML."""
+        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
+        n_obs = adata.n_obs
+        entries = []
+        for i in range(n_obs):
+            cell_id = str(obs_mem.index[i])
+            entries.append(SizeFactorEntry(cell_id=cell_id, size_factor=float(size_factors[i])))
+        manifest = SizeFactorManifest(
+            kind="size-factor-manifest",
+            contract_version=CONTRACT_VERSION,
+            release_id=self.release_id,
+            method="sum",
+            entries=tuple(entries),
+        )
+        sf_path = meta_root / f"{self.release_id}-size-factors.yaml"
+        manifest.write_yaml(sf_path)
+        return sf_path
+
+    def _write_raw_cell_metadata_parquet(
+        self,
+        adata: ad.AnnData,
+        meta_root: Path,
+    ) -> Path:
+        """Write raw cell metadata as Parquet (no SQLite, no canonical mapping).
+
+        Schema:
+        - cell_id: string
+        - dataset_id: string
+        - dataset_release: string
+        - raw_obs: string (JSON-serialized dict of all obs columns)
+        """
+        import json
+
+        parquet_path = meta_root / f"{self.release_id}-raw-obs.parquet"
+        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
+        n_obs = adata.n_obs
+
+        cell_ids = []
+        raw_obs_list = []
+        for i in range(n_obs):
+            cell_ids.append(str(obs_mem.index[i]))
+            raw_dict: dict[str, Any] = {}
+            for col in obs_mem.columns:
+                val = obs_mem.loc[obs_mem.index[i], col]
+                raw_dict[str(col)] = None if pd.isna(val) else str(val)
+            raw_obs_list.append(json.dumps(raw_dict))
+
+        table = pa.table({
+            "cell_id": pa.array(cell_ids, type=pa.string()),
+            "dataset_id": pa.array([self.dataset_id] * n_obs, type=pa.string()),
+            "dataset_release": pa.array([self.release_id] * n_obs, type=pa.string()),
+            "raw_obs": pa.array(raw_obs_list, type=pa.string()),
+        })
+        pq.write_table(table, parquet_path)
+        return parquet_path
+
+    def _write_raw_feature_metadata_parquet(
+        self,
+        var_mem: Any,
+        meta_root: Path,
+    ) -> Path:
+        """Write raw feature metadata as Parquet (no canonical mapping).
+
+        Schema:
+        - origin_index: int32
+        - feature_id: string
+        - raw_var: string (JSON-serialized dict of all var columns)
+        """
+        import json
+
+        parquet_path = meta_root / f"{self.release_id}-raw-var.parquet"
+        n_vars = var_mem.shape[0]
+
+        origin_indices = list(range(n_vars))
+        feature_ids = [str(var_mem.index[i]) for i in range(n_vars)]
+        raw_var_list = []
+        for i in range(n_vars):
+            raw_dict: dict[str, Any] = {}
+            for col in var_mem.columns:
+                val = var_mem.loc[var_mem.index[i], col]
+                raw_dict[str(col)] = None if pd.isna(val) else str(val)
+            raw_var_list.append(json.dumps(raw_dict))
+
+        table = pa.table({
+            "origin_index": pa.array(origin_indices, type=pa.int32()),
+            "feature_id": pa.array(feature_ids, type=pa.string()),
+            "raw_var": pa.array(raw_var_list, type=pa.string()),
+        })
+        pq.write_table(table, parquet_path)
+        return parquet_path
+
+    def _write_metadata_summary(
+        self,
+        adata: ad.AnnData,
+        var_mem: Any,
+        meta_root: Path,
+    ) -> Path:
+        """Write per-dataset metadata summary (field coverage, null fractions)."""
+        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
+        n_obs = obs_mem.shape[0]
+        n_vars = var_mem.shape[0]
+
+        obs_null_fractions: dict[str, float] = {}
+        for col in obs_mem.columns:
+            null_count = int(obs_mem[col].isna().sum())
+            obs_null_fractions[str(col)] = float(null_count) / float(n_obs)
+
+        var_null_fractions: dict[str, float] = {}
+        for col in var_mem.columns:
+            null_count = int(var_mem[col].isna().sum())
+            var_null_fractions[str(col)] = float(null_count) / float(n_vars)
+
+        obs_dtypes: dict[str, str] = {str(col): str(obs_mem[col].dtype) for col in obs_mem.columns}
+        var_dtypes: dict[str, str] = {str(col): str(var_mem[col].dtype) for col in var_mem.columns}
+
+        summary = DatasetMetadataSummary(
+            kind="dataset-metadata-summary",
+            contract_version=CONTRACT_VERSION,
+            dataset_id=self.dataset_id,
+            release_id=self.release_id,
+            source_path=str(Path(self.output_roots.metadata_root).parent / f"{self.release_id}.h5ad"),
+            obs_field_count=int(obs_mem.shape[1]),
+            var_field_count=int(var_mem.shape[1]),
+            obs_null_fractions=obs_null_fractions,
+            var_null_fractions=var_null_fractions,
+            obs_dtypes=obs_dtypes,
+            var_dtypes=var_dtypes,
+            obs_rows=n_obs,
+            var_rows=n_vars,
+            obs_index_name=str(obs_mem.index.name or "obs_index"),
+            var_index_name=str(var_mem.index.name or "var_index"),
+        )
+        summary_path = meta_root / f"{self.release_id}-metadata-summary.yaml"
+        summary.write_yaml(summary_path)
+        return summary_path
+
+    def _write_feature_provenance_parquet(
+        self,
+        var_index: pd.Index,
+        n_vars: int,
+        meta_root: Path,
+        count_source_selected: str,
+        source_path: str,
+    ) -> Path:
+        """Write feature provenance Parquet (origin_index, feature_id, count_source, source_path)."""
+        parquet_path = meta_root / f"{self.release_id}-feature-provenance.parquet"
+
+        origin_indices = list(range(n_vars))
+        feature_ids = [str(var_index[i]) for i in range(n_vars)]
+        count_source_vals = [count_source_selected] * n_vars
+        source_paths = [source_path] * n_vars
+
+        table = pa.table({
+            "origin_index": pa.array(origin_indices, type=pa.int32()),
+            "feature_id": pa.array(feature_ids, type=pa.string()),
+            "count_source": pa.array(count_source_vals, type=pa.string()),
+            "source_path": pa.array(source_paths, type=pa.string()),
+        })
+        pq.write_table(table, parquet_path)
+        return parquet_path
+
+    def _write_cells(
+        self,
+        count_matrix: Any,
+        adata: ad.AnnData,
+        size_factors: np.ndarray,
+        matrix_root: Path,
+    ) -> dict[str, Path]:
+        """Write sparse cell data via the configured backend."""
+        from .backends import build_backend_fn
+
+        backend_fn = build_backend_fn(self.backend)
+        kwargs: dict[str, Any] = {
+            "dataset_id": self.dataset_id,
+        }
+        return backend_fn(
+            adata, count_matrix, size_factors, self.release_id, matrix_root,
+            **kwargs,
+        )
+
+    def _run_qa_checks(
+        self,
+        backend_paths: dict[str, Path],
+        original_matrix: Any,
+    ) -> tuple[tuple[QAMetric, ...], bool]:
+        """Run QA checks on written output artifacts."""
+        metrics = []
+        for name, path in backend_paths.items():
+            if not path.exists():
+                metrics.append(QAMetric(name=f"{name}_exists", value=0.0, threshold=1.0))
+            else:
+                metrics.append(QAMetric(name=f"{name}_exists", value=1.0, threshold=1.0))
+        all_passed = all(m.passed() for m in metrics)
+        return tuple(metrics), all_passed
+
+    def _compute_and_write_hvg_arrays(
+        self,
+        count_matrix: Any,
+        n_vars: int,
+        meta_root: Path,
+        n_hvg: int = 2000,
+    ) -> Path:
+        """Compute HVG/non-HVG index arrays in dataset-local feature space and write as NumPy."""
+        from .backends.arrow_hf import _get_row_nonzero
+
+        sidecar_dir = meta_root / "hvg_sidecar"
+        sidecar_dir.mkdir(parents=True, exist_ok=True)
+
+        n_obs = count_matrix.shape[0]
+        sample_cells = min(512, n_obs)
+        cell_indices = np.linspace(0, n_obs - 1, num=sample_cells, dtype=int)
+
+        log_expr = np.zeros((sample_cells, n_vars), dtype=np.float64)
+        for row_i, ci in enumerate(cell_indices):
+            indices, counts = _get_row_nonzero(count_matrix, ci)
+            for idx, cnt in zip(indices, counts):
+                log_expr[row_i, idx] = np.log1p(float(cnt))
+
+        gene_means = np.zeros(n_vars, dtype=np.float64)
+        gene_vars = np.zeros(n_vars, dtype=np.float64)
+        for j in range(n_vars):
+            col = log_expr[:, j]
+            nonzero = col[col > 0]
+            if len(nonzero) > 0:
+                gene_means[j] = np.mean(nonzero)
+                gene_vars[j] = np.var(nonzero)
+
+        eps = 1e-10
+        dispersion = np.where(gene_means > eps, gene_vars / gene_means, 0.0)
+
+        sorted_indices = np.argsort(dispersion)
+        hvg_indices: np.ndarray = sorted_indices[-n_hvg:].astype(np.int32)
+        hvg_indices = np.sort(hvg_indices)
+
+        hvg_set = set(hvg_indices)
+        nonhvg_indices = np.array(
+            [j for j in range(n_vars) if j not in hvg_set], dtype=np.int32
+        )
+
+        np.save(str(sidecar_dir / "hvg.npy"), hvg_indices, allow_pickle=False)
+        np.save(str(sidecar_dir / "nonhvg.npy"), nonhvg_indices, allow_pickle=False)
+
+        return sidecar_dir
+
+
+# ---------------------------------------------------------------------------
+# Canonical sparse per-cell record contract (existing)
 # ---------------------------------------------------------------------------
 
 

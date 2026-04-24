@@ -1,7 +1,13 @@
-"""Phase 3 materializer: canonical materialization layer, manifests, join modes.
+"""Stage 2 materializer — schema-independent, Stage-1-gated, count-first.
 
-Tokenization is removed from the materialization flow. The corpus feature set
-is maintained separately via a pickle-backed set written by ``canonicalize-meta``.
+Phase 3 canonical materializer (expression-first, tokenizer-free) is preserved
+as the legacy schema-first path. Stage 2 adds:
+
+- ``Stage2Materializer``: schema-independent materialization entry that accepts
+  a Stage 1 ``dataset-summary.yaml`` as the only gating artifact (no schema.yaml)
+- Count-first path driven by the Stage 1 approved count source decision
+- Parquet raw metadata sidecars (SQLite deprecated for new artifacts)
+- Backend/topology separation in all interfaces
 
 This module exposes the public materializer API lazily so lightweight runtime
 imports (for example loader-only smoke validation) do not eagerly import heavy
@@ -15,6 +21,8 @@ from importlib import import_module
 
 
 _EXPORT_MAP = {
+    # Stage 2 — schema-independent entry point
+    "Stage2Materializer": (".core", "Stage2Materializer"),
     # Core classes
     "CanonicalCellRecord": (".core", "CanonicalCellRecord"),
     "CreateNewRoute": (".core", "CreateNewRoute"),
@@ -74,6 +82,8 @@ def __dir__() -> list[str]:
     return sorted(list(globals().keys()) + list(_EXPORT_MAP.keys()))
 
 __all__ = [
+    # Stage 2 — schema-independent entry point
+    "Stage2Materializer",
     # Core classes
     "CanonicalCellRecord",
     "CreateNewRoute",

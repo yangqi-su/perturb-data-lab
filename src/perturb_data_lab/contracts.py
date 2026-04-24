@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-CONTRACT_VERSION = "0.2.0"
+CONTRACT_VERSION = "0.3.0"
 MISSING_VALUE_LITERAL = "NA"
 REQUIRED_ARTIFACTS = (
     "canonical-perturbation-metadata",
