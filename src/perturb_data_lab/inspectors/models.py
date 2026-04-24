@@ -236,8 +236,6 @@ class DatasetSummaryDocument(YamlDocument):
     count_source_candidates: tuple[CountSourceCandidate, ...]
     count_source_decision: CountSourceDecision
     materialization_readiness: str
-    canonical_defaults: dict[str, str]
-    raw_field_policy: dict[str, bool]
     inspector_notes: tuple[str, ...] = ()
 
     def validate(self) -> None:
@@ -264,8 +262,6 @@ class DatasetSummaryDocument(YamlDocument):
                 data["count_source_decision"]
             ),
             materialization_readiness=str(data["materialization_readiness"]),
-            canonical_defaults=dict(data.get("canonical_defaults", {})),
-            raw_field_policy=dict(data.get("raw_field_policy", {})),
             inspector_notes=tuple(
                 str(item) for item in data.get("inspector_notes", [])
             ),
@@ -647,7 +643,6 @@ class InspectionBatchConfig(YamlDocument):
 class InspectionBatchRecord:
     dataset_id: str
     dataset_summary: str
-    schema: str
     selected_count_source: str
     materialization_readiness: str
 

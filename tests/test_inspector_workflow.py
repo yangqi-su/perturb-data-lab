@@ -10,7 +10,6 @@ from scipy.sparse import csr_matrix
 from perturb_data_lab.inspectors.models import (
     DatasetSummaryDocument,
     InspectionBatchConfig,
-    SchemaDocument,
 )
 from perturb_data_lab.inspectors.workflow import run_batch
 
@@ -56,13 +55,13 @@ def test_inspector_workflow_round_trip(tmp_path: Path) -> None:
     summary = DatasetSummaryDocument.from_yaml_file(
         dataset_dir / "dataset-summary.yaml"
     )
-    schema = SchemaDocument.from_yaml_file(dataset_dir / "schema.yaml")
 
     assert summary.count_source_decision.selected_candidate == ".raw.X"
     assert summary.count_source_decision.status == "pass"
-    assert schema.dataset_metadata["dataset_id"].literal_value == "tiny_crispr"
-    assert schema.perturbation_fields["perturbation_type"].literal_value == "CRISPR"
-    assert schema.status == "draft"
+    assert summary.materialization_readiness == "pass"
+
+    # No schema.yaml in Stage 1 output
+    assert not (dataset_dir / "schema.yaml").exists()
 
 
 def test_inspector_prefers_textual_guide_fields_over_numeric_scores(
@@ -101,12 +100,11 @@ def test_inspector_prefers_textual_guide_fields_over_numeric_scores(
     )
 
     run_batch(InspectionBatchConfig.from_yaml_file(config_path), workers=1)
-    schema = SchemaDocument.from_yaml_file(
-        output_root / "marson_like" / "schema.yaml"
+    summary = DatasetSummaryDocument.from_yaml_file(
+        output_root / "marson_like" / "dataset-summary.yaml"
     )
 
-    assert schema.perturbation_fields["perturbation_label"].source_fields == ("guide_id",)
-    assert schema.perturbation_fields["target_label"].source_fields == (
-        "perturbed_gene_name",
-    )
-    assert schema.perturbation_fields["target_id"].source_fields == ("perturbed_gene_id",)
+    # Stage 1 only verifies count source selection; field profiling is for review, not schema
+    assert summary.count_source_decision.selected_candidate in {".X", ".raw.X"}
+    # Readiness is count-only
+    assert summary.materialization_readiness in {"pass", "needs-review"}
