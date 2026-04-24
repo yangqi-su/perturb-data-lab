@@ -196,7 +196,6 @@ The stage should emit a small dataset review bundle containing:
 - count-source candidate audit
 - selected count source decision
 - approval state
-- a lightweight proposed canonicalization scaffold for later editing
 
 The key point is that the primary output is an approval artifact, not a full canonical contract.
 
@@ -313,11 +312,9 @@ The preferred design direction is:
 
 This is intentionally simpler than the current mixture of feature registry, token sidecars, and canonicalization-era feature outputs.
 
-#### 4. Produce a proposed canonicalization schema
+#### 4. DO NOT Produce a proposed canonicalization schema
 
-Materialization may emit a lightweight proposed schema or scaffold for later canonicalization work.
-
-This should be a downstream aid, not a hard runtime dependency for the simplest loading paths.
+No lightweight canonicalization schema
 
 #### 5. Update the corpus tracking object
 
