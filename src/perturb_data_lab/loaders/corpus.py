@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyarrow.parquet as pq
 
 from ..materializers.models import (
     CorpusIndexDocument,
@@ -50,7 +51,68 @@ __all__ = [
     "CorpusLoader",
     "DatasetReaderEntry",
     "build_corpus_loader",
+    "read_raw_obs_parquet",
+    "read_raw_var_parquet",
 ]
+
+
+def read_raw_obs_parquet(parquet_path: Path) -> list[dict[str, Any]]:
+    """Read raw cell metadata from a Stage 2 Parquet sidecar.
+
+    Parameters
+    ----------
+    parquet_path : Path
+        Path to ``{release_id}-raw-obs.parquet`` written by ``Stage2Materializer``.
+        Schema: cell_id (string), dataset_id (string), dataset_release (string),
+        raw_obs (string, JSON-serialized dict).
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        List of row dicts with cell_id, dataset_id, dataset_release, and raw_fields
+        (the deserialized raw_obs dict).
+    """
+    import json
+
+    table = pq.read_table(str(parquet_path))
+    result: list[dict[str, Any]] = []
+    for row in table.to_pylist():
+        result.append({
+            "cell_id": str(row["cell_id"]),
+            "dataset_id": str(row["dataset_id"]),
+            "dataset_release": str(row["dataset_release"]),
+            "raw_fields": json.loads(row["raw_obs"]),
+        })
+    return result
+
+
+def read_raw_var_parquet(parquet_path: Path) -> list[dict[str, Any]]:
+    """Read raw feature metadata from a Stage 2 Parquet sidecar.
+
+    Parameters
+    ----------
+    parquet_path : Path
+        Path to ``{release_id}-raw-var.parquet`` written by ``Stage2Materializer``.
+        Schema: origin_index (int32), feature_id (string),
+        raw_var (string, JSON-serialized dict).
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        List of row dicts with origin_index, feature_id, and raw_fields
+        (the deserialized raw_var dict).
+    """
+    import json
+
+    table = pq.read_table(str(parquet_path))
+    result: list[dict[str, Any]] = []
+    for row in table.to_pylist():
+        result.append({
+            "origin_index": int(row["origin_index"]),
+            "feature_id": str(row["feature_id"]),
+            "raw_fields": json.loads(row["raw_var"]),
+        })
+    return result
 
 
 @dataclass(frozen=True)
@@ -538,7 +600,7 @@ class CorpusLoader:
                 arrow_matrix_root = corpus_root / "matrix"
                 cells_artifact = arrow_matrix_root / "aggregated-corpus.lance"
             else:
-                # Arrow/HF runtime artifacts (cells parquet, canonical SQLite, meta parquet)
+                # Arrow/HF runtime artifacts (cells parquet, meta parquet, size-factor parquet)
                 # are written into matrix_root, not meta_root.  For relative manifest_path
                 # (stored relative to corpus_root), compute matrix_root from corpus_root.
                 # For absolute manifest_path (outside corpus_root), use manifest.outputs.matrix_root.
@@ -559,8 +621,20 @@ class CorpusLoader:
                     arrow_matrix_root = meta_root.parent / "matrix"
                 cells_artifact = arrow_matrix_root / f"{manifest.release_id}-cells.parquet"
 
+            # Determine cell-meta-sqlite path: may not exist for Stage 2 artifacts
             cell_meta_sqlite = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-cell-meta.sqlite"
+            if not cell_meta_sqlite.exists():
+                cell_meta_sqlite = None  # Stage 2 artifacts don't produce SQLite
+
             meta_parquet = Path(manifest.outputs.matrix_root) / f"{manifest.release_id}-meta.parquet"
+
+            # Resolve size-factor Parquet path from manifest
+            size_factor_parquet: Path | None = None
+            if manifest.size_factor_parquet_path:
+                sf_path = meta_root / manifest.size_factor_parquet_path
+                if sf_path.exists():
+                    size_factor_parquet = sf_path
+
             feature_meta_paths: dict[str, Path] | None = None
             if manifest.feature_meta_paths:
                 feature_meta_paths = {
@@ -581,6 +655,7 @@ class CorpusLoader:
                 "cell_meta_sqlite_path": cell_meta_sqlite,
                 "feature_registry_path": arrow_meta_root / "feature-registry.yaml",  # legacy fallback
                 "feature_meta_paths": feature_meta_paths,
+                "size_factor_parquet_path": size_factor_parquet,
             }
         elif backend == "webdataset":
             # WebDataset uses shard paths and tab-delimited meta.txt
@@ -633,16 +708,31 @@ class CorpusLoader:
             manifest = MaterializationManifest.from_yaml_file(manifest_path)
             meta_root = manifest_path.parent
             if corpus_backend in {"arrow-hf", "lancedb-aggregated"}:
-                rows.extend(
-                    CorpusLoader._metadata_rows_from_arrow_sqlite(
-                        manifest=manifest,
-                        meta_root=meta_root,
-                        backend=corpus_backend,
-                        corpus_root=corpus_root,
-                        manifest_path=ds_record.manifest_path,
-                        ds_record=ds_record,
+                # Check whether this manifest uses Stage 2 Parquet sidecars (no SQLite)
+                # versus the legacy schema-first SQLite path. Stage 2 manifests have
+                # raw_cell_meta_path pointing to a Parquet file; legacy manifests use SQLite.
+                raw_cell_meta_path = Path(manifest.raw_cell_meta_path or "")
+                if raw_cell_meta_path.suffix == ".parquet":
+                    # Stage 2 path — read from Parquet sidecar
+                    rows.extend(
+                        CorpusLoader._metadata_rows_from_stage2_parquet(
+                            manifest=manifest,
+                            meta_root=meta_root,
+                            ds_record=ds_record,
+                        )
                     )
-                )
+                else:
+                    # Legacy path — read from SQLite (schema-first materialization)
+                    rows.extend(
+                        CorpusLoader._metadata_rows_from_arrow_sqlite(
+                            manifest=manifest,
+                            meta_root=meta_root,
+                            backend=corpus_backend,
+                            corpus_root=corpus_root,
+                            manifest_path=ds_record.manifest_path,
+                            ds_record=ds_record,
+                        )
+                    )
             elif corpus_backend in {"zarr-ts", "zarr-aggregated"}:
                 rows.extend(
                     CorpusLoader._metadata_rows_from_zarr_meta(
@@ -667,6 +757,73 @@ class CorpusLoader:
             raw_fields=tuple(dict(row["raw_fields"]) for row in rows),
             size_factor=tuple(float(row["size_factor"]) for row in rows),
         )
+
+    @staticmethod
+    def _metadata_rows_from_stage2_parquet(
+        manifest: "MaterializationManifest",
+        meta_root: Path,
+        ds_record: DatasetJoinRecord,
+    ) -> list[dict[str, Any]]:
+        """Build metadata rows from Stage 2 Parquet sidecars (no SQLite dependency).
+
+        This path is used when the manifest declares ``raw_cell_meta_path``
+        pointing to a ``*-raw-obs.parquet`` file written by ``Stage2Materializer``.
+        Size factors are read from the separate ``{release_id}-size-factor.parquet``
+        written alongside the raw-obs sidecar.
+
+        Parameters
+        ----------
+        manifest : MaterializationManifest
+            The dataset's materialization manifest.
+        meta_root : Path
+            Directory containing the manifest.
+        ds_record : DatasetJoinRecord
+            The corpus join record for this dataset.
+
+        Returns
+        -------
+        list[dict[str, Any]]
+            Metadata rows with global_row_index, cell_id, dataset_id, dataset_index,
+            local_row_index, size_factor, raw_fields, and empty dicts for
+            canonical_perturbation/canonical_context.
+        """
+        import json
+
+        raw_obs_parquet = meta_root / manifest.raw_cell_meta_path
+        if not raw_obs_parquet.exists():
+            raise FileNotFoundError(
+                f"Stage 2 raw-obs Parquet not found: {raw_obs_parquet}; "
+                "cannot build metadata table from Stage 2 artifacts"
+            )
+
+        obs_table = pq.read_table(str(raw_obs_parquet))
+
+        # Read size factors from the separate size-factor Parquet.
+        # The manifest's size_factor_parquet_path points to this file.
+        size_factors: list[float] | None = None
+        if manifest.size_factor_parquet_path:
+            sf_path = meta_root / manifest.size_factor_parquet_path
+            if sf_path.exists():
+                sf_table = pq.read_table(str(sf_path))
+                size_factors = [float(v) for v in sf_table.column("size_factor").to_pylist()]
+
+        result: list[dict[str, Any]] = []
+        for local_row_index, row in enumerate(obs_table.to_pylist()):
+            sf = 1.0  # neutral default
+            if size_factors is not None and local_row_index < len(size_factors):
+                sf = size_factors[local_row_index]
+            result.append({
+                "global_row_index": ds_record.global_start + local_row_index,
+                "cell_id": str(row["cell_id"]),
+                "dataset_id": str(row["dataset_id"]),
+                "dataset_index": ds_record.dataset_index,
+                "local_row_index": local_row_index,
+                "canonical_perturbation": {},  # deferred to canonicalize-meta
+                "canonical_context": {},         # deferred to canonicalize-meta
+                "raw_fields": json.loads(row["raw_obs"]),
+                "size_factor": sf,
+            })
+        return result
 
     @staticmethod
     def _metadata_rows_from_arrow_sqlite(

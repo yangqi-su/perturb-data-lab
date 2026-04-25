@@ -206,6 +206,39 @@ class QAMetric:
 
 
 @dataclass(frozen=True)
+class CorpusRegistrationInfo:
+    """Registration metadata produced when Stage2Materializer registers with a corpus.
+
+    This is written into the MaterializationManifest when register=True is set
+    on Stage2Materializer. It records whether the dataset was registered as a
+    new corpus creation or an append, and the paths to the corpus artifacts.
+    """
+
+    corpus_id: str
+    is_create: bool  # True = new corpus, False = append to existing
+    corpus_index_path: str  # path to corpus-index.yaml
+    ledger_path: str        # path to corpus-ledger.parquet
+    dataset_index: int      # assigned dataset index in the corpus
+    global_start: int       # inclusive start of global cell range
+    global_end: int         # exclusive end of global cell range
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "CorpusRegistrationInfo":
+        return cls(
+            corpus_id=str(data["corpus_id"]),
+            is_create=bool(data["is_create"]),
+            corpus_index_path=str(data["corpus_index_path"]),
+            ledger_path=str(data["ledger_path"]),
+            dataset_index=int(data["dataset_index"]),
+            global_start=int(data["global_start"]),
+            global_end=int(data["global_end"]),
+        )
+
+
+@dataclass(frozen=True)
 class MaterializationManifest(YamlDocument):
     kind: str
     contract_version: str
@@ -225,12 +258,15 @@ class MaterializationManifest(YamlDocument):
     provenance_spec_path: str | None = None  # feature-order/provenance artifact
     # Existing paths
     feature_meta_paths: dict[str, str] | None = None  # canonical feature metadata (origin + token parquet paths)
-    size_factor_manifest_path: str | None = None
+    size_factor_manifest_path: str | None = None  # deprecated: YAML size-factor manifest (no longer written)
+    size_factor_parquet_path: str | None = None  # Parquet: per-cell size factors (separate from cells parquet)
     qa_manifest_path: str | None = None
     hvg_sidecar_path: str | None = None
     integer_verified: bool = False
     cell_count: int = 0  # number of cells materialized (set by materialize() for corpus index use)
     feature_count: int = 0  # number of features in dataset-local feature space
+    # Phase 4: corpus registration info (set when Stage2Materializer.register=True)
+    corpus_registration: CorpusRegistrationInfo | None = None
     notes: tuple[str, ...] = ()
 
     def validate(self) -> None:
@@ -295,11 +331,17 @@ class MaterializationManifest(YamlDocument):
                 k: str(v) for k, v in (data.get("feature_meta_paths") or {}).items()
             },
             size_factor_manifest_path=data.get("size_factor_manifest_path"),
+            size_factor_parquet_path=data.get("size_factor_parquet_path"),
             qa_manifest_path=data.get("qa_manifest_path"),
             hvg_sidecar_path=data.get("hvg_sidecar_path"),
             integer_verified=bool(data.get("integer_verified", False)),
             cell_count=int(data.get("cell_count", 0)),
             feature_count=int(data.get("feature_count", 0)),
+            corpus_registration=(
+                CorpusRegistrationInfo.from_dict(data["corpus_registration"])
+                if data.get("corpus_registration") is not None
+                else None
+            ),
             notes=tuple(str(item) for item in data.get("notes", [])),
         )
         document.validate()
@@ -682,3 +724,78 @@ class GlobalMetadataDocument(YamlDocument):
     @classmethod
     def from_yaml_file(cls, file_path: Path) -> "GlobalMetadataDocument":
         return cls.from_dict(cls._load_yaml_dict(file_path))
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Parquet corpus ledger (STAGE2_CONTRACT.md Section 7)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CorpusLedgerEntry:
+    """A single dataset's entry in the Parquet corpus ledger.
+
+    This is the primary machine-readable corpus membership record for Stage 2.
+    It supersedes the YAML-based ``CorpusIndexDocument`` for new Stage 2 corpora.
+
+    The ledger is append-only: existing rows are never modified, only new rows
+    are appended. This makes the Parquet file append-safe for concurrent reads.
+
+    Fields match the STAGE2_CONTRACT.md Section 7.2 schema.
+    """
+
+    corpus_id: str
+    dataset_id: str
+    release_id: str
+    dataset_index: int
+    join_mode: str  # create_new | append_routed
+    manifest_path: str  # relative path from corpus root
+    backend: str  # arrow-hf | webdataset | zarr | lance
+    topology: str  # federated | aggregate
+    cell_count: int
+    feature_count: int
+    global_start: int  # inclusive start of global cell range (aggregate only)
+    global_end: int  # exclusive end of global cell range (aggregate only)
+    created_at: str  # ISO timestamp
+
+    def validate(self) -> None:
+        if self.join_mode not in {"create_new", "append_routed"}:
+            raise ValueError(f"invalid join_mode: {self.join_mode}")
+        if self.backend not in {"arrow-hf", "webdataset", "zarr", "lance"}:
+            raise ValueError(f"invalid backend: {self.backend}")
+        if self.topology not in {"federated", "aggregate"}:
+            raise ValueError(f"invalid topology: {self.topology}")
+        if self.cell_count < 0:
+            raise ValueError(f"cell_count must be non-negative: {self.cell_count}")
+        if self.feature_count < 0:
+            raise ValueError(f"feature_count must be non-negative: {self.feature_count}")
+        if self.global_end < self.global_start:
+            raise ValueError(
+                f"global_end ({self.global_end}) must be >= global_start ({self.global_start})"
+            )
+        if self.global_end - self.global_start != self.cell_count:
+            raise ValueError(
+                f"global range [{self.global_start}, {self.global_end}) length "
+                f"({self.global_end - self.global_start}) does not match cell_count ({self.cell_count})"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return _serialize(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "CorpusLedgerEntry":
+        return cls(
+            corpus_id=str(data["corpus_id"]),
+            dataset_id=str(data["dataset_id"]),
+            release_id=str(data["release_id"]),
+            dataset_index=int(data["dataset_index"]),
+            join_mode=str(data["join_mode"]),
+            manifest_path=str(data["manifest_path"]),
+            backend=str(data["backend"]),
+            topology=str(data["topology"]),
+            cell_count=int(data["cell_count"]),
+            feature_count=int(data["feature_count"]),
+            global_start=int(data["global_start"]),
+            global_end=int(data["global_end"]),
+            created_at=str(data["created_at"]),
+        )

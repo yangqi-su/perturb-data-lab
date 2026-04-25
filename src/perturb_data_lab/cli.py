@@ -589,6 +589,149 @@ def _cmd_canonicalize_meta(args: argparse.Namespace) -> None:
     print(f"  feature_set         : {result.feature_set_path}")
 
 
+def _add_stage2_materialize_args(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "--source",
+        required=True,
+        help="Path to the source h5ad file.",
+    )
+    sub.add_argument(
+        "--review-bundle",
+        required=True,
+        help=(
+            "Path to the Stage 1 dataset-summary.yaml that gates this materialization. "
+            "This is the only required gating artifact; no schema.yaml is used."
+        ),
+    )
+    sub.add_argument(
+        "--output-root",
+        required=True,
+        help="Root directory for all metadata and matrix outputs.",
+    )
+    sub.add_argument(
+        "--release-id",
+        required=True,
+        help="Release identifier for this dataset version (e.g., v0.1).",
+    )
+    sub.add_argument(
+        "--dataset-id",
+        required=True,
+        help="Stable dataset identifier.",
+    )
+    sub.add_argument(
+        "--backend",
+        default="arrow-hf",
+        choices=["arrow-hf", "webdataset", "zarr-ts", "lancedb-aggregated", "zarr-aggregated"],
+        help="Storage backend for this materialization. Default: arrow-hf.",
+    )
+    sub.add_argument(
+        "--topology",
+        default="federated",
+        choices=["federated", "aggregate"],
+        help="Corpus topology. Default: federated.",
+    )
+    sub.add_argument(
+        "--rerun-stage1",
+        action="store_true",
+        help=(
+            "If set, rerun Stage 1 inspection before materialization as a preflight step "
+            "and use the resulting dataset-summary.yaml as the gating artifact."
+        ),
+    )
+    sub.add_argument(
+        "--n-hvg",
+        type=int,
+        default=2000,
+        help="Number of top-dispersion genes to select as HVGs. Default: 2000.",
+    )
+    sub.add_argument(
+        "--corpus-index",
+        default=None,
+        help=(
+            "Path to corpus-index.yaml for corpus registration. "
+            "If provided with --register, the dataset is registered with the corpus "
+            "after materialization. If not provided, --register cannot be used."
+        ),
+    )
+    sub.add_argument(
+        "--corpus-id",
+        default=None,
+        help="Corpus identifier. Required when registering a new corpus.",
+    )
+    sub.add_argument(
+        "--register",
+        action="store_true",
+        help=(
+            "If set, automatically register this dataset with the corpus ledger "
+            "after successful materialization. Requires --corpus-index to be set."
+        ),
+    )
+
+
+def _cmd_stage2_materialize(args: argparse.Namespace) -> None:
+    from .materializers import Stage2Materializer
+    from .materializers.models import OutputRoots
+
+    source_path = Path(args.source)
+    if not source_path.exists():
+        print(f"[error] source h5ad not found: {source_path}", file=sys.stderr)
+        sys.exit(1)
+
+    review_bundle_path = Path(args.review_bundle)
+    if not args.rerun_stage1 and not review_bundle_path.exists():
+        print(
+            f"[error] review bundle not found: {review_bundle_path}; "
+            "pass --rerun-stage1 to run Stage 1 as preflight",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    output_roots = OutputRoots(
+        metadata_root=str(Path(args.output_root) / "meta"),
+        matrix_root=str(Path(args.output_root) / "matrix"),
+    )
+
+    if args.register and args.corpus_index is None:
+        print(
+            "[error] --register requires --corpus-index to be set",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    materializer = Stage2Materializer(
+        source_path=str(source_path),
+        review_bundle_path=str(review_bundle_path),
+        output_roots=output_roots,
+        release_id=args.release_id,
+        dataset_id=args.dataset_id,
+        backend=args.backend,
+        topology=args.topology,
+        rerun_stage1=args.rerun_stage1,
+        n_hvg=args.n_hvg,
+        corpus_index_path=args.corpus_index,
+        corpus_id=args.corpus_id,
+        register=args.register,
+    )
+
+    manifest = materializer.materialize()
+
+    print(f"[stage2-materialize] done — {args.dataset_id}/{args.release_id}")
+    print(f"  backend     : {manifest.backend}")
+    print(f"  topology    : {manifest.topology}")
+    print(f"  count source: {manifest.count_source.selected}")
+    print(f"  integer_verified: {manifest.integer_verified}")
+    print(f"  cell_count  : {manifest.cell_count}")
+    print(f"  feature_count: {manifest.feature_count}")
+    print(f"  manifest    : {Path(manifest.outputs.metadata_root) / 'materialization-manifest.yaml'}")
+    if manifest.corpus_registration is not None:
+        reg = manifest.corpus_registration
+        print(f"  corpus_id   : {reg.corpus_id}")
+        print(f"  is_create   : {reg.is_create}")
+        print(f"  dataset_index: {reg.dataset_index}")
+        print(f"  global range: [{reg.global_start}, {reg.global_end})")
+        print(f"  ledger      : {reg.ledger_path}")
+
+
 # ---------------------------------------------------------------------------
 # Main CLI entry point
 # ---------------------------------------------------------------------------
@@ -633,6 +776,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_cm = sub.add_parser("canonicalize-meta", help="Rebuild corpus canonical metadata from raw artifacts.")
     _add_canonicalize_meta_args(p_cm)
 
+    # stage2-materialize — schema-independent, Stage-1-gated path
+    p_s2 = sub.add_parser(
+        "stage2-materialize",
+        help=(
+            "Materialize a dataset using the Stage 2 schema-independent path "
+            "(gated by Stage 1 dataset-summary.yaml, no schema.yaml required)."
+        ),
+    )
+    _add_stage2_materialize_args(p_s2)
+
     return parser
 
 
@@ -656,6 +809,8 @@ def main() -> None:
         _cmd_corpus_validate(args)
     elif args.command == "canonicalize-meta":
         _cmd_canonicalize_meta(args)
+    elif args.command == "stage2-materialize":
+        _cmd_stage2_materialize(args)
     else:
         parser.print_help()
         sys.exit(1)

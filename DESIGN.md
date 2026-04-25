@@ -281,9 +281,12 @@ For aggregate topologies, the logical heavy-row contract is:
 - `local_row_index`
 - `expressed_gene_indices`
 - `expression_counts`
-- optional `size_factor`
 
-For federated topologies, the per-dataset object can omit corpus-global fields internally, but the loader-facing interface should still be able to produce the same runtime identity once routed through the corpus ledger.
+For federated topologies, the per-dataset object carries the same fields minus the corpus-global ones.
+
+**Size factors are stored separately**, not inline in the heavy-row parquet. The size-factor sidecar is `{metadata_root}/{release_id}-size-factor.parquet` with one `float64` row per cell in the same order as the heavy rows. This separation keeps the heavy-row parquet focused on count data and allows runtime loaders to read size factors on demand without parsing non-count columns from the cells artifact.
+
+The flat-buffer Arrow list array pattern is used for the `arrow-hf` backend: `expressed_gene_indices` and `expression_counts` are stored as a single `pa.ListArray` per row, built directly from CSR indptr/indices/data buffers via `pa.ListArray.from_arrays()` without per-row Python list construction.
 
 #### 2. Preserve raw metadata
 

@@ -34,6 +34,7 @@ from .backends.lancedb_aggregated import mark_lance_append_committed
 from .models import (
     CellMetadataRecord,
     CorpusIndexDocument,
+    CorpusLedgerEntry,
     CountSourceSpec,
     DatasetJoinRecord,
     DatasetMetadataSummary,
@@ -89,6 +90,18 @@ class Stage2Materializer:
         as the gating artifact.
     n_hvg : int, default 2000
         Number of top-dispersion genes to select as HVGs.
+    corpus_index_path : str | None, default None
+        Path to ``corpus-index.yaml`` for corpus registration. Required when
+        ``register=True``. When provided, the corpus ledger
+        (``corpus-ledger.parquet``) is updated after materialization.
+    corpus_id : str | None, default None
+        Corpus identifier. Required when registering a new corpus; inferred from
+        existing ledger for append operations.
+    register : bool, default False
+        If True, automatically register this dataset with the corpus ledger
+        after successful materialization. Requires ``corpus_index_path`` to be set.
+        When True, the returned manifest's ``corpus_registration`` field is
+        populated and the manifest YAML is rewritten with registration metadata.
 
     Contract
     --------
@@ -117,6 +130,9 @@ class Stage2Materializer:
         topology: str = "federated",
         rerun_stage1: bool = False,
         n_hvg: int = 2000,
+        corpus_index_path: str | None = None,
+        corpus_id: str | None = None,
+        register: bool = False,
     ):
         self.source_path = source_path
         self.review_bundle_path = review_bundle_path
@@ -127,6 +143,14 @@ class Stage2Materializer:
         self.topology = topology
         self.rerun_stage1 = rerun_stage1
         self.n_hvg = n_hvg
+        self.corpus_index_path = corpus_index_path
+        self.corpus_id = corpus_id
+        self.register = register
+        if register and corpus_index_path is None:
+            raise ValueError(
+                "register=True requires corpus_index_path to be set; "
+                "pass corpus_index_path='/path/to/corpus-index.yaml'"
+            )
 
     def materialize(self) -> MaterializationManifest:
         """Run Stage 2 materialization gated by Stage 1 review bundle."""
@@ -222,14 +246,6 @@ class Stage2Materializer:
                 meta_root=meta_root,
             )
 
-            # --- Compute and write size factors ---
-            size_factors = self._compute_size_factors(count_matrix, n_obs)
-            size_factor_manifest_path = self._write_size_factor_manifest(
-                adata=adata,
-                size_factors=size_factors,
-                meta_root=meta_root,
-            )
-
             # --- Write feature provenance Parquet ---
             provenance_spec_path = self._write_feature_provenance_parquet(
                 var_index=var_index,
@@ -240,12 +256,25 @@ class Stage2Materializer:
             )
 
             # --- Write backend-specific sparse cell data ---
-            backend_paths = self._write_cells(
+            # Size factors are computed inline during the write pass (one scan, not two),
+            # then written as a separate Parquet. The backend returns
+            # ``(paths_dict, computed_normalized_factors)``.
+            backend_result: tuple[dict[str, Path], np.ndarray] | dict[str, Path]
+            backend_result = self._write_cells(
                 count_matrix=count_matrix,
                 adata=adata,
-                size_factors=size_factors,
                 matrix_root=matrix_root,
             )
+            if isinstance(backend_result, tuple):
+                backend_paths, size_factors = backend_result
+                size_factor_parquet_path = self._write_size_factor_parquet(
+                    size_factors=size_factors,
+                    cell_ids=adata.obs.index,
+                    meta_root=meta_root,
+                )
+            else:
+                backend_paths = backend_result
+                size_factor_parquet_path = None  # backend does not provide size factors
 
             # --- Compute and write HVG arrays ---
             hvg_sidecar_path = self._compute_and_write_hvg_arrays(
@@ -286,7 +315,9 @@ class Stage2Materializer:
                 raw_feature_meta_path=str(raw_feature_meta_parquet_path),
                 metadata_summary_path=str(metadata_summary_path),
                 provenance_spec_path=str(provenance_spec_path),
-                size_factor_manifest_path=str(size_factor_manifest_path),
+                size_factor_parquet_path=(
+                    str(size_factor_parquet_path) if size_factor_parquet_path else None
+                ),
                 qa_manifest_path=str(qa_path),
                 hvg_sidecar_path=str(hvg_sidecar_path),
                 integer_verified=all_passed,
@@ -301,6 +332,62 @@ class Stage2Materializer:
 
             manifest_path = meta_root / "materialization-manifest.yaml"
             manifest.write_yaml(manifest_path)
+
+            # --- Phase 4: Corpus registration ---
+            # If register=True, register this dataset with the corpus ledger.
+            # This updates corpus-index.yaml and corpus-ledger.parquet.
+            if self.register:
+                from .models import CorpusRegistrationInfo
+                from .registration import register_materialization
+
+                join_record, resolved_corpus_id, is_create = register_materialization(
+                    manifest=manifest,
+                    corpus_index_path=Path(self.corpus_index_path),
+                    corpus_id=self.corpus_id,
+                    backend=self.backend,
+                    topology=self.topology,
+                )
+                # Attach registration info to the manifest and rewrite
+                reg_info = CorpusRegistrationInfo(
+                    corpus_id=resolved_corpus_id,
+                    is_create=is_create,
+                    corpus_index_path=str(Path(self.corpus_index_path).resolve()),
+                    ledger_path=str(
+                        (Path(self.corpus_index_path).parent / "corpus-ledger.parquet").resolve()
+                    ),
+                    dataset_index=join_record.dataset_index,
+                    global_start=join_record.global_start,
+                    global_end=join_record.global_end,
+                )
+                manifest = MaterializationManifest(
+                    kind=manifest.kind,
+                    contract_version=manifest.contract_version,
+                    dataset_id=manifest.dataset_id,
+                    release_id=manifest.release_id,
+                    route=manifest.route,
+                    backend=manifest.backend,
+                    topology=manifest.topology,
+                    count_source=manifest.count_source,
+                    outputs=manifest.outputs,
+                    provenance=manifest.provenance,
+                    raw_cell_meta_path=manifest.raw_cell_meta_path,
+                    raw_feature_meta_path=manifest.raw_feature_meta_path,
+                    accepted_schema_path=manifest.accepted_schema_path,
+                    metadata_summary_path=manifest.metadata_summary_path,
+                    provenance_spec_path=manifest.provenance_spec_path,
+                    feature_meta_paths=manifest.feature_meta_paths,
+                    size_factor_manifest_path=manifest.size_factor_manifest_path,
+                    size_factor_parquet_path=manifest.size_factor_parquet_path,
+                    qa_manifest_path=manifest.qa_manifest_path,
+                    hvg_sidecar_path=manifest.hvg_sidecar_path,
+                    integer_verified=manifest.integer_verified,
+                    cell_count=manifest.cell_count,
+                    feature_count=manifest.feature_count,
+                    corpus_registration=reg_info,
+                    notes=manifest.notes,
+                )
+                # Re-write manifest with registration info
+                manifest_path.write_text(manifest.to_yaml())
 
             return manifest
 
@@ -417,13 +504,31 @@ class Stage2Materializer:
             )
 
     def _compute_size_factors(self, count_matrix: Any, n_obs: int) -> np.ndarray:
-        """Compute size factors as row_sum / median(row_sum)."""
-        from .backends.arrow_hf import _get_row_nonzero
+        """Compute size factors as row_sum / median(row_sum).
+
+        Uses batched row access for sparse CSR matrices to avoid O(n_obs)
+        individual row slices on large backed datasets.
+        """
+        from .backends.arrow_hf import _is_csr_dataset
+        from scipy.sparse import issparse
 
         factors = np.zeros(n_obs, dtype=np.float64)
-        for i in range(n_obs):
-            indices, counts = _get_row_nonzero(count_matrix, i)
-            factors[i] = float(counts.sum())
+
+        if _is_csr_dataset(count_matrix) or issparse(count_matrix):
+            # Batched: slice a batch, convert to CSR once, use .sum(axis=1)
+            # to get all row sums in one vectorized call per batch.
+            batch_size = 100000
+            for start in range(0, n_obs, batch_size):
+                end = min(start + batch_size, n_obs)
+                batch = count_matrix[start:end].tocsr()
+                factors[start:end] = np.asarray(batch.sum(axis=1)).ravel()
+        else:
+            # Dense path: batch slice and vectorized row sum
+            batch_size = 1024
+            for start in range(0, n_obs, batch_size):
+                end = min(start + batch_size, n_obs)
+                batch_dense = np.asarray(count_matrix[start:end])
+                factors[start:end] = np.asarray(batch_dense.sum(axis=1))
 
         row_median = float(np.median(factors))
         if row_median > 0:
@@ -463,32 +568,41 @@ class Stage2Materializer:
     ) -> Path:
         """Write raw cell metadata as Parquet (no SQLite, no canonical mapping).
 
-        Schema:
-        - cell_id: string
-        - dataset_id: string
-        - dataset_release: string
-        - raw_obs: string (JSON-serialized dict of all obs columns)
+        Vectorized: builds PyArrow arrays directly from obs columns to avoid
+        O(n_obs) individual pandas .loc lookups that are catastrophically slow
+        on large backed datasets.
         """
         import json
 
         parquet_path = meta_root / f"{self.release_id}-raw-obs.parquet"
         obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
-        n_obs = adata.n_obs
+        n_obs = obs_mem.shape[0]
 
-        cell_ids = []
+        # Pre-build fixed-length columns as Arrow arrays
+        cell_ids = pa.array(obs_mem.index.tolist(), type=pa.string())
+        dataset_ids = pa.array([self.dataset_id] * n_obs, type=pa.string())
+        dataset_releases = pa.array([self.release_id] * n_obs, type=pa.string())
+
+        # Vectorized per-column: convert pandas Series → Python list with NaN → None,
+        # then build Arrow array. Avoids O(n_obs) individual .loc calls.
+        raw_obs_parts = []
+        col_names: list[str] = []
+        for col in obs_mem.columns:
+            col_names.append(str(col))
+            vals = obs_mem[col].tolist()
+            processed = [None if pd.isna(v) else str(v) for v in vals]
+            raw_obs_parts.append(processed)
+
+        # Build JSON strings row-by-row using pre-extracted column lists
         raw_obs_list = []
         for i in range(n_obs):
-            cell_ids.append(str(obs_mem.index[i]))
-            raw_dict: dict[str, Any] = {}
-            for col in obs_mem.columns:
-                val = obs_mem.loc[obs_mem.index[i], col]
-                raw_dict[str(col)] = None if pd.isna(val) else str(val)
-            raw_obs_list.append(json.dumps(raw_dict))
+            d = {col_names[j]: raw_obs_parts[j][i] for j in range(len(col_names))}
+            raw_obs_list.append(json.dumps(d))
 
         table = pa.table({
-            "cell_id": pa.array(cell_ids, type=pa.string()),
-            "dataset_id": pa.array([self.dataset_id] * n_obs, type=pa.string()),
-            "dataset_release": pa.array([self.release_id] * n_obs, type=pa.string()),
+            "cell_id": cell_ids,
+            "dataset_id": dataset_ids,
+            "dataset_release": dataset_releases,
             "raw_obs": pa.array(raw_obs_list, type=pa.string()),
         })
         pq.write_table(table, parquet_path)
@@ -501,10 +615,8 @@ class Stage2Materializer:
     ) -> Path:
         """Write raw feature metadata as Parquet (no canonical mapping).
 
-        Schema:
-        - origin_index: int32
-        - feature_id: string
-        - raw_var: string (JSON-serialized dict of all var columns)
+        Vectorized: builds PyArrow arrays directly from var columns to avoid
+        O(n_vars) individual pandas .loc lookups.
         """
         import json
 
@@ -512,18 +624,25 @@ class Stage2Materializer:
         n_vars = var_mem.shape[0]
 
         origin_indices = list(range(n_vars))
-        feature_ids = [str(var_mem.index[i]) for i in range(n_vars)]
+        feature_ids = pa.array([str(var_mem.index[i]) for i in range(n_vars)], type=pa.string())
+
+        # Vectorized per-column: convert to list, NaN → None, then row-major JSON
+        col_names: list[str] = []
+        raw_var_parts = []
+        for col in var_mem.columns:
+            col_names.append(str(col))
+            vals = var_mem[col].tolist()
+            processed = [None if pd.isna(v) else str(v) for v in vals]
+            raw_var_parts.append(processed)
+
         raw_var_list = []
         for i in range(n_vars):
-            raw_dict: dict[str, Any] = {}
-            for col in var_mem.columns:
-                val = var_mem.loc[var_mem.index[i], col]
-                raw_dict[str(col)] = None if pd.isna(val) else str(val)
-            raw_var_list.append(json.dumps(raw_dict))
+            d = {col_names[j]: raw_var_parts[j][i] for j in range(len(col_names))}
+            raw_var_list.append(json.dumps(d))
 
         table = pa.table({
             "origin_index": pa.array(origin_indices, type=pa.int32()),
-            "feature_id": pa.array(feature_ids, type=pa.string()),
+            "feature_id": feature_ids,
             "raw_var": pa.array(raw_var_list, type=pa.string()),
         })
         pq.write_table(table, parquet_path)
@@ -603,20 +722,42 @@ class Stage2Materializer:
         self,
         count_matrix: Any,
         adata: ad.AnnData,
-        size_factors: np.ndarray,
         matrix_root: Path,
-    ) -> dict[str, Path]:
-        """Write sparse cell data via the configured backend."""
+    ) -> tuple[dict[str, Path], np.ndarray] | dict[str, Path]:
+        """Write sparse cell data via the configured backend.
+
+        Arrow-HF computes size factors inline during the write pass and returns
+        them as the second tuple element. Other backends return a plain dict.
+        The materialize() caller handles both cases via isinstance check.
+        """
         from .backends import build_backend_fn
 
         backend_fn = build_backend_fn(self.backend)
-        kwargs: dict[str, Any] = {
-            "dataset_id": self.dataset_id,
-        }
         return backend_fn(
-            adata, count_matrix, size_factors, self.release_id, matrix_root,
-            **kwargs,
+            adata=adata,
+            count_matrix=count_matrix,
+            release_id=self.release_id,
+            matrix_root=matrix_root,
+            dataset_id=self.dataset_id,
         )
+
+    def _write_size_factor_parquet(
+        self,
+        size_factors: np.ndarray,
+        cell_ids: pd.Index,
+        meta_root: Path,
+    ) -> Path:
+        """Write per-cell size factors as a separate Parquet (not in cells parquet).
+
+        The array must already be normalized (median-normalized, clamped).
+        """
+        parquet_path = meta_root / f"{self.release_id}-size-factor.parquet"
+        table = pa.table({
+            "cell_id": pa.array([str(c) for c in cell_ids], type=pa.string()),
+            "size_factor": pa.array(size_factors.tolist(), type=pa.float64()),
+        })
+        pq.write_table(table, parquet_path)
+        return parquet_path
 
     def _run_qa_checks(
         self,
@@ -640,21 +781,44 @@ class Stage2Materializer:
         meta_root: Path,
         n_hvg: int = 2000,
     ) -> Path:
-        """Compute HVG/non-HVG index arrays in dataset-local feature space and write as NumPy."""
-        from .backends.arrow_hf import _get_row_nonzero
+        """Compute HVG/non-HVG index arrays in dataset-local feature space and write as NumPy.
+
+        Uses batched row access for sparse matrices to avoid O(sample_cells)
+        individual row slices on large backed datasets.
+        """
+        from .backends.arrow_hf import _is_csr_dataset
+        from scipy.sparse import issparse
 
         sidecar_dir = meta_root / "hvg_sidecar"
         sidecar_dir.mkdir(parents=True, exist_ok=True)
 
         n_obs = count_matrix.shape[0]
         sample_cells = min(512, n_obs)
-        cell_indices = np.linspace(0, n_obs - 1, num=sample_cells, dtype=int)
 
         log_expr = np.zeros((sample_cells, n_vars), dtype=np.float64)
-        for row_i, ci in enumerate(cell_indices):
-            indices, counts = _get_row_nonzero(count_matrix, ci)
-            for idx, cnt in zip(indices, counts):
-                log_expr[row_i, idx] = np.log1p(float(cnt))
+
+        if _is_csr_dataset(count_matrix) or issparse(count_matrix):
+            # Sample a contiguous block and extract in one batch CSR conversion.
+            # For large datasets this avoids O(sample_cells) individual row slices.
+            start_idx = max(0, (n_obs - sample_cells) // 2)
+            end_idx = start_idx + sample_cells
+            batch = count_matrix[start_idx:end_idx].tocsr()
+            batch_indptr = batch.indptr
+            batch_data = batch.data.astype(np.float64)
+            batch_indices = batch.indices
+            for local_i in range(sample_cells):
+                j_start = batch_indptr[local_i]
+                j_end = batch_indptr[local_i + 1]
+                for j_pos in range(j_start, j_end):
+                    log_expr[local_i, batch_indices[j_pos]] = np.log1p(batch_data[j_pos])
+        else:
+            # Dense path
+            cell_indices = np.linspace(0, n_obs - 1, num=sample_cells, dtype=int)
+            for row_i, ci in enumerate(cell_indices):
+                row = np.asarray(count_matrix[ci]).ravel()
+                nonzero_mask = row != 0
+                for idx in np.where(nonzero_mask)[0]:
+                    log_expr[row_i, idx] = np.log1p(float(row[idx]))
 
         gene_means = np.zeros(n_vars, dtype=np.float64)
         gene_vars = np.zeros(n_vars, dtype=np.float64)
@@ -1191,12 +1355,25 @@ class MaterializationRoute:
     ) -> Path:
         """Write raw cell metadata as SQLite (no canonical mapping applied).
 
-        Raw obs fields are preserved as-is from the h5ad. Each row records the
-        cell_id, dataset_id, dataset_release, and a JSON blob of all obs columns.
-        This is the authoritative source for canonical cell metadata rebuild
-        in ``canonicalize-meta``.
+        .. deprecated::
+            SQLite for raw cell metadata is deprecated as of contract 0.3.0.
+            The new Stage 2 path uses Parquet instead (see
+            ``Stage2Materializer._write_raw_cell_metadata_parquet``).
+            This method is retained only for backward compatibility with
+            existing legacy corpora that used the schema-first materializer.
+            New datasets should use ``Stage2Materializer`` which writes
+            ``{release_id}-raw-obs.parquet`` instead.
         """
         import json
+        import warnings
+
+        warnings.warn(
+            "SQLite for raw cell metadata is deprecated as of contract 0.3.0. "
+            "New Stage 2 runs produce Parquet sidecars instead. "
+            "SQLite-backed metadata will not be written for new datasets.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
         db_path = meta_root / f"{self.release_id}-raw-cell-meta.sqlite"
 
@@ -1642,7 +1819,7 @@ def build_materialization_route(
     }
     if route not in routes:
         raise ValueError(f"unknown route: {route}; expected one of {list(routes)}")
-        return routes[route](
+    return routes[route](
         output_roots=output_roots,
         release_id=release_id,
         dataset_id=dataset_id,
@@ -1664,6 +1841,7 @@ def update_corpus_index(
     global_metadata: GlobalMetadataDocument | None = None,
     emission_spec_path: str | None = None,
     backend: str | None = None,
+    topology: str | None = None,
 ) -> CorpusIndexDocument:
     """Load an existing corpus index, append the new dataset record, and save.
 
@@ -1698,6 +1876,11 @@ def update_corpus_index(
         Backend declaration for the corpus (e.g., "arrow-hf", "webdataset",
         "zarr-ts"). Required when creating a new corpus; written to
         ``global-metadata.yaml``.
+    topology : str | None
+        Corpus topology for the Parquet ledger entry (e.g., "federated",
+        "aggregate"). Required for new corpus creation; inferred from ``backend``
+        for known backends (lance → aggregate, others → federated) when not
+        explicitly provided.
     """
     corpus_root = corpus_index_path.parent
 
@@ -1779,6 +1962,100 @@ def update_corpus_index(
         datasets=tuple(datasets),
     )
     updated.write_yaml(corpus_index_path)
+
+    # Write Parquet corpus ledger (Stage 2 contract: Parquet primary)
+    # Rebuild the full ledger from the updated corpus index to ensure consistency.
+    # This is safe because we always load the existing YAML index on append.
+    ledger_path = corpus_index_path.parent / "corpus-ledger.parquet"
+    # Resolve topology: use explicit parameter, infer from backend, or default to federated
+    effective_topology = topology or ("aggregate" if backend == "lance" else "federated")
+    _write_corpus_ledger_parquet(ledger_path, updated, backend, effective_topology)
+
     if backend == "lancedb-aggregated":
         mark_lance_append_committed(corpus_index_path, new_record)
     return updated
+
+
+def _backfill_feature_count(manifest_path: Path) -> int:
+    """Read a materialization manifest and return the feature_count.
+
+    Parameters
+    ----------
+    manifest_path : Path
+        Path to a materialization-manifest.yaml.
+
+    Returns
+    -------
+    int
+        The feature_count from the manifest, or 0 if unreadable.
+    """
+    try:
+        m = MaterializationManifest.from_yaml_file(manifest_path)
+        return m.feature_count
+    except Exception:
+        return 0
+
+
+def _write_corpus_ledger_parquet(
+    ledger_path: Path,
+    corpus: CorpusIndexDocument,
+    backend: str | None,
+    topology: str,
+) -> None:
+    """Write or overwrite the Parquet corpus ledger from the corpus index.
+
+    The Parquet ledger is the primary machine-readable artifact for Stage 2
+    corpus tracking. The YAML corpus-index.yaml remains for human review.
+
+    feature_count is back-filled from each dataset's materialization-manifest.yaml
+    when the manifest path is resolvable from the corpus root.
+    """
+    import datetime
+
+    corpus_root = ledger_path.parent
+
+    entries = []
+    for d in corpus.datasets:
+        # Back-fill feature_count from the per-dataset manifest
+        feature_count = 0
+        manifest_path = corpus_root / d.manifest_path
+        if manifest_path.exists():
+            feature_count = _backfill_feature_count(manifest_path)
+
+        entry = CorpusLedgerEntry(
+            corpus_id=corpus.corpus_id,
+            dataset_id=d.dataset_id,
+            release_id=d.release_id,
+            dataset_index=d.dataset_index,
+            join_mode=d.join_mode,
+            manifest_path=d.manifest_path,
+            backend=backend or "arrow-hf",
+            topology=topology,
+            cell_count=d.cell_count,
+            feature_count=feature_count,
+            global_start=d.global_start,
+            global_end=d.global_end,
+            created_at=datetime.datetime.utcnow().isoformat(),
+        )
+        entry.validate()
+        entries.append(entry.to_dict())
+
+    if not entries:
+        return
+
+    table = pa.table({
+        "corpus_id": pa.array([e["corpus_id"] for e in entries], type=pa.string()),
+        "dataset_id": pa.array([e["dataset_id"] for e in entries], type=pa.string()),
+        "release_id": pa.array([e["release_id"] for e in entries], type=pa.string()),
+        "dataset_index": pa.array([e["dataset_index"] for e in entries], type=pa.int32()),
+        "join_mode": pa.array([e["join_mode"] for e in entries], type=pa.string()),
+        "manifest_path": pa.array([e["manifest_path"] for e in entries], type=pa.string()),
+        "backend": pa.array([e["backend"] for e in entries], type=pa.string()),
+        "topology": pa.array([e["topology"] for e in entries], type=pa.string()),
+        "cell_count": pa.array([e["cell_count"] for e in entries], type=pa.int64()),
+        "feature_count": pa.array([e["feature_count"] for e in entries], type=pa.int64()),
+        "global_start": pa.array([e["global_start"] for e in entries], type=pa.int64()),
+        "global_end": pa.array([e["global_end"] for e in entries], type=pa.int64()),
+        "created_at": pa.array([e["created_at"] for e in entries], type=pa.string()),
+    })
+    pq.write_table(table, str(ledger_path))

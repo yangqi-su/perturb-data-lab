@@ -207,7 +207,7 @@ class CanonicalizeMetaRoute:
         manifest = MaterializationManifest.from_yaml_file(manifest_path)
         meta_root = manifest_path.parent
 
-        # Load accepted schema
+        # Load accepted schema (required for canonicalize-meta)
         if not manifest.accepted_schema_path:
             raise ValueError(
                 f"dataset {ds_record.dataset_id} has no accepted_schema_path — "
@@ -216,12 +216,49 @@ class CanonicalizeMetaRoute:
         schema_path = meta_root / manifest.accepted_schema_path
         schema = SchemaDocument.from_yaml_file(schema_path)
 
-        # Load raw cell metadata (SQLite)
+        # Load raw cell metadata: prefer Parquet (Stage 2) over SQLite (legacy)
         if not manifest.raw_cell_meta_path:
             raise ValueError(
                 f"dataset {ds_record.dataset_id} has no raw_cell_meta_path"
             )
-        raw_cell_sqlite = meta_root / manifest.raw_cell_meta_path
+        raw_cell_meta_path = meta_root / manifest.raw_cell_meta_path
+
+        # Determine whether the raw cell metadata is Parquet or SQLite
+        raw_cell_sqlite: Path | None = None
+        raw_cell_parquet: Path | None = None
+        if raw_cell_meta_path.suffix == ".parquet":
+            # Stage 2 Parquet sidecar
+            raw_cell_parquet = raw_cell_meta_path
+            if not raw_cell_parquet.exists():
+                raise FileNotFoundError(
+                    f"Stage 2 raw-obs Parquet not found: {raw_cell_parquet}"
+                )
+            # SQLite may still exist as a legacy artifact but is not required
+            legacy_sqlite = meta_root / f"{manifest.release_id}-cell-meta.sqlite"
+            raw_cell_sqlite = legacy_sqlite if legacy_sqlite.exists() else None
+        elif raw_cell_meta_path.suffix in (".sqlite", ".db"):
+            # Legacy SQLite
+            raw_cell_sqlite = raw_cell_meta_path
+            if not raw_cell_sqlite.exists():
+                raise FileNotFoundError(
+                    f"Legacy raw cell SQLite not found: {raw_cell_meta_path}"
+                )
+        else:
+            # Try to detect by file existence
+            if raw_cell_meta_path.exists():
+                if str(raw_cell_meta_path).endswith(".parquet"):
+                    raw_cell_parquet = raw_cell_meta_path
+                else:
+                    raw_cell_sqlite = raw_cell_meta_path
+            else:
+                # Try Stage 2 Parquet name convention
+                parquet_candidate = meta_root / f"{manifest.release_id}-raw-obs.parquet"
+                if parquet_candidate.exists():
+                    raw_cell_parquet = parquet_candidate
+                else:
+                    raise FileNotFoundError(
+                        f"Raw cell metadata not found at {raw_cell_meta_path}"
+                    )
 
         # Load raw feature metadata (Parquet)
         if not manifest.raw_feature_meta_path:
@@ -237,14 +274,23 @@ class CanonicalizeMetaRoute:
             if summary_path.exists():
                 metadata_summary = DatasetMetadataSummary.from_yaml_file(summary_path)
 
+        # Resolve size-factor path for Stage 2 Parquet artifacts
+        size_factor_parquet: Path | None = None
+        if manifest.size_factor_parquet_path:
+            sf_path = meta_root / manifest.size_factor_parquet_path
+            if sf_path.exists():
+                size_factor_parquet = sf_path
+
         return _DatasetRawArtifacts(
             dataset_id=ds_record.dataset_id,
             release_id=ds_record.release_id,
             manifest=manifest,
             schema=schema,
             raw_cell_sqlite=raw_cell_sqlite,
+            raw_cell_parquet=raw_cell_parquet,
             raw_feature_parquet=raw_feature_parquet,
             metadata_summary=metadata_summary,
+            size_factor_parquet=size_factor_parquet,
         )
 
     def _assign_global_cell_ranges(
@@ -258,7 +304,9 @@ class CanonicalizeMetaRoute:
         ranges: list[CorpusCellIndexRange] = []
         global_start = 0
         for artifacts in dataset_records:
-            n_cells = self._count_cells_in_raw_sqlite(artifacts.raw_cell_sqlite)
+            n_cells = self._count_cells_in_raw_metadata(
+                artifacts.raw_cell_sqlite, artifacts.raw_cell_parquet
+            )
             global_end = global_start + n_cells
             ranges.append(
                 CorpusCellIndexRange(
@@ -271,15 +319,29 @@ class CanonicalizeMetaRoute:
             global_start = global_end
         return ranges
 
-    def _count_cells_in_raw_sqlite(self, sqlite_path: Path) -> int:
-        """Return the number of rows in the raw cell metadata SQLite."""
-        conn = sqlite3.connect(str(sqlite_path))
-        try:
-            cur = conn.execute("SELECT COUNT(*) FROM raw_cell_meta")
-            count = int(cur.fetchone()[0])
-        finally:
-            conn.close()
-        return count
+    def _count_cells_in_raw_metadata(
+        self,
+        raw_cell_sqlite: Path | None,
+        raw_cell_parquet: Path | None,
+    ) -> int:
+        """Return the number of rows in the raw cell metadata.
+
+        Supports both SQLite (legacy) and Parquet (Stage 2) sidecars.
+        """
+        if raw_cell_parquet is not None and raw_cell_parquet.exists():
+            table = pq.read_table(str(raw_cell_parquet))
+            return table.num_rows
+        if raw_cell_sqlite is not None and raw_cell_sqlite.exists():
+            conn = sqlite3.connect(str(raw_cell_sqlite))
+            try:
+                cur = conn.execute("SELECT COUNT(*) FROM raw_cell_meta")
+                count = int(cur.fetchone()[0])
+            finally:
+                conn.close()
+            return count
+        raise FileNotFoundError(
+            "No raw cell metadata found (neither Parquet nor SQLite)"
+        )
 
     def _load_global_metadata(self) -> GlobalMetadataDocument | None:
         """Load global-metadata.yaml from corpus root, if present."""
@@ -299,39 +361,55 @@ class CanonicalizeMetaRoute:
     ) -> list[CellMetadataRecord]:
         """Canonicalize cell metadata for one dataset using its accepted schema.
 
-        Parameters
-        ----------
-        artifacts : _DatasetRawArtifacts
-            Raw cell/feature metadata, schema, and manifest for this dataset.
-        cell_range : CorpusCellIndexRange
-            The global cell index range assigned to this dataset.
+        Supports both Parquet (Stage 2) and SQLite (legacy) raw cell metadata.
+        When Parquet is available, reads raw_obs from the Parquet sidecar.
+        When only SQLite is available, falls back to the legacy path.
 
-        Returns
-        -------
-        list[CellMetadataRecord]
-            Canonical cell metadata records in original cell order.
+        Size factors are read from the separate size-factor Parquet when available
+        (Stage 2 artifacts), or default to 1.0 for legacy artifacts.
         """
         schema = artifacts.schema
-        raw_cell_sqlite = artifacts.raw_cell_sqlite
 
-        # Load raw cell metadata rows from SQLite
-        conn = sqlite3.connect(str(raw_cell_sqlite))
-        try:
-            cur = conn.execute(
-                "SELECT cell_id, raw_obs FROM raw_cell_meta ORDER BY rowid"
+        # Load raw cell metadata: prefer Parquet (Stage 2) over SQLite (legacy)
+        if artifacts.raw_cell_parquet is not None and artifacts.raw_cell_parquet.exists():
+            # Stage 2 Parquet sidecar path
+            table = pq.read_table(str(artifacts.raw_cell_parquet))
+            rows_py = table.to_pylist()
+            if not rows_py:
+                return []
+
+            raw_obs_list: list[dict[str, Any]] = []
+            cell_ids: list[str] = []
+            for row in rows_py:
+                cell_ids.append(str(row["cell_id"]))
+                raw_obs_json = row.get("raw_obs", "")
+                raw_obs = json.loads(raw_obs_json) if raw_obs_json else {}
+                raw_obs_list.append(raw_obs)
+        elif artifacts.raw_cell_sqlite is not None and artifacts.raw_cell_sqlite.exists():
+            # Legacy SQLite path
+            conn = sqlite3.connect(str(artifacts.raw_cell_sqlite))
+            try:
+                cur = conn.execute(
+                    "SELECT cell_id, raw_obs FROM raw_cell_meta ORDER BY rowid"
+                )
+                rows = cur.fetchall()
+            finally:
+                conn.close()
+
+            if not rows:
+                return []
+
+            raw_obs_list = []
+            cell_ids = []
+            for cell_id, raw_obs_json in rows:
+                cell_ids.append(str(cell_id))
+                raw_obs = json.loads(raw_obs_json) if raw_obs_json else {}
+                raw_obs_list.append(raw_obs)
+        else:
+            raise FileNotFoundError(
+                "No raw cell metadata found for dataset "
+                f"{artifacts.dataset_id} (neither Parquet nor SQLite)"
             )
-            rows = cur.fetchall()
-        finally:
-            conn.close()
-
-        if not rows:
-            return []
-
-        # Parse raw obs JSON for each row and batch-resolve via schema
-        raw_obs_list: list[dict[str, Any]] = []
-        for cell_id, raw_obs_json in rows:
-            raw_obs = json.loads(raw_obs_json) if raw_obs_json else {}
-            raw_obs_list.append(raw_obs)
 
         # Batch resolve via schema execution
         import pandas as pd
@@ -340,27 +418,30 @@ class CanonicalizeMetaRoute:
         if obs_df.empty:
             return []
 
-        # Determine size factor for each cell
-        # For now, use 1.0 as placeholder; real size factors were computed during
-        # materialization and stored in the per-dataset backend output.
-        # canonicalize-meta reads raw metadata only and does not re-read expression data,
-        # so we use a neutral size factor here. The per-dataset expression readers
-        # will provide real size factors at load time.
-        size_factors = [1.0] * len(obs_df)
+        # Load size factors from the separate Parquet when available (Stage 2)
+        size_factors: list[float] | None = None
+        if artifacts.size_factor_parquet is not None and artifacts.size_factor_parquet.exists():
+            sf_table = pq.read_table(str(artifacts.size_factor_parquet))
+            size_factors = [float(v) for v in sf_table.column("size_factor").to_pylist()]
+
+        if size_factors is None:
+            # Legacy path: use 1.0 as placeholder. Real size factors were
+            # computed during materialization and stored in the backend output.
+            # The per-dataset expression readers will provide real size factors at load time.
+            size_factors = [1.0] * len(obs_df)
 
         # Resolve canonical perturbation and context fields
         perturbations, contexts = resolve_all_cell_rows(schema, obs_df)
 
         # Build canonical cell records
         records: list[CellMetadataRecord] = []
-        for i, (cell_id, raw_obs_json) in enumerate(rows):
-            raw_obs = json.loads(raw_obs_json) if raw_obs_json else {}
+        for i in range(len(cell_ids)):
             records.append(
                 CellMetadataRecord(
-                    cell_id=str(cell_id),
+                    cell_id=cell_ids[i],
                     dataset_id=artifacts.dataset_id,
                     dataset_release=artifacts.release_id,
-                    raw_fields=dict(raw_obs),
+                    raw_fields=dict(raw_obs_list[i]),
                     canonical_perturbation=dict(perturbations[i]),
                     canonical_context=dict(contexts[i]),
                     size_factor=size_factors[i],
@@ -680,15 +761,23 @@ class CanonicalizeMetaRoute:
 
 @dataclass(frozen=True)
 class _DatasetRawArtifacts:
-    """Container for all raw artifacts needed for one dataset's canonicalization."""
+    """Container for all raw artifacts needed for one dataset's canonicalization.
+
+    Supports both Parquet (Stage 2) and SQLite (legacy) raw cell metadata.
+    For Stage 2 artifacts, ``raw_cell_parquet`` is set and ``raw_cell_sqlite``
+    may be None. For legacy artifacts, ``raw_cell_sqlite`` is set and
+    ``raw_cell_parquet`` may be None.
+    """
 
     dataset_id: str
     release_id: str
     manifest: MaterializationManifest
     schema: SchemaDocument
-    raw_cell_sqlite: Path
+    raw_cell_sqlite: Path | None
+    raw_cell_parquet: Path | None
     raw_feature_parquet: Path
     metadata_summary: DatasetMetadataSummary | None = None
+    size_factor_parquet: Path | None = None
 
 
 @dataclass(frozen=True)

@@ -51,6 +51,15 @@ _EXPORT_MAP = {
     "RawFeatureMetadataRecord": (".models", "RawFeatureMetadataRecord"),
     "DatasetMetadataSummary": (".models", "DatasetMetadataSummary"),
     "FeatureProvenanceSpec": (".models", "FeatureProvenanceSpec"),
+    # Phase 3 corpus ledger
+    "CorpusLedgerEntry": (".models", "CorpusLedgerEntry"),
+    # Phase 4 corpus registration
+    "CorpusRegistrationInfo": (".models", "CorpusRegistrationInfo"),
+    "register_materialization": (".registration", "register_materialization"),
+    "read_corpus_ledger": (".registration", "read_corpus_ledger"),
+    "corpus_exists": (".registration", "corpus_exists"),
+    "get_corpus_summary": (".registration", "get_corpus_summary"),
+    "manifest_to_join_record": (".registration", "manifest_to_join_record"),
     # Phase 4 canonicalize-meta
     "CanonicalizeMetaRoute": (".canonicalize_meta", "CanonicalizeMetaRoute"),
     "CorpusCellIndexRange": (".canonicalize_meta", "CorpusCellIndexRange"),
@@ -112,6 +121,15 @@ __all__ = [
     "RawFeatureMetadataRecord",
     "DatasetMetadataSummary",
     "FeatureProvenanceSpec",
+    # Phase 3 corpus ledger
+    "CorpusLedgerEntry",
+    # Phase 4 corpus registration
+    "CorpusRegistrationInfo",
+    "register_materialization",
+    "read_corpus_ledger",
+    "corpus_exists",
+    "get_corpus_summary",
+    "manifest_to_join_record",
     # Phase 4 canonicalize-meta
     "CanonicalizeMetaRoute",
     "CorpusCellIndexRange",

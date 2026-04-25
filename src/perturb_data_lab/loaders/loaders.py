@@ -374,11 +374,18 @@ class BackendCellReader:
 class ArrowHFCellReader(BackendCellReader):
     """Reader for Arrow/HF Parquet storage (primary backend from Phase 3).
 
-    Redesigned in Phase 8 to:
+    Redesigned to:
     - Preload per-dataset feature objects into memory for efficient
       dataset-order → token-space index translation during sample decoding
-    - Load canonical cell metadata from the materialized SQLite file
-      rather than re-executing schema mappings from the schema YAML
+    - Read size factors from the separate size-factor Parquet (Stage 2 contract)
+    - Fall back to cell-meta SQLite only for legacy (schema-first) artifacts
+    - When a metadata_table is provided (from CorpusLoader), read canonical
+      metadata from the RAM-resident table instead of SQLite or Parquet
+
+    Stage 2 artifacts use Parquet sidecars exclusively:
+    - Heavy row data (expressed_gene_indices, expression_counts) from cells parquet
+    - Size factors from the separate {release_id}-size-factor.parquet
+    - Cell metadata from the metadata_table (built from raw-obs Parquet)
     """
 
     def __init__(
@@ -388,11 +395,12 @@ class ArrowHFCellReader(BackendCellReader):
         corpus_index_path: Path,
         cells_parquet_path: Path,
         meta_parquet_path: Path,
-        cell_meta_sqlite_path: Path,
-        feature_registry_path: Path,
+        cell_meta_sqlite_path: Path | None = None,
+        feature_registry_path: Path | None = None,
         metadata_table: MetadataTable | None = None,
         global_row_offset: int = 0,
         size_factor_manifest_path: Path | None = None,
+        size_factor_parquet_path: Path | None = None,
         feature_meta_paths: dict[str, Path] | None = None,
     ):
         """
@@ -408,23 +416,27 @@ class ArrowHFCellReader(BackendCellReader):
             Path to the cells parquet file.
         meta_parquet_path : Path
             Path to the metadata parquet file.
-        cell_meta_sqlite_path : Path
-            Path to the SQLite file containing full canonical cell metadata
-            (written by Phase 6 `_write_cell_metadata`).
-        feature_registry_path : Path
-            Path to the feature registry YAML.
+        cell_meta_sqlite_path : Path | None
+            Path to the SQLite file containing full canonical cell metadata.
+            Optional for Stage 2 artifacts that use Parquet sidecars.
+            Legacy artifacts still require this path.
+        feature_registry_path : Path | None
+            Path to the feature registry YAML.  Optional for Stage 2 artifacts
+            that may not have a feature registry.
+        metadata_table : MetadataTable | None
+            Shared RAM-resident metadata table for corpus-level access.
+        global_row_offset : int
+            Global row offset for this dataset in the corpus.
         size_factor_manifest_path : Path | None
-            Deprecated; size factors are read from the cells parquet.
-            No longer required or used. Kept for backwards compatibility.
+            Deprecated. Kept for backwards compatibility only.
+        size_factor_parquet_path : Path | None
+            Path to the separate size-factor Parquet written by Stage2Materializer.
+            When provided, size factors are read from this file.  When not provided,
+            the reader falls back to the ``size_factor`` column in the cells parquet
+            (legacy artifacts that stored size_factor inline).
         feature_meta_paths : dict[str, Path] | None
             Optional dict with keys ``features_origin`` and optionally ``features_token``
-            pointing to the per-dataset feature parquet files written by
-            Phase 7 `_write_feature_metadata`.  When ``features_origin`` is provided,
-            feature objects are preloaded at reader construction for origin-index
-            translation.  ``features_token`` is optional — if absent, the reader
-            falls back to identity translation (original dataset-order indices as tokens).
-            This allows Phase 3 (tokenizer-deferred) materializations to load without
-            requiring a token-sidecar that has not yet been generated.
+            pointing to the per-dataset feature parquet files.
         """
         super().__init__(dataset_id, dataset_index, corpus_index_path)
         self.cells_parquet_path = cells_parquet_path
@@ -434,9 +446,11 @@ class ArrowHFCellReader(BackendCellReader):
         self.metadata_table = metadata_table
         self.global_row_offset = global_row_offset
         self.size_factor_manifest_path = size_factor_manifest_path
+        self.size_factor_parquet_path = size_factor_parquet_path
         self._feature_meta_paths = feature_meta_paths
         self.__cells_table = None
         self.__meta_table = None
+        self.__size_factor_table = None  # lazily loaded size factor parquet
         # Preload feature objects only when both features_origin AND features_token
         # are available.  When features_token is absent (Phase 3 tokenizer-deferred),
         # token-space translation is not yet possible — translate_to_token_ids
@@ -470,6 +484,27 @@ class ArrowHFCellReader(BackendCellReader):
             self.__meta_table = pq.read_table(self.meta_parquet_path)
         return self.__meta_table
 
+    def _size_factor_table(self):
+        """Lazily load the separate size-factor Parquet if available."""
+        if self.__size_factor_table is None and self.size_factor_parquet_path is not None:
+            import pyarrow.parquet as pq
+
+            if self.size_factor_parquet_path.exists():
+                self.__size_factor_table = pq.read_table(str(self.size_factor_parquet_path))
+        return self.__size_factor_table
+
+    def _read_size_factor(self, row_index: int) -> float:
+        """Read size factor for a cell, preferring the separate Parquet."""
+        sf_table = self._size_factor_table()
+        if sf_table is not None:
+            return float(sf_table["size_factor"][row_index].as_py())
+        # Fallback: cells parquet may have an inline size_factor column (legacy)
+        table = self._cells_table()
+        if "size_factor" in table.column_names:
+            return float(table["size_factor"][row_index].as_py())
+        # No size factor available — use 1.0 as neutral default
+        return 1.0
+
     @property
     def preloaded_features(self) -> PreloadedFeatureObjects | None:
         """Return the preloaded feature objects for this dataset, if any."""
@@ -496,7 +531,7 @@ class ArrowHFCellReader(BackendCellReader):
         table = self._cells_table()
         indices = table["expressed_gene_indices"][row_index].as_py()
         counts = table["expression_counts"][row_index].as_py()
-        sf = table["size_factor"][row_index].as_py()
+        sf = self._read_size_factor(row_index)
         return {
             "global_row_index": self.global_row_offset + row_index,
             "dataset_index": self.dataset_index,
@@ -504,7 +539,7 @@ class ArrowHFCellReader(BackendCellReader):
             "local_row_index": row_index,
             "expressed_gene_indices": tuple(int(i) for i in indices),
             "expression_counts": tuple(int(c) for c in counts),
-            "size_factor": float(sf),
+            "size_factor": sf,
         }
 
     def read_rows(self, row_indices: list[int]) -> list[dict[str, Any]]:
@@ -515,6 +550,7 @@ class ArrowHFCellReader(BackendCellReader):
         table = self._cells_table().take(pa.array(row_indices, type=pa.int64()))
         result: list[dict[str, Any]] = []
         for local_position, row_index in enumerate(row_indices):
+            sf = self._read_size_factor(row_index)
             result.append(
                 {
                     "global_row_index": self.global_row_offset + row_index,
@@ -527,21 +563,26 @@ class ArrowHFCellReader(BackendCellReader):
                     "expression_counts": tuple(
                         int(c) for c in table["expression_counts"][local_position].as_py()
                     ),
-                    "size_factor": float(table["size_factor"][local_position].as_py()),
+                    "size_factor": sf,
                 }
             )
         return result
 
     @property
     def total_genes(self) -> int:
+        if self.feature_registry_path is None:
+            # Stage 2 artifacts may not have a feature registry; use feature
+            # provenance parquet or return 0 as fallback.
+            if self._feature_meta_paths and "features_origin" in self._feature_meta_paths:
+                import pyarrow.parquet as pq
+                return pq.read_table(self._feature_meta_paths["features_origin"]).num_rows
+            return 0
         from ..materializers.models import FeatureRegistryManifest
 
         reg = FeatureRegistryManifest.from_yaml_file(self.feature_registry_path)
         return len(reg.entries)
 
     def read_cell(self, cell_index: int) -> CellState:
-        import json
-        import sqlite3
         heavy_row = self.read_row(cell_index)
         global_row_index = heavy_row["global_row_index"]
 
@@ -563,38 +604,59 @@ class ArrowHFCellReader(BackendCellReader):
                 raw_fields=dict(metadata["raw_fields"]),
             )
 
-        # Load full canonical cell metadata from the materialized SQLite file.
-        # This was written by _write_cell_metadata() during Phase 6 materialization
-        # and contains all canonical perturbation and context fields resolved
-        # row-wise from the schema at materialization time.  No schema re-execution
-        # is needed at load time.
-        conn = sqlite3.connect(str(self.cell_meta_sqlite_path))
-        conn.row_factory = sqlite3.Row
-        cur = conn.execute("SELECT * FROM cell_meta WHERE rowid = ?", (cell_index + 1,))
-        metadata_row = cur.fetchone()
-        conn.close()
+        # Legacy fallback: read canonical metadata from cell-meta SQLite.
+        # This path is only reached for pre-Stage-2 artifacts that were
+        # materialized with the schema-first path. Stage 2 artifacts should
+        # always have a metadata_table provided by CorpusLoader.
+        if self.cell_meta_sqlite_path is not None and Path(self.cell_meta_sqlite_path).exists():
+            import json
+            import sqlite3
 
-        if metadata_row is None:
-            raise IndexError(f"cell_index {cell_index} out of range")
+            conn = sqlite3.connect(str(self.cell_meta_sqlite_path))
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("SELECT * FROM cell_meta WHERE rowid = ?", (cell_index + 1,))
+            metadata_row = cur.fetchone()
+            conn.close()
 
-        canonical_perturbation = json.loads(metadata_row["canonical_perturbation"])
-        canonical_context = json.loads(metadata_row["canonical_context"])
-        raw_fields = json.loads(metadata_row["raw_obs"])
+            if metadata_row is None:
+                raise IndexError(f"cell_index {cell_index} out of range")
 
+            canonical_perturbation = json.loads(metadata_row["canonical_perturbation"])
+            canonical_context = json.loads(metadata_row["canonical_context"])
+            raw_fields = json.loads(metadata_row["raw_obs"])
+
+            return CellState(
+                identity=CellIdentity(
+                    global_row_index=global_row_index,
+                    dataset_index=self.dataset_index,
+                    dataset_id=str(metadata_row["dataset_id"]),
+                    local_row_index=cell_index,
+                ),
+                cell_id=str(metadata_row["cell_id"]),
+                expressed_gene_indices=tuple(heavy_row["expressed_gene_indices"]),
+                expression_counts=tuple(heavy_row["expression_counts"]),
+                size_factor=float(heavy_row["size_factor"]),
+                canonical_perturbation=canonical_perturbation,
+                canonical_context=canonical_context,
+                raw_fields=raw_fields,
+            )
+
+        # No metadata_table and no SQLite available — this should only happen
+        # for single-dataset reads without a corpus. Return minimal metadata.
         return CellState(
             identity=CellIdentity(
                 global_row_index=global_row_index,
                 dataset_index=self.dataset_index,
-                dataset_id=str(metadata_row["dataset_id"]),
+                dataset_id=self.dataset_id,
                 local_row_index=cell_index,
             ),
-            cell_id=str(metadata_row["cell_id"]),
+            cell_id=f"cell_{cell_index}",
             expressed_gene_indices=tuple(heavy_row["expressed_gene_indices"]),
             expression_counts=tuple(heavy_row["expression_counts"]),
             size_factor=float(heavy_row["size_factor"]),
-            canonical_perturbation=canonical_perturbation,
-            canonical_context=canonical_context,
-            raw_fields=raw_fields,
+            canonical_perturbation={},
+            canonical_context={},
+            raw_fields={},
         )
 
 

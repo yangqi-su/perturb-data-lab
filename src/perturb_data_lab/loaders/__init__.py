@@ -29,7 +29,13 @@ from .loaders import (
     AVAILABLE_READERS,
     build_cell_reader,
 )
-from .corpus import CorpusLoader, DatasetReaderEntry, build_corpus_loader
+from .corpus import (
+    CorpusLoader,
+    DatasetReaderEntry,
+    build_corpus_loader,
+    read_raw_obs_parquet,
+    read_raw_var_parquet,
+)
 
 __all__ = [
     "CellState",
@@ -63,4 +69,7 @@ __all__ = [
     "CorpusLoader",
     "DatasetReaderEntry",
     "build_corpus_loader",
+    # Phase 5 readback helpers for Stage 2 Parquet sidecars
+    "read_raw_obs_parquet",
+    "read_raw_var_parquet",
 ]

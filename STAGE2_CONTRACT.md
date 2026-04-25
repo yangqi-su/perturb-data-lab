@@ -133,7 +133,17 @@ All heavy-row storage uses **sparse representation** (CSR/CSC or equivalent). De
   - `raw_var`: `string` — JSON-serialized dict of all var columns (preserving nulls as `null`)
 - **No canonical mapping applied** — this is the raw var as it appeared in the source h5ad
 
-### 4.3 Provenance Sidecar
+### 4.3 Size-Factor Sidecar (Parquet, not inline)
+
+- **Format**: Parquet
+- **Path**: `{metadata_root}/{release_id}-size-factor.parquet`
+- **Schema**:
+  - `size_factor`: `float64` — one row per cell, ordered to match the heavy-row ordering
+- **Content**: Per-cell size factor computed as `row_sum / median(row_sum)` post-recovery, using the Stage 1-approved count source
+- **Rationale**: Size factors are stored in a separate Parquet to keep the cells heavy-row parquet free of non-count data; runtime loaders read this sidecar to provide per-row normalization context
+- **No `size_factor` column in the cells parquet itself** — the cells parquet schema is strictly `['expressed_gene_indices', 'expression_counts']` for the `arrow-hf` backend
+
+### 4.4 Provenance Sidecar
 
 - **Format**: YAML (human-readable) + Parquet (machine-readable)
 - **Path**: `{metadata_root}/{release_id}-feature-provenance.parquet`
@@ -196,7 +206,7 @@ raw_cell_meta_path: str      # path to raw-obs.parquet
 raw_feature_meta_path: str   # path to raw-var.parquet
 provenance_spec_path: str     # path to feature-provenance.parquet
 hvg_sidecar_path: str        # path to hvg_sidecar directory
-size_factor_manifest_path: str
+size_factor_parquet_path: str # path to size-factor.parquet (separate, not inline)
 qa_manifest_path: str
 integer_verified: bool
 cell_count: int
@@ -276,7 +286,7 @@ The previous `corpus-index.yaml` + SQLite-backed corpus tracking is **deprecated
 | Corpus ledger | Parquet | YAML/SQLite |
 | Heavy count storage | Backend-specific (Arrow/Zarr/WebDataset/Lance) | — |
 | HVG arrays | NumPy .npy | — |
-| Size factors | YAML | — |
+| Size factors | Parquet (separate sidecar) | — |
 
 ### 8.2 Parquet Reading Preference
 
