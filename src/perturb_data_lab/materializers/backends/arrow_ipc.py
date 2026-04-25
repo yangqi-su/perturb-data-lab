@@ -27,6 +27,7 @@ import pyarrow.parquet as pq
 from scipy.sparse import issparse
 
 from ..chunk_translation import DatasetSpec, _build_list_array
+import pyarrow.ipc as pa_ipc
 
 
 def _is_csr_dataset(x: object) -> bool:
