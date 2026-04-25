@@ -320,15 +320,16 @@ def build_backend_fn(backend: str, topology: str = "federated"):
     topology : str, default "federated"
         Topology: "federated" (per-dataset files) or "aggregate" (corpus-scoped).
     """
-    if backend in AVAILABLE_BACKENDS:
-        return AVAILABLE_BACKENDS[backend]
-    # Try new-style backend dispatch
+    # Check new-style dispatch first when topology is explicitly non-federated
     if backend in AVAILABLE_WRITERS:
         topo_map = AVAILABLE_WRITERS[backend]
         if topology in topo_map:
             return topo_map[topology]
         if "federated" in topo_map:
             return topo_map["federated"]
+    # Fall back to legacy BACKEND registry for backward compat
+    if backend in AVAILABLE_BACKENDS:
+        return AVAILABLE_BACKENDS[backend]
     raise ValueError(
         f"unknown backend: {backend}; "
         f"available legacy: {list(AVAILABLE_BACKENDS)}, "
