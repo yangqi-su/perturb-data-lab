@@ -2,6 +2,7 @@
 
 from .loaders import (
     ArrowHFCellReader,
+    ArrowIpcCellReader,
     BackendCellReader,
     CellIdentity,
     CellState,
@@ -14,7 +15,7 @@ from .loaders import (
     GlobalFeatureResolver,
     GPUSparseRuntimePath,
     HVGRandomSampler,
-    LanceDBAggregatedCellReader,
+    LanceCellReader,
     MetadataTable,
     PerturbDataLoader,
     PerturbIterableDataset,
@@ -45,7 +46,8 @@ __all__ = [
     "PreloadedFeatureObjects",
     "BackendCellReader",
     "ArrowHFCellReader",
-    "LanceDBAggregatedCellReader",
+    "ArrowIpcCellReader",
+    "LanceCellReader",
     "WebDatasetCellReader",
     "ZarrCellReader",
     "build_cell_reader",

@@ -286,7 +286,9 @@ For federated topologies, the per-dataset object carries the same fields minus t
 
 **Size factors are stored separately**, not inline in the heavy-row parquet. The size-factor sidecar is `{metadata_root}/{release_id}-size-factor.parquet` with one `float64` row per cell in the same order as the heavy rows. This separation keeps the heavy-row parquet focused on count data and allows runtime loaders to read size factors on demand without parsing non-count columns from the cells artifact.
 
-The flat-buffer Arrow list array pattern is used for the `arrow-hf` backend: `expressed_gene_indices` and `expression_counts` are stored as a single `pa.ListArray` per row, built directly from CSR indptr/indices/data buffers via `pa.ListArray.from_arrays()` without per-row Python list construction.
+The flat-buffer Arrow list array pattern is used for the `arrow-parquet` backend: `expressed_gene_indices` and `expression_counts` are stored as a single `pa.ListArray` per row, built directly from CSR indptr/indices/data buffers via `pa.ListArray.from_arrays()` without per-row Python list construction.
+
+**`Stage2Materializer._write_cells()`** loops over the count matrix in chunks (default 100,000 rows per chunk), calls `_translate_chunk()` once per chunk to produce a `ChunkBundle`, and passes each bundle to the thin backend serializer. Each backend writer accepts a `ChunkBundle` and serializes it to its native format — writers do not implement CSR logic, do not call `_translate_chunk()`, and have no legacy fallback paths.
 
 #### 2. Preserve raw metadata
 
@@ -345,13 +347,13 @@ The current combined backend names should be conceptually replaced by a matrix.
 
 ### Storage backend axis
 
-The intended storage backends are:
+The implemented storage backends are:
 
-- `arrow-parquet`
-- `arrow-ipc`
-- `webdataset`
-- `zarr`
-- `lance`
+- `arrow-parquet` — Arrow IPC serialized to Parquet via `pa.ipc.new_file`; flat-buffer list-arrays via `pa.ListArray.from_arrays()`
+- `arrow-ipc` — Arrow IPC serialized via `pa.ipc.new_file`; flat-buffer list-arrays via `pa.ListArray.from_arrays()`
+- `webdataset` — WebDataset `.tar` shards; per-cell pickle records; metadata Parquet per shard
+- `zarr` — Zarr 1D flat-buffer layout (all indices in one 1D array + row_offsets); pre-scan two-pass
+- `lance` — Direct `lance.write_dataset()` in create/append mode; no `lancedb` dependency; append-safe for aggregate topology
 
 This axis answers:
 
@@ -362,39 +364,68 @@ This axis answers:
 
 ### Corpus topology axis
 
-The intended corpus topologies are:
+The implemented corpus topologies are:
 
-- `federated`
-- `aggregate`
+- `federated` — each dataset stored independently; global_row_index assigned at corpus-append time via ledger
+- `aggregate` — multiple datasets share one heavy object with deterministic, non-overlapping corpus-scoped row ranges
 
 This axis answers:
 
 - does each dataset have its own heavy object and routing entry
 - or do multiple datasets share one heavy object with append-safe row ranges
 
+### Shared chunk translation layer
+
+All 5 backends share a single translation unit (`chunk_translation.py`) that:
+
+1. Accepts a CSR batch (`indptr`, `indices`, `counts`) + `DatasetSpec` + `chunk_start`
+2. Translates it once into a `ChunkBundle` (6 fields: `table`, `size_factors`, `indptr`, `indices`, `counts`, `row_count`)
+   - `table`: `pa.Table` with `global_row_index`, flat-buffer list-arrays (`expressed_gene_indices`, `expression_counts`) built via `pa.ListArray.from_arrays()` directly from CSR buffers
+   - `size_factors`: float32 ndarray of median-normalized per-cell size factors, computed inline during the same CSR traversal — no writer computes its own size factors
+   - `indptr`, `indices`, `counts`: raw CSR NumPy arrays for backends that need direct buffer access
+   - `indices` are always in dataset-local feature space — no canonical gene mapping is applied at this stage; canonical mapping is deferred to Stage 3
+3. Each backend writer consumes the `ChunkBundle` and produces its own serialized format
+
+`gene_lookup` has been removed. `_translate_chunk()` accepts `dataset: DatasetSpec`, `matrix_chunk: csr_matrix`, `chunk_start: int` — no gene mapping parameter.
+
+This eliminates per-backend sparse re-encoding on the hot path and enforces a common heavy-row schema across all backends. The `metadata_table` field has been removed; per-cell metadata is written by the caller as a separate Parquet sidecar.
+
+### Common heavy-row schema
+
+All backends share the same heavy-row structure written by `_translate_chunk()` via `pa.ListArray.from_arrays()` directly from CSR buffers:
+
+```
+global_row_index: int64
+expressed_gene_indices: list<int32>   — dataset-local feature indices
+expression_counts: list<int32>       — integer counts, one per expressed gene
+```
+
+Metadata (17 fields from `METADATA_SCHEMA`) is stored separately in the raw-obs Parquet sidecar, not in the heavy-row parquet. The `_build_metadata_table()` helper is available for callers that need to construct the metadata table from obs data.
+
 ### Why this split matters
 
 This split removes a major source of current bloat.
 
-The code should not need one conceptual backend name for each pair such as:
+The code previously needed one conceptual backend name for each fused pair such as:
 
-- `lancedb-aggregated`
-- `zarr-aggregated`
-- `arrow-hf`
+- `arrow-hf` (fused backend + topology)
+- `zarr-ts` (fused backend + topology)
+- `lancedb-aggregated` (fused backend + topology + wrapper)
 
-Instead, the system should support combinations where they make sense.
+Instead, the system now supports independent `backend` + `topology` dispatch:
 
-Examples:
+- `arrow-parquet` × `federated`
+- `arrow-ipc` × `federated`
+- `webdataset` × `federated`
+- `zarr` × `federated`
+- `lance` × `federated`
+- `arrow-parquet` × `aggregate`
+- `arrow-ipc` × `aggregate`
+- `webdataset` × `aggregate`
+- `zarr` × `aggregate`
+- `lance` × `aggregate`
 
-- `arrow-parquet` x `federated`
-- `arrow-ipc` x `federated`
-- `webdataset` x `federated`
-- `zarr` x `federated`
-- `lance` x `aggregate`
-
-Not every backend must support every topology immediately.
-
-The design only requires that the axes be separated.
+Not every backend must support every topology immediately. The design only requires that the axes be separated.
 
 ### What Stage 2 should not do
 

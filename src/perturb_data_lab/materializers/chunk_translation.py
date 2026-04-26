@@ -8,8 +8,8 @@ backends can consume without backend-specific sparse re-encoding.
 
 Architecture
 ------------
-The translation layer sits between the materialization entry point (Stage2Materializer
-or the legacy MaterializationRoute) and the backend-specific writer. The caller builds
+The translation layer sits between the materialization entry point (Stage2Materializer)
+and the backend-specific writer. The caller builds
 or receives a CSR matrix chunk, and passes it along with a DatasetSpec to
 _translate_chunk(), which returns a ChunkBundle. Each backend writer then converts
 the ChunkBundle into its native format.
@@ -208,37 +208,40 @@ class ChunkBundle:
     table : pa.Table
         Heavy-row Arrow table with schema HEAVY_CELL_SCHEMA. Contains one row per
         cell in the chunk, with ``expressed_gene_indices`` and ``expression_counts``
-        as Arrow list arrays built directly from CSR buffers.
-    metadata_table : pa.Table
-        Metadata Arrow table with schema METADATA_SCHEMA. Contains the per-cell
-        metadata fields (cell_id, dataset_id, size_factor, etc.). Backends handle
-        this independently — some write it as a separate Parquet, others embed
-        it in Lance rows, etc.
+        as Arrow list arrays built directly from CSR buffers via
+        ``pa.ListArray.from_arrays()``.
+    size_factors : np.ndarray
+        Median-normalized per-cell size factors (float32). Computed inline during
+        the same CSR traversal as sparse translation. Every backend writer receives
+        pre-computed size factors from ``_translate_chunk()`` — no writer computes
+        its own size factors.
     indptr : np.ndarray
-        CSR indptr array for this chunk. Int64, length n_rows + 1.
+        CSR indptr array for this chunk. Int64, length ``n_rows + 1``. Raw buffer
+        available for backends that need flat-buffer access (Zarr, WebDataset).
     indices : np.ndarray
-        Canonical gene indices (int32) for all non-zero entries in this chunk.
+        **Dataset-local** gene indices (int32) for all non-zero entries in this chunk.
+        Raw buffer for backends that need it. These indices are in the original
+        dataset's feature space — no canonical gene mapping has been applied.
+        Canonical mapping is deferred to Stage 3.
     counts : np.ndarray
-        Expression counts (int32) for all non-zero entries in this chunk.
+        Expression counts (int32) for all non-zero entries in this chunk. Raw buffer
+        for backends that need it.
     row_count : int
         Number of cell rows in this chunk.
 
     Notes
     -----
-    The ``metadata_table`` field must be populated by the caller before being passed
-    to any backend writer. The translation layer itself returns an empty sliced table
-    as a placeholder (matching the archived benchmark behavior). The caller is
-    responsible for filling in fields like ``cell_id``, ``stable_row_id``,
-    ``size_factor``, etc.
+    The ``metadata_table`` field has been removed. Per-cell metadata is written by
+    the caller (``Stage2Materializer``) as a separate Parquet sidecar
+    (``{release_id}-raw-obs.parquet``). The ``_build_metadata_table()`` helper remains
+    available for callers that need a ``METADATA_SCHEMA`` table from obs data.
 
     The ``indptr``, ``indices``, and ``counts`` arrays are raw CSR components.
-    These are available for backends that need them (e.g. Zarr, WebDataset) rather
-    than always going through the Arrow table. Backends that only need the Arrow
-    table can ignore these raw arrays.
+    Backends that only need the Arrow table can ignore these.
     """
 
     table: pa.Table
-    metadata_table: pa.Table
+    size_factors: np.ndarray
     indptr: np.ndarray
     indices: np.ndarray
     counts: np.ndarray
@@ -295,7 +298,6 @@ def _translate_chunk(
     dataset: DatasetSpec,
     matrix_chunk: csr_matrix,
     chunk_start: int,
-    gene_lookup: np.ndarray,
 ) -> ChunkBundle:
     """Translate a CSR matrix chunk into a ChunkBundle for backend writers.
 
@@ -303,10 +305,11 @@ def _translate_chunk(
     canonical ``ChunkBundle`` form once; all five backend writers then consume this
     same bundle without re-encoding sparse rows independently.
 
-    Size factors are NOT computed here — they are computed inline during the write
-    traversal in the materializer (Stage2Materializer._compute_size_factors or the
-    backend's own inline path) and written as a separate Parquet sidecar. The
-    metadata_table placeholder is returned empty (matching archived benchmark behavior).
+    Size factors are computed inline during the same CSR traversal as the sparse
+    translation (one pass). No writer computes its own size factors.
+
+    ``expressed_gene_indices`` are in **dataset-local feature space** — no canonical
+    gene mapping is applied at this stage. Canonical mapping is deferred to Stage 3.
 
     Parameters
     ----------
@@ -317,17 +320,16 @@ def _translate_chunk(
         to one without densification.
     chunk_start : int
         Row offset within the dataset at which this chunk begins (0-indexed).
-        Used to compute ``row_index_in_dataset`` and ``global_row_index``.
-    gene_lookup : np.ndarray
-        Local-to-canonical gene index mapping. Shape ``(local_vocabulary_size,)``.
-        ``gene_lookup[local_index]`` returns the canonical global gene index.
-        Must be int32 dtype.
+        Used to compute ``global_row_index``.
 
     Returns
     -------
     ChunkBundle
-        Translated chunk with heavy-row Arrow table and empty metadata table
-        placeholder.
+        Translated chunk with heavy-row Arrow table, computed size factors,
+        and raw CSR buffers. ``indices`` in the bundle are dataset-local (not
+        mapped through any gene_lookup). No ``metadata_table`` is returned —
+        callers that need a ``METADATA_SCHEMA`` table should use
+        ``_build_metadata_table()``.
 
     Raises
     ------
@@ -335,13 +337,6 @@ def _translate_chunk(
         If ``matrix_chunk`` is not sparse or cannot be converted to CSR.
     ValueError
         If any expression count is not integer-valued.
-
-    Notes
-    -----
-    The returned ``metadata_table`` is an empty sliced table (0 rows). Callers
-    must populate it with the actual per-cell metadata before passing to a backend
-    writer. See ``_build_metadata_table()`` for a helper that constructs a filled
-    metadata table from obs data.
     """
     if not issparse(matrix_chunk):
         raise ValueError(f"{dataset.dataset_id}:{chunk_start} chunk densified unexpectedly")
@@ -355,8 +350,8 @@ def _translate_chunk(
     counts = counts.astype(np.int32, copy=False)
 
     indptr = np.asarray(matrix_chunk.indptr, dtype=np.int64)
+    # indices are kept in dataset-local space — no gene_lookup mapping applied
     local_indices = np.asarray(matrix_chunk.indices, dtype=np.int32)
-    canonical_indices = np.asarray(gene_lookup[local_indices], dtype=np.int32)
     row_count = int(matrix_chunk.shape[0])
     global_row_index = np.arange(
         dataset.global_row_start + chunk_start,
@@ -364,46 +359,42 @@ def _translate_chunk(
         dtype=np.int64,
     )
 
+    # Inline size-factor computation: row sums → median normalization → clamp.
+    row_sums = np.asarray(matrix_chunk.sum(axis=1)).ravel()
+    row_median = float(np.median(row_sums))
+    if row_median > 0:
+        size_factors = row_sums / row_median
+    else:
+        size_factors = row_sums.copy()
+    size_factors = np.where(size_factors <= 0, 1.0, size_factors)
+    size_factors = np.where(np.isnan(size_factors), 1.0, size_factors)
+    size_factors = size_factors.astype(np.float32, copy=False)
+
+    # Single sparse hot path: pa.ListArray.from_arrays() from CSR buffers.
+    # expressed_gene_indices uses dataset-local indices (no canonical mapping).
+    expressed_gene_indices = pa.ListArray.from_arrays(
+        pa.array(indptr.astype(np.int32, copy=False), type=pa.int32()),
+        pa.array(local_indices, type=pa.int32()),
+    )
+    expression_counts = pa.ListArray.from_arrays(
+        pa.array(indptr.astype(np.int32, copy=False), type=pa.int32()),
+        pa.array(counts.astype(np.int32, copy=False), type=pa.int32()),
+    )
+
     table = pa.table(
         {
             "global_row_index": pa.array(global_row_index, type=pa.int64()),
-            "expressed_gene_indices": _build_list_array(indptr, canonical_indices),
-            "expression_counts": _build_list_array(indptr, counts),
+            "expressed_gene_indices": expressed_gene_indices,
+            "expression_counts": expression_counts,
         },
         schema=HEAVY_CELL_SCHEMA,
     )
 
-    # Empty metadata table placeholder — caller must populate before backend write.
-    metadata_table = pa.table(
-        {
-            "global_row_index": pa.array(global_row_index, type=pa.int64()),
-            "stable_row_id": pa.array([""] * row_count, type=pa.string()),
-            "cell_id": pa.array([""] * row_count, type=pa.string()),
-            "dataset_id": pa.array([dataset.dataset_id] * row_count, type=pa.string()),
-            "dataset_index": pa.array([dataset.dataset_index] * row_count, type=pa.int32()),
-            "row_index_in_dataset": pa.array(
-                np.arange(chunk_start, chunk_start + row_count, dtype=np.int64), type=pa.int64()
-            ),
-            "cell_context": pa.array([""] * row_count, type=pa.string()),
-            "perturbation_label": pa.array([""] * row_count, type=pa.string()),
-            "pair_id": pa.array([""] * row_count, type=pa.string()),
-            "pair_role": pa.array([""] * row_count, type=pa.string()),
-            "paired_stable_row_id": pa.array([""] * row_count, type=pa.string()),
-            "paired_row_index": pa.array(np.zeros(row_count, dtype=np.int64), type=pa.int64()),
-            "paired_global_row_index": pa.array(np.zeros(row_count, dtype=np.int64), type=pa.int64()),
-            "donor_id": pa.array([""] * row_count, type=pa.string()),
-            "batch_id": pa.array([""] * row_count, type=pa.string()),
-            "replicate_id": pa.array([""] * row_count, type=pa.string()),
-            "size_factor": pa.array(np.zeros(row_count, dtype=np.float32), type=pa.float32()),
-        },
-        schema=METADATA_SCHEMA,
-    ).slice(0, 0)
-
     return ChunkBundle(
         table=table,
-        metadata_table=metadata_table,
+        size_factors=size_factors,
         indptr=indptr,
-        indices=canonical_indices,
+        indices=local_indices,
         counts=counts,
         row_count=row_count,
     )

@@ -217,15 +217,29 @@ def _cmd_schema_preview(args: argparse.Namespace) -> None:
 
 def _add_materialize_args(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
-        "--schema",
+        "--source",
         required=True,
-        help="Path to the reviewed schema YAML (status must be 'ready').",
+        help="Path to the source h5ad file.",
+    )
+    sub.add_argument(
+        "--review-bundle",
+        required=True,
+        help=(
+            "Path to the Stage 1 dataset-summary.yaml that gates this materialization. "
+            "This is the only required gating artifact; no schema.yaml is used."
+        ),
     )
     sub.add_argument(
         "--backend",
         required=True,
-        choices=["arrow-hf", "webdataset", "zarr-ts", "lancedb-aggregated", "zarr-aggregated"],
+        choices=["arrow-parquet", "arrow-ipc", "webdataset", "zarr", "lance"],
         help="Storage backend for this materialization.",
+    )
+    sub.add_argument(
+        "--topology",
+        default="federated",
+        choices=["federated", "aggregate"],
+        help="Corpus topology. Default: federated.",
     )
     sub.add_argument(
         "--release-id",
@@ -246,118 +260,102 @@ def _add_materialize_args(sub: argparse.ArgumentParser) -> None:
         "--corpus-index",
         default=None,
         help=(
-            "Path to corpus-index.yaml for append_routed mode. "
-            "If provided, the dataset is appended to the existing corpus. "
-            "If not provided, create_new mode is used."
+            "Path to corpus-index.yaml for corpus registration. "
+            "If provided with --register, the dataset is registered with the corpus "
+            "after materialization. If not provided, --register cannot be used."
         ),
+    )
+    sub.add_argument(
+        "--corpus-id",
+        default=None,
+        help="Corpus identifier. Required when registering a new corpus.",
+    )
+    sub.add_argument(
+        "--register",
+        action="store_true",
+        help=(
+            "If set, automatically register this dataset with the corpus ledger "
+            "after successful materialization. Requires --corpus-index to be set."
+        ),
+    )
+    sub.add_argument(
+        "--rerun-stage1",
+        action="store_true",
+        help=(
+            "If set, rerun Stage 1 inspection before materialization as a preflight step "
+            "and use the resulting dataset-summary.yaml as the gating artifact."
+        ),
+    )
+    sub.add_argument(
+        "--n-hvg",
+        type=int,
+        default=2000,
+        help="Number of top-dispersion genes to select as HVGs. Default: 2000.",
     )
 
 
 def _cmd_materialize(args: argparse.Namespace) -> None:
-    from .materializers import (
-        build_materialization_route,
-        update_corpus_index,
-    )
-    from .materializers.models import (
-        CountSourceSpec,
-        OutputRoots,
-        MaterializationManifest,
-        DatasetJoinRecord,
-    )
-    from .materializers.emission_spec import CorpusEmissionSpec
+    from .materializers import Stage2Materializer
+    from .materializers.models import OutputRoots
 
-    schema_path = Path(args.schema)
-    if not schema_path.exists():
-        print(f"[error] schema not found: {schema_path}", file=sys.stderr)
+    source_path = Path(args.source)
+    if not source_path.exists():
+        print(f"[error] source h5ad not found: {source_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Load schema to get count source
-    schema = SchemaDocument.from_yaml_file(schema_path)
-    count_source = schema.count_source
+    review_bundle_path = Path(args.review_bundle)
+    if not args.rerun_stage1 and not review_bundle_path.exists():
+        print(
+            f"[error] review bundle not found: {review_bundle_path}; "
+            "pass --rerun-stage1 to run Stage 1 as preflight",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     output_roots = OutputRoots(
         metadata_root=str(Path(args.output_root) / "meta"),
         matrix_root=str(Path(args.output_root) / "matrix"),
     )
 
-    route_name = "append_routed" if args.corpus_index else "create_new"
-    corpus_index_path = Path(args.corpus_index) if args.corpus_index else None
-
-    # Validate corpus index exists for append_routed
-    if route_name == "append_routed" and corpus_index_path and not corpus_index_path.exists():
+    if args.register and args.corpus_index is None:
         print(
-            f"[error] corpus-index not found: {corpus_index_path} — "
-            "use 'corpus create' first or omit --corpus-index for create_new mode",
+            "[error] --register requires --corpus-index to be set",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    route = build_materialization_route(
-        route=route_name,
+    materializer = Stage2Materializer(
+        source_path=str(source_path),
+        review_bundle_path=str(review_bundle_path),
         output_roots=output_roots,
         release_id=args.release_id,
         dataset_id=args.dataset_id,
-        count_source=count_source,
         backend=args.backend,
-        corpus_index_path=corpus_index_path,
+        topology=args.topology,
+        rerun_stage1=args.rerun_stage1,
+        n_hvg=args.n_hvg,
+        corpus_index_path=args.corpus_index,
+        corpus_id=args.corpus_id,
+        register=args.register,
     )
 
-    manifest = route.materialize(
-        source_path=str(schema.source_path),
-        schema_path=str(schema_path),
-    )
+    manifest = materializer.materialize()
 
     print(f"[materialize] done — {args.dataset_id}/{args.release_id}")
-    print(f"  route       : {manifest.route}")
     print(f"  backend     : {manifest.backend}")
+    print(f"  topology     : {manifest.topology}")
     print(f"  count source: {manifest.count_source.selected}")
     print(f"  integer_verified: {manifest.integer_verified}")
+    print(f"  cell_count  : {manifest.cell_count}")
+    print(f"  feature_count: {manifest.feature_count}")
     print(f"  manifest    : {Path(manifest.outputs.metadata_root) / 'materialization-manifest.yaml'}")
-
-    # If create_new, also write initial corpus index and emission spec
-    if route_name == "create_new":
-        corpus_root = Path(manifest.outputs.metadata_root).parent
-        idx_path = corpus_root / "corpus-index.yaml"
-        # Store manifest_path relative to corpus_root for portability
-        manifest_rel_path = Path(manifest.outputs.metadata_root).relative_to(corpus_root) / "materialization-manifest.yaml"
-        # n_obs is the cell count — needed for global range computation in the corpus index
-        record = DatasetJoinRecord(
-            dataset_id=args.dataset_id,
-            release_id=args.release_id,
-            join_mode="create_new",
-            manifest_path=str(manifest_rel_path),
-            cell_count=manifest.cell_count,
-        )
-        corpus_idx = update_corpus_index(idx_path, record, backend=args.backend)
-        print(f"  corpus-index: {idx_path}")
-
-        # Write initial emission spec
-        corpus_root = Path(manifest.outputs.metadata_root)
-        emission_spec = CorpusEmissionSpec(corpus_id=corpus_idx.corpus_id)
-        emission_spec_path = corpus_root / "corpus-emission-spec.yaml"
-        emission_spec.write_yaml(emission_spec_path)
-        print(f"  emission-spec: {emission_spec_path}")
-
-    # If append_routed, update corpus index
-    if route_name == "append_routed" and corpus_index_path:
-        corpus_root = corpus_index_path.parent
-        manifest_abs = Path(manifest.outputs.metadata_root)
-        # Store manifest_path relative to corpus_root when possible (portable).
-        # If manifest is outside corpus_root, store the absolute path.
-        try:
-            manifest_rel = manifest_abs.relative_to(corpus_root)
-        except ValueError:
-            manifest_rel = manifest_abs
-        record = DatasetJoinRecord(
-            dataset_id=args.dataset_id,
-            release_id=args.release_id,
-            join_mode="append_routed",
-            manifest_path=str(manifest_rel / "materialization-manifest.yaml"),
-            cell_count=manifest.cell_count,
-        )
-        updated = update_corpus_index(corpus_index_path, record, backend=args.backend)
-        print(f"  corpus-index updated: {corpus_index_path}")
-        print(f"  datasets in corpus: {[d.dataset_id for d in updated.datasets]}")
+    if manifest.corpus_registration is not None:
+        reg = manifest.corpus_registration
+        print(f"  corpus_id   : {reg.corpus_id}")
+        print(f"  is_create   : {reg.is_create}")
+        print(f"  dataset_index: {reg.dataset_index}")
+        print(f"  global range: [{reg.global_start}, {reg.global_end})")
+        print(f"  ledger      : {reg.ledger_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +367,7 @@ def _add_corpus_create_args(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
         "--backend",
         required=True,
-        choices=["arrow-hf", "webdataset", "zarr-ts", "lancedb-aggregated", "zarr-aggregated"],
+        choices=["arrow-parquet", "arrow-ipc", "webdataset", "zarr", "lance"],
         help="Backend for this corpus.",
     )
     sub.add_argument(
@@ -491,7 +489,7 @@ def _add_corpus_validate_args(sub: argparse.ArgumentParser) -> None:
     )
     sub.add_argument(
         "--backend",
-        choices=["arrow-hf", "webdataset", "zarr-ts", "lancedb-aggregated", "zarr-aggregated"],
+        choices=["arrow-parquet", "arrow-ipc", "webdataset", "zarr", "lance"],
         help="Optional: verify the corpus backend matches this value.",
     )
 
@@ -620,9 +618,9 @@ def _add_stage2_materialize_args(sub: argparse.ArgumentParser) -> None:
     )
     sub.add_argument(
         "--backend",
-        default="arrow-hf",
-        choices=["arrow-hf", "webdataset", "zarr-ts", "lancedb-aggregated", "zarr-aggregated"],
-        help="Storage backend for this materialization. Default: arrow-hf.",
+        default="arrow-parquet",
+        choices=["arrow-parquet", "arrow-ipc", "webdataset", "zarr", "lance"],
+        help="Storage backend for this materialization. Default: arrow-parquet.",
     )
     sub.add_argument(
         "--topology",

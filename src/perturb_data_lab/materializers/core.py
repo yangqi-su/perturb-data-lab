@@ -29,8 +29,7 @@ import pyarrow.parquet as pq
 import scipy.sparse as sp
 from scipy.sparse import csr_matrix, issparse
 
-from .backends import materialize_arrow_hf, materialize_webdataset, materialize_zarr
-from .backends.lancedb_aggregated import mark_lance_append_committed
+from .backends import build_backend_fn
 from .models import (
     CellMetadataRecord,
     CorpusIndexDocument,
@@ -64,8 +63,7 @@ from ..inspectors.models import DatasetSummaryDocument, SchemaDocument
 class Stage2Materializer:
     """Schema-independent materialization entry point for Stage 2.
 
-    This class replaces the schema-first ``MaterializationRoute.materialize()``
-    entry point with a Stage-1-gated, count-first path.
+    This class provides a Stage-1-gated, count-first materialization path.
 
     Inputs
     ------
@@ -81,7 +79,7 @@ class Stage2Materializer:
     dataset_id : str
         Stable dataset identifier.
     backend : str
-        Storage backend: ``arrow-hf`` (default), ``webdataset``, ``zarr``.
+        Storage backend: ``arrow-parquet`` (default), ``arrow-ipc``, ``webdataset``, ``zarr``, ``lance``.
     topology : str
         Corpus topology: ``federated`` (default) or ``aggregate``.
     rerun_stage1 : bool, default False
@@ -116,7 +114,7 @@ class Stage2Materializer:
     ``backend`` names the storage format only. ``topology`` names the corpus
     organization only. The combination determines the supported subset per
     STAGE2_CONTRACT.md Section 10. The minimum supported combination is
-    ``arrow-hf`` × ``federated``.
+    ``arrow-parquet`` × ``federated``.
     """
 
     def __init__(
@@ -126,7 +124,7 @@ class Stage2Materializer:
         output_roots: OutputRoots,
         release_id: str,
         dataset_id: str,
-        backend: str = "arrow-hf",
+        backend: str = "arrow-parquet",
         topology: str = "federated",
         rerun_stage1: bool = False,
         n_hvg: int = 2000,
@@ -503,244 +501,6 @@ class Stage2Materializer:
                 "materialization requires strict integer counts from the Stage 1 approved source."
             )
 
-    def _compute_size_factors(self, count_matrix: Any, n_obs: int) -> np.ndarray:
-        """Compute size factors as row_sum / median(row_sum).
-
-        Uses batched row access for sparse CSR matrices to avoid O(n_obs)
-        individual row slices on large backed datasets.
-        """
-        from .backends.arrow_hf import _is_csr_dataset
-        from scipy.sparse import issparse
-
-        factors = np.zeros(n_obs, dtype=np.float64)
-
-        if _is_csr_dataset(count_matrix) or issparse(count_matrix):
-            # Batched: slice a batch, convert to CSR once, use .sum(axis=1)
-            # to get all row sums in one vectorized call per batch.
-            batch_size = 100000
-            for start in range(0, n_obs, batch_size):
-                end = min(start + batch_size, n_obs)
-                batch = count_matrix[start:end].tocsr()
-                factors[start:end] = np.asarray(batch.sum(axis=1)).ravel()
-        else:
-            # Dense path: batch slice and vectorized row sum
-            batch_size = 1024
-            for start in range(0, n_obs, batch_size):
-                end = min(start + batch_size, n_obs)
-                batch_dense = np.asarray(count_matrix[start:end])
-                factors[start:end] = np.asarray(batch_dense.sum(axis=1))
-
-        row_median = float(np.median(factors))
-        if row_median > 0:
-            factors = factors / row_median
-        factors = np.where(factors <= 0, 1.0, factors)
-        factors = np.where(np.isnan(factors), 1.0, factors)
-        return factors
-
-    def _write_size_factor_manifest(
-        self,
-        adata: ad.AnnData,
-        size_factors: np.ndarray,
-        meta_root: Path,
-    ) -> Path:
-        """Write per-cell size factors as a SizeFactorManifest YAML."""
-        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
-        n_obs = adata.n_obs
-        entries = []
-        for i in range(n_obs):
-            cell_id = str(obs_mem.index[i])
-            entries.append(SizeFactorEntry(cell_id=cell_id, size_factor=float(size_factors[i])))
-        manifest = SizeFactorManifest(
-            kind="size-factor-manifest",
-            contract_version=CONTRACT_VERSION,
-            release_id=self.release_id,
-            method="sum",
-            entries=tuple(entries),
-        )
-        sf_path = meta_root / f"{self.release_id}-size-factors.yaml"
-        manifest.write_yaml(sf_path)
-        return sf_path
-
-    def _write_raw_cell_metadata_parquet(
-        self,
-        adata: ad.AnnData,
-        meta_root: Path,
-    ) -> Path:
-        """Write raw cell metadata as Parquet (no SQLite, no canonical mapping).
-
-        Vectorized: builds PyArrow arrays directly from obs columns to avoid
-        O(n_obs) individual pandas .loc lookups that are catastrophically slow
-        on large backed datasets.
-        """
-        import json
-
-        parquet_path = meta_root / f"{self.release_id}-raw-obs.parquet"
-        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
-        n_obs = obs_mem.shape[0]
-
-        # Pre-build fixed-length columns as Arrow arrays
-        cell_ids = pa.array(obs_mem.index.tolist(), type=pa.string())
-        dataset_ids = pa.array([self.dataset_id] * n_obs, type=pa.string())
-        dataset_releases = pa.array([self.release_id] * n_obs, type=pa.string())
-
-        # Vectorized per-column: convert pandas Series → Python list with NaN → None,
-        # then build Arrow array. Avoids O(n_obs) individual .loc calls.
-        raw_obs_parts = []
-        col_names: list[str] = []
-        for col in obs_mem.columns:
-            col_names.append(str(col))
-            vals = obs_mem[col].tolist()
-            processed = [None if pd.isna(v) else str(v) for v in vals]
-            raw_obs_parts.append(processed)
-
-        # Build JSON strings row-by-row using pre-extracted column lists
-        raw_obs_list = []
-        for i in range(n_obs):
-            d = {col_names[j]: raw_obs_parts[j][i] for j in range(len(col_names))}
-            raw_obs_list.append(json.dumps(d))
-
-        table = pa.table({
-            "cell_id": cell_ids,
-            "dataset_id": dataset_ids,
-            "dataset_release": dataset_releases,
-            "raw_obs": pa.array(raw_obs_list, type=pa.string()),
-        })
-        pq.write_table(table, parquet_path)
-        return parquet_path
-
-    def _write_raw_feature_metadata_parquet(
-        self,
-        var_mem: Any,
-        meta_root: Path,
-    ) -> Path:
-        """Write raw feature metadata as Parquet (no canonical mapping).
-
-        Vectorized: builds PyArrow arrays directly from var columns to avoid
-        O(n_vars) individual pandas .loc lookups.
-        """
-        import json
-
-        parquet_path = meta_root / f"{self.release_id}-raw-var.parquet"
-        n_vars = var_mem.shape[0]
-
-        origin_indices = list(range(n_vars))
-        feature_ids = pa.array([str(var_mem.index[i]) for i in range(n_vars)], type=pa.string())
-
-        # Vectorized per-column: convert to list, NaN → None, then row-major JSON
-        col_names: list[str] = []
-        raw_var_parts = []
-        for col in var_mem.columns:
-            col_names.append(str(col))
-            vals = var_mem[col].tolist()
-            processed = [None if pd.isna(v) else str(v) for v in vals]
-            raw_var_parts.append(processed)
-
-        raw_var_list = []
-        for i in range(n_vars):
-            d = {col_names[j]: raw_var_parts[j][i] for j in range(len(col_names))}
-            raw_var_list.append(json.dumps(d))
-
-        table = pa.table({
-            "origin_index": pa.array(origin_indices, type=pa.int32()),
-            "feature_id": feature_ids,
-            "raw_var": pa.array(raw_var_list, type=pa.string()),
-        })
-        pq.write_table(table, parquet_path)
-        return parquet_path
-
-    def _write_metadata_summary(
-        self,
-        adata: ad.AnnData,
-        var_mem: Any,
-        meta_root: Path,
-    ) -> Path:
-        """Write per-dataset metadata summary (field coverage, null fractions)."""
-        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
-        n_obs = obs_mem.shape[0]
-        n_vars = var_mem.shape[0]
-
-        obs_null_fractions: dict[str, float] = {}
-        for col in obs_mem.columns:
-            null_count = int(obs_mem[col].isna().sum())
-            obs_null_fractions[str(col)] = float(null_count) / float(n_obs)
-
-        var_null_fractions: dict[str, float] = {}
-        for col in var_mem.columns:
-            null_count = int(var_mem[col].isna().sum())
-            var_null_fractions[str(col)] = float(null_count) / float(n_vars)
-
-        obs_dtypes: dict[str, str] = {str(col): str(obs_mem[col].dtype) for col in obs_mem.columns}
-        var_dtypes: dict[str, str] = {str(col): str(var_mem[col].dtype) for col in var_mem.columns}
-
-        summary = DatasetMetadataSummary(
-            kind="dataset-metadata-summary",
-            contract_version=CONTRACT_VERSION,
-            dataset_id=self.dataset_id,
-            release_id=self.release_id,
-            source_path=str(Path(self.output_roots.metadata_root).parent / f"{self.release_id}.h5ad"),
-            obs_field_count=int(obs_mem.shape[1]),
-            var_field_count=int(var_mem.shape[1]),
-            obs_null_fractions=obs_null_fractions,
-            var_null_fractions=var_null_fractions,
-            obs_dtypes=obs_dtypes,
-            var_dtypes=var_dtypes,
-            obs_rows=n_obs,
-            var_rows=n_vars,
-            obs_index_name=str(obs_mem.index.name or "obs_index"),
-            var_index_name=str(var_mem.index.name or "var_index"),
-        )
-        summary_path = meta_root / f"{self.release_id}-metadata-summary.yaml"
-        summary.write_yaml(summary_path)
-        return summary_path
-
-    def _write_feature_provenance_parquet(
-        self,
-        var_index: pd.Index,
-        n_vars: int,
-        meta_root: Path,
-        count_source_selected: str,
-        source_path: str,
-    ) -> Path:
-        """Write feature provenance Parquet (origin_index, feature_id, count_source, source_path)."""
-        parquet_path = meta_root / f"{self.release_id}-feature-provenance.parquet"
-
-        origin_indices = list(range(n_vars))
-        feature_ids = [str(var_index[i]) for i in range(n_vars)]
-        count_source_vals = [count_source_selected] * n_vars
-        source_paths = [source_path] * n_vars
-
-        table = pa.table({
-            "origin_index": pa.array(origin_indices, type=pa.int32()),
-            "feature_id": pa.array(feature_ids, type=pa.string()),
-            "count_source": pa.array(count_source_vals, type=pa.string()),
-            "source_path": pa.array(source_paths, type=pa.string()),
-        })
-        pq.write_table(table, parquet_path)
-        return parquet_path
-
-    def _write_cells(
-        self,
-        count_matrix: Any,
-        adata: ad.AnnData,
-        matrix_root: Path,
-    ) -> tuple[dict[str, Path], np.ndarray] | dict[str, Path]:
-        """Write sparse cell data via the configured backend.
-
-        Arrow-HF computes size factors inline during the write pass and returns
-        them as the second tuple element. Other backends return a plain dict.
-        The materialize() caller handles both cases via isinstance check.
-        """
-        from .backends import build_backend_fn
-
-        backend_fn = build_backend_fn(self.backend)
-        return backend_fn(
-            adata=adata,
-            count_matrix=count_matrix,
-            release_id=self.release_id,
-            matrix_root=matrix_root,
-            dataset_id=self.dataset_id,
-        )
-
     def _write_size_factor_parquet(
         self,
         size_factors: np.ndarray,
@@ -786,7 +546,6 @@ class Stage2Materializer:
         Uses batched row access for sparse matrices to avoid O(sample_cells)
         individual row slices on large backed datasets.
         """
-        from .backends.arrow_hf import _is_csr_dataset
         from scipy.sparse import issparse
 
         sidecar_dir = meta_root / "hvg_sidecar"
@@ -797,7 +556,9 @@ class Stage2Materializer:
 
         log_expr = np.zeros((sample_cells, n_vars), dtype=np.float64)
 
-        if _is_csr_dataset(count_matrix) or issparse(count_matrix):
+        # Check if backed anndata _CSRDataset (class name check avoids import)
+        is_backed_csr = count_matrix.__class__.__name__ == "_CSRDataset"
+        if is_backed_csr or issparse(count_matrix):
             # Sample a contiguous block and extract in one batch CSR conversion.
             # For large datasets this avoids O(sample_cells) individual row slices.
             start_idx = max(0, (n_obs - sample_cells) // 2)
@@ -845,6 +606,117 @@ class Stage2Materializer:
         np.save(str(sidecar_dir / "nonhvg.npy"), nonhvg_indices, allow_pickle=False)
 
         return sidecar_dir
+
+    def _write_cells(
+        self,
+        count_matrix: Any,
+        adata: ad.AnnData,
+        matrix_root: Path,
+    ) -> tuple[dict[str, Path], np.ndarray] | dict[str, Path]:
+        """Write sparse cell data using the configured backend and topology.
+
+        This method dispatches to either ``_write_cells_federated`` (single dataset)
+        or ``_write_cells_aggregate`` (multi-dataset corpus) based on ``self.topology``.
+
+        Size factors are computed inline by ``_translate_chunk()`` during the same
+        CSR traversal as sparse translation — one pass, not two.
+        """
+        if self.topology == "aggregate":
+            raise NotImplementedError(
+                "aggregate topology requires a corpus-level orchestrator that "
+                "collects ChunkBundles from multiple Stage2Materializer calls "
+                "and passes them to the aggregate writer. "
+                "Use federated topology for single-dataset materialization."
+            )
+        return self._write_cells_federated(count_matrix, adata, matrix_root)
+
+    def _write_cells_federated(
+        self,
+        count_matrix: Any,
+        adata: ad.AnnData,
+        matrix_root: Path,
+    ) -> tuple[dict[str, Path], np.ndarray]:
+        """Write federated (single-dataset) sparse cell data.
+
+        Loops over the count matrix in chunks, calls ``_translate_chunk()`` per chunk,
+        and passes each ``ChunkBundle`` to the thin backend serializer.
+
+        Returns ``(paths_dict, size_factors_array)``.
+        """
+        from .chunk_translation import DatasetSpec, _translate_chunk
+
+        backend_fn = build_backend_fn(self.backend, "federated")
+
+        n_obs = count_matrix.shape[0]
+
+        # Build DatasetSpec for this dataset.
+        # For federated topology, global_row_start=0 (single-dataset corpus).
+        dataset_spec = DatasetSpec(
+            dataset_id=self.dataset_id,
+            dataset_index=0,
+            file_path=Path(self.source_path),
+            rows=n_obs,
+            pairs=0,  # computed from obs if needed
+            local_vocabulary_size=count_matrix.shape[1],
+            nnz_total=int(count_matrix.nnz) if hasattr(count_matrix, "nnz") else 0,
+            global_row_start=0,
+            global_row_stop=n_obs,
+        )
+
+        CHUNK_ROWS = 100_000  # rows per chunk
+
+        all_paths: dict[str, Path] = {}
+        all_size_factors_list: list[np.ndarray] = []
+
+        for chunk_start in range(0, n_obs, CHUNK_ROWS):
+            chunk_end = min(chunk_start + CHUNK_ROWS, n_obs)
+
+            # Slice the CSR matrix chunk.
+            if hasattr(count_matrix, "local_slice"):
+                matrix_chunk = count_matrix.local_slice(chunk_start, chunk_end)
+            else:
+                matrix_chunk = count_matrix[chunk_start:chunk_end].tocsr()
+
+            # Translate the chunk via the shared translation layer.
+            bundle = _translate_chunk(
+                dataset=dataset_spec,
+                matrix_chunk=matrix_chunk,
+                chunk_start=chunk_start,
+            )
+
+            # Call the thin backend serializer.
+            paths, size_factors = backend_fn(
+                bundle=bundle,
+                release_id=self.release_id,
+                matrix_root=matrix_root,
+            )
+            all_paths.update(paths)
+            all_size_factors_list.append(size_factors)
+
+        # Concatenate all size factor arrays.
+        all_size_factors = np.concatenate(all_size_factors_list) if all_size_factors_list else np.array([])
+
+        return (all_paths, all_size_factors)
+
+    def _write_cells_aggregate(
+        self,
+        bundles: list[Any],
+        matrix_root: Path,
+    ) -> tuple[dict[str, Path], list[np.ndarray]]:
+        """Write aggregate (multi-dataset corpus) sparse cell data.
+
+        This is called by a corpus-level orchestrator after collecting
+        ``ChunkBundle`` objects from multiple ``Stage2Materializer`` calls.
+        """
+        from .chunk_translation import ChunkBundle
+
+        backend_fn = build_backend_fn(self.backend, "aggregate")
+
+        paths, size_factors_list = backend_fn(
+            bundles=bundles,
+            matrix_root=matrix_root,
+        )
+        return (paths, size_factors_list)
 
 
 # ---------------------------------------------------------------------------
@@ -895,942 +767,6 @@ class CanonicalCellRecord:
 
 
 # ---------------------------------------------------------------------------
-# Materialization routes
-# ---------------------------------------------------------------------------
-
-
-class MaterializationRoute:
-    """Base class for a materialization route.
-
-    A route encapsulates:
-    - How to write the per-cell sparse data to a backend storage format
-    - How to build/update the corpus tokenizer (append-only, preserving existing IDs)
-    - How to write per-dataset and corpus-level manifests
-
-    Subclasses implement backend-specific write logic.
-    """
-
-    route_name: str = "base"
-
-    def __init__(
-        self,
-        output_roots: OutputRoots,
-        release_id: str,
-        dataset_id: str,
-        count_source: CountSourceSpec,
-        integer_only: bool = True,
-        backend: str = "arrow-hf",
-        corpus_index_path: Path | None = None,
-    ):
-        self.output_roots = output_roots
-        self.release_id = release_id
-        self.dataset_id = dataset_id
-        self.count_source = count_source
-        self.integer_only = integer_only
-        self.backend = backend
-        self._corpus_index_path = corpus_index_path
-
-    @property
-    def _corpus_root(self) -> Path:
-        """Corpus-level root directory (where corpus-wide artifacts live).
-
-        For ``create_new`` this is the metadata_root itself.
-        For ``append_routed`` this is derived from the corpus index path.
-        """
-        if self._corpus_index_path is not None:
-            return self._corpus_index_path.parent
-        return Path(self.output_roots.metadata_root)
-
-    @property
-    def _matrix_root(self) -> Path:
-        return Path(self.output_roots.matrix_root)
-
-    def materialize(
-        self,
-        source_path: str,
-        schema_path: str,
-    ) -> MaterializationManifest:
-        """Materialize a dataset using this route.
-
-        Expression-first: the integer count matrix is the primary output.
-        All other artifacts (raw metadata, accepted schema, summaries, provenance)
-        are dataset-local and required for later canonical metadata rebuild.
-
-        Tokenizer is NOT produced or consumed during materialization. The corpus
-        feature set is maintained separately by ``canonicalize-meta``.
-
-        Returns a filled MaterializationManifest with paths to all written artifacts.
-        Subclasses override _write_cells() for backend-specific storage.
-
-        Raises
-        ------
-        ValueError
-            If the schema is not in ``status: ready`` or required fields are null.
-        """
-        # --- Schema readiness validation gate ---
-        readiness = validate_schema_readiness(schema_path)
-        readiness.raise_if_not_ready()
-
-        # Load the reviewed schema (used for row-wise canonical metadata execution)
-        schema = SchemaDocument.from_yaml_file(Path(schema_path))
-
-        # Resolve source h5ad
-        source_h5ad = Path(source_path)
-        if not source_h5ad.exists():
-            raise FileNotFoundError(f"source h5ad not found: {source_h5ad}")
-
-        # Read backed anndata
-        adata = ad.read_h5ad(str(source_h5ad), backed="r")
-        n_obs = adata.n_obs
-
-        # Determine which var reference to use based on selected count source.
-        # When .raw.X wins, it may have a different feature dimension than .X,
-        # so feature-axis-dependent steps (HVG, feature metadata) must follow
-        # the winning source's feature space.
-        raw_is_selected = self.count_source.selected == ".raw.X"
-        if raw_is_selected:
-            n_vars = int(adata.raw.shape[1])
-            var_ref = adata.raw.var
-            var_index = adata.raw.var.index
-        else:
-            n_vars = adata.n_vars
-            var_ref = adata.var
-            var_index = adata.var.index
-
-        # Select count matrix
-        if self.count_source.selected == ".raw.X":
-            count_matrix = adata.raw.X
-        elif self.count_source.selected.startswith(".layers["):
-            layer_name = self.count_source.selected[len(".layers[") : -1]
-            count_matrix = adata.layers[layer_name]
-        else:
-            count_matrix = adata.X
-
-        # Apply reverse-normalization if the inspector selected a recovered source.
-        # The inspector validated the recovery during inspection; at materialization
-        # time we apply the same approved expm1/size_factor path to produce the
-        # integer count matrix used for all downstream steps (size factors, QA, writes).
-        if self.count_source.uses_recovery:
-            count_matrix = self._apply_reverse_normalization(
-                count_matrix, adata, self.count_source.selected, n_obs
-            )
-
-        # Verify integer counts
-        if self.integer_only:
-            self._verify_integer(count_matrix, source_h5ad.name)
-
-        # Ensure output directories exist
-        meta_root = Path(self.output_roots.metadata_root)
-        matrix_root = Path(self.output_roots.matrix_root)
-        meta_root.mkdir(parents=True, exist_ok=True)
-        matrix_root.mkdir(parents=True, exist_ok=True)
-
-        # --- Phase 3: Write accepted schema copy ---
-        # Persist the accepted schema alongside dataset artifacts for later
-        # canonicalize-meta reference. The schema_path may be a user-managed
-        # path; we write a dataset-local copy.
-        import shutil
-
-        accepted_schema_path = meta_root / f"{self.release_id}-accepted-schema.yaml"
-        shutil.copy2(schema_path, accepted_schema_path)
-
-        # --- Phase 3: Write raw cell metadata (no canonical mapping) ---
-        raw_cell_meta_sqlite_path = self._write_raw_cell_metadata(
-            adata=adata,
-            meta_root=meta_root,
-        )
-
-        # --- Phase 3: Write raw feature metadata (no canonical mapping) ---
-        # Load var into memory once for efficient per-row access
-        var_mem = var_ref.to_memory() if hasattr(var_ref, "to_memory") else var_ref
-        raw_feature_meta_parquet_path = self._write_raw_feature_metadata(
-            adata=adata,
-            var_mem=var_mem,
-            meta_root=meta_root,
-        )
-
-        # --- Phase 3: Write per-dataset metadata summary ---
-        metadata_summary_path = self._write_metadata_summary(
-            adata=adata,
-            var_mem=var_mem,
-            meta_root=meta_root,
-        )
-
-        # --- Phase 3: Compute size factors (sum-based, dataset-specific) ---
-        size_factors = self._compute_size_factors(count_matrix, n_obs)
-
-        # --- Phase 3: Write size-factor artifact for later reuse ---
-        size_factor_manifest_path = self._write_size_factor_manifest(
-            adata=adata,
-            size_factors=size_factors,
-            meta_root=meta_root,
-        )
-
-        # --- Phase 3: Write feature provenance spec ---
-        # Build origin_index → feature_id mapping for canonicalize-meta
-        origin_index_to_feature_id: dict[int, str] = {
-            i: str(var_index[i]) for i in range(n_vars)
-        }
-        provenance_spec_path = self._write_feature_provenance(
-            source_h5ad=source_h5ad,
-            schema_path=accepted_schema_path,
-            n_vars=n_vars,
-            origin_index_to_feature_id=origin_index_to_feature_id,
-            meta_root=meta_root,
-        )
-
-        # --- Resolve canonical cell metadata from schema (for backend write pass-through) ---
-        # Phase 3: resolved canonical perturbation/context tuples are passed to the
-        # backend writer so Arrow/HF can write the canonical cell SQLite atomically.
-        # This avoids a second-pass scan of obs after the fact.
-        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
-        perturbations, contexts = resolve_all_cell_rows(schema, obs_mem)
-        canonical_perturbation: tuple[dict[str, str], ...] = tuple(perturbations)
-        canonical_context: tuple[dict[str, str], ...] = tuple(contexts)
-        raw_cell_tuples: tuple[dict[str, Any], ...] = tuple(
-            {col: (None if pd.isna(obs_mem.loc[obs_mem.index[i], col]) else str(obs_mem.loc[obs_mem.index[i], col]))
-             for col in obs_mem.columns}
-            for i in range(n_obs)
-        )
-
-        # --- Write backend-specific cell data ---
-        # Phase 3: canonical_perturbation, canonical_context, and raw_fields are
-        # passed so the Arrow/HF backend can write the canonical cell SQLite.
-        # WebDataset/Zarr backends accept these but write metadata into their own formats.
-        backend_paths = self._write_cells(
-            count_matrix=count_matrix,
-            adata=adata,
-            size_factors=size_factors,
-            matrix_root=matrix_root,
-            canonical_perturbation=canonical_perturbation,
-            canonical_context=canonical_context,
-            raw_fields=raw_cell_tuples,
-        )
-
-        # --- Phase 3: Write canonical feature metadata (origin parquet) ---
-        # This is the canonical feature table in original dataset var order,
-        # resolved via schema execution. Token-space mapping is handled by
-        # canonicalize-meta (not during materialization).
-        feature_meta_paths = self._write_canonical_feature_metadata(
-            adata=adata,
-            schema=schema,
-            var_mem=var_mem,
-            meta_root=meta_root,
-            n_vars=n_vars,
-        )
-
-        # --- Compute and write HVG/non-HVG arrays in original dataset feature indices ---
-        hvg_sidecar_path = self._compute_and_write_hvg_arrays(
-            count_matrix=count_matrix,
-            n_vars=n_vars,
-            meta_root=meta_root,
-        )
-
-        # QA: verify integer counts in written output
-        qa_metrics, all_passed = self._run_qa_checks(backend_paths, count_matrix)
-
-        # Write QA manifest
-        qa_manifest = QAManifest(
-            kind="qa-manifest",
-            contract_version=CONTRACT_VERSION,
-            release_id=self.release_id,
-            metrics=qa_metrics,
-            all_passed=all_passed,
-        )
-        qa_path = meta_root / "qa-manifest.yaml"
-        qa_manifest.write_yaml(qa_path)
-
-        # Build final manifest (tokenizer_path removed in Phase 3)
-        manifest = MaterializationManifest(
-            kind="materialization-manifest",
-            contract_version=CONTRACT_VERSION,
-            dataset_id=self.dataset_id,
-            release_id=self.release_id,
-            route=self.route_name,
-            backend=self.backend,
-            count_source=self.count_source,
-            outputs=self.output_roots,
-            provenance=ProvenanceSpec(
-                source_path=str(source_h5ad),
-                schema=schema_path,
-            ),
-            # Phase 3 dataset-local artifact paths
-            raw_cell_meta_path=str(raw_cell_meta_sqlite_path),
-            raw_feature_meta_path=str(raw_feature_meta_parquet_path),
-            accepted_schema_path=str(accepted_schema_path),
-            metadata_summary_path=str(metadata_summary_path),
-            provenance_spec_path=str(provenance_spec_path),
-            # Remaining existing paths
-            feature_meta_paths={
-                k: str(v) for k, v in feature_meta_paths.items()
-            },
-            size_factor_manifest_path=str(size_factor_manifest_path),
-            qa_manifest_path=str(qa_path),
-            hvg_sidecar_path=str(hvg_sidecar_path),
-            integer_verified=all_passed,
-            cell_count=n_obs,
-            notes=(f"materialized via {self.route_name} route (tokenizer-free)",),
-        )
-        manifest.validate()
-
-        manifest_path = meta_root / "materialization-manifest.yaml"
-        manifest.write_yaml(manifest_path)
-
-        return manifest
-
-    def _verify_integer(self, count_matrix: Any, source_name: str) -> None:
-        """Fail hard if count matrix is not integer-like."""
-        sample_rows = min(32, count_matrix.shape[0])
-        indices = np.linspace(0, count_matrix.shape[0] - 1, num=sample_rows, dtype=int)
-        # Collect nonzero values row-by-row to avoid sparse slicing edge cases
-        nonzero_values = []
-        for idx in indices:
-            row = count_matrix[idx]
-            if issparse(row):
-                row = np.asarray(row.toarray().ravel())
-            else:
-                row = np.asarray(row).ravel()
-            nonzero_values.append(row[row != 0])
-        if nonzero_values:
-            nonzero = np.concatenate(nonzero_values)
-        else:
-            return  # empty
-        if nonzero.size == 0:
-            return
-        deviations = np.abs(nonzero - np.rint(nonzero))
-        if np.any(deviations > 1e-6):
-            raise ValueError(
-                f"count matrix in {source_name} contains non-integer values; "
-                "materialization requires strict integer counts. "
-                "Provide a schema that selects an integer-compliant count source."
-            )
-
-    def _apply_reverse_normalization(
-        self,
-        count_matrix: Any,
-        adata: ad.AnnData,
-        selected_candidate: str,
-        n_obs: int,
-    ) -> np.ndarray:
-        """Apply the approved expm1/size_factor reverse-normalization path.
-
-        This is only called when ``count_source.uses_recovery`` is True, meaning
-        the inspector validated that recovery is possible and the selected
-        candidate is a log-normalized layer that can be reversed.
-
-        Recovery is transient: per-row scale factors are recomputed during
-        materialization from the log-normalized source itself and are NOT
-        persisted. The final integer count matrix is what is stored.
-
-        Per-row scale_factor = smallest nonzero value in expm1(source_row).
-        Recovery formula: recovered = expm1(source_row) / scale_factor.
-
-        Parameters
-        ----------
-        count_matrix : Any
-            The log-normalized matrix selected by the inspector
-            (e.g. ``adata.layers["log_norm"]``).
-        adata : ad.AnnData
-            The source AnnData object (backed, read-only is fine).
-        selected_candidate : str
-            The candidate name from the inspector's decision
-            (e.g. ``".layers[log_norm]"``).
-        n_obs : int
-            Number of observations (cells) in the dataset.
-
-        Returns
-        -------
-        np.ndarray
-            Recovered integer count matrix as a dense ``np.int32`` array.
-
-        Raises
-        ------
-        ValueError
-            If the recovered values are not sufficiently integer-like.
-        """
-        # Allocate full recovered matrix (conservative for memory but correct)
-        recovered = np.zeros((n_obs, count_matrix.shape[1]), dtype=np.float64)
-
-        for i in range(n_obs):
-            row = count_matrix[i]
-            if hasattr(row, "toarray"):
-                row = np.asarray(row.toarray().ravel())
-            else:
-                row = np.asarray(row).ravel()
-            nonzero_mask = row != 0
-            if nonzero_mask.any():
-                # expm1 of the log-normalized values
-                expm1_vals = np.expm1(row[nonzero_mask])
-                # Per-row scale factor = smallest nonzero expm1 value
-                min_nonzero = float(np.min(expm1_vals))
-                if min_nonzero <= 0:
-                    min_nonzero = 1.0  # fallback for degenerate rows
-                # Recover: divide by per-row scale factor
-                recovered[i, nonzero_mask] = expm1_vals / min_nonzero
-
-        # Verify recovered values are integer-like before returning
-        nonzero_mask = recovered != 0
-        if nonzero_mask.any():
-            deviations = np.abs(recovered[nonzero_mask] - np.rint(recovered[nonzero_mask]))
-            max_deviation = float(np.max(deviations))
-            if max_deviation > 0.01:
-                raise ValueError(
-                    f"reverse-normalization of {selected_candidate} produced "
-                    f"non-integer values (max_deviation={max_deviation:.6f}); "
-                    "recovery validation failed — check that the selected source "
-                    "is a log-normalized layer compatible with expm1/size_factor"
-                )
-
-        # Convert to int32 for sparse write efficiency
-        return np.rint(recovered).astype(np.int32)
-
-    def _compute_size_factors(self, count_matrix: Any, n_obs: int) -> np.ndarray:
-        """Compute size factors as row_sum / median(row_sum).
-
-        Dataset size factors are derived from final processed count sums
-        (post-recovery when applicable) using median normalization.
-        """
-        from .backends.arrow_hf import _get_row_nonzero
-
-        factors = np.zeros(n_obs, dtype=np.float64)
-        for i in range(n_obs):
-            indices, counts = _get_row_nonzero(count_matrix, i)
-            factors[i] = float(counts.sum())
-
-        row_median = float(np.median(factors))
-        if row_median > 0:
-            factors = factors / row_median
-        # Replace zero or NaN with 1.0
-        factors = np.where(factors <= 0, 1.0, factors)
-        factors = np.where(np.isnan(factors), 1.0, factors)
-        return factors
-
-    def _write_size_factor_manifest(
-        self,
-        adata: ad.AnnData,
-        size_factors: np.ndarray,
-        meta_root: Path,
-    ) -> Path:
-        """Write size-factor artifact for later reuse.
-
-        Persists the per-cell size factors computed during materialization so they
-        can be reused by later metadata rebuild steps without recomputing from counts.
-        Written as a SizeFactorManifest YAML containing one entry per cell.
-        """
-        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
-        n_obs = adata.n_obs
-        entries = []
-        for i in range(n_obs):
-            cell_id = str(obs_mem.index[i])
-            entries.append(SizeFactorEntry(cell_id=cell_id, size_factor=float(size_factors[i])))
-        manifest = SizeFactorManifest(
-            kind="size-factor-manifest",
-            contract_version=CONTRACT_VERSION,
-            release_id=self.release_id,
-            method="sum",
-            entries=tuple(entries),
-        )
-        sf_path = meta_root / f"{self.release_id}-size-factors.yaml"
-        manifest.write_yaml(sf_path)
-        return sf_path
-
-    def _write_cells(
-        self,
-        count_matrix: Any,
-        adata: ad.AnnData,
-        size_factors: np.ndarray,
-        matrix_root: Path,
-    ) -> dict[str, Path]:
-        """Write per-cell sparse data. Override in subclass."""
-        raise NotImplementedError
-
-    # ---------------------------------------------------------------------------
-    # Phase 3: New raw metadata writers (tokenizer-free)
-    # ---------------------------------------------------------------------------
-
-    def _write_raw_cell_metadata(
-        self,
-        adata: ad.AnnData,
-        meta_root: Path,
-    ) -> Path:
-        """Write raw cell metadata as SQLite (no canonical mapping applied).
-
-        .. deprecated::
-            SQLite for raw cell metadata is deprecated as of contract 0.3.0.
-            The new Stage 2 path uses Parquet instead (see
-            ``Stage2Materializer._write_raw_cell_metadata_parquet``).
-            This method is retained only for backward compatibility with
-            existing legacy corpora that used the schema-first materializer.
-            New datasets should use ``Stage2Materializer`` which writes
-            ``{release_id}-raw-obs.parquet`` instead.
-        """
-        import json
-        import warnings
-
-        warnings.warn(
-            "SQLite for raw cell metadata is deprecated as of contract 0.3.0. "
-            "New Stage 2 runs produce Parquet sidecars instead. "
-            "SQLite-backed metadata will not be written for new datasets.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-        db_path = meta_root / f"{self.release_id}-raw-cell-meta.sqlite"
-
-        # Load obs into memory once for efficient per-row access
-        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
-
-        conn = sqlite3.connect(str(db_path))
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS raw_cell_meta "
-            "(cell_id TEXT, dataset_id TEXT, dataset_release TEXT, raw_obs TEXT)"
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cell_id ON raw_cell_meta(cell_id)")
-
-        batch_size = 256
-        n_obs = adata.n_obs
-        for start in range(0, n_obs, batch_size):
-            end = min(start + batch_size, n_obs)
-            batch = []
-            for i in range(start, end):
-                cell_id = str(obs_mem.index[i])
-                # Serialize all obs columns as JSON
-                raw: dict[str, Any] = {}
-                for col in obs_mem.columns:
-                    val = obs_mem.loc[obs_mem.index[i], col]
-                    raw[str(col)] = None if pd.isna(val) else str(val)
-                raw_json = json.dumps(raw) if raw else "{}"
-                batch.append(
-                    (
-                        cell_id,
-                        self.dataset_id,
-                        self.release_id,
-                        raw_json,
-                    )
-                )
-            conn.executemany(
-                "INSERT INTO raw_cell_meta VALUES (?, ?, ?, ?)",
-                batch,
-            )
-        conn.commit()
-        conn.close()
-        return db_path
-
-    def _write_raw_feature_metadata(
-        self,
-        adata: ad.AnnData,
-        var_mem: Any,
-        meta_root: Path,
-    ) -> Path:
-        """Write raw feature metadata as Parquet (no canonical mapping applied).
-
-        Raw var fields are preserved as-is from the h5ad. Each row records the
-        origin_index (original dataset var order), feature_id (var index value),
-        and a JSON blob of all var columns. This is the authoritative source for
-        canonical feature metadata rebuild in ``canonicalize-meta``.
-        """
-        import json
-
-        origin_path = meta_root / f"{self.release_id}-raw-feature-meta.parquet"
-
-        n_vars = var_mem.shape[0]
-        origin_indices = list(range(n_vars))
-        feature_ids = [str(var_mem.index[i]) for i in range(n_vars)]
-
-        # Serialize all var columns as a JSON string per feature
-        raw_var_list: list[str] = []
-        for i in range(n_vars):
-            raw: dict[str, Any] = {}
-            for col in var_mem.columns:
-                val = var_mem.loc[var_mem.index[i], col]
-                raw[str(col)] = None if pd.isna(val) else str(val)
-            raw_var_list.append(json.dumps(raw))
-
-        table = pa.table(
-            {
-                "origin_index": pa.array(origin_indices, type=pa.int32()),
-                "feature_id": pa.array(feature_ids, type=pa.string()),
-                "raw_var": pa.array(raw_var_list, type=pa.string()),
-            }
-        )
-        pq.write_table(table, origin_path)
-        return origin_path
-
-    def _write_metadata_summary(
-        self,
-        adata: ad.AnnData,
-        var_mem: Any,
-        meta_root: Path,
-    ) -> Path:
-        """Write per-dataset metadata summary (field coverage, null fractions).
-
-        This summary provides dataset-level statistics extracted from raw obs/var
-        before any canonical mapping. It can assist schema review when onboarding
-        new datasets. Written as YAML for human readability.
-        """
-        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
-        n_obs = obs_mem.shape[0]
-        n_vars = var_mem.shape[0]
-
-        # Compute null fractions per obs column
-        obs_null_fractions: dict[str, float] = {}
-        for col in obs_mem.columns:
-            null_count = int(obs_mem[col].isna().sum())
-            obs_null_fractions[str(col)] = float(null_count) / float(n_obs)
-
-        # Compute null fractions per var column
-        var_null_fractions: dict[str, float] = {}
-        for col in var_mem.columns:
-            null_count = int(var_mem[col].isna().sum())
-            var_null_fractions[str(col)] = float(null_count) / float(n_vars)
-
-        # Collect dtypes
-        obs_dtypes: dict[str, str] = {str(col): str(obs_mem[col].dtype) for col in obs_mem.columns}
-        var_dtypes: dict[str, str] = {str(col): str(var_mem[col].dtype) for col in var_mem.columns}
-
-        summary = DatasetMetadataSummary(
-            kind="dataset-metadata-summary",
-            contract_version=CONTRACT_VERSION,
-            dataset_id=self.dataset_id,
-            release_id=self.release_id,
-            source_path=str(Path(self.output_roots.metadata_root).parent / f"{self.release_id}.h5ad"),
-            obs_field_count=int(obs_mem.shape[1]),
-            var_field_count=int(var_mem.shape[1]),
-            obs_null_fractions=obs_null_fractions,
-            var_null_fractions=var_null_fractions,
-            obs_dtypes=obs_dtypes,
-            var_dtypes=var_dtypes,
-            obs_rows=n_obs,
-            var_rows=n_vars,
-            obs_index_name=str(obs_mem.index.name or "obs_index"),
-            var_index_name=str(var_mem.index.name or "var_index"),
-        )
-        summary_path = meta_root / f"{self.release_id}-metadata-summary.yaml"
-        summary.write_yaml(summary_path)
-        return summary_path
-
-    def _write_feature_provenance(
-        self,
-        source_h5ad: Path,
-        schema_path: Path,
-        n_vars: int,
-        origin_index_to_feature_id: dict[int, str],
-        meta_root: Path,
-    ) -> Path:
-        """Write feature-order/provenance artifact.
-
-        Records the per-dataset feature ordering and provenance needed by
-        ``canonicalize-meta`` to rebuild the corpus feature set without a tokenizer.
-        """
-        provenance = FeatureProvenanceSpec(
-            release_id=self.release_id,
-            feature_count=n_vars,
-            source_path=str(source_h5ad),
-            schema_path=str(schema_path),
-            count_source=self.count_source,
-            origin_index_to_feature_id=origin_index_to_feature_id,
-        )
-        provenance_path = meta_root / f"{self.release_id}-feature-provenance.yaml"
-        provenance.write_yaml(provenance_path)
-        return provenance_path
-
-    def _write_canonical_feature_metadata(
-        self,
-        adata: ad.AnnData,
-        schema: SchemaDocument,
-        var_mem: Any,
-        meta_root: Path,
-        n_vars: int,
-    ) -> dict[str, Path]:
-        """Write canonical feature metadata in original dataset var order.
-
-        Writes one parquet file: ``{release_id}-features-origin.parquet``
-        containing origin_index and feature_id, with canonical fields resolved
-        via schema execution. Token-space mapping is NOT done here — it is
-        handled by ``canonicalize-meta`` which maintains the corpus feature set.
-
-        Returns dict with key "features_origin".
-        """
-        origin_path = meta_root / f"{self.release_id}-features-origin.parquet"
-        origin_indices = list(range(n_vars))
-
-        # Resolve canonical feature fields via schema execution
-        feature_rows = resolve_all_feature_rows(schema, var_mem)
-
-        # Build feature_id list from var index
-        if self.count_source.selected == ".raw.X" and hasattr(adata.raw, "var"):
-            var_index = adata.raw.var.index
-        else:
-            var_index = adata.var.index
-        origin_feature_ids = [str(var_index[i]) for i in origin_indices]
-
-        # Build base table
-        origin_table = pa.table(
-            {
-                "origin_index": pa.array(origin_indices, type=pa.int32()),
-                "feature_id": pa.array(origin_feature_ids, type=pa.string()),
-            }
-        )
-
-        # Attach resolved canonical feature fields as a struct column
-        field_names = list(schema.feature_fields.keys())
-        if field_names:
-            canonical_struct = pa.struct([
-                (fname, pa.string()) for fname in field_names
-            ])
-            canonical_values = [
-                [row.get(fname, MISSING_VALUE_LITERAL) for row in feature_rows]
-                for fname in field_names
-            ]
-            canonical_array = pa.array(
-                [dict(zip(field_names, vals)) for vals in zip(*canonical_values)],
-                type=canonical_struct,
-            )
-            origin_table = origin_table.append_column("canonical", canonical_array)
-
-        pq.write_table(origin_table, origin_path)
-        return {"features_origin": origin_path}
-
-    def _run_qa_checks(
-        self,
-        backend_paths: dict[str, Path],
-        original_matrix: Any,
-    ) -> tuple[tuple[QAMetric, ...], bool]:
-        """Run QA checks on written output."""
-        metrics = []
-        for name, path in backend_paths.items():
-            if not path.exists():
-                metrics.append(
-                    QAMetric(name=f"{name}_exists", value=0.0, threshold=1.0)
-                )
-            else:
-                metrics.append(
-                    QAMetric(name=f"{name}_exists", value=1.0, threshold=1.0)
-                )
-        all_passed = all(m.passed() for m in metrics)
-        return tuple(metrics), all_passed
-
-    def _compute_and_write_hvg_arrays(
-        self,
-        count_matrix: Any,
-        n_vars: int,
-        meta_root: Path,
-        n_hvg: int = 2000,
-    ) -> Path:
-        """Compute HVG/non-HVG index arrays from the count matrix and write them.
-
-        HVG selection uses top-N dispersion on log-normalized values:
-        dispersion = variance / mean for each feature across cells.
-        The selected indices are written in **original dataset feature index**
-        space (not token space) as ``hvg.npy`` and ``nonhvg.npy``.
-
-        Parameters
-        ----------
-        count_matrix : Any
-            The count matrix; must be log-normalized before calling this method.
-            This method applies ``log1p`` internally to compute dispersion.
-        n_vars : int
-            Total number of features (n_vars from adata).
-        meta_root : Path
-            Directory to write the sidecar files.
-        n_hvg : int
-            Number of top-dispersion genes to select as HVGs. Default 2000.
-
-        Returns
-        -------
-        Path
-            Path to the directory containing ``hvg.npy`` and ``nonhvg.npy``.
-        """
-        sidecar_dir = meta_root / "hvg_sidecar"
-        sidecar_dir.mkdir(parents=True, exist_ok=True)
-
-        # Compute mean and variance of log1p(count_matrix) per feature (column)
-        # We sample cells to keep memory bounded for large datasets.
-        from .backends.arrow_hf import _get_row_nonzero
-
-        n_obs = count_matrix.shape[0]
-        sample_cells = min(512, n_obs)
-        cell_indices = np.linspace(0, n_obs - 1, num=sample_cells, dtype=int)
-
-        log_expr = np.zeros((sample_cells, n_vars), dtype=np.float64)
-        for row_i, ci in enumerate(cell_indices):
-            indices, counts = _get_row_nonzero(count_matrix, ci)
-            # Place log1p(count) at the gene indices
-            for idx, cnt in zip(indices, counts):
-                log_expr[row_i, idx] = np.log1p(float(cnt))
-
-        # Compute per-feature mean and variance of log-normalized expression
-        # Use a clipped mean to avoid zero-mean artifacts
-        gene_means = np.zeros(n_vars, dtype=np.float64)
-        gene_vars = np.zeros(n_vars, dtype=np.float64)
-        for j in range(n_vars):
-            col = log_expr[:, j]
-            nonzero = col[col > 0]
-            if len(nonzero) > 0:
-                gene_means[j] = np.mean(nonzero)
-                gene_vars[j] = np.var(nonzero)
-            else:
-                gene_means[j] = 0.0
-                gene_vars[j] = 0.0
-
-        # Dispersion = variance / mean (with a small epsilon to avoid division by zero)
-        eps = 1e-10
-        dispersion = np.where(gene_means > eps, gene_vars / gene_means, 0.0)
-
-        # Select top-N HVG indices by dispersion
-        #.argsort() gives ascending; take last N for descending
-        sorted_indices = np.argsort(dispersion)
-        hvg_indices: np.ndarray = sorted_indices[-n_hvg:].astype(np.int32)
-        # Sort for consistent ordering
-        hvg_indices = np.sort(hvg_indices)
-
-        # Non-HVG = complement in original index space
-        hvg_set = set(hvg_indices)
-        nonhvg_indices = np.array(
-            [j for j in range(n_vars) if j not in hvg_set], dtype=np.int32
-        )
-
-        # Write artifacts
-        np.save(str(sidecar_dir / "hvg.npy"), hvg_indices, allow_pickle=False)
-        np.save(str(sidecar_dir / "nonhvg.npy"), nonhvg_indices, allow_pickle=False)
-
-        return sidecar_dir
-
-
-class CreateNewRoute(MaterializationRoute):
-    """Materialization route: create a new standalone dataset release.
-
-    This is used when materializing the first dataset of a new corpus,
-    or a standalone dataset that will not be joined to a corpus.
-    """
-
-    route_name = "create_new"
-
-    def _write_cells(
-        self,
-        count_matrix: Any,
-        adata: ad.AnnData,
-        size_factors: np.ndarray,
-        matrix_root: Path,
-        canonical_perturbation: tuple[dict[str, str], ...] | None = None,
-        canonical_context: tuple[dict[str, str], ...] | None = None,
-        raw_fields: tuple[dict[str, Any], ...] | None = None,
-    ) -> dict[str, Path]:
-        from .backends import build_backend_fn
-
-        backend_fn = build_backend_fn(self.backend)
-        kwargs: dict[str, Any] = {
-            "canonical_perturbation": canonical_perturbation,
-            "canonical_context": canonical_context,
-            "raw_fields": raw_fields,
-            "dataset_id": self.dataset_id,
-        }
-        if self.backend == "lancedb-aggregated":
-            kwargs["corpus_index_path"] = self._corpus_index_path
-        return backend_fn(
-            adata, count_matrix, size_factors, self.release_id, matrix_root,
-            **kwargs,
-        )
-
-
-class AppendRoutedRoute(MaterializationRoute):
-    """Materialization route: add a dataset to a growing indexed corpus.
-
-    Each dataset is stored independently with its own manifest. A corpus index
-    maps dataset IDs to release IDs. The corpus tokenizer is appended with new
-    token IDs while preserving existing entries. This is the default path for
-    corpora expected to grow with additional datasets.
-
-    ``corpus_index_path`` must be provided and must point to an existing
-    ``corpus-index.yaml`` so the route can locate the corpus tokenizer for
-    append compatibility checking.
-    """
-
-    route_name = "append_routed"
-
-    @property
-    def _corpus_root(self) -> Path:
-        """Corpus root is derived from the corpus index path for append routes."""
-        if self._corpus_index_path is None:
-            raise ValueError(
-                "append_routed requires corpus_index_path to be set so the "
-                "existing corpus tokenizer can be located"
-            )
-        return self._corpus_index_path.parent
-
-    def _write_cells(
-        self,
-        count_matrix: Any,
-        adata: ad.AnnData,
-        size_factors: np.ndarray,
-        matrix_root: Path,
-        canonical_perturbation: tuple[dict[str, str], ...] | None = None,
-        canonical_context: tuple[dict[str, str], ...] | None = None,
-        raw_fields: tuple[dict[str, Any], ...] | None = None,
-    ) -> dict[str, Path]:
-        from .backends import build_backend_fn
-
-        backend_fn = build_backend_fn(self.backend)
-        kwargs: dict[str, Any] = {
-            "canonical_perturbation": canonical_perturbation,
-            "canonical_context": canonical_context,
-            "raw_fields": raw_fields,
-            "dataset_id": self.dataset_id,
-        }
-        if self.backend == "lancedb-aggregated":
-            kwargs["corpus_index_path"] = self._corpus_index_path
-        return backend_fn(
-            adata, count_matrix, size_factors, self.release_id, matrix_root,
-            **kwargs,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Route factory
-# ---------------------------------------------------------------------------
-
-
-def build_materialization_route(
-    route: str,
-    output_roots: OutputRoots,
-    release_id: str,
-    dataset_id: str,
-    count_source: CountSourceSpec,
-    integer_only: bool = True,
-    backend: str = "arrow-hf",
-    corpus_index_path: Path | None = None,
-) -> MaterializationRoute:
-    """Factory to build the correct materialization route by name.
-
-    Parameters
-    ----------
-    backend : str
-        Storage backend for this materialization: ``arrow-hf``, ``webdataset``,
-        or ``zarr-ts``. This is recorded in the MaterializationManifest and
-        must match the corpus's declared backend. Defaults to ``arrow-hf``.
-    corpus_index_path : Path | None
-        Path to the corpus index YAML.  Used by ``append_routed`` to locate
-        the corpus root for artifact writes.  Optional for ``create_new``.
-        Tokenizer is NOT required — corpus feature set is maintained separately.
-    """
-    routes = {
-        "create_new": CreateNewRoute,
-        "append_routed": AppendRoutedRoute,
-    }
-    if route not in routes:
-        raise ValueError(f"unknown route: {route}; expected one of {list(routes)}")
-    return routes[route](
-        output_roots=output_roots,
-        release_id=release_id,
-        dataset_id=dataset_id,
-        count_source=count_source,
-        integer_only=integer_only,
-        backend=backend,
-        corpus_index_path=corpus_index_path,
-    )
-
-
-# ---------------------------------------------------------------------------
 # Corpus index updater
 # ---------------------------------------------------------------------------
 
@@ -1873,8 +809,8 @@ def update_corpus_index(
     emission_spec_path : str | None
         Relative path to ``corpus-emission-spec.yaml`` from the corpus root.
     backend : str | None
-        Backend declaration for the corpus (e.g., "arrow-hf", "webdataset",
-        "zarr-ts"). Required when creating a new corpus; written to
+        Backend declaration for the corpus (e.g., "arrow-parquet", "arrow-ipc",
+        "webdataset", "zarr", "lance"). Required when creating a new corpus; written to
         ``global-metadata.yaml``.
     topology : str | None
         Corpus topology for the Parquet ledger entry (e.g., "federated",
@@ -1971,8 +907,6 @@ def update_corpus_index(
     effective_topology = topology or ("aggregate" if backend == "lance" else "federated")
     _write_corpus_ledger_parquet(ledger_path, updated, backend, effective_topology)
 
-    if backend == "lancedb-aggregated":
-        mark_lance_append_committed(corpus_index_path, new_record)
     return updated
 
 
@@ -2029,7 +963,7 @@ def _write_corpus_ledger_parquet(
             dataset_index=d.dataset_index,
             join_mode=d.join_mode,
             manifest_path=d.manifest_path,
-            backend=backend or "arrow-hf",
+            backend=backend or "arrow-parquet",
             topology=topology,
             cell_count=d.cell_count,
             feature_count=feature_count,

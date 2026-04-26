@@ -25,9 +25,6 @@ _EXPORT_MAP = {
     "Stage2Materializer": (".core", "Stage2Materializer"),
     # Core classes
     "CanonicalCellRecord": (".core", "CanonicalCellRecord"),
-    "CreateNewRoute": (".core", "CreateNewRoute"),
-    "AppendRoutedRoute": (".core", "AppendRoutedRoute"),
-    "build_materialization_route": (".core", "build_materialization_route"),
     "update_corpus_index": (".core", "update_corpus_index"),
     # Tokenizer (available but NOT used during materialization)
     "CorpusTokenizer": (".tokenizer", "CorpusTokenizer"),
@@ -95,9 +92,6 @@ __all__ = [
     "Stage2Materializer",
     # Core classes
     "CanonicalCellRecord",
-    "CreateNewRoute",
-    "AppendRoutedRoute",
-    "build_materialization_route",
     "update_corpus_index",
     # Tokenizer (available but NOT used during materialization)
     "CorpusTokenizer",

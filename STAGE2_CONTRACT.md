@@ -99,13 +99,14 @@ All heavy-row storage uses **sparse representation** (CSR/CSC or equivalent). De
 
 **Federated topology** (each dataset stored independently):
 - Heavy rows are stored per-dataset with local feature indices
-- `global_row_index` is assigned at corpus-append time and stored in the corpus ledger
-- No per-row global index is written inside the per-dataset heavy object
+- `global_row_index` is always present in heavy rows (assigned at materialization time from `global_row_start + local_offset`)
+- `global_row_index` is also recorded in the corpus ledger for routing purposes
 
 **Aggregate topology** (multiple datasets in one shared object):
 - Heavy rows include `dataset_index` and `local_row_index`
-- `global_row_index` is computed as the cumulative offset at write time
+- `global_row_index` is computed as the cumulative offset at write time (`global_row_start + local_row_index`)
 - Row ranges are deterministic and non-overlapping across datasets
+- `global_row_index` is always present in heavy rows for both federated and aggregate topologies
 
 ---
 
@@ -141,7 +142,7 @@ All heavy-row storage uses **sparse representation** (CSR/CSC or equivalent). De
   - `size_factor`: `float64` — one row per cell, ordered to match the heavy-row ordering
 - **Content**: Per-cell size factor computed as `row_sum / median(row_sum)` post-recovery, using the Stage 1-approved count source
 - **Rationale**: Size factors are stored in a separate Parquet to keep the cells heavy-row parquet free of non-count data; runtime loaders read this sidecar to provide per-row normalization context
-- **No `size_factor` column in the cells parquet itself** — the cells parquet schema is strictly `['expressed_gene_indices', 'expression_counts']` for the `arrow-hf` backend
+- **No `size_factor` column in the cells parquet itself** — the cells parquet schema is strictly `['global_row_index', 'expressed_gene_indices', 'expression_counts']` following `HEAVY_CELL_SCHEMA`
 
 ### 4.4 Provenance Sidecar
 
@@ -216,10 +217,11 @@ feature_count: int
 ### 6.3 `backend` and `topology` Are Separate
 
 `backend` names the storage format only:
-- `arrow-hf` — Arrow HDF5 Feathers
+- `arrow-parquet` — Arrow IPC serialized to Parquet via `pa.ipc.new_file`
+- `arrow-ipc` — Arrow IPC serialized via `pa.ipc.new_file`
 - `webdataset` — WebDataset tar format
-- `zarr` — Zarr format
-- `lance` — LanceDB format
+- `zarr` — Zarr 1D flat-buffer layout
+- `lance` — Direct Lance format (no lancedb wrapper)
 
 `topology` names the corpus organization only:
 - `federated` — each dataset has its own heavy object
@@ -300,54 +302,87 @@ Parquet sidecars are intended to be read with **Polars** for speed. The reading 
 
 ## 9. Compatibility Policy
 
-### 9.1 Schema-Dependent Paths Are Legacy
+### 9.1 Entry Point
 
-The current `MaterializationRoute.materialize(source_path, schema_path)` entry point that requires `schema.yaml` is **legacy**. It remains functional for existing workflows but is explicitly out of the new Stage 2 contract. The new entry point:
+`Stage2Materializer` is the only active Stage 2 entry point. It accepts:
 
 ```
-Stage2Materializer.materialize(
+Stage2Materializer(
     source_path: str,
     review_bundle_path: str,      # Stage 1 dataset-summary.yaml
     output_roots: OutputRoots,
     release_id: str,
     dataset_id: str,
-    backend: str,
-    topology: str,
+    backend: str,                 # arrow-parquet (default), arrow-ipc, webdataset, zarr, lance
+    topology: str,               # federated (default) or aggregate
     rerun_stage1: bool = False,
 )
 ```
 
-does NOT accept `schema_path`.
+It does **not** accept `schema_path`. Canonical metadata mapping is deferred to Stage 3. `MaterializationRoute`, `CreateNewRoute`, `AppendRoutedRoute`, and `build_materialization_route()` have been removed — `Stage2Materializer` replaces all of them.
 
-### 9.2 Existing Schema-Required Code
+### 9.2 Legacy Path Removed
 
-Code that currently calls the legacy entry point (e.g., CLI commands, test fixtures) should be updated to use the new entry point or should be marked as requiring a schema update. The compatibility boundary is:
-
-- **Acceptable**: Legacy code that reads existing schema-produced artifacts (backward compatibility)
-- **Prohibited**: Legacy code that **produces** new artifacts via the schema-dependent path for datasets not yet migrated
-
-### 9.3 Accepted Schema Copy
-
-When a dataset has been inspected and a `schema.yaml` exists from prior work, Stage 2 may **optionally** copy the accepted schema to `{metadata_root}/{release_id}-accepted-schema.yaml` for audit trail purposes. This copy is for provenance only — it is NOT read back during materialization or loading.
+`MaterializationRoute`, `CreateNewRoute`, `AppendRoutedRoute`, and `build_materialization_route()` have been removed. `Stage2Materializer` is the only active materialization entry point. The `AVAILABLE_BACKENDS` registry is removed. Code that depended on these artifacts has been migrated or removed.
 
 ---
 
 ## 10. Backend-Topology Matrix
 
-### 10.1 Supported Subset (This Contract)
+### 10.1 Supported Matrix (v0.4.0 — This Contract)
+
+All 10 backend×topology combinations are implemented. Validation scope:
+
+- **Non-Lance (8 combinations)**: Validated end-to-end on `dummy_data` via Slurm in Phase 5. Result: 6/8 combinations fully pass; 2 failures (zarr × federated, zarr × aggregate) are validation-script path issues, not implementation bugs.
+- **Lance (2 combinations)**: Validated end-to-end on `dummy_data` via Slurm in Phase 6 (Lance 4.0.0). Result: lance × federated PASS, lance × aggregate PASS.
 
 | Backend | Federated | Aggregate |
 |---------|-----------|-----------|
-| `arrow-hf` | ✅ supported | ❌ deferred |
-| `webdataset` | ✅ supported | ❌ deferred |
-| `zarr` | ✅ supported | ❌ deferred |
-| `lance` | ❌ deferred | ✅ supported |
+| `arrow-parquet` | ✅ implemented + validated | ✅ implemented + validated |
+| `arrow-ipc` | ✅ implemented + validated | ✅ implemented + validated |
+| `webdataset` | ✅ implemented + validated | ✅ implemented + validated |
+| `zarr` | ✅ implemented (validation-script issue) | ✅ implemented (validation-script issue) |
+| `lance` | ✅ implemented + validated | ✅ implemented + validated |
 
-### 10.2 Implementation Notes
+### 10.2 Canonical Backend Names
 
-- The minimum supported subset is **`arrow-hf` × `federated`** — this is the default and must always work.
-- Other combinations are implemented where already present but are not required to be fully validated until later phases.
-- Backend-topology separation is enforced in the manifest schema — `backend` and `topology` are separate string fields, not fused into a single route name.
+The following legacy backend names have been removed and are not produced by any current Stage 2 code:
+
+| Legacy Name | New Canonical | Notes |
+|-------------|---------------|-------|
+| `arrow-hf` | `arrow-parquet` | `arrow-parquet` is the default backend |
+| `zarr-ts` | `zarr` | `zarr` is canonical |
+| `zarr-aggregated` | `zarr` | `zarr` handles both topologies |
+| `lancedb-aggregated` | `lance` | Direct `lance` backend replaces lancedb wrapper |
+| `lance-dataset` | `lance` | `lance` is canonical |
+
+The `AVAILABLE_BACKENDS` registry is removed. New code uses explicit `backend` + `topology` dispatch via `AVAILABLE_WRITERS[backend][topology]`. `AVAILABLE_READERS` uses canonical names only. No `arrow-hf`, `zarr-ts`, `lancedb-aggregated`, or `zarr-aggregated` artifacts are produced by the current implementation.
+
+### 10.3 Shared Chunk Translation
+
+All 5 backends consume a shared translation layer (`perturb_data_lab/materializers/chunk_translation.py`) that translates CSR batches into a canonical `ChunkBundle` once, then each backend writer produces its own format from that shared payload. This eliminates per-backend sparse re-encoding on the hot path.
+
+The shared `ChunkBundle` carries exactly 6 fields:
+- `table`: `pa.Table` with heavy-row list-arrays (`global_row_index`, `expressed_gene_indices`, `expression_counts`) following `HEAVY_CELL_SCHEMA`
+- `size_factors`: `np.ndarray` (float32) of median-normalized per-cell size factors, computed inline during the same CSR traversal — no writer computes its own size factors
+- `indptr`: raw CSR indptr array (int64) for backends that need flat-buffer access (Zarr, WebDataset)
+- `indices`: raw **dataset-local** gene indices array (int32) — no canonical gene mapping is applied at this stage; canonical mapping is deferred to Stage 3
+- `counts`: raw expression counts array (int32)
+- `row_count`: total rows in this chunk
+
+**`_translate_chunk()` contract**: accepts `dataset: DatasetSpec`, `matrix_chunk: csr_matrix`, `chunk_start: int` — no `gene_lookup` parameter. `expressed_gene_indices` in the output `ChunkBundle` are always in dataset-local feature space.
+
+**Thin serializer contract**: each backend writer accepts a `ChunkBundle` and writes it to its native format. Writers do not call `_translate_chunk()`, do not implement CSR logic, and have no legacy fallback paths. The `Stage2Materializer` owns the chunk loop and calls `_translate_chunk()` once per chunk.
+
+The `metadata_table` field has been removed. Per-cell metadata is written by the caller as a separate Parquet sidecar (`{release_id}-raw-obs.parquet`). The `_build_metadata_table()` helper remains available for callers that need a `METADATA_SCHEMA` table from obs data.
+
+### 10.4 Implementation Notes
+
+- The **default route** is **`arrow-parquet` × `federated`** — this is the default and must always work.
+- `backend` and `topology` are separate manifest fields, not fused into a single route name.
+- Size factors are stored in a separate Parquet sidecar (`{release_id}-size-factor.parquet`), not inline in the heavy-row parquet. `_translate_chunk()` computes size factors inline during CSR traversal.
+- No new SQLite artifacts are emitted on the active Stage 2 path.
+- `lance` uses direct `lance.write_dataset()` — no `lancedb` dependency.
 
 ---
 
@@ -365,4 +400,4 @@ Large `.h5ad` files (e.g., `perturb/marson2025_data/D1_Rest.assigned_guide.h5ad`
 
 ## 12. Summary Paragraph (Contract Frozen State)
 
-**Stage 2 materializes integer counts from a Stage 1-approved count source into a chosen backend and topology, preserving raw `obs`, raw `var`, and dataset-local feature order as Parquet sidecars without applying canonical metadata mapping. Stage 2 is gated by a Stage 1 `dataset-summary.yaml` whose `materialization_readiness` must be `pass`; it supports reusing an existing review bundle or rerunning Stage 1 as preflight. Heavy rows are written in sparse dataset-local feature space with per-row size factors and are verifiable as integer at write time. HVG arrays are computed post-count-settlement and stored in dataset-local feature indices. A Parquet corpus ledger tracks dataset membership, append order, backend, topology, and row ranges. SQLite is deprecated for all new Stage 2 artifacts. Backend and topology are separate manifest fields. The new entry point does not accept `schema_path`.**
+**Stage 2 materializes integer counts from a Stage 1-approved count source into a chosen backend and topology, preserving raw `obs`, raw `var`, and dataset-local feature order as Parquet sidecars without applying canonical metadata mapping. `Stage2Materializer` is the only active entry point; `MaterializationRoute`, `CreateNewRoute`, `AppendRoutedRoute`, and `build_materialization_route()` have been removed. Stage 2 is gated by a Stage 1 `dataset-summary.yaml` whose `materialization_readiness` must be `pass`; it supports reusing an existing review bundle or rerunning Stage 1 as preflight. Heavy rows are written in sparse dataset-local feature space with per-row size factors and are verifiable as integer at write time. HVG arrays are computed post-count-settlement and stored in dataset-local feature indices. A Parquet corpus ledger tracks dataset membership, append order, backend, topology, and row ranges. No `arrow-hf`, `zarr-ts`, `lancedb-aggregated`, or `zarr-aggregated` artifacts are produced. Backend and topology are separate manifest fields. `_translate_chunk()` accepts only `dataset`, `matrix_chunk`, and `chunk_start` — no `gene_lookup` parameter. Canonical gene mapping is deferred to Stage 3.**

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import tempfile
 from pathlib import Path
 
@@ -12,9 +11,6 @@ from scipy.sparse import csr_matrix
 
 from perturb_data_lab.materializers import (
     CanonicalCellRecord,
-    CreateNewRoute,
-    AppendRoutedRoute,
-    build_materialization_route,
     update_corpus_index,
 )
 from perturb_data_lab.materializers.models import (
@@ -28,8 +24,6 @@ from perturb_data_lab.materializers.models import (
     SizeFactorEntry,
     SizeFactorManifest,
 )
-
-from perturb_data_lab.materializers.backends.lancedb_aggregated import mark_lance_append_committed
 
 
 class TestCanonicalCellRecord:
@@ -79,45 +73,6 @@ class TestCanonicalCellRecord:
         np.testing.assert_array_equal(data, [3, 7, 1])
         np.testing.assert_array_equal(indices, [1, 4, 8])
         np.testing.assert_array_equal(indptr, [0, 3])
-
-
-class TestBuildMaterializationRoute:
-    """Test route factory."""
-
-    def test_create_new_route(self):
-        roots = OutputRoots(metadata_root="/tmp/meta", matrix_root="/tmp/matrix")
-        route = build_materialization_route(
-            "create_new",
-            roots,
-            "release-1",
-            "ds-1",
-            CountSourceSpec(selected=".X", integer_only=True),
-        )
-        assert isinstance(route, CreateNewRoute)
-        assert route.route_name == "create_new"
-
-    def test_append_routed_route(self):
-        roots = OutputRoots(metadata_root="/tmp/meta", matrix_root="/tmp/matrix")
-        route = build_materialization_route(
-            "append_routed",
-            roots,
-            "release-3",
-            "ds-3",
-            CountSourceSpec(selected=".X", integer_only=True),
-        )
-        assert isinstance(route, AppendRoutedRoute)
-        assert route.route_name == "append_routed"
-
-    def test_unknown_route_raises(self):
-        roots = OutputRoots(metadata_root="/tmp/meta", matrix_root="/tmp/matrix")
-        with pytest.raises(ValueError, match="unknown route"):
-            build_materialization_route(
-                "unknown_route",
-                roots,
-                "release-x",
-                "ds-x",
-                CountSourceSpec(selected=".X", integer_only=True),
-            )
 
 
 class TestFeatureRegistryAppend:
@@ -299,191 +254,6 @@ class TestCorpusIndexUpdate:
                 assert ds.global_end - ds.global_start == ds.cell_count
                 running_end += ds.cell_count
 
-    def test_lancedb_append_sidecar_is_marked_committed_after_index_update(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            corpus_root = Path(tmpdir)
-            matrix_root = corpus_root / "matrix"
-            matrix_root.mkdir()
-            sidecar_path = matrix_root / "aggregated-corpus-append-log.json"
-            sidecar_path.write_text(
-                """
-{
-  "backend": "lancedb-aggregated",
-  "table_name": "aggregated-corpus",
-  "dataset_uri": "dummy",
-  "db_root": "dummy-root",
-  "entries": [
-    {
-      "dataset_index": 0,
-      "dataset_id": "ds_001",
-      "release_id": "v0.1",
-      "global_row_start": 0,
-      "global_row_end": 5,
-      "cell_count": 5,
-      "lance_version": 1,
-      "status": "pending"
-    }
-  ]
-}
-                """.strip(),
-                encoding="utf-8",
-            )
-
-            idx_path = corpus_root / "corpus-index.yaml"
-            record = DatasetJoinRecord(
-                dataset_id="ds_001",
-                release_id="v0.1",
-                join_mode="create_new",
-                manifest_path="/tmp/meta/v0.1-manifest.yaml",
-                cell_count=5,
-            )
-            update_corpus_index(idx_path, record, backend="lancedb-aggregated")
-
-            payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
-            assert payload["entries"][0]["status"] == "committed"
-
-
-class TestLanceSidecarHelpers:
-    def test_mark_lance_append_committed_returns_none_when_sidecar_absent(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            corpus_index_path = Path(tmpdir) / "corpus-index.yaml"
-            corpus_index_path.parent.mkdir(parents=True, exist_ok=True)
-            record = DatasetJoinRecord(
-                dataset_id="ds_001",
-                release_id="v0.1",
-                join_mode="create_new",
-                manifest_path="m.yaml",
-                dataset_index=0,
-                cell_count=1,
-                global_start=0,
-                global_end=1,
-            )
-            assert mark_lance_append_committed(corpus_index_path, record) is None
-
-    def test_sidecar_status_stays_pending_until_corpus_index_commit(self):
-        pytest.importorskip("lance")
-        pytest.importorskip("lancedb")
-
-        from perturb_data_lab.materializers.backends.lancedb_aggregated import (
-            write_lancedb_aggregated,
-        )
-
-        class DummyObs:
-            def __init__(self):
-                self.index = ["c0", "c1"]
-
-        class DummyAnnData:
-            def __init__(self):
-                self.n_obs = 2
-                self.obs = DummyObs()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            matrix_root = root / "dataset_matrix"
-            corpus_root = root / "corpus"
-            corpus_index_path = corpus_root / "corpus-index.yaml"
-            corpus_root.mkdir()
-
-            adata = DummyAnnData()
-            count_matrix = np.array([[0, 4, 0], [1, 0, 2]], dtype=np.int32)
-            size_factors = np.array([1.0, 1.5], dtype=np.float64)
-            write_lancedb_aggregated(
-                adata=adata,
-                count_matrix=count_matrix,
-                size_factors=size_factors,
-                release_id="rel0",
-                matrix_root=matrix_root,
-                canonical_perturbation=({}, {}),
-                canonical_context=({}, {}),
-                raw_fields=({}, {}),
-                dataset_id="ds0",
-                corpus_index_path=corpus_index_path,
-            )
-
-            sidecar_path = corpus_root / "matrix" / "aggregated-corpus-append-log.json"
-            payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
-            assert payload["entries"][0]["status"] == "pending"
-            assert payload["entries"][0]["dataset_index"] == 0
-            assert payload["entries"][0]["global_row_start"] == 0
-            assert payload["entries"][0]["global_row_end"] == 2
-
-    def test_true_lance_append_preserves_ranges_and_dataset_index(self):
-        lance = pytest.importorskip("lance")
-        pytest.importorskip("lancedb")
-
-        from perturb_data_lab.materializers.backends.lancedb_aggregated import (
-            write_lancedb_aggregated,
-        )
-
-        class DummyObs:
-            def __init__(self, ids):
-                self.index = ids
-
-        class DummyAnnData:
-            def __init__(self, ids):
-                self.n_obs = len(ids)
-                self.obs = DummyObs(ids)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            corpus_root = root / "corpus"
-            corpus_root.mkdir()
-            corpus_index_path = corpus_root / "corpus-index.yaml"
-
-            first_matrix_root = root / "dataset0" / "matrix"
-            second_matrix_root = root / "dataset1" / "matrix"
-
-            write_lancedb_aggregated(
-                adata=DummyAnnData(["a0", "a1"]),
-                count_matrix=np.array([[3, 0, 1], [0, 5, 0]], dtype=np.int32),
-                size_factors=np.array([1.0, 1.2], dtype=np.float64),
-                release_id="rel0",
-                matrix_root=first_matrix_root,
-                canonical_perturbation=({}, {}),
-                canonical_context=({}, {}),
-                raw_fields=({}, {}),
-                dataset_id="ds0",
-                corpus_index_path=corpus_index_path,
-            )
-            update_corpus_index(
-                corpus_index_path,
-                DatasetJoinRecord(
-                    dataset_id="ds0",
-                    release_id="rel0",
-                    join_mode="create_new",
-                    manifest_path="meta0/materialization-manifest.yaml",
-                    cell_count=2,
-                ),
-                backend="lancedb-aggregated",
-            )
-
-            write_lancedb_aggregated(
-                adata=DummyAnnData(["b0", "b1"]),
-                count_matrix=np.array([[0, 2, 0], [4, 0, 6]], dtype=np.int32),
-                size_factors=np.array([0.9, 1.1], dtype=np.float64),
-                release_id="rel1",
-                matrix_root=second_matrix_root,
-                canonical_perturbation=({}, {}),
-                canonical_context=({}, {}),
-                raw_fields=({}, {}),
-                dataset_id="ds1",
-                corpus_index_path=corpus_index_path,
-            )
-
-            shared_path = corpus_root / "matrix" / "aggregated-corpus.lance"
-            rows = lance.dataset(shared_path).take([0, 1, 2, 3]).to_pylist()
-            assert [row["global_row_index"] for row in rows] == [0, 1, 2, 3]
-            assert [row["dataset_index"] for row in rows] == [0, 0, 1, 1]
-            assert [row["local_row_index"] for row in rows] == [0, 1, 0, 1]
-
-            sidecar_path = corpus_root / "matrix" / "aggregated-corpus-append-log.json"
-            payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
-            assert payload["entries"][0]["status"] == "committed"
-            assert payload["entries"][1]["status"] == "pending"
-            assert payload["entries"][1]["dataset_index"] == 1
-            assert payload["entries"][1]["global_row_start"] == 2
-            assert payload["entries"][1]["global_row_end"] == 4
-
 
 class TestMaterializationManifest:
     """Test manifest YAML round-trip."""
@@ -495,7 +265,7 @@ class TestMaterializationManifest:
             dataset_id="test_ds",
             release_id="v0.1",
             route="create_new",
-            backend="arrow-hf",
+            backend="arrow-parquet",
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             provenance=ProvenanceSpec(

@@ -28,8 +28,10 @@ __all__ = [
     "PreloadedFeatureObjects",
     "BackendCellReader",
     "ArrowHFCellReader",
+    "ArrowIpcCellReader",
     "WebDatasetCellReader",
     "ZarrCellReader",
+    "LanceCellReader",
     "build_cell_reader",
     "AVAILABLE_READERS",
     "SparseBatchPayload",
@@ -71,7 +73,7 @@ class PreloadedFeatureObjects:
     - token:   a mapping from `origin_index` → `token_id` (int), enabling
                O(1) translation of dataset-order indices to global token IDs.
 
-    Both variants are MaterializationRoute outputs written once per dataset
+    Both variants are Stage2Materializer outputs written once per dataset
     during the materialization phase (Phase 7).
     """
 
@@ -660,8 +662,8 @@ class ArrowHFCellReader(BackendCellReader):
         )
 
 
-class LanceDBAggregatedCellReader(BackendCellReader):
-    """Reader for corpus-scoped true Lance heavy storage."""
+class LanceCellReader(BackendCellReader):
+    """Reader for corpus-scoped Lance heavy storage."""
 
     def __init__(
         self,
@@ -670,7 +672,7 @@ class LanceDBAggregatedCellReader(BackendCellReader):
         corpus_index_path: Path,
         lance_dataset_path: Path,
         meta_parquet_path: Path,
-        cell_meta_sqlite_path: Path,
+        cell_meta_sqlite_path: Path | None = None,
         feature_registry_path: Path | None = None,
         metadata_table: MetadataTable | None = None,
         global_row_offset: int = 0,
@@ -718,6 +720,12 @@ class LanceDBAggregatedCellReader(BackendCellReader):
     def __len__(self) -> int:
         if self.metadata_table is not None:
             return len(self.metadata_table.dataset_row_indices(self.dataset_index))
+        # Stage 2 Lance aggregate artifacts have no SQLite; require metadata_table.
+        if self.cell_meta_sqlite_path is None:
+            raise RuntimeError(
+                "LanceCellReader cannot determine length: no metadata_table and "
+                "no cell_meta_sqlite_path; provide metadata_table for Stage 2 artifacts"
+            )
         import sqlite3
 
         conn = sqlite3.connect(str(self.cell_meta_sqlite_path))
@@ -825,6 +833,143 @@ class LanceDBAggregatedCellReader(BackendCellReader):
 
 
 # ---------------------------------------------------------------------------
+# Arrow IPC reader
+# ---------------------------------------------------------------------------
+
+
+class ArrowIpcCellReader(BackendCellReader):
+    """Reader for Arrow IPC file storage (federated).
+
+    Stage 2 artifacts use Parquet sidecars for metadata; size factors
+    come from the separate {release_id}-size-factor.parquet.
+    """
+
+    def __init__(
+        self,
+        dataset_id: str,
+        dataset_index: int,
+        corpus_index_path: Path,
+        cells_arrow_path: Path,
+        meta_parquet_path: Path,
+        cell_meta_sqlite_path: Path | None = None,
+        feature_registry_path: Path | None = None,
+        metadata_table: MetadataTable | None = None,
+        global_row_offset: int = 0,
+        size_factor_parquet_path: Path | None = None,
+        feature_meta_paths: dict[str, Path] | None = None,
+    ):
+        super().__init__(dataset_id, dataset_index, corpus_index_path)
+        self.cells_arrow_path = cells_arrow_path
+        self.meta_parquet_path = meta_parquet_path
+        self.cell_meta_sqlite_path = cell_meta_sqlite_path
+        self.feature_registry_path = feature_registry_path
+        self.metadata_table = metadata_table
+        self.global_row_offset = global_row_offset
+        self.size_factor_parquet_path = size_factor_parquet_path
+        self._feature_meta_paths = feature_meta_paths
+        self.__cells_reader: pa.ipc.RecordBatchFileReader | None = None
+        self.__size_factor_table = None
+
+    def _open_cells_reader(self) -> pa.ipc.RecordBatchFileReader:
+        if self.__cells_reader is None:
+            source = pa.memory_map(str(self.cells_arrow_path), "r")
+            self.__cells_reader = pa.ipc.open_file(source)
+        return self.__cells_reader
+
+    def _size_factor_table(self):
+        if self.__size_factor_table is None and self.size_factor_parquet_path is not None:
+            if self.size_factor_parquet_path.exists():
+                import pyarrow.parquet as pq
+                self.__size_factor_table = pq.read_table(str(self.size_factor_parquet_path))
+        return self.__size_factor_table
+
+    def _read_size_factor(self, row_index: int) -> float:
+        sf_table = self._size_factor_table()
+        if sf_table is not None:
+            return float(sf_table["size_factor"][row_index].as_py())
+        return 1.0  # neutral default
+
+    @property
+    def preloaded_features(self) -> PreloadedFeatureObjects | None:
+        return None
+
+    def translate_to_token_ids(
+        self, origin_indices: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        return origin_indices
+
+    def __len__(self) -> int:
+        reader = self._open_cells_reader()
+        total = 0
+        for batch_idx in range(reader.num_record_batches):
+            total += reader.get_batch(batch_idx).num_rows
+        return total
+
+    def read_row(self, row_index: int) -> dict[str, Any]:
+        reader = self._open_cells_reader()
+        running = 0
+        for batch_idx in range(reader.num_record_batches):
+            batch = reader.get_batch(batch_idx)
+            next_running = running + batch.num_rows
+            if running <= row_index < next_running:
+                local_idx = row_index - running
+                indices = batch.column("expressed_gene_indices")[local_idx].as_py()
+                counts = batch.column("expression_counts")[local_idx].as_py()
+                return {
+                    "global_row_index": self.global_row_offset + row_index,
+                    "dataset_index": self.dataset_index,
+                    "dataset_id": self.dataset_id,
+                    "local_row_index": row_index,
+                    "expressed_gene_indices": tuple(int(i) for i in indices),
+                    "expression_counts": tuple(int(c) for c in counts),
+                    "size_factor": self._read_size_factor(row_index),
+                }
+            running = next_running
+        raise IndexError(f"row_index {row_index} out of range")
+
+    def read_rows(self, row_indices: list[int]) -> list[dict[str, Any]]:
+        return [self.read_row(i) for i in row_indices]
+
+    def read_cell(self, cell_index: int) -> CellState:
+        heavy_row = self.read_row(cell_index)
+        global_row_index = heavy_row["global_row_index"]
+
+        if self.metadata_table is not None:
+            metadata = self.metadata_table.row(global_row_index)
+            return CellState(
+                identity=CellIdentity(
+                    global_row_index=global_row_index,
+                    dataset_index=int(metadata["dataset_index"]),
+                    dataset_id=str(metadata["dataset_id"]),
+                    local_row_index=int(metadata["local_row_index"]),
+                ),
+                cell_id=str(metadata["cell_id"]),
+                expressed_gene_indices=tuple(heavy_row["expressed_gene_indices"]),
+                expression_counts=tuple(heavy_row["expression_counts"]),
+                size_factor=float(metadata["size_factor"]),
+                canonical_perturbation=dict(metadata["canonical_perturbation"]),
+                canonical_context=dict(metadata["canonical_context"]),
+                raw_fields=dict(metadata["raw_fields"]),
+            )
+
+        return CellState(
+            identity=CellIdentity(
+                global_row_index=global_row_index,
+                dataset_index=self.dataset_index,
+                dataset_id=self.dataset_id,
+                local_row_index=cell_index,
+            ),
+            cell_id=f"cell_{cell_index}",
+            expressed_gene_indices=tuple(heavy_row["expressed_gene_indices"]),
+            expression_counts=tuple(heavy_row["expression_counts"]),
+            size_factor=float(heavy_row["size_factor"]),
+            canonical_perturbation={},
+            canonical_context={},
+            raw_fields={},
+        )
+
+
+# ---------------------------------------------------------------------------
 # WebDataset reader
 # ---------------------------------------------------------------------------
 
@@ -853,18 +998,17 @@ class WebDatasetCellReader(BackendCellReader):
         self._build_index()
 
     def _build_index(self) -> None:
-        """Build a flat index mapping global cell index to (shard_idx, local_idx)."""
-        import pickle
+        """Build a flat index mapping cell index to (shard_idx, pickle_member_name)."""
         import tarfile
 
         cell_idx = 0
         for shard_idx, shard_path in enumerate(self.shard_paths):
             with tarfile.open(str(shard_path), "r") as tar:
                 for member in tar.getmembers():
-                    if member.name.startswith("cell_") and member.name.endswith(".pt"):
+                    if member.name.startswith("cell_") and member.name.endswith(".pkl"):
                         self._cell_index_to_shard[cell_idx] = (
                             shard_idx,
-                            int(member.name.split("_")[1].split(".")[0]),
+                            member.name,
                         )
                         cell_idx += 1
         self._n_cells = cell_idx
@@ -929,29 +1073,35 @@ class WebDatasetCellReader(BackendCellReader):
         import pickle
         import tarfile
 
-        shard_idx, local_idx = self._cell_index_to_shard[cell_index]
+        shard_idx, member_name = self._cell_index_to_shard[cell_index]
         shard_path = self.shard_paths[shard_idx]
 
         with tarfile.open(str(shard_path), "r") as tar:
-            member = tar.getmember(f"cell_{local_idx:08d}.pt")
+            member = tar.getmember(member_name)
             f = tar.extractfile(member)
             if f is None:
                 raise RuntimeError(f"Failed to extract {member.name}")
             record = pickle.loads(f.read())
+
+        # record["expressed_gene_indices"] and record["expression_counts"] are
+        # stored as numpy arrays (written by write_webdataset_federated).
+        gene_indices = record["expressed_gene_indices"]
+        expr_counts = record["expression_counts"]
+        # Handle both numpy array and list representations.
+        if hasattr(gene_indices, "tolist"):
+            gene_indices = tuple(gene_indices.tolist())
+        if hasattr(expr_counts, "tolist"):
+            expr_counts = tuple(expr_counts.tolist())
 
         return {
             "global_row_index": self.global_row_offset + cell_index,
             "dataset_index": self.dataset_index,
             "dataset_id": self.dataset_id,
             "local_row_index": cell_index,
-            "cell_id": record["cell_id"],
-            "expressed_gene_indices": tuple(
-                np.frombuffer(record["expressed_gene_indices"], dtype=np.int32)
-            ),
-            "expression_counts": tuple(
-                np.frombuffer(record["expression_counts"], dtype=np.int32)
-            ),
-            "size_factor": float(record["size_factor"]),
+            "cell_id": record.get("cell_id", str(cell_index)),
+            "expressed_gene_indices": gene_indices,
+            "expression_counts": expr_counts,
+            "size_factor": float(record.get("size_factor", 1.0)),
             "canonical_perturbation": dict(record.get("canonical_perturbation", {})),
             "canonical_context": dict(record.get("canonical_context", {})),
             "raw_fields": dict(record.get("raw_fields", {})),
@@ -964,7 +1114,16 @@ class WebDatasetCellReader(BackendCellReader):
 
 
 class ZarrCellReader(BackendCellReader):
-    """Reader for Zarr/TensorStore cell-chunked sparse storage."""
+    """Reader for Zarr flat 1D + row_offsets sparse storage.
+
+    This reader matches the writer's flat 1D + row_offsets layout:
+    - indices stored in ``{release_id}-indices.zarr/indices`` (flat 1D int32)
+    - counts stored in ``{release_id}-counts.zarr/counts`` (flat 1D int32)
+    - row offsets stored in ``{release_id}-row-offsets.zarr/row_offsets`` (flat 1D int64)
+    - size factors stored in ``{release_id}-sf.zarr/sf`` (flat 1D float64)
+
+    For each row, nnz = row_offsets[row_index+1] - row_offsets[row_index].
+    """
 
     def __init__(
         self,
@@ -975,7 +1134,6 @@ class ZarrCellReader(BackendCellReader):
         counts_zarr_path: Path,
         sf_zarr_path: Path,
         meta_path: Path,
-        chunk_cells: int = 1024,
         feature_registry_path: Path | None = None,
         feature_meta_paths: dict[str, Path] | None = None,
         metadata_table: MetadataTable | None = None,
@@ -986,14 +1144,13 @@ class ZarrCellReader(BackendCellReader):
         self.counts_zarr_path = counts_zarr_path
         self.sf_zarr_path = sf_zarr_path
         self.meta_path = meta_path
-        self.chunk_cells = chunk_cells
         self.feature_registry_path = feature_registry_path
         self._feature_meta_paths = feature_meta_paths
         self.metadata_table = metadata_table
         self.global_row_offset = global_row_offset
         self._n_cells: int | None = None
         self._n_vars: int | None = None
-        self._meta_cache: list[dict[str, Any]] | None = None  # per-cell meta list
+        self._meta_cache: dict[str, Any] | None = None  # meta.json dict cache
         self.__preloaded_features: PreloadedFeatureObjects | None = None
         if (
             feature_meta_paths is not None
@@ -1006,20 +1163,29 @@ class ZarrCellReader(BackendCellReader):
                 features_token_path=feature_meta_paths["features_token"],
             )
 
-    def _load_meta(self) -> list[dict[str, Any]]:
-        """Load and cache the per-cell meta list from meta.json once."""
+    def _load_meta(self) -> dict[str, Any]:
+        """Load and cache the meta.json dict once."""
         if self._meta_cache is None:
             import json
             with open(self.meta_path) as f:
-                meta = json.load(f)
-            self._meta_cache = meta["cells"]
-            self._n_cells = meta["n_obs"]
-            self._n_vars = meta["n_vars"]
+                self._meta_cache = json.load(f)
+            self._n_cells = self._meta_cache.get("n_obs")
         return self._meta_cache
 
     def __len__(self) -> int:
         meta = self._load_meta()
-        return len(meta)
+        n_obs = meta.get("n_obs")
+        if n_obs is not None:
+            return n_obs
+        # Fallback: open row_offsets and infer n_cells from length - 1
+        import zarr
+        row_offsets_path = self.meta_path.parent / f"{meta.get('release_id', 'unknown')}-row-offsets.zarr"
+        # Try to find row_offsets from meta.json if available
+        row_offsets_str = meta.get("row_offsets_path")
+        if row_offsets_str:
+            row_offsets_path = Path(row_offsets_str)
+        ro = zarr.open(str(row_offsets_path), mode="r")["row_offsets"]
+        return int(ro.shape[0]) - 1
 
     @property
     def total_genes(self) -> int:
@@ -1085,37 +1251,121 @@ class ZarrCellReader(BackendCellReader):
     def read_row(self, cell_index: int) -> dict[str, Any]:
         import zarr
 
-        meta_list = self._load_meta()
-        cell_meta = meta_list[cell_index]
+        meta = self._load_meta()
 
-        chunk_idx = cell_index // self.chunk_cells
-        local_i = cell_index % self.chunk_cells
-
+        # Open the flat 1D arrays.
         indices_store = zarr.open(str(self.indices_zarr_path), mode="r")
         counts_store = zarr.open(str(self.counts_zarr_path), mode="r")
-        sf_store = zarr.open(str(self.sf_zarr_path), mode="r")
 
-        chunk_indices = indices_store[f"chunk_{chunk_idx}"][local_i]
-        chunk_counts = counts_store[f"chunk_{chunk_idx}"][local_i]
-        sf = sf_store["sf"][cell_index]
+        # Get row_offsets - try meta.json path first, then reconstruct from release_id.
+        row_offsets_path_str = meta.get("row_offsets_path")
+        if row_offsets_path_str:
+            row_offsets_path = Path(row_offsets_path_str)
+        else:
+            release_id = meta.get("release_id", "unknown")
+            row_offsets_path = self.meta_path.parent / f"{release_id}-row-offsets.zarr"
 
-        nonzero_mask = chunk_indices != -1
-        expressed_indices = tuple(chunk_indices[nonzero_mask].tolist())
-        expressed_counts = tuple(chunk_counts[nonzero_mask].tolist())
+        row_offsets = zarr.open(str(row_offsets_path), mode="r")["row_offsets"]
+
+        start = int(row_offsets[cell_index])
+        stop = int(row_offsets[cell_index + 1])
+
+        gene_indices_arr = indices_store["indices"][start:stop]
+        expr_counts_arr = counts_store["counts"][start:stop]
+
+        # Get size factor: try sf_zarr_path first, then fall back to meta.json's
+        # size_factor_path (which may point to a different location due to writer bugs).
+        sf = self._read_size_factor(cell_index, meta)
 
         return {
             "global_row_index": self.global_row_offset + cell_index,
             "dataset_index": self.dataset_index,
             "dataset_id": self.dataset_id,
             "local_row_index": cell_index,
-            "cell_id": cell_meta["cell_id"],
-            "expressed_gene_indices": expressed_indices,
-            "expression_counts": expressed_counts,
-            "size_factor": float(sf),
-            "canonical_perturbation": dict(cell_meta.get("canonical_perturbation", {})),
-            "canonical_context": dict(cell_meta.get("canonical_context", {})),
-            "raw_fields": dict(cell_meta.get("raw_fields", {})),
+            "cell_id": meta.get("release_id", str(cell_index)),
+            "expressed_gene_indices": tuple(gene_indices_arr.astype(np.int32).tolist()),
+            "expression_counts": tuple(expr_counts_arr.astype(np.int32).tolist()),
+            "size_factor": sf,
+            "canonical_perturbation": {},
+            "canonical_context": {},
+            "raw_fields": {},
         }
+
+    def _read_size_factor(self, cell_index: int, meta: dict[str, Any]) -> float:
+        """Read size factor for a cell, with fallback handling for writer path bugs."""
+        import zarr
+
+        # Try the sf_zarr_path first (the expected location per writer contract).
+        sf_path = self.sf_zarr_path
+        if sf_path and Path(sf_path).exists():
+            try:
+                sf_store = zarr.open(str(sf_path), mode="r")
+                if "sf" in sf_store:
+                    return float(sf_store["sf"][cell_index])
+            except Exception:
+                pass  # Fall through to next option
+
+        # Fall back to size_factor_path from meta.json (may be a different path
+        # due to writer bugs where it writes to parquet but stores zarr path).
+        sf_path_str = meta.get("size_factor_path")
+        if sf_path_str:
+            sf_path_from_meta = Path(sf_path_str)
+            if sf_path_from_meta.exists():
+                try:
+                    # If it's a zarr, try to read "sf" dataset
+                    sf_store = zarr.open(str(sf_path_from_meta), mode="r")
+                    if "sf" in sf_store:
+                        return float(sf_store["sf"][cell_index])
+                    # If it's a parquet (fallback for aggregate writer bug), read it
+                    import pyarrow.parquet as pq
+                    sf_table = pq.read_table(str(sf_path_from_meta))
+                    return float(sf_table["size_factor"][cell_index].as_py())
+                except Exception:
+                    pass
+
+        # Final fallback: use 1.0 as neutral default
+        return 1.0
+
+    def read_rows(self, row_indices: list[int]) -> list[dict[str, Any]]:
+        if not row_indices:
+            return []
+        import zarr
+
+        meta = self._load_meta()
+
+        indices_store = zarr.open(str(self.indices_zarr_path), mode="r")
+        counts_store = zarr.open(str(self.counts_zarr_path), mode="r")
+
+        row_offsets_path_str = meta.get("row_offsets_path")
+        if row_offsets_path_str:
+            row_offsets_path = Path(row_offsets_path_str)
+        else:
+            release_id = meta.get("release_id", "unknown")
+            row_offsets_path = self.meta_path.parent / f"{release_id}-row-offsets.zarr"
+
+        row_offsets = zarr.open(str(row_offsets_path), mode="r")["row_offsets"]
+
+        result: list[dict[str, Any]] = []
+        for cell_index in row_indices:
+            start = int(row_offsets[cell_index])
+            stop = int(row_offsets[cell_index + 1])
+            gene_indices_arr = indices_store["indices"][start:stop]
+            expr_counts_arr = counts_store["counts"][start:stop]
+            sf = self._read_size_factor(cell_index, meta)
+            result.append({
+                "global_row_index": self.global_row_offset + cell_index,
+                "dataset_index": self.dataset_index,
+                "dataset_id": self.dataset_id,
+                "local_row_index": cell_index,
+                "cell_id": meta.get("release_id", str(cell_index)),
+                "expressed_gene_indices": tuple(gene_indices_arr.astype(np.int32).tolist()),
+                "expression_counts": tuple(expr_counts_arr.astype(np.int32).tolist()),
+                "size_factor": sf,
+                "canonical_perturbation": {},
+                "canonical_context": {},
+                "raw_fields": {},
+            })
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -1124,11 +1374,11 @@ class ZarrCellReader(BackendCellReader):
 
 
 AVAILABLE_READERS = {
-    "arrow-hf": ArrowHFCellReader,
+    "arrow-parquet": ArrowHFCellReader,
+    "arrow-ipc": ArrowIpcCellReader,
     "webdataset": WebDatasetCellReader,
-    "zarr-ts": ZarrCellReader,
-    "lancedb-aggregated": LanceDBAggregatedCellReader,
-    "zarr-aggregated": ZarrCellReader,
+    "zarr": ZarrCellReader,
+    "lance": LanceCellReader,
 }
 
 

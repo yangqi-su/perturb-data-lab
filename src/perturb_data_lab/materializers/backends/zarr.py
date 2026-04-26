@@ -1,21 +1,14 @@
 """Backend adapter: Zarr federated and aggregate writers.
 
-Phase 3: refactored to consume the shared flat-buffer Arrow list-array
-pattern from the translation layer for heavy-row construction, while
-preserving Zarr's chunked 2D array layout (indices, counts per cell-chunk)
-as the native Zarr storage format.
-
-Phase 4: adds aggregate topology writer for corpus-scoped single-file output.
+Phase 5 (this file): thin serializer refactor — all writers accept ``ChunkBundle``
+directly. No per-writer CSR logic, no legacy fallback, no ``_is_csr_dataset()``.
+Gene indices in ``ChunkBundle.indices`` are always dataset-local.
 
 Zarr layout (federated):
-- {release_id}-indices.zarr: (n_cells, chunk_cells) padded sparse indices (int32)
-- {release_id}-counts.zarr:   (n_cells, chunk_cells) padded sparse counts (int32)
-- {release_id}-meta.json:    cell metadata + size_factor path reference
-
-The indices/counts arrays use a global 1D flat-buffer approach: all rows
-are concatenated and stored as 1D zarr arrays, with a separate row_offsets
-array to delineate boundaries. This avoids the padded 2D cell-chunk layout
-of the Phase 1 Zarr writer and aligns with the archived benchmark's pattern.
+- {release_id}-indices.zarr: 1D flat buffer of all gene indices
+- {release_id}-counts.zarr: 1D flat buffer of all counts
+- {release_id}-row-offsets.zarr: row offset boundaries
+- {release_id}-meta.json: cell metadata + size_factor path reference
 
 Zarr layout (aggregate):
 - aggregated-indices.zarr: 1D flat buffer of all gene indices across datasets
@@ -30,106 +23,68 @@ Backend name in registry: ``zarr``.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+import json
 
-import anndata as ad
 import numpy as np
-from scipy.sparse import issparse
 
-from ..chunk_translation import DatasetSpec, _build_list_array
-
-
-def _is_csr_dataset(x: object) -> bool:
-    """Check if x is an anndata _CSRDataset (backed sparse)."""
-    return x.__class__.__name__ == "_CSRDataset"
+from ..chunk_translation import ChunkBundle
 
 
 def write_zarr_federated(
-    adata: ad.AnnData,
-    count_matrix: Any,
-    size_factors: np.ndarray,
+    bundle: ChunkBundle,
     release_id: str,
     matrix_root: Path,
-    chunk_cells: int = 1024,
-    dataset_id: str = "",
 ) -> dict[str, Path]:
-    """Write federated sparse per-cell data in Zarr format.
+    """Write a ``ChunkBundle`` as Zarr flat 1D buffers.
 
-    Uses a flat-buffer 1D layout (matching archived benchmark):
-    - all gene indices concatenated into one flat array
-    - all counts concatenated into one flat array
-    - row_offsets delineates cell boundaries
+    This is the ``zarr × federated`` thin serializer.
+    It accepts a ``ChunkBundle`` and writes flat 1D Zarr arrays for
+    indices, counts, and row_offsets.
 
-    Returns a dict with keys: ``{"indices": ..., "counts": ..., "meta": ...}``.
+    Parameters
+    ----------
+    bundle : ChunkBundle
+        The translated chunk bundle from ``_translate_chunk()``.
+    release_id : str
+        Release identifier used for output file naming.
+    matrix_root : Path
+        Output directory for matrix artifacts.
+
+    Returns a dict with keys: ``{"indices": ..., "counts": ..., "row_offsets": ..., "meta": ...}``.
     """
+    import zarr
+
     matrix_root.mkdir(parents=True, exist_ok=True)
-
-    try:
-        import zarr
-    except ImportError:
-        raise ImportError(
-            "zarr is required for Zarr backend; "
-            "install with: pip install zarr"
-        )
-
-    n_obs = adata.n_obs
 
     indices_path = matrix_root / f"{release_id}-indices.zarr"
     counts_path = matrix_root / f"{release_id}-counts.zarr"
+    row_offsets_path = matrix_root / f"{release_id}-row-offsets.zarr"
 
-    # Collect all row data into flat 1D arrays.
-    # We pre-compute total_nnz by scanning once (batched).
-    total_nnz = 0
-    batch_size = 50_000
-    row_offsets = [0]
-    for start in range(0, n_obs, batch_size):
-        end = min(start + batch_size, n_obs)
-        batch_csr = count_matrix[start:end].tocsr()
-        for i in range(end - start):
-            total_nnz += batch_csr.indptr[i + 1] - batch_csr.indptr[i]
-            row_offsets.append(row_offsets[-1] + batch_csr.indptr[i + 1] - batch_csr.indptr[i])
-
-    row_offsets_arr = np.array(row_offsets, dtype=np.int64)
-
-    # Pre-allocate flat arrays and fill them.
-    all_indices = np.empty(total_nnz, dtype=np.int32)
-    all_counts = np.zeros(total_nnz, dtype=np.int32)
-
-    offset = 0
-    for start in range(0, n_obs, batch_size):
-        end = min(start + batch_size, n_obs)
-        batch_csr = count_matrix[start:end].tocsr()
-        for i in range(end - start):
-            nnz = batch_csr.indptr[i + 1] - batch_csr.indptr[i]
-            if nnz > 0:
-                all_indices[offset:offset + nnz] = batch_csr.indices[
-                    batch_csr.indptr[i] : batch_csr.indptr[i + 1]
-                ].astype(np.int32)
-                all_counts[offset:offset + nnz] = batch_csr.data[
-                    batch_csr.indptr[i] : batch_csr.indptr[i + 1]
-                ].astype(np.int32)
-            offset += nnz
+    # Build flat arrays from the bundle's CSR buffers.
+    all_indices = bundle.indices
+    all_counts = bundle.counts
+    row_offsets_arr = bundle.indptr
 
     # Write as zarr 1D arrays.
     indices_zarr = zarr.open(str(indices_path), mode="w")
     counts_zarr = zarr.open(str(counts_path), mode="w")
+    row_offsets_zarr = zarr.open(str(row_offsets_path), mode="w")
 
     indices_zarr.create_dataset("indices", data=all_indices, dtype="i4")
     counts_zarr.create_dataset("counts", data=all_counts, dtype="i4")
-    indices_zarr.create_dataset("row_offsets", data=row_offsets_arr, dtype="i8")
+    row_offsets_zarr.create_dataset("row_offsets", data=row_offsets_arr, dtype="i8")
 
     # Write metadata JSON.
-    import json
-
     meta_path = matrix_root / f"{release_id}-meta.json"
     with open(meta_path, "w") as f:
         json.dump(
             {
                 "release_id": release_id,
-                "n_obs": n_obs,
+                "n_obs": bundle.row_count,
                 "size_factor_path": str(matrix_root / f"{release_id}-size-factor.zarr"),
                 "indices_path": str(indices_path),
                 "counts_path": str(counts_path),
+                "row_offsets_path": str(row_offsets_path),
             },
             f,
             indent=2,
@@ -138,6 +93,7 @@ def write_zarr_federated(
     return {
         "indices": indices_path,
         "counts": counts_path,
+        "row_offsets": row_offsets_path,
         "meta": meta_path,
     }
 
@@ -186,31 +142,19 @@ def read_zarr_cell(
 
 
 def write_zarr_aggregate(
-    datasets: list[DatasetSpec],
-    count_matrices: list[Any],
-    size_factors_list: list[np.ndarray],
+    bundles: list[ChunkBundle],
     matrix_root: Path,
 ) -> tuple[dict[str, Path], list[np.ndarray]]:
     """Write aggregate sparse per-cell data in Zarr format.
 
-    This is the ``zarr × aggregate`` backend writer. It produces a single
-    corpus-scoped Zarr store with deterministic global row indices spanning
-    all datasets in order.
-
-    Zarr aggregate layout:
-    - aggregated-indices.zarr: 1D flat buffer of all gene indices
-    - aggregated-counts.zarr: 1D flat buffer of all counts
-    - aggregated-row-offsets.zarr: row offsets (cumulative) across all datasets
-    - aggregated-meta.json: corpus-level metadata with per-dataset offsets
+    This is the ``zarr × aggregate`` thin serializer.
+    It consumes an ordered list of ``ChunkBundle`` objects and produces
+    a single corpus-scoped Zarr store with flat 1D buffers.
 
     Parameters
     ----------
-    datasets : list[DatasetSpec]
-        Dataset specifications in order.
-    count_matrices : list[Any]
-        Sparse count matrices (CSR or dense), one per dataset.
-    size_factors_list : list[np.ndarray]
-        Pre-computed size factors for each dataset.
+    bundles : list[ChunkBundle]
+        Chunk bundles in corpus order (one per dataset).
     matrix_root : Path
         Output directory.
 
@@ -219,57 +163,27 @@ def write_zarr_aggregate(
     tuple[dict[str, Path], list[np.ndarray]]
         ``(paths_dict, size_factors_out_list)``.
     """
-    import json
     import zarr
 
     matrix_root.mkdir(parents=True, exist_ok=True)
 
-    # Pre-scan all datasets to compute total sizes.
-    total_rows = sum(ds.rows for ds in datasets)
-    total_nnz = 0
-    dataset_row_offsets = []  # cumulative row counts at each dataset boundary
+    # Compute total sizes across all bundles.
+    total_rows = sum(b.row_count for b in bundles)
+    total_nnz = sum(len(b.indices) for b in bundles)
 
-    for ds in datasets:
-        dataset_row_offsets.append(total_rows)
-        for i in range(ds.rows):
-            pass  # we need to count nnz per row
-
-    # Actually count nnz per dataset
-    nnz_per_dataset = []
-    current_row_offset = 0
-    for ds, cm in zip(datasets, count_matrices):
-        ds_nnz = 0
-        for start in range(0, ds.rows, 10000):
-            end = min(start + 10000, ds.rows)
-            batch_csr = cm[start:end].tocsr()
-            for i in range(end - start):
-                ds_nnz += batch_csr.indptr[i + 1] - batch_csr.indptr[i]
-        nnz_per_dataset.append(ds_nnz)
-        current_row_offset += ds.rows
-
-    total_nnz = sum(nnz_per_dataset)
-
-    # Build flat arrays and row_offsets across all datasets.
+    # Build flat arrays across all datasets.
     all_indices = np.empty(total_nnz, dtype=np.int32)
     all_counts = np.zeros(total_nnz, dtype=np.int32)
     row_offsets = [0]
     global_row_offset = 0
 
-    for ds, cm, nnz in zip(datasets, count_matrices, nnz_per_dataset):
-        for start in range(0, ds.rows, 10000):
-            end = min(start + 10000, ds.rows)
-            batch_csr = cm[start:end].tocsr()
-            for i in range(end - start):
-                nnz_row = batch_csr.indptr[i + 1] - batch_csr.indptr[i]
-                if nnz_row > 0:
-                    all_indices[global_row_offset:global_row_offset + nnz_row] = (
-                        batch_csr.indices[batch_csr.indptr[i]:batch_csr.indptr[i + 1]]
-                    ).astype(np.int32)
-                    all_counts[global_row_offset:global_row_offset + nnz_row] = (
-                        batch_csr.data[batch_csr.indptr[i]:batch_csr.indptr[i + 1]]
-                    ).astype(np.int32)
-                global_row_offset += nnz_row
-                row_offsets.append(global_row_offset)
+    for bundle in bundles:
+        nnz = len(bundle.indices)
+        if nnz > 0:
+            all_indices[global_row_offset:global_row_offset + nnz] = bundle.indices
+            all_counts[global_row_offset:global_row_offset + nnz] = bundle.counts
+        global_row_offset += nnz
+        row_offsets.append(global_row_offset)
 
     row_offsets_arr = np.array(row_offsets, dtype=np.int64)
 
@@ -290,15 +204,12 @@ def write_zarr_aggregate(
     meta_path = matrix_root / "aggregated-meta.json"
     dataset_offsets = []
     cum_rows = 0
-    for ds in datasets:
+    for ds_idx, bundle in enumerate(bundles):
         dataset_offsets.append({
-            "dataset_id": ds.dataset_id,
-            "dataset_index": int(ds.dataset_index),
-            "global_row_start": int(ds.global_row_start),
-            "global_row_stop": int(ds.global_row_stop),
-            "rows": int(ds.rows),
+            "dataset_index": ds_idx,
+            "rows": bundle.row_count,
         })
-        cum_rows += ds.rows
+        cum_rows += bundle.row_count
 
     with open(meta_path, "w") as f:
         json.dump(
@@ -314,22 +225,7 @@ def write_zarr_aggregate(
             indent=2,
         )
 
-    # Compute normalized size factors per dataset.
-    size_factors_out_list: list[np.ndarray] = []
-    for ds, size_factors in zip(datasets, size_factors_list):
-        if size_factors is None:
-            raw_sums = np.ones(ds.rows, dtype=np.float64)
-        else:
-            raw_sums = size_factors.copy()
-
-        row_median = float(np.median(raw_sums))
-        if row_median > 0:
-            sf_norm = raw_sums / row_median
-        else:
-            sf_norm = raw_sums.copy()
-        sf_norm = np.where(sf_norm <= 0, 1.0, sf_norm)
-        sf_norm = np.where(np.isnan(sf_norm), 1.0, sf_norm)
-        size_factors_out_list.append(sf_norm)
+    size_factors_out_list = [b.size_factors for b in bundles]
 
     return (
         {

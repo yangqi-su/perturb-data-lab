@@ -24,7 +24,6 @@ from perturb_data_lab.contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
 from perturb_data_lab.materializers import (
     CorpusEmissionSpec,
     CorpusTokenizer,
-    build_materialization_route,
     update_corpus_index,
 )
 from perturb_data_lab.materializers.models import (
@@ -374,39 +373,25 @@ class TestUpdateCorpusIndexWithEmissionSpec:
 
 
 # ---------------------------------------------------------------------------
-# Build materialization route and verify hvg_sidecar_path in manifest
+# Verify hvg_sidecar_path in manifest
 # ---------------------------------------------------------------------------
 
 
-class TestMaterializationRouteWithHVG:
+class TestMaterializationManifestHVGPath:
     def test_materialization_manifest_includes_hvg_sidecar_path(self, tmp_path: Path):
-        """After route materialization, manifest.hvg_sidecar_path is set."""
-        # Create a minimal corpus index so create_new route works
-        corpus_index = tmp_path / "corpus-index.yaml"
+        """After Stage2Materializer materialization, manifest.hvg_sidecar_path is set."""
         output_roots = OutputRoots(
             metadata_root=str(tmp_path / "meta"),
             matrix_root=str(tmp_path / "matrix"),
         )
-        from perturb_data_lab.materializers.models import CountSourceSpec
-
-        route = build_materialization_route(
-            route="create_new",
-            output_roots=output_roots,
-            release_id="syn-v0",
-            dataset_id="syn-ds",
-            count_source=CountSourceSpec(selected=".X", integer_only=True),
-            corpus_index_path=None,  # create_new does not require existing corpus
-        )
-        # We can't run full materialize() without a real h5ad + schema,
-        # but we can verify the manifest construction path sets hvg_sidecar_path
-        # by checking the manifest model accepts the field
+        # Verify the manifest model accepts hvg_sidecar_path
         manifest = MaterializationManifest(
             kind="materialization-manifest",
             contract_version=CONTRACT_VERSION,
             dataset_id="syn-ds",
             release_id="syn-v0",
             route="create_new",
-            backend="arrow-hf",
+            backend="arrow-parquet",
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=output_roots,
             provenance=ProvenanceSpec(

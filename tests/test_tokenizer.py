@@ -18,9 +18,6 @@ import pytest
 
 from perturb_data_lab.materializers import (
     CorpusTokenizer,
-    CreateNewRoute,
-    AppendRoutedRoute,
-    build_materialization_route,
     update_corpus_index,
 )
 from perturb_data_lab.materializers.models import (
@@ -343,70 +340,6 @@ class TestCorpusTokenizerTokenizeLabels:
         )
         ids = tok.tokenize_labels(["BRCA1", "UNKNOWN"], on_unknown="skip")
         assert ids == [tok.to_id("BRCA1"), -1]
-
-
-# ---------------------------------------------------------------------------
-# Materialization route factory
-# ---------------------------------------------------------------------------
-
-
-class TestBuildMaterializationRoute:
-    def test_create_new_route_instance(self):
-        """Factory builds CreateNewRoute for 'create_new'."""
-        roots = OutputRoots(metadata_root="/tmp/meta", matrix_root="/tmp/matrix")
-        route = build_materialization_route(
-            "create_new",
-            roots,
-            "release-1",
-            "ds-1",
-            CountSourceSpec(selected=".X", integer_only=True),
-        )
-        assert isinstance(route, CreateNewRoute)
-        assert route.route_name == "create_new"
-        assert route._corpus_root == Path("/tmp/meta")
-
-    def test_append_routed_route_instance(self):
-        """Factory builds AppendRoutedRoute for 'append_routed'."""
-        roots = OutputRoots(metadata_root="/tmp/meta", matrix_root="/tmp/matrix")
-        idx_path = Path("/corpus/corpus-index.yaml")
-        route = build_materialization_route(
-            "append_routed",
-            roots,
-            "release-2",
-            "ds-2",
-            CountSourceSpec(selected=".X", integer_only=True),
-            corpus_index_path=idx_path,
-        )
-        assert isinstance(route, AppendRoutedRoute)
-        assert route.route_name == "append_routed"
-        # Corpus root derived from corpus index path
-        assert route._corpus_root == Path("/corpus")
-
-    def test_corpus_root_for_create_new_without_index_path(self):
-        """create_new without corpus_index_path uses metadata_root as corpus root."""
-        roots = OutputRoots(metadata_root="/tmp/meta", matrix_root="/tmp/matrix")
-        route = build_materialization_route(
-            "create_new",
-            roots,
-            "release-1",
-            "ds-1",
-            CountSourceSpec(selected=".X", integer_only=True),
-        )
-        assert route._corpus_root == Path("/tmp/meta")
-
-    def test_append_routed_raises_without_index_path(self):
-        """append_routed requires corpus_index_path to determine corpus root."""
-        roots = OutputRoots(metadata_root="/tmp/meta", matrix_root="/tmp/matrix")
-        route = build_materialization_route(
-            "append_routed",
-            roots,
-            "release-2",
-            "ds-2",
-            CountSourceSpec(selected=".X", integer_only=True),
-            corpus_index_path=None,
-        )
-        with pytest.raises(ValueError, match="corpus_index_path"):
-            _ = route._corpus_root
 
 
 # ---------------------------------------------------------------------------
