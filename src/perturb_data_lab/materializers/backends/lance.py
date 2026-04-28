@@ -119,50 +119,69 @@ def read_lance_cell(
 
 
 # ---------------------------------------------------------------------------
-# Aggregate writer (Phase 4)
+# Aggregate writer (Phase 2 — streaming)
 # ---------------------------------------------------------------------------
 
 
 def write_lance_aggregate(
-    bundles: list[ChunkBundle],
+    bundle: ChunkBundle,
+    release_id: str,
     matrix_root: Path,
-    corpus_index_path: Path | None = None,
-) -> dict[str, Path]:
-    """Write aggregate sparse per-cell data as a Lance dataset.
+    *,
+    _writer_state: dict[str, Any] | None = None,
+    _is_last_chunk: bool = False,
+    **kwargs: Any,
+) -> tuple[dict[str, Path], dict | None]:
+    """Stream ChunkBundle tables to a single aggregated Lance dataset.
 
-    This is the ``lance × aggregate`` thin serializer.
-    It consumes an ordered list of ``ChunkBundle`` objects (one per dataset)
-    and appends them into a single corpus-scoped .lance file with
-    deterministic global_row_index values spanning all datasets.
+    On first call (_writer_state is None): create the dataset.
+    On subsequent calls: append to the existing dataset.
+    On last call (_is_last_chunk=True): return None for writer_state.
 
     Parameters
     ----------
-    bundles : list[ChunkBundle]
-        Chunk bundles in corpus order (one per dataset).
+    bundle : ChunkBundle
+        The translated chunk bundle from ``_translate_chunk()``.
+    release_id : str
+        Release identifier (used for metadata context only).
     matrix_root : Path
-        Output directory.
-    corpus_index_path : Path | None
-        Path to the corpus index YAML for corpus registration (unused, kept for API compat).
+        Output directory for matrix artifacts.
+    _writer_state : dict | None
+        Writer state dict. None on first chunk — dataset is created.
+    _is_last_chunk : bool
+        True when this is the final chunk — returns None for writer_state.
 
     Returns
     -------
-    dict[str, Path]
-        ``paths_dict`` containing ``{"cells": lance_path}``.
+    tuple[dict[str, Path], dict | None]
+        ``({"cells": lance_path}, writer_state_or_None)``.
+        On last chunk the second element is None.
     """
     lance = _import_lance()
     matrix_root.mkdir(parents=True, exist_ok=True)
+    lance_path = matrix_root / "aggregated-cells.lance"
 
-    lance_path = matrix_root / "aggregated-corpus.lance"
-    writer_initialized = False
+    if _writer_state is None:
+        # First chunk: create if dataset doesn't exist, otherwise append.
+        # This supports incremental aggregate materialization across
+        # separate CLI invocations where a new Stage2Materializer instance
+        # does not carry forward the previous writer_state.
+        if lance_path.exists():
+            mode = "append"
+        else:
+            mode = "create"
+        _writer_state = {"lance_path": str(lance_path), "initialized": True}
+    else:
+        mode = "append"
 
-    for bundle in bundles:
-        mode = "append" if writer_initialized else "create"
-        lance.write_dataset(
-            bundle.table,
-            str(lance_path),
-            mode=mode,
-            max_rows_per_group=4096,
-        )
-        writer_initialized = True
+    lance.write_dataset(
+        bundle.table,
+        str(lance_path),
+        mode=mode,
+        max_rows_per_group=4096,
+    )
 
-    return {"cells": lance_path}
+    if _is_last_chunk:
+        return {"cells": lance_path}, None
+    else:
+        return {"cells": lance_path}, _writer_state

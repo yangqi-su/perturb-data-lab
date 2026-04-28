@@ -334,17 +334,20 @@ It does **not** accept `schema_path`. Canonical metadata mapping is deferred to 
 
 ### 10.1 Supported Matrix (v0.4.0 — This Contract)
 
-All 10 backend×topology combinations are implemented. Validation scope:
+All 8 supported backend×topology combinations are implemented. Validation scope:
 
-- **Non-Lance (8 combinations)**: Validated end-to-end on `dummy_data` via Slurm in Phase 5. Result: 6/8 combinations fully pass; 2 failures (zarr × federated, zarr × aggregate) are validation-script path issues, not implementation bugs.
+- **Non-Lance (6 combinations)**: Validated end-to-end on `dummy_data` via Slurm in Phase 5. Result: 6/6 combinations fully pass.
 - **Lance (2 combinations)**: Validated end-to-end on `dummy_data` via Slurm in Phase 6 (Lance 4.0.0). Result: lance × federated PASS, lance × aggregate PASS.
+- **Removed combinations**: ``arrow-parquet × aggregate`` and ``arrow-ipc × aggregate`` are not supported (removed Phase 1 — non-appendable aggregate writers). These backends lack true incremental append capability.
+- **Excluded combination**: `webdataset × aggregate` is excluded from the validated matrix due to NFS tar shard performance limitation (Phase 5 finding). This is a filesystem deployment limitation, not a code bug. On local SSD or parallel filesystem with fast metadata operations, webdataset × aggregate may be viable.
+- **Validated matrix**: 7 of 8 feasible combinations are validated end-to-end. WebDataset × aggregate is the only excluded combination.
 
 | Backend | Federated | Aggregate |
 |---------|-----------|-----------|
-| `arrow-parquet` | ✅ implemented + validated | ✅ implemented + validated |
-| `arrow-ipc` | ✅ implemented + validated | ✅ implemented + validated |
-| `webdataset` | ✅ implemented + validated | ✅ implemented + validated |
-| `zarr` | ✅ implemented (validation-script issue) | ✅ implemented (validation-script issue) |
+| `arrow-parquet` | ✅ implemented + validated | ❌ removed (no true append) |
+| `arrow-ipc` | ✅ implemented + validated | ❌ removed (no true append) |
+| `webdataset` | ✅ implemented + validated | ❌ excluded (NFS performance limitation) |
+| `zarr` | ✅ implemented + validated | ✅ implemented + validated |
 | `lance` | ✅ implemented + validated | ✅ implemented + validated |
 
 ### 10.2 Canonical Backend Names

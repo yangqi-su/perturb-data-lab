@@ -16,7 +16,7 @@ Produces:
   expressed_gene_indices LIST<INT32>, expression_counts LIST<INT32>)
 - Caller writes the separate size-factor Parquet sidecar.
 
-Topology: federated (per-dataset files) and aggregate (corpus-scoped single file).
+Topology: federated (per-dataset files).
 Backend name in registry: ``arrow-ipc``.
 """
 
@@ -119,47 +119,3 @@ def read_arrow_ipc_cell(
 
     return (tuple(indices), tuple(counts), sf)
 
-
-# ---------------------------------------------------------------------------
-# Aggregate writer (Phase 4)
-# ---------------------------------------------------------------------------
-
-
-def write_arrow_ipc_aggregate(
-    bundles: list[ChunkBundle],
-    matrix_root: Path,
-) -> dict[str, Path]:
-    """Write aggregate sparse per-cell data as a single Arrow IPC file.
-
-    This is the ``arrow-ipc × aggregate`` thin serializer.
-    It consumes an ordered list of ``ChunkBundle`` objects (one per dataset)
-    and concatenates them into a single corpus-scoped IPC file with
-    deterministic global_row_index values.
-
-    Parameters
-    ----------
-    bundles : list[ChunkBundle]
-        Chunk bundles in corpus order (one per dataset).
-    matrix_root : Path
-        Output directory for matrix artifacts.
-
-    Returns
-    -------
-    dict[str, Path]
-        ``paths_dict`` containing ``{"cells": cells_arrow_path}``.
-    """
-    matrix_root.mkdir(parents=True, exist_ok=True)
-    cell_path = matrix_root / "aggregated-cells.arrow"
-
-    writer: pa.ipc.RecordBatchFileWriter | None = None
-
-    for bundle in bundles:
-        if writer is None:
-            writer = pa.ipc.new_file(str(cell_path), bundle.table.schema)
-        batch = bundle.table.to_batches()[0]
-        writer.write_batch(batch)
-
-    if writer is not None:
-        writer.close()
-
-    return {"cells": cell_path}

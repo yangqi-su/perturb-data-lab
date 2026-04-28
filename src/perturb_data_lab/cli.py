@@ -504,12 +504,14 @@ def _cmd_corpus_validate(args: argparse.Namespace) -> None:
 
     corpus = CorpusIndexDocument.from_yaml_file(corpus_index_path)
 
+    corpus_root = corpus_index_path.parent
+
     print(f"\n=== Corpus Validation: {corpus.corpus_id} ===")
     print(f"Datasets ({len(corpus.datasets)}):")
     violations: list[str] = []
 
     for ds in corpus.datasets:
-        manifest_path = Path(ds.manifest_path)
+        manifest_path = corpus_root / ds.manifest_path
         exists = "✓" if manifest_path.exists() else "✗ MISSING"
         print(f"  {exists} {ds.dataset_id}/{ds.release_id}  [{ds.join_mode}]")
         if not manifest_path.exists():
@@ -533,7 +535,6 @@ def _cmd_corpus_validate(args: argparse.Namespace) -> None:
                 violations.append(f"failed to load manifest for {ds.dataset_id}: {e}")
 
     # Check tokenizer (Phase 3: tokenizer is no longer required for corpus validation)
-    corpus_root = corpus_index_path.parent
     tokenizer_path = corpus_root / "tokenizer.json"
     tokenizer_exists = tokenizer_path.exists()
     print(f"\nTokenizer: {'✓' if tokenizer_exists else '✗ (optional since Phase 3)'} {tokenizer_path}")

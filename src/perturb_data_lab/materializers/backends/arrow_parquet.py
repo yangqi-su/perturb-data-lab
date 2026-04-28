@@ -17,7 +17,7 @@ Produces:
   expressed_gene_indices LIST<INT32>, expression_counts LIST<INT32>)
 - Caller (Stage2Materializer) writes the separate size-factor Parquet sidecar.
 
-Topology: federated (per-dataset files) and aggregate (corpus-scoped single file).
+Topology: federated (per-dataset files).
 Backend name in registry: ``arrow-parquet``.
 """
 
@@ -85,21 +85,6 @@ def write_arrow_parquet_federated(
     else:
         return {"cells": cell_path}, _writer_state
 
-
-def _append_arrow_parquet(
-    cell_path: Path,
-    table: pa.Table,
-) -> None:
-    """Append a single-chunk ``pa.Table`` to an existing Arrow Parquet file.
-
-    Uses streaming write mode (no schema mutation allowed after first write).
-    The file must already exist with a valid schema.
-    """
-    writer = pq.ParquetWriter(cell_path, table.schema, mode="a")
-    writer.write_table(table)
-    writer.close()
-
-
 def read_arrow_parquet_cell(
     parquet_path: Path,
     cell_index: int,
@@ -132,47 +117,3 @@ def read_arrow_parquet_cell(
 
     return (tuple(indices), tuple(counts), sf)
 
-
-# ---------------------------------------------------------------------------
-# Aggregate writer (Phase 4)
-# ---------------------------------------------------------------------------
-
-
-def write_arrow_parquet_aggregate(
-    bundles: list[ChunkBundle],
-    matrix_root: Path,
-) -> dict[str, Path]:
-    """Write aggregate sparse per-cell data as a single Arrow Parquet file.
-
-    This is the ``arrow-parquet × aggregate`` thin serializer.
-    It consumes an ordered list of ``ChunkBundle`` objects (one per dataset)
-    and concatenates them into a single corpus-scoped Parquet file with
-    deterministic global_row_index values.
-
-    Parameters
-    ----------
-    bundles : list[ChunkBundle]
-        Chunk bundles in corpus order (one per dataset). Each bundle's
-        ``table`` must follow ``HEAVY_CELL_SCHEMA``.
-    matrix_root : Path
-        Output directory for matrix artifacts.
-
-    Returns
-    -------
-    dict[str, Path]
-        ``paths_dict`` containing ``{"cells": cells_parquet_path}``.
-    """
-    matrix_root.mkdir(parents=True, exist_ok=True)
-    cell_path = matrix_root / "aggregated-cells.parquet"
-
-    writer: pq.ParquetWriter | None = None
-
-    for bundle in bundles:
-        if writer is None:
-            writer = pq.ParquetWriter(cell_path, bundle.table.schema)
-        writer.write_table(bundle.table)
-
-    if writer is not None:
-        writer.close()
-
-    return {"cells": cell_path}

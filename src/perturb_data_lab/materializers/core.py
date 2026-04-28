@@ -166,6 +166,8 @@ class Stage2Materializer:
         corpus_index_path: str | None = None,
         corpus_id: str | None = None,
         register: bool = False,
+        dataset_index: int = 0,
+        global_row_start: int = 0,
     ):
         self.source_path = source_path
         self.review_bundle_path = review_bundle_path
@@ -180,6 +182,10 @@ class Stage2Materializer:
         self.corpus_index_path = corpus_index_path
         self.corpus_id = corpus_id
         self.register = register
+        self.dataset_index = dataset_index
+        self.global_row_start = global_row_start
+        self.writer_state: dict | None = None
+        self._is_last_dataset: bool = False
         if register and corpus_index_path is None:
             raise ValueError(
                 "register=True requires corpus_index_path to be set; "
@@ -666,13 +672,15 @@ class Stage2Materializer:
 
         HVG accumulation and global size factor computation are done during the
         chunk loop; both are finalized and written to sidecars after the loop.
+
+        For aggregate topology, writer state is passed through ``self.writer_state``
+        and ``self._is_last_dataset``, set by the corpus-level orchestrator before
+        calling ``materialize()``.
         """
         if self.topology == "aggregate":
-            raise NotImplementedError(
-                "aggregate topology requires a corpus-level orchestrator that "
-                "collects ChunkBundles from multiple Stage2Materializer calls "
-                "and passes them to the aggregate writer. "
-                "Use federated topology for single-dataset materialization."
+            return self._write_cells_aggregate(
+                count_matrix, adata, matrix_root,
+                needs_recovery=needs_recovery,
             )
         return self._write_cells_federated(
             count_matrix, adata, matrix_root, needs_recovery=needs_recovery
@@ -810,23 +818,141 @@ class Stage2Materializer:
 
     def _write_cells_aggregate(
         self,
-        bundles: list[Any],
+        count_matrix: Any,
+        adata: ad.AnnData,
         matrix_root: Path,
-    ) -> tuple[dict[str, Path], list[np.ndarray]]:
+        *,
+        needs_recovery: bool = False,
+    ) -> tuple[dict[str, Path], np.ndarray, Path]:
         """Write aggregate (multi-dataset corpus) sparse cell data.
 
-        This is called by a corpus-level orchestrator after collecting
-        ``ChunkBundle`` objects from multiple ``Stage2Materializer`` calls.
+        Loops over the count matrix in chunks, calling the aggregate backend
+        writer per chunk with shared ``self.writer_state``. The writer state is
+        carried across datasets via ``self.writer_state``, which the corpus-level
+        orchestrator sets before each ``materialize()`` call and reads afterward.
+
+        Row sums and HVG statistics are accumulated during the chunk loop.
+        Global size factors and HVG selection are computed and written to
+        per-dataset sidecars after the loop (same as federated).
+
+        Returns ``(paths_dict, size_factors_array, hvg_sidecar_dir)`` — same
+        format as ``_write_cells_federated``.
+
+        Note: Only ``lance``, ``zarr``, and ``webdataset`` backends support
+        aggregate topology. ``arrow-parquet`` and ``arrow-ipc`` do not support
+        aggregate because they lack true incremental append capability.
         """
-        from .chunk_translation import ChunkBundle
+        from .chunk_translation import DatasetSpec, _finalize_hvg, _translate_chunk
 
         backend_fn = build_backend_fn(self.backend, "aggregate")
 
-        paths, size_factors_list = backend_fn(
-            bundles=bundles,
-            matrix_root=matrix_root,
+        n_obs = count_matrix.shape[0]
+        n_vars = count_matrix.shape[1]
+
+        # Build DatasetSpec with the configured global_row_start (pre-computed
+        # by the corpus-level orchestrator to ensure contiguous global_row_index).
+        dataset_spec = DatasetSpec(
+            dataset_id=self.dataset_id,
+            dataset_index=self.dataset_index,
+            file_path=Path(self.source_path),
+            rows=n_obs,
+            pairs=0,
+            local_vocabulary_size=n_vars,
+            nnz_total=int(count_matrix.nnz) if hasattr(count_matrix, "nnz") else 0,
+            global_row_start=self.global_row_start,
+            global_row_stop=self.global_row_start + n_obs,
         )
-        return (paths, size_factors_list)
+
+        # --- Streaming accumulators ---
+        all_paths: dict[str, Path] = {}
+        all_row_sums: list[np.ndarray] = []
+        sum_log1p = np.zeros(n_vars, dtype=np.float64)
+        sum_log1p_sq = np.zeros(n_vars, dtype=np.float64)
+        n_cells_total = 0
+
+        # Carry writer state from previous dataset (None on first call).
+        writer_state: dict | None = self.writer_state
+
+        for chunk_start in range(0, n_obs, self.chunk_rows):
+            chunk_end = min(chunk_start + self.chunk_rows, n_obs)
+            # is_last_chunk is True only when this is the final chunk of the
+            # final dataset — triggers aggregate backend finalization.
+            is_last_chunk = (chunk_end == n_obs) and self._is_last_dataset
+
+            # Slice the CSR matrix chunk.
+            if hasattr(count_matrix, "local_slice"):
+                matrix_chunk = count_matrix.local_slice(chunk_start, chunk_end)
+            else:
+                matrix_chunk = count_matrix[chunk_start:chunk_end].tocsr()
+
+            # Translate the chunk via the shared translation layer.
+            bundle = _translate_chunk(
+                dataset=dataset_spec,
+                matrix_chunk=matrix_chunk,
+                chunk_start=chunk_start,
+                needs_recovery=needs_recovery,
+            )
+
+            # Accumulate row sums for global size factor computation.
+            all_row_sums.append(bundle.row_sums)
+
+            # Accumulate HVG statistics via np.add.at on dataset-local indices.
+            log1p_counts = np.log1p(bundle.counts.astype(np.float64))
+            np.add.at(sum_log1p, bundle.indices, log1p_counts)
+            np.add.at(sum_log1p_sq, bundle.indices, log1p_counts ** 2)
+            n_cells_total += bundle.row_count
+
+            # Call the aggregate backend writer with streaming state.
+            cell_ids_chunk: tuple[str, ...] | None = None
+            if self.backend == "webdataset":
+                cell_ids_chunk = tuple(adata.obs.index[chunk_start:chunk_end])
+
+            paths, writer_state = backend_fn(
+                bundle=bundle,
+                release_id=self.release_id,
+                matrix_root=matrix_root,
+                _writer_state=writer_state,
+                _is_last_chunk=is_last_chunk,
+                cell_ids=cell_ids_chunk,
+                dataset_id=self.dataset_id,
+            )
+
+            all_paths.update(paths)
+
+        # Store final writer state (None after last dataset) for next iteration.
+        self.writer_state = writer_state
+
+        # --- After loop: compute GLOBAL size factors from all row sums ---
+        global_row_sums = np.concatenate(all_row_sums)
+        global_median = float(np.median(global_row_sums))
+        if global_median > 0:
+            size_factors = global_row_sums / global_median
+        else:
+            size_factors = np.ones_like(global_row_sums)
+        size_factors = np.where(size_factors <= 0, 1.0, size_factors)
+        size_factors = np.where(np.isnan(size_factors), 1.0, size_factors)
+        size_factors = size_factors.astype(np.float32)
+
+        # --- After loop: write size factor Parquet sidecar ---
+        size_factor_parquet_path = self._write_size_factor_parquet(
+            size_factors=size_factors,
+            cell_ids=adata.obs.index,
+            meta_root=Path(self.output_roots.metadata_root),
+        )
+
+        # --- After loop: compute Seurat-style HVG from streaming accumulators ---
+        hvg_indices, nonhvg_indices = _finalize_hvg(
+            sum_log1p, sum_log1p_sq, n_cells_total, n_vars, n_hvg=self.n_hvg
+        )
+
+        # --- After loop: write HVG sidecar ---
+        meta_root = Path(self.output_roots.metadata_root)
+        hvg_sidecar_dir = meta_root / "hvg_sidecar"
+        hvg_sidecar_dir.mkdir(parents=True, exist_ok=True)
+        np.save(str(hvg_sidecar_dir / "hvg.npy"), hvg_indices, allow_pickle=False)
+        np.save(str(hvg_sidecar_dir / "nonhvg.npy"), nonhvg_indices, allow_pickle=False)
+
+        return (all_paths, size_factors, hvg_sidecar_dir)
 
 
 # ---------------------------------------------------------------------------

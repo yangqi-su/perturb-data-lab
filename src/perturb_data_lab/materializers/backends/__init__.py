@@ -5,15 +5,19 @@ with explicit backend/topology separation. The legacy ``AVAILABLE_BACKENDS``
 registry and all fused-name aliases have been removed.
 
 New backend names (Phase 3):
-- ``arrow-parquet``: Arrow IPC over Parquet storage (federated)
-- ``arrow-ipc``: Arrow IPC file storage (federated)
-- ``webdataset``: WebDataset shard format (federated)
-- ``zarr``: Zarr 1D flat-buffer storage (federated)
-- ``lance``: Lance dataset storage (federated)
+- ``arrow-parquet``: Arrow IPC over Parquet storage
+- ``arrow-ipc``: Arrow IPC file storage
+- ``webdataset``: WebDataset shard format
+- ``zarr``: Zarr 1D flat-buffer storage
+- ``lance``: Lance dataset storage
 
 New topology names (Phase 3):
 - ``federated``: per-dataset output files
 - ``aggregate``: corpus-scoped single output files
+
+Removed (Phase 1 — backend-topology validation):
+- ``arrow-parquet × aggregate``: not supported (no true append in Parquet)
+- ``arrow-ipc × aggregate``: not supported (no true append in IPC files)
 
 Migration map (legacy → canonical):
 - ``arrow-hf`` → ``arrow-parquet × federated``
@@ -38,8 +42,6 @@ from .zarr import write_zarr_federated
 from .lance import write_lance_federated
 
 # ---- Phase 3 aggregate writers ----
-from .arrow_parquet import write_arrow_parquet_aggregate
-from .arrow_ipc import write_arrow_ipc_aggregate
 from .webdataset import write_webdataset_aggregate
 from .zarr import write_zarr_aggregate
 from .lance import write_lance_aggregate
@@ -175,11 +177,9 @@ def materialize_lance(
 AVAILABLE_WRITERS: dict[str, dict[str, Any]] = {
     "arrow-parquet": {
         "federated": materialize_arrow_parquet,
-        "aggregate": write_arrow_parquet_aggregate,
     },
     "arrow-ipc": {
         "federated": materialize_arrow_ipc,
-        "aggregate": write_arrow_ipc_aggregate,
     },
     "webdataset": {
         "federated": materialize_webdataset,

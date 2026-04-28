@@ -62,11 +62,12 @@ def manifest_to_join_record(
     - feature_count lives in the ledger entry, not DatasetJoinRecord
     """
     manifest_dir = Path(manifest.raw_cell_meta_path or manifest.provenance_spec_path).parent
+    manifest_yaml = manifest_dir / "materialization-manifest.yaml"
     try:
-        manifest_path_relative = manifest_dir.relative_to(corpus_root)
+        manifest_path_relative = manifest_yaml.relative_to(corpus_root)
     except ValueError:
         # Manifest is outside corpus_root — store absolute path as fallback
-        manifest_path_relative = manifest_dir
+        manifest_path_relative = manifest_yaml
 
     return DatasetJoinRecord(
         dataset_id=manifest.dataset_id,

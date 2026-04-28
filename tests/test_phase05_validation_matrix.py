@@ -1,4 +1,4 @@
-"""Phase 5: End-to-end validation matrix for all 10 backend×topology combinations.
+"""Phase 5: End-to-end validation matrix for all supported backend×topology combinations.
 
 This test validates source-vs-output parity on dummy_data for all backends:
 - arrow-parquet × federated
@@ -6,11 +6,12 @@ This test validates source-vs-output parity on dummy_data for all backends:
 - webdataset × federated
 - zarr × federated
 - lance × federated
-- arrow-parquet × aggregate
-- arrow-ipc × aggregate
 - webdataset × aggregate
 - zarr × aggregate
 - lance × aggregate
+
+Note: ``arrow-parquet × aggregate`` and ``arrow-ipc × aggregate`` are not
+supported (removed Phase 1 — non-appendable aggregate writers).
 
 Uses dummy_00 (273MB, ~50K cells) for federated tests.
 Uses dummy_00 + dummy_08 for aggregate tests (combined ~1.2M cells).
@@ -345,7 +346,11 @@ class TestFederatedMatrix:
 
 
 class TestAggregateMatrix:
-    """Validate all 5 aggregate backends on dummy_00 + dummy_08."""
+    """Validate 3 aggregate backends on dummy_00 + dummy_08.
+
+    Note: arrow-parquet and arrow-ipc do not support aggregate topology
+    (they lack true incremental append capability).
+    """
 
     DUMMY_00_PATH = Path(
         "/autofs/projects-t3/lilab/yangqisu/repos/data_perturb_v2/dummy_data/dummy_00_counts.h5ad"
@@ -389,84 +394,6 @@ class TestAggregateMatrix:
             specs.append(spec)
             global_row_start += rows
         return specs
-
-    # ---- arrow-parquet × aggregate ----
-    def test_arrow_parquet_aggregate_parity(self, dummy_00_and_08, tmp_root: Path):
-        from perturb_data_lab.materializers.backends.arrow_parquet import (
-            write_arrow_parquet_aggregate,
-        )
-
-        adatas = dummy_00_and_08
-        matrix_root = tmp_root / "arrow-parquet-agg"
-        matrix_root.mkdir(parents=True, exist_ok=True)
-
-        specs = self._make_dataset_specs(adatas)
-        count_matrices = [a.X for a in adatas]
-        size_factors_list = [np.ones(a.n_obs, dtype=np.float64) for a in adatas]
-
-        paths_dict, sf_list = write_arrow_parquet_aggregate(
-            datasets=specs,
-            count_matrices=count_matrices,
-            size_factors_list=size_factors_list,
-            matrix_root=matrix_root,
-        )
-        assert "cells" in paths_dict
-        cell_path = paths_dict["cells"]
-        assert cell_path.exists()
-
-        # Verify total row count
-        import pyarrow.parquet as pq
-
-        table = pq.read_table(str(cell_path))
-        total_rows = table.num_rows
-        expected_total = sum(a.n_obs for a in adatas)
-        assert total_rows == expected_total, (
-            f"aggregate row count {total_rows} != expected {expected_total}"
-        )
-
-        # Verify global_row_index continuity across dataset boundary
-        global_row_col = table.column("global_row_index")
-        first_ds_rows = adatas[0].n_obs
-        last_of_first = global_row_col[first_ds_rows - 1].as_py()
-        first_of_second = global_row_col[first_ds_rows].as_py()
-        assert last_of_first + 1 == first_of_second, (
-            f"global_row_index gap at dataset boundary: {last_of_first} -> {first_of_second}"
-        )
-
-    # ---- arrow-ipc × aggregate ----
-    def test_arrow_ipc_aggregate_parity(self, dummy_00_and_08, tmp_root: Path):
-        from perturb_data_lab.materializers.backends.arrow_ipc import (
-            write_arrow_ipc_aggregate,
-        )
-
-        adatas = dummy_00_and_08
-        matrix_root = tmp_root / "arrow-ipc-agg"
-        matrix_root.mkdir(parents=True, exist_ok=True)
-
-        specs = self._make_dataset_specs(adatas)
-        count_matrices = [a.X for a in adatas]
-        size_factors_list = [np.ones(a.n_obs, dtype=np.float64) for a in adatas]
-
-        paths_dict, sf_list = write_arrow_ipc_aggregate(
-            datasets=specs,
-            count_matrices=count_matrices,
-            size_factors_list=size_factors_list,
-            matrix_root=matrix_root,
-        )
-        assert "cells" in paths_dict
-        cell_path = paths_dict["cells"]
-        assert cell_path.exists()
-
-        # Verify total row count
-        import pyarrow as pa
-
-        with pa.memory_map(str(cell_path), "r") as source:
-            reader = pa.ipc.RecordBatchFileReader(source)
-            total_rows = sum(reader.get_batch(i).num_rows for i in range(reader.num_record_batches))
-        expected_total = sum(a.n_obs for a in adatas)
-        assert total_rows == expected_total, (
-            f"aggregate row count {total_rows} != expected {expected_total}"
-        )
 
     # ---- webdataset × aggregate ----
     def test_webdataset_aggregate_parity(self, dummy_00_and_08, tmp_root: Path):
