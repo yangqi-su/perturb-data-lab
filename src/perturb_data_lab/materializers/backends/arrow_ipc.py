@@ -23,6 +23,7 @@ Backend name in registry: ``arrow-ipc``.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -35,13 +36,15 @@ def write_arrow_ipc_federated(
     bundle: ChunkBundle,
     release_id: str,
     matrix_root: Path,
-) -> tuple[dict[str, Path], np.ndarray]:
-    """Write a single-chunk ``ChunkBundle`` as an Arrow IPC file.
+    *,
+    _writer_state: dict[str, Any] | None = None,
+    _is_last_chunk: bool = False,
+) -> tuple[dict[str, Path], dict | None]:
+    """Stream ChunkBundle tables to a single Arrow IPC file.
 
-    This is the ``arrow-ipc × federated`` thin serializer.
-    It accepts a ``ChunkBundle`` from ``_translate_chunk()`` and writes the
-    heavy-row ``table`` directly to IPC format. Size factors are returned
-    to the caller for separate sidecar write.
+    On first call (_writer_state is None): open writer and store in state dict.
+    On subsequent calls: reuse the open writer from state.
+    On last call (_is_last_chunk=True): close writer and return None for writer_state.
 
     Parameters
     ----------
@@ -51,22 +54,35 @@ def write_arrow_ipc_federated(
         Release identifier used for output file naming.
     matrix_root : Path
         Output directory for matrix artifacts.
+    _writer_state : dict | None
+        Writer state dict carrying the open IPC writer across chunks.
+        None on first chunk — a new writer is opened.
+    _is_last_chunk : bool
+        True when this is the final chunk — closes the writer and returns None.
 
     Returns
     -------
-    tuple[dict[str, Path], np.ndarray]
-        ``(paths_dict, size_factors_array)`` where paths_dict contains
-        ``{"cells": cells_arrow_path}``.
+    tuple[dict[str, Path], dict | None]
+        ``({"cells": cells_arrow_path}, writer_state_or_None)``.
+        On last chunk the second element is None.
     """
     matrix_root.mkdir(parents=True, exist_ok=True)
     cell_path = matrix_root / f"{release_id}-cells.arrow"
 
-    writer = pa.ipc.new_file(str(cell_path), bundle.table.schema)
+    if _writer_state is None:
+        writer = pa.ipc.new_file(str(cell_path), bundle.table.schema)
+        _writer_state = {"writer": writer, "cell_path": cell_path}
+    else:
+        writer = _writer_state["writer"]
+
     batch = bundle.table.to_batches()[0]
     writer.write_batch(batch)
-    writer.close()
 
-    return ({"cells": cell_path}, bundle.size_factors)
+    if _is_last_chunk:
+        writer.close()
+        return {"cells": cell_path}, None
+    else:
+        return {"cells": cell_path}, _writer_state
 
 
 def read_arrow_ipc_cell(
@@ -112,7 +128,7 @@ def read_arrow_ipc_cell(
 def write_arrow_ipc_aggregate(
     bundles: list[ChunkBundle],
     matrix_root: Path,
-) -> tuple[dict[str, Path], list[np.ndarray]]:
+) -> dict[str, Path]:
     """Write aggregate sparse per-cell data as a single Arrow IPC file.
 
     This is the ``arrow-ipc × aggregate`` thin serializer.
@@ -129,24 +145,21 @@ def write_arrow_ipc_aggregate(
 
     Returns
     -------
-    tuple[dict[str, Path], list[np.ndarray]]
-        ``(paths_dict, size_factors_out_list)`` where paths_dict contains
-        ``{"cells": cells_arrow_path}``.
+    dict[str, Path]
+        ``paths_dict`` containing ``{"cells": cells_arrow_path}``.
     """
     matrix_root.mkdir(parents=True, exist_ok=True)
     cell_path = matrix_root / "aggregated-cells.arrow"
 
     writer: pa.ipc.RecordBatchFileWriter | None = None
-    size_factors_out_list: list[np.ndarray] = []
 
     for bundle in bundles:
         if writer is None:
             writer = pa.ipc.new_file(str(cell_path), bundle.table.schema)
         batch = bundle.table.to_batches()[0]
         writer.write_batch(batch)
-        size_factors_out_list.append(bundle.size_factors)
 
     if writer is not None:
         writer.close()
 
-    return ({"cells": cell_path}, size_factors_out_list)
+    return {"cells": cell_path}

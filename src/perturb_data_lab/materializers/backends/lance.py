@@ -13,6 +13,7 @@ Backend name in registry: ``lance``.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -36,12 +37,15 @@ def write_lance_federated(
     release_id: str,
     matrix_root: Path,
     dataset_id: str = "",
-) -> dict[str, Path]:
-    """Write a ``ChunkBundle`` as a Lance dataset.
+    *,
+    _lance_writer_state: dict[str, Any] | None = None,
+    _is_last_chunk: bool = False,
+) -> tuple[dict[str, Path], dict | None]:
+    """Stream ChunkBundle tables to a single Lance dataset.
 
-    This is the ``lance × federated`` thin serializer.
-    It accepts a ``ChunkBundle`` from ``_translate_chunk()`` and writes the
-    heavy-row ``table`` directly to Lance via ``lance.write_dataset``.
+    On first call (_lance_writer_state is None): create the dataset.
+    On subsequent calls: append to the existing dataset.
+    On last call (_is_last_chunk=True): return None for writer_state.
 
     Parameters
     ----------
@@ -53,22 +57,38 @@ def write_lance_federated(
         Output directory for matrix artifacts.
     dataset_id : str, optional
         Dataset identifier (used for Lance metadata context only).
+    _lance_writer_state : dict | None
+        Writer state dict. None on first chunk — dataset is created.
+    _is_last_chunk : bool
+        True when this is the final chunk — returns None for writer_state.
 
-    Returns a dict with keys: ``{"cells": lance_path}``.
+    Returns
+    -------
+    tuple[dict[str, Path], dict | None]
+        ``({"cells": lance_path}, writer_state_or_None)``.
+        On last chunk the second element is None.
     """
     lance = _import_lance()
     matrix_root.mkdir(parents=True, exist_ok=True)
-
     lance_path = matrix_root / f"{release_id}.lance"
+
+    if _lance_writer_state is None:
+        mode = "create"
+        _lance_writer_state = {"initialized": True, "lance_path": str(lance_path)}
+    else:
+        mode = "append"
 
     lance.write_dataset(
         bundle.table,
         str(lance_path),
-        mode="create",
+        mode=mode,
         max_rows_per_group=4096,
     )
 
-    return {"cells": lance_path}
+    if _is_last_chunk:
+        return {"cells": lance_path}, None
+    else:
+        return {"cells": lance_path}, _lance_writer_state
 
 
 def read_lance_cell(
@@ -107,7 +127,7 @@ def write_lance_aggregate(
     bundles: list[ChunkBundle],
     matrix_root: Path,
     corpus_index_path: Path | None = None,
-) -> tuple[dict[str, Path], list[np.ndarray]]:
+) -> dict[str, Path]:
     """Write aggregate sparse per-cell data as a Lance dataset.
 
     This is the ``lance × aggregate`` thin serializer.
@@ -126,15 +146,14 @@ def write_lance_aggregate(
 
     Returns
     -------
-    tuple[dict[str, Path], list[np.ndarray]]
-        ``(paths_dict, size_factors_out_list)``.
+    dict[str, Path]
+        ``paths_dict`` containing ``{"cells": lance_path}``.
     """
     lance = _import_lance()
     matrix_root.mkdir(parents=True, exist_ok=True)
 
     lance_path = matrix_root / "aggregated-corpus.lance"
     writer_initialized = False
-    size_factors_out_list: list[np.ndarray] = []
 
     for bundle in bundles:
         mode = "append" if writer_initialized else "create"
@@ -145,6 +164,5 @@ def write_lance_aggregate(
             max_rows_per_group=4096,
         )
         writer_initialized = True
-        size_factors_out_list.append(bundle.size_factors)
 
-    return ({"cells": lance_path}, size_factors_out_list)
+    return {"cells": lance_path}

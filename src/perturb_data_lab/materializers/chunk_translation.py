@@ -21,8 +21,13 @@ Design principles from the archived benchmark (materialize_split_brain_backends.
     from CSR indptr/data/indices buffers directly — no per-row Python nested-list assembly.
   - Metadata table is a separate Arrow table with its own schema, allowing backends
     to handle it independently (write to separate Parquet, embed in Lance rows, etc.).
-  - Size factors are computed inline during translation (same traversal as the sparse
-    data) and returned as a NumPy array for separate Parquet sidecar write.
+  - Row sums (un-normalized) are computed during translation and accumulated globally
+    by the caller for median-based size factor computation after all chunks are written.
+  - Recovery (when ``needs_recovery=True``) is applied as a vectorized per-row operation
+    inside ``_translate_chunk()`` using a temporary expm1 CSR matrix — no full-matrix
+    densification. The caller passes ``needs_recovery`` based on Stage 1's decision.
+  - HVG statistics are accumulated by the caller during the chunk loop (via np.add.at)
+    and finalized by ``_finalize_hvg()`` after all chunks are written — no separate pass.
 
 Schema summary
 --------------
@@ -210,11 +215,13 @@ class ChunkBundle:
         cell in the chunk, with ``expressed_gene_indices`` and ``expression_counts``
         as Arrow list arrays built directly from CSR buffers via
         ``pa.ListArray.from_arrays()``.
-    size_factors : np.ndarray
-        Median-normalized per-cell size factors (float32). Computed inline during
-        the same CSR traversal as sparse translation. Every backend writer receives
-        pre-computed size factors from ``_translate_chunk()`` — no writer computes
-        its own size factors.
+    row_sums : np.ndarray
+        Raw (un-normalized) per-cell row sums (float64). These are computed inside
+        ``_translate_chunk()`` and accumulated by the caller across all chunks. After
+        the chunk loop, the caller computes the global median of all accumulated row
+        sums and produces globally-normalized size factors (``row_sum / global_median``).
+        Size factors are written to a separate Parquet sidecar — no backend writer
+        receives or embeds them.
     indptr : np.ndarray
         CSR indptr array for this chunk. Int64, length ``n_rows + 1``. Raw buffer
         available for backends that need flat-buffer access (Zarr, WebDataset).
@@ -241,7 +248,7 @@ class ChunkBundle:
     """
 
     table: pa.Table
-    size_factors: np.ndarray
+    row_sums: np.ndarray
     indptr: np.ndarray
     indices: np.ndarray
     counts: np.ndarray
@@ -298,6 +305,7 @@ def _translate_chunk(
     dataset: DatasetSpec,
     matrix_chunk: csr_matrix,
     chunk_start: int,
+    needs_recovery: bool = False,
 ) -> ChunkBundle:
     """Translate a CSR matrix chunk into a ChunkBundle for backend writers.
 
@@ -305,8 +313,8 @@ def _translate_chunk(
     canonical ``ChunkBundle`` form once; all five backend writers then consume this
     same bundle without re-encoding sparse rows independently.
 
-    Size factors are computed inline during the same CSR traversal as the sparse
-    translation (one pass). No writer computes its own size factors.
+    Recovery (when ``needs_recovery=True``) is applied as a vectorized per-row
+    operation using a temporary expm1 CSR matrix — no full-matrix densification.
 
     ``expressed_gene_indices`` are in **dataset-local feature space** — no canonical
     gene mapping is applied at this stage. Canonical mapping is deferred to Stage 3.
@@ -321,22 +329,30 @@ def _translate_chunk(
     chunk_start : int
         Row offset within the dataset at which this chunk begins (0-indexed).
         Used to compute ``global_row_index``.
+    needs_recovery : bool, default False
+        When False (integer counts path): matrix_chunk data must be integer-valued
+        (max deviation < 1e-6 for nonzero entries). Float-dtype integer-like data
+        is accepted, verified inline, and cast to int32.
+        When True (log1p recovery path): matrix_chunk is treated as log1p-normalized
+        counts; vectorized recovery produces integer counts via
+        ``expm1(data) / row_min_expm1``.
 
     Returns
     -------
     ChunkBundle
-        Translated chunk with heavy-row Arrow table, computed size factors,
-        and raw CSR buffers. ``indices`` in the bundle are dataset-local (not
-        mapped through any gene_lookup). No ``metadata_table`` is returned —
-        callers that need a ``METADATA_SCHEMA`` table should use
-        ``_build_metadata_table()``.
+        Translated chunk with heavy-row Arrow table, raw row sums, and raw CSR
+        buffers. ``indices`` in the bundle are dataset-local (not mapped through
+        any gene_lookup). No ``metadata_table`` is returned — callers that need
+        a ``METADATA_SCHEMA`` table should use ``_build_metadata_table()``.
 
     Raises
     ------
     ValueError
         If ``matrix_chunk`` is not sparse or cannot be converted to CSR.
     ValueError
-        If any expression count is not integer-valued.
+        If ``needs_recovery=False`` and nonzero values deviate from integer by > 1e-6.
+    ValueError
+        If ``needs_recovery=True`` and recovered values deviate from integer by > 0.01.
     """
     if not issparse(matrix_chunk):
         raise ValueError(f"{dataset.dataset_id}:{chunk_start} chunk densified unexpectedly")
@@ -344,31 +360,78 @@ def _translate_chunk(
     if not isinstance(matrix_chunk, csr_matrix):
         matrix_chunk = csr_matrix(matrix_chunk)
 
-    counts = np.asarray(matrix_chunk.data)
-    if counts.dtype.kind not in {"i", "u"}:
-        raise ValueError(f"{dataset.dataset_id}:{chunk_start} counts are not integer-valued")
-    counts = counts.astype(np.int32, copy=False)
+    # For recovery, eliminate explicit zeros BEFORE extracting components.
+    if needs_recovery:
+        matrix_chunk.eliminate_zeros()
 
     indptr = np.asarray(matrix_chunk.indptr, dtype=np.int64)
-    # indices are kept in dataset-local space — no gene_lookup mapping applied
     local_indices = np.asarray(matrix_chunk.indices, dtype=np.int32)
     row_count = int(matrix_chunk.shape[0])
+    n_vars = int(matrix_chunk.shape[1])
     global_row_index = np.arange(
         dataset.global_row_start + chunk_start,
         dataset.global_row_start + chunk_start + row_count,
         dtype=np.int64,
     )
 
-    # Inline size-factor computation: row sums → median normalization → clamp.
-    row_sums = np.asarray(matrix_chunk.sum(axis=1)).ravel()
-    row_median = float(np.median(row_sums))
-    if row_median > 0:
-        size_factors = row_sums / row_median
+    if needs_recovery:
+        # --- Vectorized log1p recovery ---
+        raw_data = matrix_chunk.data  # may be float32 or float64
+        expm1_data = np.expm1(raw_data)
+
+        # Per-row sums and minima via reduceat (replaces expensive expm1_matrix
+        # construction + per-row Python loop). Both np.add.reduceat and
+        # np.minimum.reduceat produce incorrect results when consecutive indptr
+        # entries are equal (empty rows), so we use a valid_rows guard.
+        row_sums = np.zeros(row_count, dtype=np.float64)
+        row_min_expm1 = np.full(row_count, 1.0, dtype=np.float64)
+        row_lengths = np.diff(indptr)
+        valid_rows = row_lengths > 0
+        if valid_rows.any():
+            valid_starts = indptr[:-1][valid_rows]
+            row_sums[valid_rows] = np.add.reduceat(expm1_data, valid_starts).astype(np.float64)
+            row_min_expm1[valid_rows] = np.minimum.reduceat(expm1_data, valid_starts)
+        row_min_expm1[row_min_expm1 <= 0] = 1.0
+
+        # Row sums are normalized by row_min (the scaling factor for recovery).
+        row_sums = row_sums / row_min_expm1
+
+        # Broadcast per-row minima to per-nonzero for elementwise division.
+        row_starts = indptr[:-1]
+        row_stops = indptr[1:]
+        row_min_per_nonzero = np.repeat(row_min_expm1, (row_stops - row_starts).astype(np.intp))
+        recovered_data = expm1_data / row_min_per_nonzero
+
+        # Integer verification: max deviation from nearest integer must be < 0.01.
+        deviations = np.abs(recovered_data - np.rint(recovered_data))
+        if np.any(deviations > 0.01):
+            max_dev = float(np.max(deviations))
+            raise ValueError(
+                f"{dataset.dataset_id}:{chunk_start} recovered values are non-integer "
+                f"(max_deviation={max_dev:.6f}); recovery validation failed"
+            )
+
+        counts = np.rint(recovered_data).astype(np.int32)
     else:
-        size_factors = row_sums.copy()
-    size_factors = np.where(size_factors <= 0, 1.0, size_factors)
-    size_factors = np.where(np.isnan(size_factors), 1.0, size_factors)
-    size_factors = size_factors.astype(np.float32, copy=False)
+        # --- Integer counts path (no recovery) ---
+        raw_data = np.asarray(matrix_chunk.data)
+        if raw_data.dtype.kind not in {"i", "u"}:
+            # Float-dtype integer-like matrix: verify and accept.
+            nonzero_mask = raw_data != 0
+            if nonzero_mask.any():
+                deviations = np.abs(raw_data[nonzero_mask] - np.rint(raw_data[nonzero_mask]))
+                if np.any(deviations > 1e-6):
+                    max_dev = float(np.max(deviations))
+                    raise ValueError(
+                        f"{dataset.dataset_id}:{chunk_start} float matrix is not integer-like "
+                        f"(max_deviation={max_dev:.6f}); materialization requires integer counts"
+                    )
+            counts = np.rint(raw_data).astype(np.int32)
+        else:
+            counts = raw_data.astype(np.int32, copy=False)
+
+        # Compute raw row sums from original counts.
+        row_sums = np.asarray(matrix_chunk.sum(axis=1)).ravel()
 
     # Single sparse hot path: pa.ListArray.from_arrays() from CSR buffers.
     # expressed_gene_indices uses dataset-local indices (no canonical mapping).
@@ -392,12 +455,83 @@ def _translate_chunk(
 
     return ChunkBundle(
         table=table,
-        size_factors=size_factors,
+        row_sums=row_sums,
         indptr=indptr,
         indices=local_indices,
         counts=counts,
         row_count=row_count,
     )
+
+
+# ---------------------------------------------------------------------------
+# Seurat-style HVG selection
+# ---------------------------------------------------------------------------
+
+def _finalize_hvg(
+    sum_log1p: np.ndarray,
+    sum_log1p_sq: np.ndarray,
+    n_cells_total: int,
+    n_vars: int,
+    n_hvg: int = 2000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute Seurat-style highly variable gene selection from streaming accumulators.
+
+    Parameters
+    ----------
+    sum_log1p : np.ndarray
+        Per-gene sum of log1p(counts) accumulated via np.add.at during the chunk loop.
+    sum_log1p_sq : np.ndarray
+        Per-gene sum of log1p(counts)^2 accumulated via np.add.at during the chunk loop.
+    n_cells_total : int
+        Total number of cells across all chunks.
+    n_vars : int
+        Number of genes (features) in the dataset.
+    n_hvg : int, default 2000
+        Number of top-dispersion genes to mark as highly variable.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(hvg_indices, nonhvg_indices)`` — dataset-local gene indices (int32) for
+        highly variable and non-highly variable genes respectively.
+    """
+    import pandas as pd
+
+    mean = sum_log1p / n_cells_total
+    var = (sum_log1p_sq - sum_log1p**2 / n_cells_total) / max(n_cells_total - 1, 1)
+    mean[mean == 0] = 1e-12
+    dispersion = var / mean
+    dispersion[dispersion == 0] = np.nan
+    dispersion = np.log(dispersion)
+    mean = np.log1p(mean)
+
+    df = pd.DataFrame({"means": mean, "dispersions": dispersion})
+    # pd.cut(bins=20) can produce empty bins when gene count < 20.
+    # Lines below handle the single-gene-bin edge case: when a bin contains
+    # exactly one gene, dev=std is NaN; it is replaced with dev=avg so the
+    # normalization does not crash (single-gene bins end up with deviation=0).
+    df["mean_bin"] = pd.cut(df["means"], bins=20)
+    disp_grouped = df.groupby("mean_bin", observed=True)["dispersions"]
+    disp_stats = disp_grouped.agg(avg="mean", dev="std")
+    one_gene_per_bin = disp_stats["dev"].isnull()
+    disp_stats.loc[one_gene_per_bin, "dev"] = disp_stats.loc[one_gene_per_bin, "avg"]
+    disp_stats.loc[one_gene_per_bin, "avg"] = 0
+
+    df["dispersions_norm"] = (
+        df["dispersions"] - disp_stats.loc[df["mean_bin"], "avg"].values
+    ) / disp_stats.loc[df["mean_bin"], "dev"].values
+
+    df = df.sort_values("dispersions_norm", ascending=False)
+    df["highly_variable"] = False
+    df.iloc[:n_hvg, df.columns.get_loc("highly_variable")] = True
+    df = df.sort_index()
+
+    hvg_indices = df.index[df["highly_variable"]].to_numpy().astype(np.int32)
+    hvg_indices.sort()
+    nonhvg_indices = np.array(
+        [j for j in range(n_vars) if j not in set(hvg_indices)], dtype=np.int32
+    )
+    return hvg_indices, nonhvg_indices
 
 
 # ---------------------------------------------------------------------------

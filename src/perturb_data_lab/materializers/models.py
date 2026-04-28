@@ -278,6 +278,8 @@ class MaterializationManifest(YamlDocument):
             raise ValueError(f"invalid route: {self.route}")
         if self.backend not in {
             "arrow-hf",
+            "arrow-parquet",
+            "arrow-ipc",
             "webdataset",
             "zarr",
             "lance",
@@ -291,6 +293,7 @@ class MaterializationManifest(YamlDocument):
         backend_raw = data.get("backend", "arrow-hf")
         # Normalize legacy backend names to the contract's clean names
         _LEGACY_BACKEND_MAP = {
+            "arrow-hf": "arrow-parquet",
             "zarr-ts": "zarr",
             "lancedb-aggregated": "lance",
             "zarr-aggregated": "zarr",
@@ -696,6 +699,8 @@ class GlobalMetadataDocument(YamlDocument):
     def validate(self) -> None:
         if self.backend is not None and self.backend not in {
             "arrow-hf",
+            "arrow-parquet",
+            "arrow-ipc",
             "webdataset",
             "zarr",
             "lance",

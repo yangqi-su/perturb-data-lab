@@ -379,9 +379,9 @@ This axis answers:
 All 5 backends share a single translation unit (`chunk_translation.py`) that:
 
 1. Accepts a CSR batch (`indptr`, `indices`, `counts`) + `DatasetSpec` + `chunk_start`
-2. Translates it once into a `ChunkBundle` (6 fields: `table`, `size_factors`, `indptr`, `indices`, `counts`, `row_count`)
+2. Translates it once into a `ChunkBundle` (6 fields: `table`, `row_sums`, `indptr`, `indices`, `counts`, `row_count`)
    - `table`: `pa.Table` with `global_row_index`, flat-buffer list-arrays (`expressed_gene_indices`, `expression_counts`) built via `pa.ListArray.from_arrays()` directly from CSR buffers
-   - `size_factors`: float32 ndarray of median-normalized per-cell size factors, computed inline during the same CSR traversal — no writer computes its own size factors
+   - `row_sums`: float64 ndarray of raw (un-normalized) per-cell row sums — the caller accumulates these across chunks via a global array and computes globally-normalized size factors from the global median after the loop
    - `indptr`, `indices`, `counts`: raw CSR NumPy arrays for backends that need direct buffer access
    - `indices` are always in dataset-local feature space — no canonical gene mapping is applied at this stage; canonical mapping is deferred to Stage 3
 3. Each backend writer consumes the `ChunkBundle` and produces its own serialized format

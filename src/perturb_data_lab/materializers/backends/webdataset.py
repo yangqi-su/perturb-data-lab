@@ -33,14 +33,21 @@ def write_webdataset_federated(
     release_id: str,
     matrix_root: Path,
     cell_ids: tuple[str, ...] | None = None,
-) -> dict[str, Path]:
-    """Write a ``ChunkBundle`` as a WebDataset shard (.tar with .pkl per cell).
+    *,
+    _writer_state: dict[str, Any] | None = None,
+    _is_last_chunk: bool = False,
+) -> tuple[dict[str, Path], dict | None]:
+    """Stream ChunkBundle to WebDataset shard format with stateful tarfile.
 
-    This is the ``webdataset × federated`` thin serializer.
-    It accepts a ``ChunkBundle`` from ``_translate_chunk()`` and writes each
-    cell as a ``cell_{global_row_index:08d}.pkl`` pickle record. The meta
-    parquet (cell_id ↔ shard mapping) is written separately by the caller
-    (``Stage2Materializer``).
+    On first call (_writer_state is None): create state dict (no tar opened yet).
+    On each chunk: open tar in write mode for first chunk, append mode for
+    subsequent chunks (tarfile "a"), write all cells, close tar.
+    On last call (_is_last_chunk=True): after writing cells, return None
+    for writer_state.
+
+    No bundles are accumulated in memory — each chunk is written directly
+    to the tar shard as it arrives. The tar is opened and closed per chunk
+    to keep state management simple (no filesystem handle held across chunks).
 
     Parameters
     ----------
@@ -51,57 +58,62 @@ def write_webdataset_federated(
     matrix_root : Path
         Output directory for shard artifacts.
     cell_ids : tuple[str, ...] | None
-        Cell IDs in order, one per row in the chunk. If None, cells are
-        named by their global_row_index.
+        Cell IDs in order, one per row in the chunk.
+    _writer_state : dict | None
+        State dict holding shard path and cell offset.
+        None on first chunk — new state is created.
+    _is_last_chunk : bool
+        True when this is the final chunk — returned writer_state is None.
 
-    Returns a dict with keys: ``{"shard_path": Path, "meta": Path}``.
+    Returns
+    -------
+    tuple[dict[str, Path], dict | None]
+        ``({"shard_path": ...}, state_or_None)``.
+        On last chunk the second element is None.
     """
+    import io
+    import pickle
+    import tarfile
+
     matrix_root.mkdir(parents=True, exist_ok=True)
-
-    n_rows = bundle.row_count
-    table = bundle.table
-    global_row_indices = table["global_row_index"].to_numpy()
-    size_factors = bundle.size_factors
-
     shard_path = matrix_root / f"{release_id}-cells.tar"
-    meta_rows: list[dict[str, Any]] = []
 
-    with tarfile.open(str(shard_path), "w") as tar:
+    if _writer_state is None:
+        _writer_state = {
+            "shard_path": shard_path,
+            "cell_offset": 0,
+        }
+
+    table = bundle.table
+    n_rows = bundle.row_count
+
+    # Open tar in write mode for first chunk, append mode for subsequent chunks.
+    mode = "w" if _writer_state["cell_offset"] == 0 else "a"
+    with tarfile.open(str(shard_path), mode) as tar:
         for i in range(n_rows):
-            global_idx = int(global_row_indices[i])
+            global_idx = int(table["global_row_index"][i].as_py())
             row_indices = table["expressed_gene_indices"][i].as_py()
             row_counts = table["expression_counts"][i].as_py()
-            cell_sf = float(size_factors[i])
 
             cell_record = {
                 "expressed_gene_indices": np.array(row_indices, dtype=np.int32),
                 "expression_counts": np.array(row_counts, dtype=np.int32),
-                "size_factor": cell_sf,
                 "global_row_index": global_idx,
             }
-            if cell_ids is not None:
-                cell_record["cell_id"] = cell_ids[i]
 
             data_bytes = pickle.dumps(cell_record, protocol=pickle.HIGHEST_PROTOCOL)
             info = tarfile.TarInfo(name=f"cell_{global_idx:08d}.pkl")
             info.size = len(data_bytes)
             tar.addfile(info, io.BytesIO(data_bytes))
 
-            cell_id = cell_ids[i] if cell_ids is not None else str(global_idx)
-            meta_rows.append({
-                "cell_id": cell_id,
-                "size_factor": cell_sf,
-            })
+    _writer_state["cell_offset"] += n_rows
 
-    # Write meta as Parquet for efficient random access.
-    meta_path = matrix_root / f"{release_id}-meta.parquet"
-    meta_table = pa.table({
-        "cell_id": pa.array([r["cell_id"] for r in meta_rows], type=pa.string()),
-        "size_factor": pa.array([r["size_factor"] for r in meta_rows], type=pa.float64()),
-    })
-    pq.write_table(meta_table, meta_path)
+    paths = {"shard_path": shard_path}
 
-    return {"shard_path": shard_path, "meta": meta_path}
+    if _is_last_chunk:
+        return paths, None
+    else:
+        return paths, _writer_state
 
 
 def read_webdataset_cell(
@@ -127,7 +139,7 @@ def read_webdataset_cell(
         import pyarrow.parquet as pq
 
         sf_table = pq.read_table(str(size_factor_path))
-        sf = float(sf_table["size_factor"][cell_index].as_py())
+        sf = float(sf_table["size_factor"][record["global_row_index"]].as_py())
 
     return (indices, counts, sf)
 
@@ -140,13 +152,14 @@ def read_webdataset_cell(
 def write_webdataset_aggregate(
     bundles: list[ChunkBundle],
     matrix_root: Path,
-) -> tuple[dict[str, Path], list[np.ndarray]]:
+) -> dict[str, Path]:
     """Write aggregate sparse per-cell data in WebDataset shard format.
 
     This is the ``webdataset × aggregate`` thin serializer.
     It consumes an ordered list of ``ChunkBundle`` objects and writes them
     as a single corpus-scoped set of .tar shards with deterministic
-    global_row_index values spanning all datasets.
+    global_row_index values spanning all datasets. Size factors are in a
+    separate Parquet sidecar written by the caller after all chunks.
 
     Parameters
     ----------
@@ -157,9 +170,8 @@ def write_webdataset_aggregate(
 
     Returns
     -------
-    tuple[dict[str, Path], list[np.ndarray]]
-        ``(paths_dict, size_factors_out_list)`` where paths_dict contains
-        ``{"shard_paths": list[Path], "meta": meta_parquet_path}``.
+    dict[str, Path]
+        ``paths_dict`` containing ``{"shard_paths": list[Path], "meta": meta_parquet_path}``.
     """
     matrix_root.mkdir(parents=True, exist_ok=True)
 
@@ -171,7 +183,6 @@ def write_webdataset_aggregate(
     meta_rows: list[dict[str, Any]] = []
 
     cell_global_index = 0  # running global row index across all datasets
-    size_factors_out_list: list[np.ndarray] = []
 
     for shard_idx in range(n_shards):
         shard_path = matrix_root / f"aggregate-{shard_idx:05d}.tar"
@@ -197,13 +208,11 @@ def write_webdataset_aggregate(
                 global_idx = int(global_row_indices[local_index])
                 row_indices = table["expressed_gene_indices"][local_index].as_py()
                 row_counts = table["expression_counts"][local_index].as_py()
-                cell_sf = float(bundle.size_factors[local_index])
 
                 cell_record = {
                     "global_row_index": global_idx,
                     "expressed_gene_indices": np.array(row_indices, dtype=np.int32),
                     "expression_counts": np.array(row_counts, dtype=np.int32),
-                    "size_factor": cell_sf,
                     "dataset_index": ds_idx,
                 }
 
@@ -216,12 +225,9 @@ def write_webdataset_aggregate(
                     "global_row_index": global_idx,
                     "dataset_index": ds_idx,
                     "shard": shard_idx,
-                    "size_factor": cell_sf,
                 })
 
                 cell_global_index += 1
-
-        size_factors_out_list.append(bundle.size_factors)
 
     # Write meta as Parquet for efficient random access.
     meta_path = matrix_root / "aggregate-meta.parquet"
@@ -229,8 +235,7 @@ def write_webdataset_aggregate(
         "global_row_index": pa.array([r["global_row_index"] for r in meta_rows], type=pa.int64()),
         "dataset_index": pa.array([r["dataset_index"] for r in meta_rows], type=pa.int32()),
         "shard": pa.array([r["shard"] for r in meta_rows], type=pa.int32()),
-        "size_factor": pa.array([r["size_factor"] for r in meta_rows], type=pa.float64()),
     })
     pq.write_table(meta_table, meta_path)
 
-    return ({"shard_paths": shard_paths, "meta": meta_path}, size_factors_out_list)
+    return {"shard_paths": shard_paths, "meta": meta_path}

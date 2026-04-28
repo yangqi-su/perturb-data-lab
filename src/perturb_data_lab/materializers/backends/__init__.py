@@ -53,16 +53,22 @@ def materialize_arrow_parquet(
     bundle: Any,
     release_id: str,
     matrix_root: Path,
-) -> tuple[dict[str, Path], np.ndarray]:
+    *,
+    _writer_state: dict[str, Any] | None = None,
+    _is_last_chunk: bool = False,
+    **kwargs: Any,
+) -> tuple[dict[str, Path], dict | None]:
     """Write using arrow-parquet × federated backend.
 
-    Thin serializer: accepts a single ``ChunkBundle`` and writes it to Parquet.
-    Returns ``(paths_dict, size_factors_array)``.
+    Thin serializer: accepts a single ``ChunkBundle`` and streams it to Parquet.
+    Returns ``({"cells": path}, writer_state_or_none)``.
     """
     return write_arrow_parquet_federated(
         bundle=bundle,
         release_id=release_id,
         matrix_root=matrix_root,
+        _writer_state=_writer_state,
+        _is_last_chunk=_is_last_chunk,
     )
 
 
@@ -70,16 +76,22 @@ def materialize_arrow_ipc(
     bundle: Any,
     release_id: str,
     matrix_root: Path,
-) -> tuple[dict[str, Path], np.ndarray]:
+    *,
+    _writer_state: dict[str, Any] | None = None,
+    _is_last_chunk: bool = False,
+    **kwargs: Any,
+) -> tuple[dict[str, Path], dict | None]:
     """Write using arrow-ipc × federated backend.
 
-    Thin serializer: accepts a single ``ChunkBundle`` and writes it to IPC.
-    Returns ``(paths_dict, size_factors_array)``.
+    Thin serializer: accepts a single ``ChunkBundle`` and streams it to IPC.
+    Returns ``({"cells": path}, writer_state_or_none)``.
     """
     return write_arrow_ipc_federated(
         bundle=bundle,
         release_id=release_id,
         matrix_root=matrix_root,
+        _writer_state=_writer_state,
+        _is_last_chunk=_is_last_chunk,
     )
 
 
@@ -87,54 +99,73 @@ def materialize_webdataset(
     bundle: Any,
     release_id: str,
     matrix_root: Path,
-) -> tuple[dict[str, Path], np.ndarray | None]:
+    *,
+    _writer_state: dict[str, Any] | None = None,
+    _is_last_chunk: bool = False,
+    cell_ids: tuple[str, ...] | None = None,
+    **kwargs: Any,
+) -> tuple[dict[str, Path], dict | None]:
     """Write using webdataset × federated backend.
 
-    Thin serializer: accepts a single ``ChunkBundle`` and writes it as a shard.
-    Returns ``(paths_dict, None)`` — size factors are embedded in shard records.
+    Thin serializer: streams each ``ChunkBundle`` directly to a tar shard.
+    Returns ``({"shard_path": ..., "meta": ...}, writer_state_or_none)``.
     """
-    result = write_webdataset_federated(
+    return write_webdataset_federated(
         bundle=bundle,
         release_id=release_id,
         matrix_root=matrix_root,
+        cell_ids=cell_ids,
+        _writer_state=_writer_state,
+        _is_last_chunk=_is_last_chunk,
     )
-    return (result, None)
 
 
 def materialize_zarr(
     bundle: Any,
     release_id: str,
     matrix_root: Path,
-) -> tuple[dict[str, Path], np.ndarray | None]:
+    *,
+    _writer_state: dict[str, Any] | None = None,
+    _is_last_chunk: bool = False,
+    **kwargs: Any,
+) -> tuple[dict[str, Path], dict | None]:
     """Write using zarr × federated backend.
 
-    Thin serializer: accepts a single ``ChunkBundle`` and writes flat buffers.
-    Returns ``(paths_dict, None)`` — size factors are embedded in Zarr meta.
+    Thin serializer: streams each ``ChunkBundle`` directly to open zarr groups.
+    Returns ``({"indices": ..., "counts": ..., "row_offsets": ..., "meta": ...}, writer_state_or_none)``.
     """
-    result = write_zarr_federated(
+    return write_zarr_federated(
         bundle=bundle,
         release_id=release_id,
         matrix_root=matrix_root,
+        _writer_state=_writer_state,
+        _is_last_chunk=_is_last_chunk,
     )
-    return (result, None)
 
 
 def materialize_lance(
     bundle: Any,
     release_id: str,
     matrix_root: Path,
-) -> tuple[dict[str, Path], np.ndarray | None]:
+    *,
+    _writer_state: dict[str, Any] | None = None,
+    _is_last_chunk: bool = False,
+    dataset_id: str = "",
+    **kwargs: Any,
+) -> tuple[dict[str, Path], dict | None]:
     """Write using lance × federated backend.
 
-    Thin serializer: accepts a single ``ChunkBundle`` and writes it to Lance.
-    Returns ``(paths_dict, None)``.
+    Thin serializer: streams bundles to Lance with append mode after first chunk.
+    Returns ``({"cells": path}, writer_state_or_none)``.
     """
-    result = write_lance_federated(
+    return write_lance_federated(
         bundle=bundle,
         release_id=release_id,
         matrix_root=matrix_root,
+        dataset_id=dataset_id,
+        _lance_writer_state=_writer_state,
+        _is_last_chunk=_is_last_chunk,
     )
-    return (result, None)
 
 
 # ---------------------------------------------------------------------------

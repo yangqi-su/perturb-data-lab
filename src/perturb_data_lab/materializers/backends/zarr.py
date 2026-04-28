@@ -23,6 +23,7 @@ Backend name in registry: ``zarr``.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 import json
 
 import numpy as np
@@ -34,12 +35,21 @@ def write_zarr_federated(
     bundle: ChunkBundle,
     release_id: str,
     matrix_root: Path,
-) -> dict[str, Path]:
-    """Write a ``ChunkBundle`` as Zarr flat 1D buffers.
+    *,
+    _writer_state: dict[str, Any] | None = None,
+    _is_last_chunk: bool = False,
+) -> tuple[dict[str, Path], dict | None]:
+    """Stream ChunkBundle to Zarr format with stateful open-zarr groups.
 
-    This is the ``zarr × federated`` thin serializer.
-    It accepts a ``ChunkBundle`` and writes flat 1D Zarr arrays for
-    indices, counts, and row_offsets.
+    On first call (_writer_state is None): create zarr arrays with initial
+    size based on first chunk's nnz, store zarr group references in state.
+    On subsequent calls: resize zarr arrays as needed, write chunk data
+    via slice assignment.
+    On last call (_is_last_chunk=True): resize arrays to exact final sizes,
+    write meta.json, and return None for writer_state.
+
+    No bundles are accumulated in memory — each chunk is written directly
+    to the open zarr arrays as it arrives.
 
     Parameters
     ----------
@@ -49,53 +59,105 @@ def write_zarr_federated(
         Release identifier used for output file naming.
     matrix_root : Path
         Output directory for matrix artifacts.
+    _writer_state : dict | None
+        State dict holding open zarr group references, accumulated nnz/row
+        counts, and output paths. None on first chunk — new state is created.
+    _is_last_chunk : bool
+        True when this is the final chunk — triggers final resize,
+        meta.json write, and returns None for writer_state.
 
-    Returns a dict with keys: ``{"indices": ..., "counts": ..., "row_offsets": ..., "meta": ...}``.
+    Returns
+    -------
+    tuple[dict[str, Path], dict | None]
+        ``({"indices": ..., "counts": ..., "row_offsets": ..., "meta": ...}, state_or_None)``.
+        On last chunk the second element is None.
     """
     import zarr
 
     matrix_root.mkdir(parents=True, exist_ok=True)
-
     indices_path = matrix_root / f"{release_id}-indices.zarr"
     counts_path = matrix_root / f"{release_id}-counts.zarr"
     row_offsets_path = matrix_root / f"{release_id}-row-offsets.zarr"
 
-    # Build flat arrays from the bundle's CSR buffers.
-    all_indices = bundle.indices
-    all_counts = bundle.counts
-    row_offsets_arr = bundle.indptr
+    if _writer_state is None:
+        # First chunk: create zarr arrays with initial size.
+        initial_size = max(len(bundle.indices), 1)
 
-    # Write as zarr 1D arrays.
-    indices_zarr = zarr.open(str(indices_path), mode="w")
-    counts_zarr = zarr.open(str(counts_path), mode="w")
-    row_offsets_zarr = zarr.open(str(row_offsets_path), mode="w")
+        indices_zarr = zarr.open(str(indices_path), mode="w")
+        counts_zarr = zarr.open(str(counts_path), mode="w")
+        row_offsets_zarr = zarr.open(str(row_offsets_path), mode="w")
 
-    indices_zarr.create_dataset("indices", data=all_indices, dtype="i4")
-    counts_zarr.create_dataset("counts", data=all_counts, dtype="i4")
-    row_offsets_zarr.create_dataset("row_offsets", data=row_offsets_arr, dtype="i8")
+        indices_zarr.create_dataset("indices", shape=(initial_size,), dtype="i4")
+        counts_zarr.create_dataset("counts", shape=(initial_size,), dtype="i4")
+        row_offsets_zarr.create_dataset("row_offsets", shape=(bundle.row_count + 1,), dtype="i8")
 
-    # Write metadata JSON.
-    meta_path = matrix_root / f"{release_id}-meta.json"
-    with open(meta_path, "w") as f:
-        json.dump(
-            {
-                "release_id": release_id,
-                "n_obs": bundle.row_count,
-                "size_factor_path": str(matrix_root / f"{release_id}-size-factor.zarr"),
-                "indices_path": str(indices_path),
-                "counts_path": str(counts_path),
-                "row_offsets_path": str(row_offsets_path),
-            },
-            f,
-            indent=2,
-        )
+        _writer_state = {
+            "indices_zarr": indices_zarr,
+            "counts_zarr": counts_zarr,
+            "row_offsets_zarr": row_offsets_zarr,
+            "indices_path": indices_path,
+            "counts_path": counts_path,
+            "row_offsets_path": row_offsets_path,
+            "global_nnz": 0,
+            "row_count": 0,
+        }
 
-    return {
+    # Verify indptr starts at 0 — otherwise the offset logic below
+    # (adding current_nnz to all indptr values) would silently corrupt data.
+    assert bundle.indptr[0] == 0, f"chunk indptr[0] == {bundle.indptr[0]}, expected 0"
+
+    current_nnz = _writer_state["global_nnz"]
+    current_rows = _writer_state["row_count"]
+    chunk_nnz = len(bundle.indices)
+    chunk_rows = bundle.row_count
+
+    # Write row_offsets (one per row + 1).
+    ro_start = current_rows
+    ro_end = current_rows + chunk_rows + 1
+    if ro_end > _writer_state["row_offsets_zarr"]["row_offsets"].shape[0]:
+        _writer_state["row_offsets_zarr"]["row_offsets"].resize((ro_end + 1000,))
+    _writer_state["row_offsets_zarr"]["row_offsets"][ro_start:ro_end] = bundle.indptr + current_nnz
+
+    # Ensure indices/counts arrays are large enough for this chunk.
+    needed_nnz = current_nnz + chunk_nnz
+    if needed_nnz > _writer_state["indices_zarr"]["indices"].shape[0]:
+        _writer_state["indices_zarr"]["indices"].resize((needed_nnz + 1000,))
+        _writer_state["counts_zarr"]["counts"].resize((needed_nnz + 1000,))
+
+    # Write chunk data via slice assignment.
+    _writer_state["indices_zarr"]["indices"][current_nnz:current_nnz + chunk_nnz] = bundle.indices
+    _writer_state["counts_zarr"]["counts"][current_nnz:current_nnz + chunk_nnz] = bundle.counts
+
+    # Update accumulated state.
+    _writer_state["global_nnz"] = needed_nnz
+    _writer_state["row_count"] += chunk_rows
+
+    paths = {
         "indices": indices_path,
         "counts": counts_path,
         "row_offsets": row_offsets_path,
-        "meta": meta_path,
+        "meta": matrix_root / f"{release_id}-meta.json",
     }
+
+    if _is_last_chunk:
+        # Resize to exact final sizes.
+        _writer_state["indices_zarr"]["indices"].resize((_writer_state["global_nnz"],))
+        _writer_state["counts_zarr"]["counts"].resize((_writer_state["global_nnz"],))
+
+        # Write meta.json with final dimensions.
+        with open(matrix_root / f"{release_id}-meta.json", "w") as f:
+            json.dump({
+                "release_id": release_id,
+                "n_obs": _writer_state["row_count"],
+                "nnz": _writer_state["global_nnz"],
+                "indices_path": str(indices_path),
+                "counts_path": str(counts_path),
+                "row_offsets_path": str(row_offsets_path),
+            }, f, indent=2)
+
+        return paths, None
+    else:
+        return paths, _writer_state
 
 
 def read_zarr_cell(
@@ -144,12 +206,13 @@ def read_zarr_cell(
 def write_zarr_aggregate(
     bundles: list[ChunkBundle],
     matrix_root: Path,
-) -> tuple[dict[str, Path], list[np.ndarray]]:
+) -> dict[str, Path]:
     """Write aggregate sparse per-cell data in Zarr format.
 
     This is the ``zarr × aggregate`` thin serializer.
     It consumes an ordered list of ``ChunkBundle`` objects and produces
-    a single corpus-scoped Zarr store with flat 1D buffers.
+    a single corpus-scoped Zarr store with flat 1D buffers. Size factors
+    are in a separate Parquet sidecar written by the caller after all chunks.
 
     Parameters
     ----------
@@ -160,8 +223,8 @@ def write_zarr_aggregate(
 
     Returns
     -------
-    tuple[dict[str, Path], list[np.ndarray]]
-        ``(paths_dict, size_factors_out_list)``.
+    dict[str, Path]
+        ``paths_dict`` containing ``{"indices": ..., "counts": ..., "row_offsets": ..., "meta": ...}``.
     """
     import zarr
 
@@ -225,14 +288,9 @@ def write_zarr_aggregate(
             indent=2,
         )
 
-    size_factors_out_list = [b.size_factors for b in bundles]
-
-    return (
-        {
-            "indices": indices_path,
-            "counts": counts_path,
-            "row_offsets": row_offsets_path,
-            "meta": meta_path,
-        },
-        size_factors_out_list,
-    )
+    return {
+        "indices": indices_path,
+        "counts": counts_path,
+        "row_offsets": row_offsets_path,
+        "meta": meta_path,
+    }

@@ -60,13 +60,16 @@ else:
 
 ### 2.3 Recovery Application
 
-When `uses_recovery == True`, Stage 2 applies the approved reverse-normalization path **during materialization only**. The approved path is:
+When `uses_recovery == True`, Stage 2 applies vectorized reverse-normalization inside `_translate_chunk()` using a **temporary expm1 CSR matrix** — no full-matrix densification. The caller passes `needs_recovery=True` based on Stage 1's `uses_recovery` decision.
+
+The approved path is:
 
 ```
-recovered_row = expm1(source_row) / min_nonzero_expm1(source_row)
+expm1_data = expm1(source_nonzeros)
+recovered = rint(expm1_data / row_min_expm1)   # row_min_expm1 per-row over actual nonzero entries
 ```
 
-This is applied per-row on the selected matrix. The **recovered integer count matrix** is what is written to storage. Recovery metadata (scale factors) is NOT persisted — only the final integer counts.
+The **recovered integer count matrix** is what is written to storage. Recovery metadata (scale factors) is NOT persisted — only the final integer counts.
 
 ### 2.4 Integer Verification
 
@@ -140,7 +143,7 @@ All heavy-row storage uses **sparse representation** (CSR/CSC or equivalent). De
 - **Path**: `{metadata_root}/{release_id}-size-factor.parquet`
 - **Schema**:
   - `size_factor`: `float64` — one row per cell, ordered to match the heavy-row ordering
-- **Content**: Per-cell size factor computed as `row_sum / median(row_sum)` post-recovery, using the Stage 1-approved count source
+- **Content**: Per-cell size factor computed as `row_sum / global_median(row_sum)` after all chunks are written — `ChunkBundle.row_sums` (raw float64 per-cell sums) are accumulated chunk-wise during the chunk loop, a global median is computed across all cells, and the normalized size factors are written in a single pass after the loop
 - **Rationale**: Size factors are stored in a separate Parquet to keep the cells heavy-row parquet free of non-count data; runtime loaders read this sidecar to provide per-row normalization context
 - **No `size_factor` column in the cells parquet itself** — the cells parquet schema is strictly `['global_row_index', 'expressed_gene_indices', 'expression_counts']` following `HEAVY_CELL_SCHEMA`
 
@@ -169,7 +172,7 @@ The **dataset-local feature order is the authoritative feature order** for this 
 - **Content**:
   - `hvg.npy`: `int32` array of dataset-local feature indices selected as HVGs
   - `nonhvg.npy`: `int32` array of the complement (all other feature indices)
-- **Selection method**: Top-N dispersion (`variance / mean` of log1p(counts), computed on a sampled cell subset)
+- **Selection method**: Top-N dispersion (`variance / mean` of log1p(counts), computed via exact all-cells streaming accumulation using `np.add.at` during the chunk loop — no sampling)
 - **N default**: 2000 (configurable via `n_hvg` parameter)
 - **HVG indices are in dataset-local feature space** — they are NOT token IDs or global feature indices
 
@@ -364,7 +367,7 @@ All 5 backends consume a shared translation layer (`perturb_data_lab/materialize
 
 The shared `ChunkBundle` carries exactly 6 fields:
 - `table`: `pa.Table` with heavy-row list-arrays (`global_row_index`, `expressed_gene_indices`, `expression_counts`) following `HEAVY_CELL_SCHEMA`
-- `size_factors`: `np.ndarray` (float32) of median-normalized per-cell size factors, computed inline during the same CSR traversal — no writer computes its own size factors
+- `row_sums`: `np.ndarray` (float64) of raw (un-normalized) per-cell row sums — the caller accumulates these across chunks, computes the global median, and writes globally-normalized size factors to a separate Parquet sidecar after the loop
 - `indptr`: raw CSR indptr array (int64) for backends that need flat-buffer access (Zarr, WebDataset)
 - `indices`: raw **dataset-local** gene indices array (int32) — no canonical gene mapping is applied at this stage; canonical mapping is deferred to Stage 3
 - `counts`: raw expression counts array (int32)
@@ -380,7 +383,7 @@ The `metadata_table` field has been removed. Per-cell metadata is written by the
 
 - The **default route** is **`arrow-parquet` × `federated`** — this is the default and must always work.
 - `backend` and `topology` are separate manifest fields, not fused into a single route name.
-- Size factors are stored in a separate Parquet sidecar (`{release_id}-size-factor.parquet`), not inline in the heavy-row parquet. `_translate_chunk()` computes size factors inline during CSR traversal.
+- Size factors are stored in a separate Parquet sidecar (`{release_id}-size-factor.parquet`), not inline in the heavy-row parquet. `_translate_chunk()` computes raw `row_sums` (float64) per chunk; the caller accumulates them into a global array, computes the global median, and produces `size_factor = row_sum / global_median` after all chunks are written.
 - No new SQLite artifacts are emitted on the active Stage 2 path.
 - `lance` uses direct `lance.write_dataset()` — no `lancedb` dependency.
 

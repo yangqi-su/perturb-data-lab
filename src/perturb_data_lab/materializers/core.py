@@ -15,6 +15,7 @@ Never write to protected symlink roots (data/, pertTF/, perturb/).
 
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 from dataclasses import dataclass
@@ -30,6 +31,35 @@ import scipy.sparse as sp
 from scipy.sparse import csr_matrix, issparse
 
 from .backends import build_backend_fn
+
+
+def _safe_serialize(val: Any) -> Any:
+    """Serialize a value to a JSON-safe representation.
+
+    Handles numpy scalars, pandas NA/NaN, and other common types
+    that json.dumps cannot serialize directly.
+    """
+    if val is None or (isinstance(val, float) and (val != val)):  # NaN check
+        return None
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    if isinstance(val, (np.floating,)):
+        return float(val)
+    if isinstance(val, (np.bool_,)):
+        return bool(val)
+    if hasattr(val, "item"):
+        return val.item()
+    if isinstance(val, pd.CategoricalDtype):
+        return str(val)
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, (str, int, float, bool)):
+        return val
+    return str(val)
+
 from .models import (
     CellMetadataRecord,
     CorpusIndexDocument,
@@ -88,6 +118,10 @@ class Stage2Materializer:
         as the gating artifact.
     n_hvg : int, default 2000
         Number of top-dispersion genes to select as HVGs.
+    chunk_rows : int, default 100000
+        Number of rows per chunk when streaming the count matrix through the
+        write path. Larger values reduce the number of loop iterations but
+        increase per-chunk memory. Must be positive.
     corpus_index_path : str | None, default None
         Path to ``corpus-index.yaml`` for corpus registration. Required when
         ``register=True``. When provided, the corpus ledger
@@ -128,6 +162,7 @@ class Stage2Materializer:
         topology: str = "federated",
         rerun_stage1: bool = False,
         n_hvg: int = 2000,
+        chunk_rows: int = 100_000,
         corpus_index_path: str | None = None,
         corpus_id: str | None = None,
         register: bool = False,
@@ -141,6 +176,7 @@ class Stage2Materializer:
         self.topology = topology
         self.rerun_stage1 = rerun_stage1
         self.n_hvg = n_hvg
+        self.chunk_rows = chunk_rows
         self.corpus_index_path = corpus_index_path
         self.corpus_id = corpus_id
         self.register = register
@@ -200,24 +236,6 @@ class Stage2Materializer:
                 var_ref = adata.var
                 var_index = adata.var.index
 
-            # --- Select count matrix ---
-            if count_source.selected == ".raw.X":
-                count_matrix = adata.raw.X
-            elif count_source.selected.startswith(".layers["):
-                layer_name = count_source.selected[len(".layers[") : -1]
-                count_matrix = adata.layers[layer_name]
-            else:
-                count_matrix = adata.X
-
-            # --- Apply approved recovery ---
-            if count_source.uses_recovery:
-                count_matrix = self._apply_reverse_normalization(
-                    count_matrix, adata, count_source.selected, n_obs
-                )
-
-            # --- Integer verification (post-recovery) ---
-            self._verify_integer(count_matrix, source_h5ad.name)
-
             # --- Ensure output directories exist ---
             meta_root = Path(self.output_roots.metadata_root)
             matrix_root = Path(self.output_roots.matrix_root)
@@ -253,18 +271,22 @@ class Stage2Materializer:
                 source_path=str(source_h5ad),
             )
 
+            # --- Select count matrix from the approved count source ---
+            count_matrix = self._select_count_matrix(adata, count_source.selected)
+
             # --- Write backend-specific sparse cell data ---
-            # Size factors are computed inline during the write pass (one scan, not two),
-            # then written as a separate Parquet. The backend returns
-            # ``(paths_dict, computed_normalized_factors)``.
-            backend_result: tuple[dict[str, Path], np.ndarray] | dict[str, Path]
+            # HVG statistics are accumulated during the chunk loop via np.add.at.
+            # Global size factors are computed after the loop from all row_sums.
+            # Both HVG arrays and size factors are written to sidecars after the loop.
+            backend_result: tuple[dict[str, Path], np.ndarray, Path] | dict[str, Path]
             backend_result = self._write_cells(
                 count_matrix=count_matrix,
                 adata=adata,
                 matrix_root=matrix_root,
+                needs_recovery=count_source.uses_recovery,
             )
             if isinstance(backend_result, tuple):
-                backend_paths, size_factors = backend_result
+                backend_paths, size_factors, hvg_sidecar_path = backend_result
                 size_factor_parquet_path = self._write_size_factor_parquet(
                     size_factors=size_factors,
                     cell_ids=adata.obs.index,
@@ -272,15 +294,8 @@ class Stage2Materializer:
                 )
             else:
                 backend_paths = backend_result
-                size_factor_parquet_path = None  # backend does not provide size factors
-
-            # --- Compute and write HVG arrays ---
-            hvg_sidecar_path = self._compute_and_write_hvg_arrays(
-                count_matrix=count_matrix,
-                n_vars=n_vars,
-                meta_root=meta_root,
-                n_hvg=self.n_hvg,
-            )
+                size_factor_parquet_path = None
+                hvg_sidecar_path = None
 
             # --- Run QA checks ---
             qa_metrics, all_passed = self._run_qa_checks(backend_paths, count_matrix)
@@ -434,72 +449,174 @@ class Stage2Materializer:
         else:
             return adata.X
 
-    def _apply_reverse_normalization(
+    def _write_raw_cell_metadata_parquet(
         self,
-        count_matrix: Any,
         adata: ad.AnnData,
-        selected_candidate: str,
-        n_obs: int,
-    ) -> np.ndarray:
-        """Apply the approved expm1/size_factor reverse-normalization path.
+        meta_root: Path,
+    ) -> Path:
+        """Write raw cell metadata (obs) as a Parquet sidecar.
 
-        Recovery is only called when the Stage 1 decision set ``uses_recovery=True``.
-        The approved path is: recovered = expm1(source_row) / min_nonzero_expm1(source_row)
-        per row.
+        Each row contains:
+        - cell_id: the obs index value (string)
+        - dataset_id: stable dataset identifier
+        - dataset_release: immutable release identifier
+        - raw_fields: JSON string of all obs fields for this cell
+
+        This is the Stage 2 Parquet replacement for the legacy SQLite
+        raw cell metadata store.
         """
-        recovered = np.zeros((n_obs, count_matrix.shape[1]), dtype=np.float64)
+        import pyarrow as pa
+        import pyarrow.parquet as pq
 
-        for i in range(n_obs):
-            row = count_matrix[i]
-            if hasattr(row, "toarray"):
-                row = np.asarray(row.toarray().ravel())
-            else:
-                row = np.asarray(row).ravel()
-            nonzero_mask = row != 0
-            if nonzero_mask.any():
-                expm1_vals = np.expm1(row[nonzero_mask])
-                min_nonzero = float(np.min(expm1_vals))
-                if min_nonzero <= 0:
-                    min_nonzero = 1.0
-                recovered[i, nonzero_mask] = expm1_vals / min_nonzero
+        parquet_path = meta_root / f"{self.release_id}-raw-obs.parquet"
+        obs = adata.obs
+        n = len(obs)
 
-        nonzero_mask = recovered != 0
-        if nonzero_mask.any():
-            deviations = np.abs(recovered[nonzero_mask] - np.rint(recovered[nonzero_mask]))
-            max_deviation = float(np.max(deviations))
-            if max_deviation > 0.01:
-                raise ValueError(
-                    f"reverse-normalization of {selected_candidate} produced "
-                    f"non-integer values (max_deviation={max_deviation:.6f}); "
-                    "recovery validation failed"
-                )
+        cell_ids = [str(idx) for idx in obs.index]
+        dataset_ids = [self.dataset_id] * n
+        dataset_releases = [self.release_id] * n
 
-        return np.rint(recovered).astype(np.int32)
+        # Efficiently build raw_fields as JSON strings per row.
+        # Use Series.to_list() for each column and avoid iterrows().
+        col_names = list(obs.columns)
+        col_lists = {col: obs[col].apply(_safe_serialize).to_list() for col in col_names}
 
-    def _verify_integer(self, count_matrix: Any, source_name: str) -> None:
-        """Fail hard if count matrix is not integer-like (max deviation > 1e-6)."""
-        sample_rows = min(32, count_matrix.shape[0])
-        indices = np.linspace(0, count_matrix.shape[0] - 1, num=sample_rows, dtype=int)
-        nonzero_values = []
-        for idx in indices:
-            row = count_matrix[idx]
-            if hasattr(row, "toarray"):
-                row = np.asarray(row.toarray().ravel())
-            else:
-                row = np.asarray(row).ravel()
-            nonzero_values.append(row[row != 0])
-        if not nonzero_values:
-            return
-        nonzero = np.concatenate(nonzero_values)
-        if nonzero.size == 0:
-            return
-        deviations = np.abs(nonzero - np.rint(nonzero))
-        if np.any(deviations > 1e-6):
-            raise ValueError(
-                f"count matrix in {source_name} contains non-integer values "
-                f"(max deviation {float(np.max(deviations)):.6f}); "
-                "materialization requires strict integer counts from the Stage 1 approved source."
-            )
+        raw_fields = [
+            json.dumps({col: col_lists[col][i] for col in col_names})
+            for i in range(n)
+        ]
+
+        table = pa.table({
+            "cell_id": pa.array(cell_ids, type=pa.string()),
+            "dataset_id": pa.array(dataset_ids, type=pa.string()),
+            "dataset_release": pa.array(dataset_releases, type=pa.string()),
+            "raw_fields": pa.array(raw_fields, type=pa.string()),
+        })
+        pq.write_table(table, parquet_path)
+        return parquet_path
+
+    def _write_raw_feature_metadata_parquet(
+        self,
+        var_mem: pd.DataFrame,
+        meta_root: Path,
+    ) -> Path:
+        """Write raw feature metadata (var) as a Parquet sidecar.
+
+        Each row contains:
+        - origin_index: the feature index in the original var ordering
+        - feature_id: the var index value (gene identifier)
+        - raw_var: JSON string of all var fields for this feature
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        parquet_path = meta_root / f"{self.release_id}-raw-var.parquet"
+        n = len(var_mem)
+
+        origin_indices = list(range(n))
+        feature_ids = [str(idx) for idx in var_mem.index]
+
+        # Efficient vectorized approach: column-wise apply, then combine
+        col_names = list(var_mem.columns)
+        col_lists = {col: var_mem[col].apply(_safe_serialize).to_list() for col in col_names}
+
+        raw_var = [
+            json.dumps({col: col_lists[col][i] for col in col_names})
+            for i in range(n)
+        ]
+
+        table = pa.table({
+            "origin_index": pa.array(origin_indices, type=pa.int32()),
+            "feature_id": pa.array(feature_ids, type=pa.string()),
+            "raw_var": pa.array(raw_var, type=pa.string()),
+        })
+        pq.write_table(table, parquet_path)
+        return parquet_path
+
+    def _write_metadata_summary(
+        self,
+        adata: ad.AnnData,
+        var_mem: pd.DataFrame,
+        meta_root: Path,
+    ) -> Path:
+        """Write a per-dataset metadata summary YAML file.
+
+        Summarizes field-level coverage statistics (null fractions, dtypes)
+        extracted from the raw obs/var before any canonical mapping.
+        """
+        obs = adata.obs
+
+        obs_null_fractions: dict[str, float] = {}
+        obs_dtypes: dict[str, str] = {}
+        for col in obs.columns:
+            obs_null_fractions[col] = float(obs[col].isna().mean())
+            obs_dtypes[col] = str(obs[col].dtype)
+
+        var_null_fractions: dict[str, float] = {}
+        var_dtypes: dict[str, str] = {}
+        for col in var_mem.columns:
+            var_null_fractions[col] = float(var_mem[col].isna().mean())
+            var_dtypes[col] = str(var_mem[col].dtype)
+
+        summary = DatasetMetadataSummary(
+            kind="dataset-metadata-summary",
+            contract_version=CONTRACT_VERSION,
+            dataset_id=self.dataset_id,
+            release_id=self.release_id,
+            source_path=self.source_path,
+            obs_field_count=len(obs.columns),
+            var_field_count=len(var_mem.columns),
+            obs_null_fractions=obs_null_fractions,
+            var_null_fractions=var_null_fractions,
+            obs_dtypes=obs_dtypes,
+            var_dtypes=var_dtypes,
+            obs_rows=len(obs),
+            var_rows=len(var_mem),
+            obs_index_name=str(obs.index.name or "index"),
+            var_index_name=str(var_mem.index.name or "index"),
+            notes=(
+                f"materialized via Stage2Materializer (schema-independent)",
+            ),
+        )
+
+        summary_path = meta_root / f"{self.release_id}-metadata-summary.yaml"
+        summary.write_yaml(summary_path)
+        return summary_path
+
+    def _write_feature_provenance_parquet(
+        self,
+        var_index: pd.Index,
+        n_vars: int,
+        meta_root: Path,
+        count_source_selected: str = ".X",
+        source_path: str = "",
+    ) -> Path:
+        """Write a feature provenance Parquet recording feature ID ordering.
+
+        Tracks the per-dataset feature ordering (origin_index in original dataset
+        var order) and provenance info (source h5ad, count source selected).
+        Used by canonicalize-meta to rebuild the corpus feature set.
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        parquet_path = meta_root / f"{self.release_id}-feature-provenance.parquet"
+
+        origin_indices = list(range(n_vars))
+        feature_ids = [str(var_index[i]) for i in range(n_vars)]
+
+        table = pa.table({
+            "origin_index": pa.array(origin_indices, type=pa.int32()),
+            "feature_id": pa.array(feature_ids, type=pa.string()),
+            "count_source": pa.array(
+                [count_source_selected] * n_vars, type=pa.string()
+            ),
+            "source_path": pa.array(
+                [source_path] * n_vars, type=pa.string()
+            ),
+        })
+        pq.write_table(table, parquet_path)
+        return parquet_path
 
     def _write_size_factor_parquet(
         self,
@@ -534,92 +651,21 @@ class Stage2Materializer:
         all_passed = all(m.passed() for m in metrics)
         return tuple(metrics), all_passed
 
-    def _compute_and_write_hvg_arrays(
-        self,
-        count_matrix: Any,
-        n_vars: int,
-        meta_root: Path,
-        n_hvg: int = 2000,
-    ) -> Path:
-        """Compute HVG/non-HVG index arrays in dataset-local feature space and write as NumPy.
-
-        Uses batched row access for sparse matrices to avoid O(sample_cells)
-        individual row slices on large backed datasets.
-        """
-        from scipy.sparse import issparse
-
-        sidecar_dir = meta_root / "hvg_sidecar"
-        sidecar_dir.mkdir(parents=True, exist_ok=True)
-
-        n_obs = count_matrix.shape[0]
-        sample_cells = min(512, n_obs)
-
-        log_expr = np.zeros((sample_cells, n_vars), dtype=np.float64)
-
-        # Check if backed anndata _CSRDataset (class name check avoids import)
-        is_backed_csr = count_matrix.__class__.__name__ == "_CSRDataset"
-        if is_backed_csr or issparse(count_matrix):
-            # Sample a contiguous block and extract in one batch CSR conversion.
-            # For large datasets this avoids O(sample_cells) individual row slices.
-            start_idx = max(0, (n_obs - sample_cells) // 2)
-            end_idx = start_idx + sample_cells
-            batch = count_matrix[start_idx:end_idx].tocsr()
-            batch_indptr = batch.indptr
-            batch_data = batch.data.astype(np.float64)
-            batch_indices = batch.indices
-            for local_i in range(sample_cells):
-                j_start = batch_indptr[local_i]
-                j_end = batch_indptr[local_i + 1]
-                for j_pos in range(j_start, j_end):
-                    log_expr[local_i, batch_indices[j_pos]] = np.log1p(batch_data[j_pos])
-        else:
-            # Dense path
-            cell_indices = np.linspace(0, n_obs - 1, num=sample_cells, dtype=int)
-            for row_i, ci in enumerate(cell_indices):
-                row = np.asarray(count_matrix[ci]).ravel()
-                nonzero_mask = row != 0
-                for idx in np.where(nonzero_mask)[0]:
-                    log_expr[row_i, idx] = np.log1p(float(row[idx]))
-
-        gene_means = np.zeros(n_vars, dtype=np.float64)
-        gene_vars = np.zeros(n_vars, dtype=np.float64)
-        for j in range(n_vars):
-            col = log_expr[:, j]
-            nonzero = col[col > 0]
-            if len(nonzero) > 0:
-                gene_means[j] = np.mean(nonzero)
-                gene_vars[j] = np.var(nonzero)
-
-        eps = 1e-10
-        dispersion = np.where(gene_means > eps, gene_vars / gene_means, 0.0)
-
-        sorted_indices = np.argsort(dispersion)
-        hvg_indices: np.ndarray = sorted_indices[-n_hvg:].astype(np.int32)
-        hvg_indices = np.sort(hvg_indices)
-
-        hvg_set = set(hvg_indices)
-        nonhvg_indices = np.array(
-            [j for j in range(n_vars) if j not in hvg_set], dtype=np.int32
-        )
-
-        np.save(str(sidecar_dir / "hvg.npy"), hvg_indices, allow_pickle=False)
-        np.save(str(sidecar_dir / "nonhvg.npy"), nonhvg_indices, allow_pickle=False)
-
-        return sidecar_dir
-
     def _write_cells(
         self,
         count_matrix: Any,
         adata: ad.AnnData,
         matrix_root: Path,
-    ) -> tuple[dict[str, Path], np.ndarray] | dict[str, Path]:
+        *,
+        needs_recovery: bool = False,
+    ) -> tuple[dict[str, Path], np.ndarray, Path] | dict[str, Path]:
         """Write sparse cell data using the configured backend and topology.
 
         This method dispatches to either ``_write_cells_federated`` (single dataset)
         or ``_write_cells_aggregate`` (multi-dataset corpus) based on ``self.topology``.
 
-        Size factors are computed inline by ``_translate_chunk()`` during the same
-        CSR traversal as sparse translation — one pass, not two.
+        HVG accumulation and global size factor computation are done during the
+        chunk loop; both are finalized and written to sidecars after the loop.
         """
         if self.topology == "aggregate":
             raise NotImplementedError(
@@ -628,26 +674,32 @@ class Stage2Materializer:
                 "and passes them to the aggregate writer. "
                 "Use federated topology for single-dataset materialization."
             )
-        return self._write_cells_federated(count_matrix, adata, matrix_root)
+        return self._write_cells_federated(
+            count_matrix, adata, matrix_root, needs_recovery=needs_recovery
+        )
 
     def _write_cells_federated(
         self,
         count_matrix: Any,
         adata: ad.AnnData,
         matrix_root: Path,
-    ) -> tuple[dict[str, Path], np.ndarray]:
+        *,
+        needs_recovery: bool = False,
+    ) -> tuple[dict[str, Path], np.ndarray, Path]:
         """Write federated (single-dataset) sparse cell data.
 
         Loops over the count matrix in chunks, calls ``_translate_chunk()`` per chunk,
-        and passes each ``ChunkBundle`` to the thin backend serializer.
+        accumulates row sums and HVG statistics during the loop, then computes
+        global size factors and finalizes HVG selection after the loop.
 
-        Returns ``(paths_dict, size_factors_array)``.
+        Returns ``(paths_dict, size_factors_array, hvg_sidecar_dir)``.
         """
-        from .chunk_translation import DatasetSpec, _translate_chunk
+        from .chunk_translation import DatasetSpec, _finalize_hvg, _translate_chunk
 
         backend_fn = build_backend_fn(self.backend, "federated")
 
         n_obs = count_matrix.shape[0]
+        n_vars = count_matrix.shape[1]
 
         # Build DatasetSpec for this dataset.
         # For federated topology, global_row_start=0 (single-dataset corpus).
@@ -657,19 +709,28 @@ class Stage2Materializer:
             file_path=Path(self.source_path),
             rows=n_obs,
             pairs=0,  # computed from obs if needed
-            local_vocabulary_size=count_matrix.shape[1],
+            local_vocabulary_size=n_vars,
             nnz_total=int(count_matrix.nnz) if hasattr(count_matrix, "nnz") else 0,
             global_row_start=0,
             global_row_stop=n_obs,
         )
 
-        CHUNK_ROWS = 100_000  # rows per chunk
-
+        # --- Streaming accumulators ---
         all_paths: dict[str, Path] = {}
-        all_size_factors_list: list[np.ndarray] = []
+        all_row_sums: list[np.ndarray] = []
+        sum_log1p = np.zeros(n_vars, dtype=np.float64)
+        sum_log1p_sq = np.zeros(n_vars, dtype=np.float64)
+        n_cells_total = 0
 
-        for chunk_start in range(0, n_obs, CHUNK_ROWS):
-            chunk_end = min(chunk_start + CHUNK_ROWS, n_obs)
+        # --- Stateful writer for multi-chunk streaming ---
+        # A single writer_state is used across all backends. backend_fn (the
+        # thin wrapper from backends/__init__.py) handles backend-specific
+        # state initialization, streaming writes, and finalization.
+        writer_state: dict | None = None
+
+        for chunk_start in range(0, n_obs, self.chunk_rows):
+            chunk_end = min(chunk_start + self.chunk_rows, n_obs)
+            is_last = (chunk_end == n_obs)
 
             # Slice the CSR matrix chunk.
             if hasattr(count_matrix, "local_slice"):
@@ -682,21 +743,70 @@ class Stage2Materializer:
                 dataset=dataset_spec,
                 matrix_chunk=matrix_chunk,
                 chunk_start=chunk_start,
+                needs_recovery=needs_recovery,
             )
 
-            # Call the thin backend serializer.
-            paths, size_factors = backend_fn(
+            # Accumulate row sums for global size factor computation.
+            all_row_sums.append(bundle.row_sums)
+
+            # Accumulate HVG statistics via np.add.at on dataset-local indices.
+            log1p_counts = np.log1p(bundle.counts.astype(np.float64))
+            np.add.at(sum_log1p, bundle.indices, log1p_counts)
+            np.add.at(sum_log1p_sq, bundle.indices, log1p_counts ** 2)
+            n_cells_total += bundle.row_count
+
+            # Call the thin backend serializer with state management.
+            # backend_fn returns (paths_dict, state_or_none).
+            # On first chunk: writer_state is None, writer opens/initializes.
+            # On subsequent chunks: writer_state passed back, writer reuses/appends.
+            # On last chunk: _is_last_chunk=True, writer closes/commits, returns None.
+            cell_ids_chunk: tuple[str, ...] | None = None
+            if self.backend == "webdataset":
+                cell_ids_chunk = tuple(adata.obs.index[chunk_start:chunk_end])
+
+            paths, writer_state = backend_fn(
                 bundle=bundle,
                 release_id=self.release_id,
                 matrix_root=matrix_root,
+                _writer_state=writer_state,
+                _is_last_chunk=is_last,
+                cell_ids=cell_ids_chunk,
+                dataset_id=self.dataset_id,
             )
+
             all_paths.update(paths)
-            all_size_factors_list.append(size_factors)
 
-        # Concatenate all size factor arrays.
-        all_size_factors = np.concatenate(all_size_factors_list) if all_size_factors_list else np.array([])
+        # --- After loop: compute GLOBAL size factors from all row sums ---
+        global_row_sums = np.concatenate(all_row_sums)
+        global_median = float(np.median(global_row_sums))
+        if global_median > 0:
+            size_factors = global_row_sums / global_median
+        else:
+            size_factors = np.ones_like(global_row_sums)
+        size_factors = np.where(size_factors <= 0, 1.0, size_factors)
+        size_factors = np.where(np.isnan(size_factors), 1.0, size_factors)
+        size_factors = size_factors.astype(np.float32)
 
-        return (all_paths, all_size_factors)
+        # --- After loop: write size factor Parquet sidecar ---
+        size_factor_parquet_path = self._write_size_factor_parquet(
+            size_factors=size_factors,
+            cell_ids=adata.obs.index,
+            meta_root=Path(self.output_roots.metadata_root),
+        )
+
+        # --- After loop: compute Seurat-style HVG from streaming accumulators ---
+        hvg_indices, nonhvg_indices = _finalize_hvg(
+            sum_log1p, sum_log1p_sq, n_cells_total, n_vars, n_hvg=self.n_hvg
+        )
+
+        # --- After loop: write HVG sidecar ---
+        meta_root = Path(self.output_roots.metadata_root)
+        hvg_sidecar_dir = meta_root / "hvg_sidecar"
+        hvg_sidecar_dir.mkdir(parents=True, exist_ok=True)
+        np.save(str(hvg_sidecar_dir / "hvg.npy"), hvg_indices, allow_pickle=False)
+        np.save(str(hvg_sidecar_dir / "nonhvg.npy"), nonhvg_indices, allow_pickle=False)
+
+        return (all_paths, size_factors, hvg_sidecar_dir)
 
     def _write_cells_aggregate(
         self,

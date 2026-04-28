@@ -24,6 +24,7 @@ Backend name in registry: ``arrow-parquet``.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -36,13 +37,15 @@ def write_arrow_parquet_federated(
     bundle: ChunkBundle,
     release_id: str,
     matrix_root: Path,
-) -> tuple[dict[str, Path], np.ndarray]:
-    """Write a single-chunk ``ChunkBundle`` as an Arrow Parquet file.
+    *,
+    _writer_state: dict[str, Any] | None = None,
+    _is_last_chunk: bool = False,
+) -> tuple[dict[str, Path], dict | None]:
+    """Stream ChunkBundle tables to a single Parquet file.
 
-    This is the ``arrow-parquet × federated`` thin serializer.
-    It accepts a ``ChunkBundle`` from ``_translate_chunk()`` and writes the
-    heavy-row ``table`` directly to Parquet. Size factors are returned to the
-    caller for separate sidecar write.
+    On first call (_writer_state is None): open writer and store in state dict.
+    On subsequent calls: reuse the open writer from state.
+    On last call (_is_last_chunk=True): close writer and return None for writer_state.
 
     Parameters
     ----------
@@ -52,22 +55,49 @@ def write_arrow_parquet_federated(
         Release identifier used for output file naming.
     matrix_root : Path
         Output directory for matrix artifacts.
+    _writer_state : dict | None
+        Writer state dict carrying the open ParquetWriter across chunks.
+        None on first chunk — a new writer is opened.
+    _is_last_chunk : bool
+        True when this is the final chunk — closes the writer and returns None.
 
     Returns
     -------
-    tuple[dict[str, Path], np.ndarray]
-        ``(paths_dict, size_factors_array)`` where paths_dict contains
-        ``{"cells": cells_parquet_path}``. The size_factors_array contains
-        median-normalized per-cell factors (clamped at >0, NaN-safe).
+    tuple[dict[str, Path], dict | None]
+        ``({"cells": cells_parquet_path}, writer_state_or_None)``.
+        On last chunk the second element is None.
     """
     matrix_root.mkdir(parents=True, exist_ok=True)
     cell_path = matrix_root / f"{release_id}-cells.parquet"
 
-    writer = pq.ParquetWriter(cell_path, bundle.table.schema)
-    writer.write_table(bundle.table)
-    writer.close()
+    if _writer_state is None:
+        # First chunk: open writer
+        writer = pq.ParquetWriter(cell_path, bundle.table.schema)
+        _writer_state = {"writer": writer, "cell_path": cell_path}
+    else:
+        writer = _writer_state["writer"]
 
-    return ({"cells": cell_path}, bundle.size_factors)
+    writer.write_table(bundle.table)
+
+    if _is_last_chunk:
+        writer.close()
+        return {"cells": cell_path}, None
+    else:
+        return {"cells": cell_path}, _writer_state
+
+
+def _append_arrow_parquet(
+    cell_path: Path,
+    table: pa.Table,
+) -> None:
+    """Append a single-chunk ``pa.Table`` to an existing Arrow Parquet file.
+
+    Uses streaming write mode (no schema mutation allowed after first write).
+    The file must already exist with a valid schema.
+    """
+    writer = pq.ParquetWriter(cell_path, table.schema, mode="a")
+    writer.write_table(table)
+    writer.close()
 
 
 def read_arrow_parquet_cell(
@@ -111,7 +141,7 @@ def read_arrow_parquet_cell(
 def write_arrow_parquet_aggregate(
     bundles: list[ChunkBundle],
     matrix_root: Path,
-) -> tuple[dict[str, Path], list[np.ndarray]]:
+) -> dict[str, Path]:
     """Write aggregate sparse per-cell data as a single Arrow Parquet file.
 
     This is the ``arrow-parquet × aggregate`` thin serializer.
@@ -129,24 +159,20 @@ def write_arrow_parquet_aggregate(
 
     Returns
     -------
-    tuple[dict[str, Path], list[np.ndarray]]
-        ``(paths_dict, size_factors_list)`` where paths_dict contains
-        ``{"cells": cells_parquet_path}``. size_factors_list contains the
-        computed size factors for each dataset.
+    dict[str, Path]
+        ``paths_dict`` containing ``{"cells": cells_parquet_path}``.
     """
     matrix_root.mkdir(parents=True, exist_ok=True)
     cell_path = matrix_root / "aggregated-cells.parquet"
 
     writer: pq.ParquetWriter | None = None
-    size_factors_out_list: list[np.ndarray] = []
 
     for bundle in bundles:
         if writer is None:
             writer = pq.ParquetWriter(cell_path, bundle.table.schema)
         writer.write_table(bundle.table)
-        size_factors_out_list.append(bundle.size_factors)
 
     if writer is not None:
         writer.close()
 
-    return ({"cells": cell_path}, size_factors_out_list)
+    return {"cells": cell_path}
