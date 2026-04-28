@@ -1,13 +1,31 @@
-"""Phase 4/8 training-facing loaders and samplers."""
+"""Phase 3 refactored loaders package."""
 
+from .executor import BatchExecutor
+from .expression import (
+    AggregateLanceReader,
+    AggregateZarrReader,
+    ArrowIpcDatasetEntry,
+    BaseExpressionReader,
+    DatasetEntry,
+    ExpressionReader,
+    ExpressionRow,
+    FederatedArrowIpcReader,
+    FederatedLanceReader,
+    FederatedParquetReader,
+    FederatedWebDatasetReader,
+    FederatedZarrReader,
+    LanceDatasetEntry,
+    ParquetDatasetEntry,
+    WebDatasetEntry,
+    ZarrDatasetEntry,
+    build_expression_reader,
+)
+from .index import MetadataIndex, MetadataRow
 from .loaders import (
-    ArrowHFCellReader,
-    ArrowIpcCellReader,
-    BackendCellReader,
     CellIdentity,
     CellState,
-    CorpusRandomBatchSampler,
     CPUDenseRuntimePath,
+    CorpusRandomBatchSampler,
     DatasetBatchSampler,
     DatasetContextBatchSampler,
     DatasetContextKey,
@@ -15,63 +33,68 @@ from .loaders import (
     GlobalFeatureResolver,
     GPUSparseRuntimePath,
     HVGRandomSampler,
-    LanceCellReader,
-    MetadataTable,
     PerturbDataLoader,
     PerturbIterableDataset,
-    PreloadedFeatureObjects,
     RandomContextSampler,
     ResolvedSparseBatch,
     SamplerState,
     SparseBatchCollator,
     SparseBatchPayload,
-    WebDatasetCellReader,
-    ZarrCellReader,
-    AVAILABLE_READERS,
-    build_cell_reader,
 )
 from .corpus import (
-    CorpusLoader,
-    DatasetReaderEntry,
-    build_corpus_loader,
     read_raw_obs_parquet,
     read_raw_var_parquet,
 )
 
 __all__ = [
+    # Phase 1 — MetadataIndex
+    "MetadataIndex",
+    "MetadataRow",
+    # Phase 2 — ExpressionReader (backend-agnostic)
+    "ExpressionRow",
+    "ExpressionReader",
+    "BaseExpressionReader",
+    "DatasetEntry",
+    "AggregateLanceReader",
+    "FederatedLanceReader",
+    "AggregateZarrReader",
+    "FederatedZarrReader",
+    "FederatedArrowIpcReader",
+    "FederatedParquetReader",
+    "FederatedWebDatasetReader",
+    "LanceDatasetEntry",
+    "ZarrDatasetEntry",
+    "ArrowIpcDatasetEntry",
+    "ParquetDatasetEntry",
+    "WebDatasetEntry",
+    "build_expression_reader",
+    # Phase 3 — BatchExecutor
+    "BatchExecutor",
+    # Phase 3 — Core types
     "CellState",
     "CellIdentity",
     "DatasetContextKey",
-    "MetadataTable",
-    "PreloadedFeatureObjects",
-    "BackendCellReader",
-    "ArrowHFCellReader",
-    "ArrowIpcCellReader",
-    "LanceCellReader",
-    "WebDatasetCellReader",
-    "ZarrCellReader",
-    "build_cell_reader",
-    "AVAILABLE_READERS",
+    # Phase 3 — Collation
     "SparseBatchPayload",
     "ResolvedSparseBatch",
     "SparseBatchCollator",
     "GlobalFeatureResolver",
+    # Phase 3 — Samplers (MetadataIndex-backed)
     "CorpusRandomBatchSampler",
     "DatasetBatchSampler",
     "DatasetContextBatchSampler",
+    # Phase 3 — Runtime paths
     "CPUDenseRuntimePath",
     "GPUSparseRuntimePath",
     "SamplerState",
+    # Phase 3 — Sampler modes
     "RandomContextSampler",
     "ExpressedZerosSampler",
     "HVGRandomSampler",
+    # Phase 3 — Data loaders
     "PerturbDataLoader",
     "PerturbIterableDataset",
-    # Phase 5 corpus runtime loader
-    "CorpusLoader",
-    "DatasetReaderEntry",
-    "build_corpus_loader",
-    # Phase 5 readback helpers for Stage 2 Parquet sidecars
+    # Utilities
     "read_raw_obs_parquet",
     "read_raw_var_parquet",
 ]
