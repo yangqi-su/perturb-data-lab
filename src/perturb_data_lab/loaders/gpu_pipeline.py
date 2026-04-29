@@ -208,8 +208,11 @@ class GPUSparsePipeline:
         split_genes = list(torch.split(flat_gene_indices, split_sizes))
         split_cnts = list(torch.split(flat_counts, split_sizes))
 
+        # Pad with max_local_vocab (>= all valid local indices) so padding
+        # positions can be distinguished and mapped to a global sentinel.
+        _local_pad = self._max_local_vocab
         padded_local_genes = pad_sequence(
-            split_genes, batch_first=True, padding_value=0
+            split_genes, batch_first=True, padding_value=_local_pad
         )  # (batch_size, max_nnz)
         padded_counts = pad_sequence(
             split_cnts, batch_first=True, padding_value=0.0
@@ -218,7 +221,9 @@ class GPUSparsePipeline:
         max_nnz = int(padded_local_genes.shape[1])
 
         # ---- Local→Global resolution ----
-        # Clamp local indices to [0, max_local_vocab-1] for safe array indexing.
+        is_padding = padded_local_genes >= self._max_local_vocab
+
+        # Clamp local indices to [0, max_local_vocab-1] for safe indexing
         clamped = padded_local_genes.clamp(0, self._max_local_vocab - 1)
 
         # Advanced indexing: (n_datasets, max_local_vocab)[ds, local]
@@ -226,6 +231,15 @@ class GPUSparsePipeline:
         global_genes = local_to_global_t[
             dataset_indices.unsqueeze(1), clamped
         ]  # (batch_size, max_nnz)
+
+        # Set padding positions to a sentinel beyond all valid global gene IDs
+        # so they sort after real genes and never match searchsorted queries.
+        _global_sentinel = self._global_vocab  # beyond 0..global_vocab-1
+        global_genes = torch.where(
+            is_padding,
+            torch.full_like(global_genes, _global_sentinel),
+            global_genes,
+        )
 
         # ---- Sort global genes (and counts) for searchsorted ----
         global_genes_sorted, sort_idx = global_genes.sort(dim=1)
