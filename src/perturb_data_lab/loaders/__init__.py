@@ -50,6 +50,10 @@ from .feature_registry import (
     FeatureRegistry,
     GlobalGeneSampler,
 )
+from .gpu_pipeline import (
+    GPUSparsePipeline,
+    CPUPipeline,
+)
 
 __all__ = [
     # Phase 1 — MetadataIndex
@@ -103,6 +107,9 @@ __all__ = [
     # Phase 2 — Feature Registry
     "FeatureRegistry",
     "GlobalGeneSampler",
+    # Phase 3 — GPU Pipeline
+    "GPUSparsePipeline",
+    "CPUPipeline",
     # Utilities
     "read_raw_obs_parquet",
     "read_raw_var_parquet",
