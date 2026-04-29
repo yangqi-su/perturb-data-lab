@@ -30,6 +30,7 @@ from .loaders import (
     DatasetContextBatchSampler,
     DatasetContextKey,
     ExpressedZerosSampler,
+    ExpressionBatch,
     GlobalFeatureResolver,
     GPUSparseRuntimePath,
     HVGRandomSampler,
@@ -44,6 +45,10 @@ from .loaders import (
 from .corpus import (
     read_raw_obs_parquet,
     read_raw_var_parquet,
+)
+from .feature_registry import (
+    FeatureRegistry,
+    GlobalGeneSampler,
 )
 
 __all__ = [
@@ -73,6 +78,7 @@ __all__ = [
     # Phase 3 — Core types
     "CellState",
     "CellIdentity",
+    "ExpressionBatch",
     "DatasetContextKey",
     # Phase 3 — Collation
     "SparseBatchPayload",
@@ -94,6 +100,9 @@ __all__ = [
     # Phase 3 — Data loaders
     "PerturbDataLoader",
     "PerturbIterableDataset",
+    # Phase 2 — Feature Registry
+    "FeatureRegistry",
+    "GlobalGeneSampler",
     # Utilities
     "read_raw_obs_parquet",
     "read_raw_var_parquet",

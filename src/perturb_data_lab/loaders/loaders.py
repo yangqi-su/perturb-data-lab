@@ -19,6 +19,7 @@ import polars as pl
 __all__ = [
     "CellState",
     "CellIdentity",
+    "ExpressionBatch",
     "DatasetContextKey",
     "SparseBatchPayload",
     "ResolvedSparseBatch",
@@ -106,6 +107,49 @@ class CellState:
 
 
 @dataclass(frozen=True)
+class ExpressionBatch:
+    """Flat expression arrays for a batch — zero per-cell Python objects.
+
+    Designed as the output of ``BatchExecutor.read_expression_batch()``
+    to eliminate ``CellState`` tuple conversions in the hot path.
+
+    Fields
+    ------
+    batch_size : int
+        Number of cells in this batch.
+    global_row_index : np.ndarray
+        1-D int64 array of shape ``(batch_size,)``.
+    row_offsets : np.ndarray
+        1-D int64 array of shape ``(batch_size+1,)`` mapping row position
+        to a slice in the flat expression arrays.
+    expressed_gene_indices : np.ndarray
+        1-D int32 flat array of dataset-local gene indices.
+    expression_counts : np.ndarray
+        1-D int32 flat array of corresponding expression counts.
+    """
+
+    batch_size: int
+    global_row_index: np.ndarray  # (batch_size,) int64
+    row_offsets: np.ndarray  # (batch_size+1,) int64
+    expressed_gene_indices: np.ndarray  # flat int32
+    expression_counts: np.ndarray  # flat int32
+
+    def row_slice(self, row_position: int) -> slice:
+        """Return the slice into the flat expression arrays for *row_position*."""
+        start = int(self.row_offsets[row_position])
+        stop = int(self.row_offsets[row_position + 1])
+        return slice(start, stop)
+
+    def row_gene_indices(self, row_position: int) -> np.ndarray:
+        """Return the expressed gene indices array for a single row."""
+        return self.expressed_gene_indices[self.row_slice(row_position)]
+
+    def row_counts(self, row_position: int) -> np.ndarray:
+        """Return the expression counts array for a single row."""
+        return self.expression_counts[self.row_slice(row_position)]
+
+
+@dataclass(frozen=True)
 class SparseBatchPayload:
     """Flat sparse payload plus offsets for runtime-hot-path batch handling."""
 
@@ -165,7 +209,13 @@ class ResolvedSparseBatch:
 
 
 class SparseBatchCollator:
-    """Collate `CellState` rows into flat sparse payloads plus offsets."""
+    """Collate ``CellState`` rows into flat sparse payloads plus offsets.
+
+    The standard path accepts ``CellState`` objects (backward-compatible).
+    For hot-path optimization, use ``from_batch_dict()`` which directly
+    consumes the output of ``BatchExecutor.read_batch()`` with zero
+    per-cell Python object creation.
+    """
 
     def __call__(self, cells: Sequence[CellState]) -> SparseBatchPayload:
         row_offsets = [0]
@@ -201,6 +251,47 @@ class SparseBatchCollator:
             cell_id=tuple(cell.cell_id for cell in cells),
             canonical_perturbation=tuple(dict(cell.canonical_perturbation) for cell in cells),
             canonical_context=tuple(dict(cell.canonical_context) for cell in cells),
+        )
+
+    @classmethod
+    def from_batch_dict(cls, batch: dict) -> SparseBatchPayload:
+        """Build ``SparseBatchPayload`` from a ``read_batch()`` dict.
+
+        This path avoids all per-cell Python object allocations and
+        tuple conversions — expression data stays as numpy arrays
+        from Lance reader → collator.
+
+        Parameters
+        ----------
+        batch : dict
+            Output of ``BatchExecutor.read_batch()``.  Must contain keys:
+            ``batch_size``, ``global_row_index``, ``row_offsets``,
+            ``expressed_gene_indices``, ``expression_counts``,
+            ``dataset_index``, ``local_row_index``, ``size_factor``,
+            ``dataset_id``, ``cell_id``, ``canonical_perturbation``,
+            ``canonical_context``.
+
+        Returns
+        -------
+        SparseBatchPayload
+        """
+        return SparseBatchPayload(
+            batch_size=batch["batch_size"],
+            global_row_index=batch["global_row_index"].copy(),
+            dataset_index=batch["dataset_index"].copy(),
+            local_row_index=batch["local_row_index"].copy(),
+            row_offsets=batch["row_offsets"].copy(),
+            expressed_gene_indices=batch["expressed_gene_indices"].copy(),
+            expression_counts=batch["expression_counts"].copy(),
+            size_factor=batch["size_factor"].copy(),
+            dataset_id=tuple(batch["dataset_id"]),
+            cell_id=tuple(batch["cell_id"]),
+            canonical_perturbation=tuple(
+                dict(item) for item in batch["canonical_perturbation"]
+            ),
+            canonical_context=tuple(
+                dict(item) for item in batch["canonical_context"]
+            ),
         )
 
 
@@ -603,14 +694,32 @@ class RandomContextSampler:
     Produces a fixed-size gene subset uniformly at random from the full vocab,
     regardless of whether those genes are expressed. Used for baseline context
     training where the model learns to predict random missing genes.
+
+    ``sample_indices`` accepts either a ``CellState`` (backward-compatible)
+    or a raw ``np.ndarray`` of expressed gene indices for the hot path.
     """
 
     def __init__(self, state: SamplerState, rng: np.random.Generator):
         self.state = state
         self.rng = rng
 
-    def sample_indices(self, cell: CellState, context_size: int) -> np.ndarray:
-        """Return a random context of context_size gene indices."""
+    def sample_indices(
+        self,
+        cell_or_genes: CellState | np.ndarray,
+        context_size: int,
+    ) -> np.ndarray:
+        """Return a random context of *context_size* gene indices.
+
+        Parameters
+        ----------
+        cell_or_genes : CellState or np.ndarray
+            ``CellState`` for backward compatibility, or a numpy array
+            of expressed gene indices for the hot path.  This sampler
+            does not use expression data — it samples uniformly from
+            the full vocab regardless.
+        context_size : int
+            Number of random genes to sample.
+        """
         if context_size > self.state.n_genes:
             context_size = self.state.n_genes
         return self.rng.choice(
@@ -635,6 +744,9 @@ class ExpressedZerosSampler:
     Produces a mixed context with all expressed genes plus an equal count of
     randomly sampled unexpressed genes. Used for training on expressed+
     zero context so the model learns both signal and silence.
+
+    ``sample_indices`` accepts either a ``CellState`` (backward-compatible)
+    or a raw ``np.ndarray`` of expressed gene indices for the hot path.
     """
 
     def __init__(self, state: SamplerState, rng: np.random.Generator):
@@ -642,10 +754,25 @@ class ExpressedZerosSampler:
         self.rng = rng
 
     def sample_indices(
-        self, cell: CellState, max_context: int | None = None
+        self,
+        cell_or_genes: CellState | np.ndarray,
+        max_context: int | None = None,
     ) -> np.ndarray:
-        """Return expressed + equal zeros, capped at max_context."""
-        expressed = set(cell.expressed_gene_indices)
+        """Return expressed + equal zeros, capped at *max_context*.
+
+        Parameters
+        ----------
+        cell_or_genes : CellState or np.ndarray
+            ``CellState`` for backward compatibility, or a numpy array
+            of expressed gene indices for the hot path.
+        max_context : int, optional
+            Maximum context size.  If ``None``, uses the full vocabulary.
+        """
+        expressed = set(
+            cell_or_genes.expressed_gene_indices
+            if isinstance(cell_or_genes, CellState)
+            else cell_or_genes.tolist()
+        )
         n_expressed = len(expressed)
         max_zeros = (
             (max_context - n_expressed) // 2
@@ -678,6 +805,9 @@ class HVGRandomSampler:
     Produces a mixed context with highly variable genes plus randomly sampled
     non-HVG genes. Used for focusing training on variable genes while keeping
     a baseline representation of other genes.
+
+    ``sample_indices`` accepts either a ``CellState`` (backward-compatible)
+    or a raw ``np.ndarray`` of expressed gene indices for the hot path.
     """
 
     def __init__(self, state: SamplerState, rng: np.random.Generator):
@@ -685,11 +815,26 @@ class HVGRandomSampler:
         self.rng = rng
 
     def sample_indices(
-        self, cell: CellState, max_context: int | None = None
+        self,
+        cell_or_genes: CellState | np.ndarray,
+        max_context: int | None = None,
     ) -> np.ndarray:
-        """Return HVG + equal random non-HVG, capped at max_context."""
+        """Return HVG + equal random non-HVG, capped at *max_context*.
+
+        Parameters
+        ----------
+        cell_or_genes : CellState or np.ndarray
+            ``CellState`` for backward compatibility, or a numpy array
+            of expressed gene indices for the hot path.
+        max_context : int, optional
+            Maximum context size.  If ``None``, uses the full vocabulary.
+        """
         hvg_set = set(self.state.hvg_set)
-        expressed = set(cell.expressed_gene_indices)
+        expressed = set(
+            cell_or_genes.expressed_gene_indices
+            if isinstance(cell_or_genes, CellState)
+            else cell_or_genes.tolist()
+        )
         hvg_expressed = hvg_set & expressed
         n_hvg = len(hvg_expressed)
         max_nonhvg = (
