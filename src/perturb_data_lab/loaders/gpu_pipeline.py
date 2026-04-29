@@ -276,7 +276,8 @@ class GPUSparsePipeline:
         # Index into has_gene: (batch_size, global_vocab)[:, sampled_gid]
         valid_rows = has_gene_t[dataset_indices]  # (batch_size, global_vocab)
         safe_gids = sampled_gids.clamp(0, self._global_vocab - 1)
-        valid_mask = valid_rows.gather(1, safe_gids)  # (batch_size, seq_len)
+        in_vocab = (sampled_gids >= 0) & (sampled_gids < self._global_vocab)
+        valid_mask = valid_rows.gather(1, safe_gids) & in_vocab  # (batch_size, seq_len)
 
         # Replace invalid positions with sentinels
         final_gene_ids = torch.where(
@@ -431,7 +432,7 @@ class CPUPipeline:
 
         has_gene = self._registry.dataset_has_gene
 
-        # ---- Per-cell: resolve and gather ----
+        # ---- Per-cell: validate and gather ----
         for i in range(bsz):
             ds_idx = int(dataset_indices[i])
             start = int(row_offsets[i])
@@ -439,34 +440,38 @@ class CPUPipeline:
             cell_local = expressed_gene_indices[start:stop]
             cell_counts = expression_counts[start:stop]
 
-            # Handle zero-gene cells
-            if len(cell_local) == 0:
-                continue
-
-            # Map local→global
-            mapping_row = self._local_to_global[ds_idx]
-            cell_global = mapping_row[cell_local]
-
-            # Sort by global gene ID for O(log n) lookup
-            sort_idx = np.argsort(cell_global, kind="stable")
-            sorted_global = cell_global[sort_idx]
-            sorted_counts = cell_counts[sort_idx]
+            # Map local→global (may be empty for zero-gene cells)
+            if len(cell_local) > 0:
+                mapping_row = self._local_to_global[ds_idx]
+                cell_global = mapping_row[cell_local]
+                # Sort by global gene ID for O(log n) lookup
+                sort_idx = np.argsort(cell_global, kind="stable")
+                sorted_global = cell_global[sort_idx]
+                sorted_counts = cell_counts[sort_idx]
+            else:
+                sorted_global = np.array([], dtype=np.int32)
+                sorted_counts = np.array([], dtype=np.float32)
 
             for j in range(self._seq_len):
                 target = int(sids[i, j])
                 if target < 0:
                     continue  # pad position (from sampler)
 
-                # Check dataset validity (sampled gene may not be in this
-                # cell's dataset, e.g., padding from GlobalGeneSampler)
+                # Check dataset validity: gene must be in this cell's dataset
                 if target >= has_gene.shape[1] or not has_gene[ds_idx, target]:
-                    continue
+                    continue  # stays invalid (count = sentinel, valid_mask = False)
 
-                pos = int(np.searchsorted(sorted_global, target, side="left"))
-                if pos < len(sorted_global) and sorted_global[pos] == target:
-                    sampled_counts[i, j] = float(sorted_counts[pos])
-                    valid_mask[i, j] = True
-                    exact_match_mask[i, j] = True
+                # Gene is valid for this dataset
+                valid_mask[i, j] = True
+                # Default count is 0.0 (gene valid but not necessarily expressed)
+                sampled_counts[i, j] = 0.0
+
+                # Exact match: check if the gene is expressed in this cell
+                if len(sorted_global) > 0:
+                    pos = int(np.searchsorted(sorted_global, target, side="left"))
+                    if pos < len(sorted_global) and sorted_global[pos] == target:
+                        sampled_counts[i, j] = float(sorted_counts[pos])
+                        exact_match_mask[i, j] = True
 
         return {
             "batch_size": bsz,
