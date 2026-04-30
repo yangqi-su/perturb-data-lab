@@ -1,31 +1,35 @@
-"""Phase 4 smoke test: federated Lance corpus with all three sampler modes.
+"""Phase 4 smoke test: federated Lance corpus via PerturbBatchDataset + GPU pipeline.
 
-Exercises the full loader stack (MetadataIndex + FederatedLanceReader → BatchExecutor
-→ PerturbDataLoader/PerturbIterableDataset) on the federated Lance topology.
+Exercises the full hot path with federated reader:
+  BatchExecutor.read_batch() → PerturbBatchDataset → collate_batch_dict → GPUSparsePipeline
 
-Runs 10 batches per sampler mode and validates:
+Runs 10 batches per sampling mode and validates:
 - Batch sizes and shapes
-- canonical_perturbation and canonical_context populated correctly
-- No IndexError or ValueError from global/local index mismatch
 - Interleaved dataset batches are handled correctly
-- Both map-style and streaming APIs
+- Both aggregate-style and federated-specific edge cases
 """
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 import pytest
+import torch
+from torch.utils.data import DataLoader, BatchSampler, SequentialSampler
 
 from perturb_data_lab.loaders import (
     BatchExecutor,
     FederatedLanceReader,
+    FeatureRegistry,
+    GPUSparsePipeline,
     LanceDatasetEntry,
     MetadataIndex,
-    PerturbDataLoader,
-    PerturbIterableDataset,
-    SparseBatchPayload,
+    PerturbBatchDataset,
+    collate_batch_dict,
+    cpu_parallel_collate_fn,
 )
 
 # ===================================================================
@@ -39,20 +43,27 @@ _ARCHIVED_ROOT = (
 
 FEDERATED_BASE = _ARCHIVED_ROOT / "lance-federated"
 
+_VAR_00_PATH = str(
+    _ARCHIVED_ROOT / "lance-federated/dummy_00/metadata/dummy_00-release-raw-var.parquet"
+)
+_VAR_01_PATH = str(
+    _ARCHIVED_ROOT / "lance-federated/dummy_01/metadata/dummy_01-release-raw-var.parquet"
+)
+
+SEQ_LEN = 20
+BATCH_SIZE = 32
+N_BATCHES = 10
+RNG_SEED = 42
+
 
 def _fed_entries() -> list[LanceDatasetEntry]:
-    """Federated Lance entries for dummy_00 (50K) and dummy_01 (75K)."""
     return [
         LanceDatasetEntry(
-            "dummy_00",
-            0,
-            50_000,
+            "dummy_00", 0, 50_000,
             FEDERATED_BASE / "dummy_00/matrix/dummy_00-release.lance",
         ),
         LanceDatasetEntry(
-            "dummy_01",
-            50_000,
-            125_000,
+            "dummy_01", 50_000, 125_000,
             FEDERATED_BASE / "dummy_01/matrix/dummy_01-release.lance",
         ),
     ]
@@ -65,183 +76,93 @@ def _fed_entries() -> list[LanceDatasetEntry]:
 
 @pytest.fixture(scope="module")
 def meta() -> MetadataIndex:
-    """MetadataIndex for dummy_00 (50K) + dummy_01 (75K)."""
     return MetadataIndex.from_dummy_data()
 
 
 @pytest.fixture(scope="module")
 def fed_reader() -> FederatedLanceReader:
-    """FederatedLanceReader for dummy_00 + dummy_01."""
     return FederatedLanceReader(_fed_entries())
 
 
 @pytest.fixture(scope="module")
-def executor(
-    fed_reader: FederatedLanceReader, meta: MetadataIndex
-) -> BatchExecutor:
-    """BatchExecutor composing FederatedLanceReader + MetadataIndex."""
+def executor(fed_reader: FederatedLanceReader, meta: MetadataIndex) -> BatchExecutor:
     return BatchExecutor(fed_reader, meta)
 
 
-# ===================================================================
-# HVG set helper
-# ===================================================================
+@pytest.fixture(scope="module")
+def registry() -> FeatureRegistry:
+    var00 = pl.read_parquet(_VAR_00_PATH)
+    var01 = pl.read_parquet(_VAR_01_PATH)
+    return FeatureRegistry(named_var_dfs={"dummy_00": var00, "dummy_01": var01})
 
 
-def _build_hvg_set() -> tuple[int, ...]:
-    """Load HVG gene indices from dummy_00 + dummy_01 sidecar npy files."""
-    hvg_paths = [
-        _ARCHIVED_ROOT / "lance-federated/dummy_00/metadata/hvg_sidecar/hvg.npy",
-        _ARCHIVED_ROOT / "lance-federated/dummy_01/metadata/hvg_sidecar/hvg.npy",
-    ]
-    hvg_all: set[int] = set()
-    for p in hvg_paths:
-        arr = np.load(p)
-        hvg_all.update(int(x) for x in arr)
-    return tuple(sorted(hvg_all))
+@pytest.fixture(scope="module")
+def pipeline(registry: FeatureRegistry) -> GPUSparsePipeline:
+    return GPUSparsePipeline(registry, seq_len=SEQ_LEN)
 
 
 # ===================================================================
-# Shared validation helpers
-# ===================================================================
-
-
-def _validate_batch_item(item: dict, sampler_mode: str) -> None:
-    """Validate a single item dict returned by PerturbDataLoader."""
-    assert "expressed_gene_indices" in item
-    assert "expression_counts" in item
-    assert "context_indices" in item
-    assert "cell_id" in item
-    assert "dataset_id" in item
-    assert "dataset_index" in item
-    assert "global_row_index" in item
-    assert "size_factor" in item
-    assert "canonical_perturbation" in item
-    assert "canonical_context" in item
-
-    assert isinstance(item["cell_id"], str)
-    assert isinstance(item["dataset_id"], str)
-    assert item["dataset_index"] in (0, 1)
-    assert 0 <= item["global_row_index"] < 125_000
-    assert item["size_factor"] > 0.0
-    assert len(item["expressed_gene_indices"]) == len(item["expression_counts"])
-    assert len(item["expressed_gene_indices"]) > 0
-    assert len(item["context_indices"]) > 0
-    assert isinstance(item["canonical_perturbation"], dict)
-    assert isinstance(item["canonical_context"], dict)
-    assert "guide_1" in item["canonical_perturbation"]
-
-
-def _validate_sparse_payload(payload: SparseBatchPayload, batch_size: int) -> None:
-    """Validate a SparseBatchPayload."""
-    assert isinstance(payload, SparseBatchPayload)
-    assert payload.batch_size == batch_size
-    assert payload.global_row_index.shape == (batch_size,)
-    assert payload.dataset_index.shape == (batch_size,)
-    assert payload.size_factor.shape == (batch_size,)
-    assert payload.row_offsets[0] == 0
-    assert payload.row_offsets[-1] == len(payload.expressed_gene_indices)
-    for i in range(batch_size):
-        s = payload.row_slice(i)
-        assert (
-            payload.expressed_gene_indices[s].size
-            == payload.expression_counts[s].size
-        )
-
-
-# ===================================================================
-# Tests — PerturbDataLoader with all three sampler modes
+# Tests — PerturbBatchDataset with federated reader
 # ===================================================================
 
 
 class TestFederatedLanceSmoke:
-    """Smoke test: federated Lance corpus via PerturbDataLoader."""
+    """Smoke test: federated Lance corpus via PerturbBatchDataset + collation."""
 
-    @pytest.mark.parametrize(
-        "sampler_mode,kwargs",
-        [
-            ("random_context", {"context_size": 100}),
-            # max_context=None uses default n_genes-based sizing
-            ("expressed_zeros", {"max_context": None}),
-            ("hvg_random", {"max_context": None, "hvg_set": _build_hvg_set()}),
-        ],
-    )
-    def test_dataloader_10_batches(
+    def test_read_batch_via_dataset(self, executor: BatchExecutor):
+        """PerturbBatchDataset.__getitems__ produces valid flat batch with federated reader."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+        assert len(ds) == 125_000
+
+        rng = np.random.default_rng(RNG_SEED)
+        indices = rng.integers(0, len(executor), size=BATCH_SIZE).tolist()
+        items = ds.__getitems__(indices)
+        batch = items[0]
+        assert batch["batch_size"] == BATCH_SIZE
+        assert batch["global_row_index"].dtype == np.int64
+        assert batch["dataset_index"].dtype == np.int32
+        assert batch["size_factor"].dtype == np.float32
+        assert len(batch["cell_id"]) == BATCH_SIZE
+
+    def test_collate_batch_dict_10_batches(self, executor: BatchExecutor):
+        """10 random batches via PerturbBatchDataset + collate_batch_dict with federated reader."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+        rng = np.random.default_rng(RNG_SEED)
+        for _ in range(N_BATCHES):
+            indices = rng.integers(0, len(executor), size=BATCH_SIZE).tolist()
+            items = ds.__getitems__(indices)
+            collated = collate_batch_dict(items)
+            assert collated["batch_size"] == BATCH_SIZE
+            assert collated["global_row_index"].device.type == "cpu"
+            assert isinstance(collated["dataset_id"], tuple)
+
+    def test_pipeline_all_sampling_modes(
         self,
         executor: BatchExecutor,
-        sampler_mode: str,
-        kwargs: dict,
+        pipeline: GPUSparsePipeline,
     ):
-        """Run 10 batches via PerturbDataLoader.__getitems__ for each sampler mode."""
-        dl = PerturbDataLoader(
-            executor,
-            n_genes=5000,
-            sampler_mode=sampler_mode,
-            seed=42,
-            **kwargs,
-        )
+        """All three sampling modes produce valid output via federated reader."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+        rng = np.random.default_rng(RNG_SEED)
+        indices = rng.integers(0, len(executor), size=BATCH_SIZE).tolist()
+        items = ds.__getitems__(indices)
+        collated = collate_batch_dict(items)
 
-        rng = np.random.default_rng(42)
-        for batch_num in range(10):
-            batch_size = 32
-            indices = rng.integers(0, len(executor), size=batch_size).tolist()
-            items = dl.__getitems__(indices)
-            assert len(items) == batch_size, (
-                f"batch {batch_num}: expected {batch_size}, got {len(items)}"
-            )
-            for item in items:
-                _validate_batch_item(item, sampler_mode)
+        for mode in ["uniform", "expressed", "hvg"]:
+            result = pipeline.process_batch(collated, device="cpu", sampling_mode=mode)
+            assert result["sampled_gene_ids"].shape == (BATCH_SIZE, SEQ_LEN)
+            assert result["sampled_gene_ids"].device.type == "cpu"
 
-    @pytest.mark.parametrize(
-        "sampler_mode,kwargs",
-        [
-            ("random_context", {"context_size": 100}),
-            ("expressed_zeros", {"max_context": None}),
-            ("hvg_random", {"max_context": None, "hvg_set": _build_hvg_set()}),
-        ],
-    )
-    def test_iterable_dataset_10_cells(
-        self,
-        executor: BatchExecutor,
-        sampler_mode: str,
-        kwargs: dict,
-    ):
-        """Iterate 10 cells via PerturbIterableDataset for each sampler mode."""
-        ds = PerturbIterableDataset(
-            executor,
-            n_genes=5000,
-            sampler_mode=sampler_mode,
-            shuffle=False,
-            seed=42,
-            **kwargs,
-        )
-
-        count = 0
-        for item in ds:
-            _validate_batch_item(item, sampler_mode)
-            count += 1
-            if count >= 10:
-                break
-        assert count == 10
-
-
-# ===================================================================
-# Tests — collation and direct BatchExecutor
-# ===================================================================
-
-
-class TestFederatedLanceCollation:
-    """Smoke test: collate_sparse_batch and direct BatchExecutor for federated."""
-
-    def test_collate_10_random_batches(self, executor: BatchExecutor, meta: MetadataIndex):
-        """Collate 10 random batches via federated reader."""
-        rng = np.random.default_rng(456)
-        for batch_num in range(10):
-            batch_size = 32
-            sampled = meta.sample(batch_size, seed=456 + batch_num)
-            indices = sampled["global_row_index"].to_list()
-            payload = executor.collate_sparse_batch(indices)
-            _validate_sparse_payload(payload, batch_size)
+    def test_pipeline_10_batches(self, executor: BatchExecutor, pipeline: GPUSparsePipeline):
+        """10 batches through full pipeline with federated reader."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+        rng = np.random.default_rng(RNG_SEED)
+        for _ in range(N_BATCHES):
+            indices = rng.integers(0, len(executor), size=BATCH_SIZE).tolist()
+            items = ds.__getitems__(indices)
+            collated = collate_batch_dict(items)
+            result = pipeline.process_batch(collated, device="cpu", sampling_mode="uniform")
+            assert result["sampled_gene_ids"].shape == (BATCH_SIZE, SEQ_LEN)
 
 
 # ===================================================================
@@ -255,41 +176,43 @@ class TestFederatedInterleavedBatches:
     def test_interleaved_order_preserved(self, executor: BatchExecutor):
         """Output order matches input order for interleaved dataset indices."""
         indices = [0, 50000, 1, 50001, 2, 50002]
-        cells = executor.read_cells(indices)
-        assert len(cells) == 6
-        assert [c.global_row_index for c in cells] == indices
+        batch = executor.read_batch(indices)
+        assert batch["batch_size"] == 6
+        np.testing.assert_array_equal(
+            batch["global_row_index"],
+            np.array(indices, dtype=np.int64),
+        )
 
     def test_interleaved_dataset_ids(self, executor: BatchExecutor):
         """Dataset IDs are correct for interleaved indices."""
         indices = [0, 50000, 1, 50001]
-        cells = executor.read_cells(indices)
-        assert cells[0].dataset_id == "dummy_00"
-        assert cells[1].dataset_id == "dummy_01"
-        assert cells[2].dataset_id == "dummy_00"
-        assert cells[3].dataset_id == "dummy_01"
+        batch = executor.read_batch(indices)
+        assert batch["dataset_id"][0] == "dummy_00"
+        assert batch["dataset_id"][1] == "dummy_01"
+        assert batch["dataset_id"][2] == "dummy_00"
+        assert batch["dataset_id"][3] == "dummy_01"
 
     def test_interleaved_expression_content(self, executor: BatchExecutor):
         """Each cell in an interleaved batch has valid expression data."""
         indices = [0, 50000, 10, 50010, 100, 50100]
-        cells = executor.read_cells(indices)
-        for c in cells:
-            assert len(c.expressed_gene_indices) > 0
-            assert len(c.expression_counts) > 0
-            assert len(c.expressed_gene_indices) == len(c.expression_counts)
-            assert all(isinstance(g, int) for g in c.expressed_gene_indices)
-            assert all(isinstance(cnt, int) for cnt in c.expression_counts)
+        batch = executor.read_batch(indices)
+        # row_offsets should be valid
+        assert batch["row_offsets"][0] == 0
+        assert batch["row_offsets"][-1] == len(batch["expressed_gene_indices"])
+        assert len(batch["expressed_gene_indices"]) == len(batch["expression_counts"])
+        assert len(batch["expressed_gene_indices"]) > 0
 
-    def test_batch_across_interleaved_boundary(self, executor: BatchExecutor, meta: MetadataIndex):
+    def test_batch_across_interleaved_boundary(self, executor: BatchExecutor):
         """Large interleaved batch near the dataset boundary."""
-        # Pick 64 indices mixing dummy_00 and dummy_01 near boundary
         rng = np.random.default_rng(777)
         indices_d00 = rng.integers(49_000, 50_000, size=32).tolist()
         indices_d01 = rng.integers(50_000, 51_000, size=32).tolist()
         all_indices = indices_d00 + indices_d01
         rng.shuffle(all_indices)
 
-        payload = executor.collate_sparse_batch(all_indices)
-        _validate_sparse_payload(payload, 64)
+        batch = executor.read_batch(all_indices)
+        assert batch["batch_size"] == 64
+        assert len(batch["dataset_id"]) == 64
 
 
 # ===================================================================
@@ -300,55 +223,106 @@ class TestFederatedInterleavedBatches:
 class TestFederatedEdgeCases:
     """Smoke test: edge cases for federated topology."""
 
-    def test_empty_batch_federated(self, executor: BatchExecutor):
-        """Empty index list returns empty payload."""
-        payload = executor.collate_sparse_batch([])
-        assert payload.batch_size == 0
+    def test_empty_batch(self, executor: BatchExecutor):
+        """Empty index list returns empty batch dict."""
+        batch = executor.read_batch([])
+        assert batch["batch_size"] == 0
 
     def test_single_dataset_only(self, executor: BatchExecutor):
         """Batch with only dummy_00 cells."""
-        indices = list(range(10))
-        cells = executor.read_cells(indices)
-        assert len(cells) == 10
-        for c in cells:
-            assert c.dataset_id == "dummy_00"
-            assert c.dataset_index == 0
+        batch = executor.read_batch(list(range(10)))
+        assert batch["batch_size"] == 10
+        for ds_id in batch["dataset_id"]:
+            assert ds_id == "dummy_00"
+        for ds_idx in batch["dataset_index"]:
+            assert ds_idx == 0
 
     def test_second_dataset_only(self, executor: BatchExecutor):
         """Batch with only dummy_01 cells."""
-        indices = list(range(50000, 50010))
-        cells = executor.read_cells(indices)
-        assert len(cells) == 10
-        for c in cells:
-            assert c.dataset_id == "dummy_01"
-            assert c.dataset_index == 1
+        batch = executor.read_batch(list(range(50000, 50010)))
+        assert batch["batch_size"] == 10
+        for ds_id in batch["dataset_id"]:
+            assert ds_id == "dummy_01"
 
-    def test_dataset_boundary_indices_federated(self, executor: BatchExecutor):
+    def test_dataset_boundary_indices(self, executor: BatchExecutor):
         """First and last cell of each dataset via federated reader."""
-        indices = [0, 49999, 50000, 124999]
-        cells = executor.read_cells(indices)
-        assert cells[0].global_row_index == 0
-        assert cells[1].global_row_index == 49999
-        assert cells[2].global_row_index == 50000
-        assert cells[3].global_row_index == 124999
+        batch = executor.read_batch([0, 49999, 50000, 124999])
+        np.testing.assert_array_equal(
+            batch["global_row_index"],
+            np.array([0, 49999, 50000, 124999], dtype=np.int64),
+        )
 
-    def test_all_single_dataset_federated(self, executor: BatchExecutor):
-        """Multiple cells all from dummy_01."""
+    def test_all_single_dataset(self, executor: BatchExecutor):
+        """Multiple cells all from dummy_01 via federated reader."""
         rng = np.random.default_rng(42)
         indices = rng.integers(50000, 125000, size=50).tolist()
-        cells = executor.read_cells(indices)
-        assert len(cells) == 50
-        for c in cells:
-            assert c.dataset_id == "dummy_01"
+        batch = executor.read_batch(indices)
+        assert batch["batch_size"] == 50
+        for ds_id in batch["dataset_id"]:
+            assert ds_id == "dummy_01"
 
-    def test_read_cells_deterministic_federated(self, executor: BatchExecutor):
-        """Same indices produce identical CellState on repeated reads via federated."""
+    def test_read_batch_deterministic(self, executor: BatchExecutor):
+        """Same indices produce identical read_batch output via federated reader."""
         indices = [0, 50000, 1, 50001, 99999, 124999]
-        cells_1 = executor.read_cells(indices)
-        cells_2 = executor.read_cells(indices)
+        batch1 = executor.read_batch(indices)
+        batch2 = executor.read_batch(indices)
+        np.testing.assert_array_equal(batch1["global_row_index"], batch2["global_row_index"])
+        np.testing.assert_array_equal(batch1["expressed_gene_indices"], batch2["expressed_gene_indices"])
+        np.testing.assert_array_equal(batch1["expression_counts"], batch2["expression_counts"])
+        assert batch1["dataset_id"] == batch2["dataset_id"]
 
-        for c1, c2 in zip(cells_1, cells_2):
-            assert c1.global_row_index == c2.global_row_index
-            assert c1.dataset_id == c2.dataset_id
-            assert c1.expressed_gene_indices == c2.expressed_gene_indices
-            assert c1.expression_counts == c2.expression_counts
+    def test_no_crash_large_interleaved(self, executor: BatchExecutor):
+        """Large interleaved batch does not crash."""
+        rng = np.random.default_rng(42)
+        d00 = rng.integers(0, 50_000, size=100).tolist()
+        d01 = rng.integers(50_000, 125_000, size=100).tolist()
+        all_indices = d00 + d01
+        rng.shuffle(all_indices)
+        batch = executor.read_batch(all_indices)
+        assert batch["batch_size"] == 200
+
+
+# ===================================================================
+# Tests — canonical metadata (federated)
+# ===================================================================
+
+
+class TestFederatedCanonicalMetadata:
+    """Validate canonical fields via federated reader."""
+
+    def test_perturbation_fields(self, executor: BatchExecutor):
+        """canonical_perturbation contains expected keys."""
+        batch = executor.read_batch([0, 50000])
+        for pert in batch["canonical_perturbation"]:
+            assert "guide_1" in pert
+
+    def test_context_fields(self, executor: BatchExecutor):
+        """canonical_context contains expected keys."""
+        batch = executor.read_batch([0, 50000])
+        for ctx in batch["canonical_context"]:
+            assert "cell_type" in ctx
+
+
+# ===================================================================
+# Tests — cpu_parallel_collate_fn with federated reader
+# ===================================================================
+
+
+class TestFederatedCPUParallelCollate:
+    """cpu_parallel_collate_fn with federated reader."""
+
+    def test_single_process_all_modes(self, executor: BatchExecutor, pipeline: GPUSparsePipeline):
+        """cpu_parallel_collate_fn produces valid output with all 3 sampling modes."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+        sampler = BatchSampler(SequentialSampler(ds), batch_size=BATCH_SIZE, drop_last=True)
+
+        for mode in ["uniform", "expressed", "hvg"]:
+            collate_fn = partial(cpu_parallel_collate_fn, pipeline=pipeline, sampling_mode=mode)
+            loader = DataLoader(
+                ds, batch_sampler=sampler, collate_fn=collate_fn, num_workers=0,
+            )
+            for batch_idx, batch in enumerate(loader):
+                if batch_idx >= 1:
+                    break
+                assert batch["sampled_gene_ids"].device.type == "cpu"
+                assert batch["sampled_gene_ids"].shape == (BATCH_SIZE, SEQ_LEN)

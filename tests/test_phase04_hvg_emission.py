@@ -270,9 +270,10 @@ class TestEmissionSpecLoaderIntegration:
         conn.close()
         return cells_path, meta_path, sqlite_path
 
+    @pytest.mark.skip(reason="ArrowHFCellReader removed in deprecated-loader-stack cleanup (Phase 1)")
     def test_arrow_hf_cell_reader_emits_fields_via_spec(self, tmp_path: Path):
         """ArrowHFCellReader returns CellState with canonical fields populated from SQLite."""
-        from perturb_data_lab.loaders import ArrowHFCellReader
+        from perturb_data_lab.loaders import ArrowHFCellReader  # noqa: F401
 
         cells_path, meta_path, sqlite_path = self._make_reader_components(tmp_path)
         corpus_index = tmp_path / "corpus-index.yaml"

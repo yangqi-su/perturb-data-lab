@@ -1,31 +1,37 @@
-"""Phase 4 smoke test: aggregate Lance corpus with all three sampler modes.
+"""Phase 4 smoke test: aggregate Lance corpus via PerturbBatchDataset + GPU pipeline.
 
-Exercises the full loader stack (MetadataIndex + ExpressionReader → BatchExecutor
-→ PerturbDataLoader/PerturbIterableDataset) on the aggregate Lance topology.
+Exercises the full hot path:
+  BatchExecutor.read_batch() → PerturbBatchDataset → collate_batch_dict/cpu_parallel_collate_fn → GPUSparsePipeline
 
-Runs 10 batches per sampler mode and validates:
+Runs 10 batches per sampling mode and validates:
 - Batch sizes and shapes
-- canonical_perturbation and canonical_context populated correctly
-- No IndexError or ValueError from global/local index mismatch
-- Both map-style (PerturbDataLoader) and streaming (PerturbIterableDataset) APIs
+- All 12 flat-batch dict keys present with correct dtypes
+- collate_batch_dict produces CPU tensors compatible with GPUSparsePipeline.process_batch()
+- GPUSparsePipeline outputs correct shape (bsz, seq_len) on CPU device
 """
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
+from typing import Any, Sequence
 
 import numpy as np
+import polars as pl
 import pytest
+import torch
+from torch.utils.data import DataLoader, BatchSampler, SequentialSampler
 
 from perturb_data_lab.loaders import (
     AggregateLanceReader,
     BatchExecutor,
     DatasetEntry,
+    FeatureRegistry,
+    GPUSparsePipeline,
     MetadataIndex,
-    PerturbDataLoader,
-    PerturbIterableDataset,
-    SparseBatchCollator,
-    SparseBatchPayload,
+    PerturbBatchDataset,
+    collate_batch_dict,
+    cpu_parallel_collate_fn,
 )
 
 # ===================================================================
@@ -41,6 +47,18 @@ AGGREGATE_LANCE = str(
     _ARCHIVED_ROOT / "lance-aggregate/matrix/aggregated-cells.lance"
 )
 
+_VAR_00_PATH = str(
+    _ARCHIVED_ROOT / "lance-federated/dummy_00/metadata/dummy_00-release-raw-var.parquet"
+)
+_VAR_01_PATH = str(
+    _ARCHIVED_ROOT / "lance-federated/dummy_01/metadata/dummy_01-release-raw-var.parquet"
+)
+
+SEQ_LEN = 20
+BATCH_SIZE = 32
+N_BATCHES = 10
+RNG_SEED = 42
+
 # ===================================================================
 # Module-scoped fixtures (loaded once)
 # ===================================================================
@@ -48,42 +66,31 @@ AGGREGATE_LANCE = str(
 
 @pytest.fixture(scope="module")
 def meta() -> MetadataIndex:
-    """MetadataIndex for dummy_00 (50K) + dummy_01 (75K)."""
     return MetadataIndex.from_dummy_data()
 
 
 @pytest.fixture(scope="module")
 def agg_reader() -> AggregateLanceReader:
-    """AggregateLanceReader limited to dummy_00 + dummy_01 range."""
-    start = 0
-    end = 50_000 + 75_000  # 125_000
     return AggregateLanceReader(
-        AGGREGATE_LANCE, [DatasetEntry("aggregated", start, end)]
+        AGGREGATE_LANCE, [DatasetEntry("aggregated", 0, 50_000 + 75_000)]
     )
 
 
 @pytest.fixture(scope="module")
 def executor(agg_reader: AggregateLanceReader, meta: MetadataIndex) -> BatchExecutor:
-    """BatchExecutor composing AggregateLanceReader + MetadataIndex."""
     return BatchExecutor(agg_reader, meta)
 
 
-# ===================================================================
-# HVG set helper — load from sidecar files
-# ===================================================================
+@pytest.fixture(scope="module")
+def registry() -> FeatureRegistry:
+    var00 = pl.read_parquet(_VAR_00_PATH)
+    var01 = pl.read_parquet(_VAR_01_PATH)
+    return FeatureRegistry(named_var_dfs={"dummy_00": var00, "dummy_01": var01})
 
 
-def _build_hvg_set() -> tuple[int, ...]:
-    """Load HVG gene indices from dummy_00 + dummy_01 sidecar npy files."""
-    hvg_paths = [
-        _ARCHIVED_ROOT / "lance-federated/dummy_00/metadata/hvg_sidecar/hvg.npy",
-        _ARCHIVED_ROOT / "lance-federated/dummy_01/metadata/hvg_sidecar/hvg.npy",
-    ]
-    hvg_all: set[int] = set()
-    for p in hvg_paths:
-        arr = np.load(p)
-        hvg_all.update(int(x) for x in arr)
-    return tuple(sorted(hvg_all))
+@pytest.fixture(scope="module")
+def pipeline(registry: FeatureRegistry) -> GPUSparsePipeline:
+    return GPUSparsePipeline(registry, seq_len=SEQ_LEN)
 
 
 # ===================================================================
@@ -91,237 +98,220 @@ def _build_hvg_set() -> tuple[int, ...]:
 # ===================================================================
 
 
-def _validate_batch_item(item: dict, sampler_mode: str) -> None:
-    """Validate a single item dict returned by PerturbDataLoader / PerturbIterableDataset."""
-    # Required keys
-    assert "expressed_gene_indices" in item
-    assert "expression_counts" in item
-    assert "context_indices" in item
-    assert "cell_id" in item
-    assert "dataset_id" in item
-    assert "dataset_index" in item
-    assert "global_row_index" in item
-    assert "size_factor" in item
-    assert "canonical_perturbation" in item
-    assert "canonical_context" in item
-
-    # Type checks
-    assert isinstance(item["cell_id"], str)
-    assert isinstance(item["dataset_id"], str)
-    assert item["dataset_index"] in (0, 1)
-    assert 0 <= item["global_row_index"] < 125_000
-    assert item["size_factor"] > 0.0
-
-    # Expression arrays match in length
-    assert isinstance(item["expressed_gene_indices"], np.ndarray)
-    assert isinstance(item["expression_counts"], np.ndarray)
-    assert len(item["expressed_gene_indices"]) == len(item["expression_counts"])
-    assert len(item["expressed_gene_indices"]) > 0
-
-    # Context indices
-    assert isinstance(item["context_indices"], np.ndarray)
-    if sampler_mode == "random_context":
-        assert len(item["context_indices"]) > 0
-    elif sampler_mode == "expressed_zeros":
-        assert len(item["context_indices"]) > 0
-    elif sampler_mode == "hvg_random":
-        assert len(item["context_indices"]) > 0
-
-    # Canonical metadata populated
-    assert isinstance(item["canonical_perturbation"], dict)
-    assert isinstance(item["canonical_context"], dict)
-    # Dummy data should have at least guide_1 in perturbation
-    assert "guide_1" in item["canonical_perturbation"]
+def _validate_flat_batch(batch: dict[str, Any], expected_batch_size: int) -> None:
+    """Validate that a read_batch() dict has all expected keys and correct dtypes."""
+    assert batch["batch_size"] == expected_batch_size
+    assert batch["global_row_index"].dtype == np.int64
+    assert batch["dataset_index"].dtype == np.int32
+    assert batch["local_row_index"].dtype == np.int64
+    assert batch["size_factor"].dtype == np.float32
+    assert batch["expressed_gene_indices"].dtype == np.int32
+    assert batch["expression_counts"].dtype == np.int32
+    assert batch["row_offsets"].dtype == np.int64
+    assert batch["row_offsets"][0] == 0
+    assert batch["row_offsets"][-1] == len(batch["expressed_gene_indices"])
+    assert len(batch["dataset_id"]) == expected_batch_size
+    assert len(batch["cell_id"]) == expected_batch_size
+    assert len(batch["canonical_perturbation"]) == expected_batch_size
+    assert len(batch["canonical_context"]) == expected_batch_size
+    assert "guide_1" in batch["canonical_perturbation"][0]
 
 
-def _validate_sparse_payload(payload: SparseBatchPayload, batch_size: int) -> None:
-    """Validate a SparseBatchPayload produced by collate_sparse_batch."""
-    assert isinstance(payload, SparseBatchPayload)
-    assert payload.batch_size == batch_size
-    assert payload.global_row_index.shape == (batch_size,)
-    assert payload.dataset_index.shape == (batch_size,)
-    assert payload.size_factor.shape == (batch_size,)
-    assert len(payload.dataset_id) == batch_size
-    assert len(payload.cell_id) == batch_size
+def _validate_collated_batch(item: dict[str, Any], expected_batch_size: int) -> None:
+    """Validate collate_batch_dict output has CPU tensors."""
+    assert item["batch_size"] == expected_batch_size
+    assert item["global_row_index"].device.type == "cpu"
+    assert item["row_offsets"].device.type == "cpu"
+    assert item["expressed_gene_indices"].device.type == "cpu"
+    assert item["expression_counts"].device.type == "cpu"
+    assert item["dataset_index"].device.type == "cpu"
+    assert item["size_factor"].device.type == "cpu"
 
-    # Row offsets must be valid
-    assert payload.row_offsets[0] == 0
-    assert payload.row_offsets[-1] == len(payload.expressed_gene_indices)
 
-    # Each row slice must be valid
-    for i in range(batch_size):
-        s = payload.row_slice(i)
-        assert (
-            payload.expressed_gene_indices[s].size
-            == payload.expression_counts[s].size
+def _validate_pipeline_output(
+    result: dict[str, Any], expected_batch_size: int, expected_seq_len: int
+) -> None:
+    """Validate GPUSparsePipeline.process_batch() output."""
+    assert result["batch_size"] == expected_batch_size
+    expected_shape = (expected_batch_size, expected_seq_len)
+    for key in ["sampled_gene_ids", "sampled_counts", "valid_mask", "exact_match_mask"]:
+        assert key in result, f"Missing key: {key}"
+        tensor = result[key]
+        assert tensor.shape == expected_shape, (
+            f"{key} shape {tuple(tensor.shape)} != {expected_shape}"
         )
+        assert tensor.device.type == "cpu", f"{key} device: {tensor.device}"
+    # dataset_index and global_row_index should also be present
+    assert result["dataset_index"].device.type == "cpu"
+    assert result["size_factor"].device.type == "cpu"
 
 
 # ===================================================================
-# Tests — PerturbDataLoader with all three sampler modes
+# Tests — PerturbBatchDataset + collate_batch_dict
 # ===================================================================
 
 
 class TestAggregateLanceSmoke:
-    """Smoke test: aggregate Lance corpus via PerturbDataLoader."""
+    """Smoke test: aggregate Lance corpus via PerturbBatchDataset + collation."""
 
-    @pytest.mark.parametrize(
-        "sampler_mode,kwargs",
-        [
-            ("random_context", {"context_size": 100}),
-            # max_context=None uses default (n_genes-based) sizing to avoid
-            # negative-size errors when n_expressed > max_context
-            ("expressed_zeros", {"max_context": None}),
-            ("hvg_random", {"max_context": None, "hvg_set": _build_hvg_set()}),
-        ],
-    )
-    def test_dataloader_10_batches(
+    def test_read_batch_via_dataset(self, executor: BatchExecutor):
+        """PerturbBatchDataset.__getitems__ produces valid flat batch dict."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+        assert len(ds) == 125_000
+
+        rng = np.random.default_rng(RNG_SEED)
+        indices = rng.integers(0, len(executor), size=BATCH_SIZE).tolist()
+        items = ds.__getitems__(indices)
+        assert isinstance(items, list)
+        assert len(items) == 1
+        batch = items[0]
+        _validate_flat_batch(batch, BATCH_SIZE)
+
+    def test_read_batch_empty_via_dataset(self, executor: BatchExecutor):
+        """Empty indices via PerturbBatchDataset produces valid empty batch."""
+        ds = PerturbBatchDataset(executor)
+        items = ds.__getitems__([])
+        assert len(items) == 1
+        batch = items[0]
+        assert batch["batch_size"] == 0
+
+    def test_collate_batch_dict(self, executor: BatchExecutor):
+        """collate_batch_dict converts numpy arrays to CPU tensors."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+        rng = np.random.default_rng(RNG_SEED)
+        indices = rng.integers(0, len(executor), size=BATCH_SIZE).tolist()
+        items = ds.__getitems__(indices)
+        collated = collate_batch_dict(items)
+        _validate_collated_batch(collated, BATCH_SIZE)
+
+    def test_collate_batch_dict_10_batches(self, executor: BatchExecutor):
+        """10 random batches via PerturbBatchDataset + collate_batch_dict."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+        rng = np.random.default_rng(RNG_SEED)
+        for _ in range(N_BATCHES):
+            indices = rng.integers(0, len(executor), size=BATCH_SIZE).tolist()
+            items = ds.__getitems__(indices)
+            collated = collate_batch_dict(items)
+            _validate_collated_batch(collated, BATCH_SIZE)
+
+    def test_cross_dataset_batch(self, executor: BatchExecutor):
+        """Batch spanning dummy_00 and dummy_01 boundary via new API."""
+        ds = PerturbBatchDataset(executor)
+        indices = [49998, 49999, 50000, 50001]
+        items = ds.__getitems__(indices)
+        batch = items[0]
+        assert batch["batch_size"] == 4
+        assert batch["dataset_id"][0] == "dummy_00"
+        assert batch["dataset_id"][2] == "dummy_01"
+
+
+# ===================================================================
+# Tests — GPUSparsePipeline integration
+# ===================================================================
+
+
+class TestGPUPipelineIntegration:
+    """Smoke test: PerturbBatchDataset → collate_batch_dict → GPUSparsePipeline."""
+
+    def test_pipeline_basic_cpu(self, executor: BatchExecutor, pipeline: GPUSparsePipeline):
+        """GPUSparsePipeline.process_batch() on CPU produces correct output shapes."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+        rng = np.random.default_rng(RNG_SEED)
+        indices = rng.integers(0, len(executor), size=BATCH_SIZE).tolist()
+        items = ds.__getitems__(indices)
+        collated = collate_batch_dict(items)
+
+        result = pipeline.process_batch(collated, device="cpu", sampling_mode="uniform")
+        _validate_pipeline_output(result, BATCH_SIZE, SEQ_LEN)
+
+    @pytest.mark.parametrize("sampling_mode", ["uniform", "expressed", "hvg"])
+    def test_pipeline_all_sampling_modes(
         self,
         executor: BatchExecutor,
-        sampler_mode: str,
-        kwargs: dict,
+        pipeline: GPUSparsePipeline,
+        sampling_mode: str,
     ):
-        """Run 10 batches via PerturbDataLoader.__getitems__ for each sampler mode."""
-        dl = PerturbDataLoader(
-            executor,
-            n_genes=5000,
-            sampler_mode=sampler_mode,
-            seed=42,
-            **kwargs,
-        )
+        """All three sampling modes produce valid output on CPU."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+        rng = np.random.default_rng(RNG_SEED)
+        indices = rng.integers(0, len(executor), size=BATCH_SIZE).tolist()
+        items = ds.__getitems__(indices)
+        collated = collate_batch_dict(items)
 
-        rng = np.random.default_rng(42)
-        for batch_num in range(10):
-            batch_size = 32
-            indices = rng.integers(0, len(executor), size=batch_size).tolist()
-            items = dl.__getitems__(indices)
-            assert len(items) == batch_size, (
-                f"batch {batch_num}: expected {batch_size}, got {len(items)}"
+        result = pipeline.process_batch(
+            collated, device="cpu", sampling_mode=sampling_mode
+        )
+        _validate_pipeline_output(result, BATCH_SIZE, SEQ_LEN)
+
+    def test_pipeline_10_batches(self, executor: BatchExecutor, pipeline: GPUSparsePipeline):
+        """10 batches through the full pipeline on CPU."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+        rng = np.random.default_rng(RNG_SEED)
+        for _ in range(N_BATCHES):
+            indices = rng.integers(0, len(executor), size=BATCH_SIZE).tolist()
+            items = ds.__getitems__(indices)
+            collated = collate_batch_dict(items)
+            result = pipeline.process_batch(
+                collated, device="cpu", sampling_mode="uniform"
             )
-            for item in items:
-                _validate_batch_item(item, sampler_mode)
+            _validate_pipeline_output(result, BATCH_SIZE, SEQ_LEN)
 
-    @pytest.mark.parametrize(
-        "sampler_mode,kwargs",
-        [
-            ("random_context", {"context_size": 100}),
-            ("expressed_zeros", {"max_context": None}),
-            ("hvg_random", {"max_context": None, "hvg_set": _build_hvg_set()}),
-        ],
-    )
-    def test_iterable_dataset_10_batches(
-        self,
-        executor: BatchExecutor,
-        sampler_mode: str,
-        kwargs: dict,
-    ):
-        """Iterate 10 cells via PerturbIterableDataset for each sampler mode."""
-        ds = PerturbIterableDataset(
-            executor,
-            n_genes=5000,
-            sampler_mode=sampler_mode,
-            shuffle=False,
-            seed=42,
-            **kwargs,
+
+# ===================================================================
+# Tests — cpu_parallel_collate_fn (collation + pipeline in one step)
+# ===================================================================
+
+
+class TestCPUParallelCollate:
+    """Smoke test: cpu_parallel_collate_fn with DataLoader."""
+
+    def test_cpu_parallel_collate_single_process(self, executor: BatchExecutor, pipeline: GPUSparsePipeline):
+        """cpu_parallel_collate_fn produces valid output with num_workers=0."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+
+        sampler = BatchSampler(
+            SequentialSampler(ds),
+            batch_size=BATCH_SIZE,
+            drop_last=True,
         )
 
-        count = 0
-        for item in ds:
-            _validate_batch_item(item, sampler_mode)
-            count += 1
-            if count >= 10:
+        collate_fn = partial(
+            cpu_parallel_collate_fn,
+            pipeline=pipeline,
+            sampling_mode="uniform",
+        )
+
+        loader = DataLoader(
+            ds,
+            batch_sampler=sampler,
+            collate_fn=collate_fn,
+            num_workers=0,
+        )
+
+        for batch_idx, batch in enumerate(loader):
+            if batch_idx >= 3:
                 break
-        assert count == 10
+            assert batch["sampled_gene_ids"].device.type == "cpu"
+            assert batch["sampled_counts"].device.type == "cpu"
+            assert batch["sampled_gene_ids"].shape == (BATCH_SIZE, SEQ_LEN)
 
+    def test_cpu_parallel_collate_single_process_all_modes(
+        self, executor: BatchExecutor, pipeline: GPUSparsePipeline
+    ):
+        """cpu_parallel_collate_fn with all 3 sampling modes."""
+        ds = PerturbBatchDataset(executor, seq_len=SEQ_LEN)
+        sampler = BatchSampler(SequentialSampler(ds), batch_size=BATCH_SIZE, drop_last=True)
 
-# ===================================================================
-# Tests — collate_sparse_batch & direct BatchExecutor usage
-# ===================================================================
-
-
-class TestAggregateLanceCollation:
-    """Smoke test: collate_sparse_batch and direct BatchExecutor.read_cells."""
-
-    def test_collate_10_random_batches(self, executor: BatchExecutor, meta: MetadataIndex):
-        """Collate 10 random batches into SparseBatchPayload."""
-        rng = np.random.default_rng(123)
-        for batch_num in range(10):
-            batch_size = 32
-            sampled = meta.sample(batch_size, seed=123 + batch_num)
-            indices = sampled["global_row_index"].to_list()
-            payload = executor.collate_sparse_batch(indices)
-            _validate_sparse_payload(payload, batch_size)
-
-    def test_read_cells_100_random(self, executor: BatchExecutor, meta: MetadataIndex):
-        """Read 100 random cells and validate CellState consistency."""
-        sampled = meta.sample(100, seed=99)
-        indices = sampled["global_row_index"].to_list()
-        cells = executor.read_cells(indices)
-        assert len(cells) == 100
-
-        for c in cells:
-            assert c.global_row_index in indices
-            assert c.dataset_id in ("dummy_00", "dummy_01")
-            assert c.dataset_index in (0, 1)
-            assert c.size_factor > 0.0
-            assert len(c.expressed_gene_indices) == len(c.expression_counts)
-            assert len(c.expressed_gene_indices) > 0
-            assert isinstance(c.canonical_perturbation, dict)
-            assert isinstance(c.canonical_context, dict)
-            assert "guide_1" in c.canonical_perturbation
-
-    def test_read_cells_deterministic(self, executor: BatchExecutor):
-        """Same indices produce identical CellState objects on repeated reads."""
-        indices = [0, 1, 2, 50000, 50001, 99999, 124999]
-        cells_1 = executor.read_cells(indices)
-        cells_2 = executor.read_cells(indices)
-        assert len(cells_1) == len(cells_2) == len(indices)
-
-        for c1, c2 in zip(cells_1, cells_2):
-            assert c1.global_row_index == c2.global_row_index
-            assert c1.dataset_id == c2.dataset_id
-            assert c1.dataset_index == c2.dataset_index
-            assert c1.cell_id == c2.cell_id
-            assert c1.expressed_gene_indices == c2.expressed_gene_indices
-            assert c1.expression_counts == c2.expression_counts
-            assert c1.size_factor == c2.size_factor
-            assert c1.canonical_perturbation == c2.canonical_perturbation
-            assert c1.canonical_context == c2.canonical_context
-
-
-# ===================================================================
-# Tests — canonical_perturbation and canonical_context
-# ===================================================================
-
-
-class TestCanonicalMetadata:
-    """Validate canonical_perturbation and canonical_context correctness."""
-
-    def test_perturbation_fields(self, executor: BatchExecutor):
-        """canonical_perturbation contains expected keys from dummy data."""
-        cells = executor.read_cells([0, 10, 50000, 75000])
-        for c in cells:
-            pert = c.canonical_perturbation
-            # Dummy data has: guide_1, guide_2, treatment, site, genotype
-            assert "guide_1" in pert
-            assert isinstance(pert["guide_1"], str)
-
-    def test_context_fields(self, executor: BatchExecutor):
-        """canonical_context contains expected keys from dummy data."""
-        cells = executor.read_cells([0, 10, 50000, 75000])
-        for c in cells:
-            ctx = c.canonical_context
-            assert "cell_type" in ctx
-            assert isinstance(ctx["cell_type"], str)
-
-    def test_raw_fields_not_empty(self, executor: BatchExecutor):
-        """raw_fields contains non-canonical columns."""
-        cells = executor.read_cells([0])
-        c = cells[0]
-        assert isinstance(c.raw_fields, dict)
-        # raw_fields should have some non-canonical entries
-        # at minimum: doublet_score, pct_mito, n_counts, n_features, scrublet_score, etc.
-        assert len(c.raw_fields) >= 1
+        for mode in ["uniform", "expressed", "hvg"]:
+            collate_fn = partial(cpu_parallel_collate_fn, pipeline=pipeline, sampling_mode=mode)
+            loader = DataLoader(
+                ds, batch_sampler=sampler, collate_fn=collate_fn, num_workers=0,
+            )
+            for batch_idx, batch in enumerate(loader):
+                if batch_idx >= 1:
+                    break
+                assert batch["sampled_gene_ids"].device.type == "cpu"
+                assert batch["sampled_gene_ids"].shape == (BATCH_SIZE, SEQ_LEN)
 
 
 # ===================================================================
@@ -330,58 +320,47 @@ class TestCanonicalMetadata:
 
 
 class TestEdgeCases:
-    """Smoke test: edge cases for the new architecture."""
+    """Smoke test: edge cases for the new hot-path architecture."""
 
     def test_empty_batch(self, executor: BatchExecutor):
-        """Empty index list returns empty payload."""
-        payload = executor.collate_sparse_batch([])
-        assert payload.batch_size == 0
+        """Empty index list returns empty batch dict."""
+        batch = executor.read_batch([])
+        assert batch["batch_size"] == 0
 
     def test_single_cell_batch(self, executor: BatchExecutor):
-        """Single cell batch produces valid payload."""
-        payload = executor.collate_sparse_batch([0])
-        assert payload.batch_size == 1
-
-    def test_cross_dataset_batch(self, executor: BatchExecutor, meta: MetadataIndex):
-        """Batch spanning dummy_00 and dummy_01 boundary."""
-        # Indices near the 50K boundary
-        indices = [49998, 49999, 50000, 50001]
-        cells = executor.read_cells(indices)
-        assert len(cells) == 4
-        assert cells[0].dataset_id == "dummy_00"
-        assert cells[1].dataset_id == "dummy_00"
-        assert cells[2].dataset_id == "dummy_01"
-        assert cells[3].dataset_id == "dummy_01"
+        """Single cell batch produces valid read_batch output."""
+        batch = executor.read_batch([0])
+        assert batch["batch_size"] == 1
+        assert batch["global_row_index"][0] == 0
 
     def test_dataset_boundary_indices(self, executor: BatchExecutor):
         """First and last cell of each dataset."""
-        indices = [0, 49999, 50000, 124999]
-        cells = executor.read_cells(indices)
-        assert cells[0].global_row_index == 0
-        assert cells[1].global_row_index == 49999
-        assert cells[2].global_row_index == 50000
-        assert cells[3].global_row_index == 124999
-
-    def test_hvg_sampler_has_hvg_set(self, executor: BatchExecutor):
-        """HVGRandomSampler produces context containing at least some HVG genes."""
-        hvg_set = _build_hvg_set()
-        dl = PerturbDataLoader(
-            executor,
-            n_genes=5000,
-            sampler_mode="hvg_random",
-            seed=42,
-            max_context=None,  # default n_genes-based sizing to avoid negative-size errors
-            hvg_set=hvg_set,
+        batch = executor.read_batch([0, 49999, 50000, 124999])
+        assert batch["batch_size"] == 4
+        np.testing.assert_array_equal(
+            batch["global_row_index"],
+            np.array([0, 49999, 50000, 124999], dtype=np.int64),
         )
-        # Sample multiple cells to check HVG coverage
-        rng = np.random.default_rng(99)
-        hvg_in_context_count = 0
-        for _ in range(20):
-            idx = int(rng.integers(0, len(executor)))
-            item = dl[idx]
-            context = set(item["context_indices"])
-            hvg_overlap = context & set(hvg_set)
-            if hvg_overlap:
-                hvg_in_context_count += 1
-        # At least some cells should have HVG genes in context
-        assert hvg_in_context_count > 0, "HVG sampler should include HVG genes"
+
+
+# ===================================================================
+# Tests — canonical metadata
+# ===================================================================
+
+
+class TestCanonicalMetadata:
+    """Validate canonical_perturbation and canonical_context in read_batch output."""
+
+    def test_perturbation_fields(self, executor: BatchExecutor):
+        """canonical_perturbation contains expected keys from dummy data."""
+        batch = executor.read_batch([0, 10, 50000, 75000])
+        for pert in batch["canonical_perturbation"]:
+            assert "guide_1" in pert
+            assert isinstance(pert["guide_1"], str)
+
+    def test_context_fields(self, executor: BatchExecutor):
+        """canonical_context contains expected keys from dummy data."""
+        batch = executor.read_batch([0, 10, 50000, 75000])
+        for ctx in batch["canonical_context"]:
+            assert "cell_type" in ctx
+            assert isinstance(ctx["cell_type"], str)

@@ -22,26 +22,11 @@ from .expression import (
 )
 from .index import MetadataIndex, MetadataRow
 from .loaders import (
-    CellIdentity,
-    CellState,
-    CPUDenseRuntimePath,
     CorpusRandomBatchSampler,
     DatasetBatchSampler,
     DatasetContextBatchSampler,
-    DatasetContextKey,
-    ExpressedZerosSampler,
     ExpressionBatch,
-    GlobalFeatureResolver,
-    GPUSparseRuntimePath,
-    HVGRandomSampler,
     PerturbBatchDataset,
-    PerturbDataLoader,
-    PerturbIterableDataset,
-    RandomContextSampler,
-    ResolvedSparseBatch,
-    SamplerState,
-    SparseBatchCollator,
-    SparseBatchPayload,
     collate_batch_dict,
     cpu_parallel_collate_fn,
 )
@@ -83,29 +68,12 @@ __all__ = [
     # Phase 3 — BatchExecutor
     "BatchExecutor",
     # Phase 3 — Core types
-    "CellState",
-    "CellIdentity",
     "ExpressionBatch",
-    "DatasetContextKey",
-    # Phase 3 — Collation
-    "SparseBatchPayload",
-    "ResolvedSparseBatch",
-    "SparseBatchCollator",
-    "GlobalFeatureResolver",
     # Phase 3 — Samplers (MetadataIndex-backed)
     "CorpusRandomBatchSampler",
     "DatasetBatchSampler",
     "DatasetContextBatchSampler",
-    # Phase 3 — Runtime paths (CPUDenseRuntimePath / GPUSparseRuntimePath
-    # are deprecated — import from .loaders directly if still needed)
-    "SamplerState",
-    # Phase 3 — Sampler modes
-    "RandomContextSampler",
-    "ExpressedZerosSampler",
-    "HVGRandomSampler",
     # Phase 3 — Data loaders
-    "PerturbDataLoader",
-    "PerturbIterableDataset",
     "PerturbBatchDataset",
     "collate_batch_dict",
     "cpu_parallel_collate_fn",

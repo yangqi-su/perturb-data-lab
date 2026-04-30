@@ -2,17 +2,16 @@
 
 The ``BatchExecutor`` is the single entry point for reading cell data from a
 corpus.  It queries metadata from ``MetadataIndex`` and expression data from
-an ``ExpressionReader``, then composes them into ``CellState`` objects.
+an ``ExpressionReader``, returning flat numpy array dicts via ``read_batch()``.
 
 Key design rules:
 - Metadata comes from ``MetadataIndex``, **not** from expression readers.
 - Expression readers return only the 3-field ``ExpressionRow``.
-- Samplers operate on global indices and receive full ``CellState`` objects.
+- ``read_batch()`` returns flat dicts with zero per-cell Python objects.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 import numpy as np
@@ -20,11 +19,7 @@ import numpy as np
 from .index import MetadataIndex
 from .expression import ExpressionReader
 from .loaders import (
-    CellIdentity,
-    CellState,
     ExpressionBatch,
-    SparseBatchCollator,
-    SparseBatchPayload,
 )
 
 __all__ = [
@@ -87,67 +82,10 @@ class BatchExecutor:
             else _DEFAULT_CONTEXT_KEYS
         )
 
-        # Pre-warm: identify raw_-prefixed columns and their stems
-        self._raw_cols: list[str] = [
-            c for c in metadata_index.df.columns if c.startswith("raw_")
-        ]
+        # Note: raw_ columns are extracted on-demand via _extract_canonical
 
     # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def read_cells(self, global_indices: Sequence[int]) -> list[CellState]:
-        """Read and compose ``CellState`` objects for the given global indices.
-
-        Parameters
-        ----------
-        global_indices : sequence of int
-            Corpus-global cell indices (0 ≤ idx < len(metadata_index)).
-
-        Returns
-        -------
-        list[CellState]
-            One ``CellState`` per input index, preserving input order.
-        """
-        indices = [int(i) for i in global_indices]
-        n = len(indices)
-        if n == 0:
-            return []
-
-        # 1. Fetch expression data (preserves order)
-        expr_rows = self._reader.read_expression(indices)
-
-        # 2. Fetch metadata via positional indexing (preserves order)
-        meta_subset = self._meta[indices]
-
-        # 3. Compose CellState by zipping expression + metadata
-        cells: list[CellState] = []
-        for i in range(n):
-            cells.append(self._compose(expr_rows[i], meta_subset, i))
-        return cells
-
-    def collate_sparse_batch(
-        self, global_indices: Sequence[int]
-    ) -> SparseBatchPayload:
-        """Read and collate a batch into a flat sparse payload.
-
-        Convenience wrapper around ``read_cells`` + ``SparseBatchCollator``.
-
-        Parameters
-        ----------
-        global_indices : sequence of int
-            Corpus-global cell indices.
-
-        Returns
-        -------
-        SparseBatchPayload
-            Flat sparse batch ready for downstream processing.
-        """
-        collator = SparseBatchCollator()
-        return collator(self.read_cells(global_indices))
-
-    # ------------------------------------------------------------------
-    # New hot-path API (Phase 1: flat-batch, zero per-cell Python objects)
+    # Public API — flat-batch, zero per-cell Python objects
     # ------------------------------------------------------------------
 
     def read_expression_batch(
@@ -356,40 +294,6 @@ class BatchExecutor:
     # Internal: composition
     # ------------------------------------------------------------------
 
-    def _compose(
-        self,
-        expr_row,
-        meta_subset: MetadataIndex,
-        position: int,
-    ) -> CellState:
-        """Compose a single ``CellState`` from expression + metadata."""
-        # Extract metadata row as a dict
-        row = meta_subset.df.row(position, named=True)
-
-        canonical_perturbation = self._extract_canonical(row, self._perturbation_keys)
-        canonical_context = self._extract_canonical(row, self._context_keys)
-        raw_fields = self._extract_remaining_raw(row)
-
-        return CellState(
-            identity=CellIdentity(
-                global_row_index=int(row["global_row_index"]),
-                dataset_index=int(row["dataset_index"]),
-                dataset_id=str(row["dataset_id"]),
-                local_row_index=int(row["local_row_index"]),
-            ),
-            cell_id=str(row["cell_id"]),
-            expressed_gene_indices=tuple(
-                int(i) for i in expr_row.expressed_gene_indices
-            ),
-            expression_counts=tuple(
-                int(c) for c in expr_row.expression_counts
-            ),
-            size_factor=float(row["size_factor"]),
-            canonical_perturbation=canonical_perturbation,
-            canonical_context=canonical_context,
-            raw_fields=raw_fields,
-        )
-
     @staticmethod
     def _extract_canonical(row: dict[str, Any], keys: frozenset[str]) -> dict[str, str]:
         """Extract canonical dict from a metadata row.
@@ -404,14 +308,4 @@ class BatchExecutor:
                 result[key] = str(row[col])
         return result
 
-    def _extract_remaining_raw(self, row: dict[str, Any]) -> dict[str, Any]:
-        """Collect all raw_ columns not in perturbation or context keys."""
-        all_canonical = self._perturbation_keys | self._context_keys
-        result: dict[str, Any] = {}
-        for col in self._raw_cols:
-            stem = col.removeprefix("raw_")
-            if stem in all_canonical:
-                continue
-            if col in row and row[col] is not None:
-                result[stem] = row[col]
-        return result
+

@@ -1,8 +1,8 @@
 """Phase 4 smoke test: equivalence between aggregate and federated readers.
 
-Validates that the new BatchExecutor produces identical CellState objects
-(expression data, metadata) regardless of which reader backend is used
-(aggregate vs federated Lance) for the same global indices.
+Validates that BatchExecutor produces identical read_batch() / read_expression_batch()
+output regardless of which reader backend is used (aggregate vs federated Lance)
+for the same global indices.
 
 Also validates deterministic reproducibility on repeated reads.
 """
@@ -46,13 +46,11 @@ FEDERATED_BASE = _ARCHIVED_ROOT / "lance-federated"
 
 @pytest.fixture(scope="module")
 def meta() -> MetadataIndex:
-    """MetadataIndex for dummy_00 + dummy_01."""
     return MetadataIndex.from_dummy_data()
 
 
 @pytest.fixture(scope="module")
 def agg_executor(meta: MetadataIndex) -> BatchExecutor:
-    """BatchExecutor with AggregateLanceReader."""
     agg_reader = AggregateLanceReader(
         AGGREGATE_LANCE,
         [DatasetEntry("aggregated", 0, len(meta))],
@@ -62,18 +60,13 @@ def agg_executor(meta: MetadataIndex) -> BatchExecutor:
 
 @pytest.fixture(scope="module")
 def fed_executor(meta: MetadataIndex) -> BatchExecutor:
-    """BatchExecutor with FederatedLanceReader."""
     fed_reader = FederatedLanceReader([
         LanceDatasetEntry(
-            "dummy_00",
-            0,
-            50_000,
+            "dummy_00", 0, 50_000,
             FEDERATED_BASE / "dummy_00/matrix/dummy_00-release.lance",
         ),
         LanceDatasetEntry(
-            "dummy_01",
-            50_000,
-            125_000,
+            "dummy_01", 50_000, 125_000,
             FEDERATED_BASE / "dummy_01/matrix/dummy_01-release.lance",
         ),
     ])
@@ -81,12 +74,11 @@ def fed_executor(meta: MetadataIndex) -> BatchExecutor:
 
 
 # ===================================================================
-# Helper: generate 100 fixed random indices
+# Helper
 # ===================================================================
 
 
 def _sample_100_indices(meta: MetadataIndex, seed: int = 42) -> list[int]:
-    """Return 100 random global indices from the metadata index."""
     sampled = meta.sample(100, seed=seed)
     return sorted(sampled["global_row_index"].to_list())
 
@@ -97,7 +89,7 @@ def _sample_100_indices(meta: MetadataIndex, seed: int = 42) -> list[int]:
 
 
 class TestAggregateFederatedEquivalence:
-    """Validate that aggregate and federated readers produce identical results."""
+    """Validate that aggregate and federated readers produce identical read_batch output."""
 
     def test_expression_equivalence(
         self,
@@ -105,30 +97,25 @@ class TestAggregateFederatedEquivalence:
         fed_executor: BatchExecutor,
         meta: MetadataIndex,
     ):
-        """100 random indices: aggregate and federated produce identical CellState."""
+        """100 random indices: aggregate and federated produce identical expression data."""
         indices = _sample_100_indices(meta, seed=42)
 
-        agg_cells = agg_executor.read_cells(indices)
-        fed_cells = fed_executor.read_cells(indices)
+        agg_batch = agg_executor.read_expression_batch(indices)
+        fed_batch = fed_executor.read_expression_batch(indices)
 
-        assert len(agg_cells) == len(fed_cells) == 100
+        assert agg_batch.batch_size == fed_batch.batch_size == 100
 
-        mismatches = []
-        for i, (a, f) in enumerate(zip(agg_cells, fed_cells)):
-            if a.expressed_gene_indices != f.expressed_gene_indices:
-                mismatches.append(
-                    f"index {indices[i]} gene_indices mismatch: "
-                    f"agg={a.expressed_gene_indices[:5]}..., "
-                    f"fed={f.expressed_gene_indices[:5]}..."
-                )
-            elif a.expression_counts != f.expression_counts:
-                mismatches.append(
-                    f"index {indices[i]} counts mismatch"
-                )
-
-        assert len(mismatches) == 0, (
-            f"Found {len(mismatches)} mismatches between aggregate and federated:\n"
-            + "\n".join(mismatches[:5])
+        np.testing.assert_array_equal(
+            agg_batch.global_row_index, fed_batch.global_row_index
+        )
+        np.testing.assert_array_equal(
+            agg_batch.expressed_gene_indices, fed_batch.expressed_gene_indices
+        )
+        np.testing.assert_array_equal(
+            agg_batch.expression_counts, fed_batch.expression_counts
+        )
+        np.testing.assert_array_equal(
+            agg_batch.row_offsets, fed_batch.row_offsets
         )
 
     def test_metadata_equivalence(
@@ -140,17 +127,56 @@ class TestAggregateFederatedEquivalence:
         """Metadata fields are identical between aggregate and federated readers."""
         indices = _sample_100_indices(meta, seed=42)
 
-        agg_cells = agg_executor.read_cells(indices)
-        fed_cells = fed_executor.read_cells(indices)
+        agg_meta = agg_executor.read_metadata_batch(indices)
+        fed_meta = fed_executor.read_metadata_batch(indices)
 
-        for i, (a, f) in enumerate(zip(agg_cells, fed_cells)):
-            assert a.global_row_index == f.global_row_index, f"index {i}"
-            assert a.dataset_id == f.dataset_id, f"index {i}"
-            assert a.dataset_index == f.dataset_index, f"index {i}"
-            assert a.cell_id == f.cell_id, f"index {i}"
-            assert a.size_factor == f.size_factor, f"index {i}"
-            assert a.canonical_perturbation == f.canonical_perturbation, f"index {i}"
-            assert a.canonical_context == f.canonical_context, f"index {i}"
+        np.testing.assert_array_equal(
+            agg_meta["global_row_index"], fed_meta["global_row_index"]
+        )
+        np.testing.assert_array_equal(
+            agg_meta["dataset_index"], fed_meta["dataset_index"]
+        )
+        np.testing.assert_array_equal(
+            agg_meta["size_factor"], fed_meta["size_factor"]
+        )
+        assert agg_meta["dataset_id"] == fed_meta["dataset_id"]
+        assert agg_meta["cell_id"] == fed_meta["cell_id"]
+        assert agg_meta["canonical_perturbation"] == fed_meta["canonical_perturbation"]
+        assert agg_meta["canonical_context"] == fed_meta["canonical_context"]
+
+    def test_read_batch_equivalence(
+        self,
+        agg_executor: BatchExecutor,
+        fed_executor: BatchExecutor,
+        meta: MetadataIndex,
+    ):
+        """read_batch() returns identical results from aggregate and federated readers."""
+        indices = _sample_100_indices(meta, seed=42)
+
+        agg_batch = agg_executor.read_batch(indices)
+        fed_batch = fed_executor.read_batch(indices)
+
+        assert agg_batch["batch_size"] == fed_batch["batch_size"]
+        np.testing.assert_array_equal(
+            agg_batch["global_row_index"], fed_batch["global_row_index"]
+        )
+        np.testing.assert_array_equal(
+            agg_batch["expressed_gene_indices"], fed_batch["expressed_gene_indices"]
+        )
+        np.testing.assert_array_equal(
+            agg_batch["expression_counts"], fed_batch["expression_counts"]
+        )
+        np.testing.assert_array_equal(
+            agg_batch["row_offsets"], fed_batch["row_offsets"]
+        )
+        np.testing.assert_array_equal(
+            agg_batch["dataset_index"], fed_batch["dataset_index"]
+        )
+        np.testing.assert_array_equal(
+            agg_batch["size_factor"], fed_batch["size_factor"]
+        )
+        assert agg_batch["dataset_id"] == fed_batch["dataset_id"]
+        assert agg_batch["cell_id"] == fed_batch["cell_id"]
 
     def test_expression_at_boundary(
         self,
@@ -159,14 +185,18 @@ class TestAggregateFederatedEquivalence:
     ):
         """Cells at the dataset boundary are identical."""
         boundary_indices = [49998, 49999, 50000, 50001]
-        agg_cells = agg_executor.read_cells(boundary_indices)
-        fed_cells = fed_executor.read_cells(boundary_indices)
+        agg_expr = agg_executor.read_expression_batch(boundary_indices)
+        fed_expr = fed_executor.read_expression_batch(boundary_indices)
 
-        for a, f in zip(agg_cells, fed_cells):
-            assert a.expressed_gene_indices == f.expressed_gene_indices
-            assert a.expression_counts == f.expression_counts
-            assert a.dataset_id == f.dataset_id
-            assert a.global_row_index == f.global_row_index
+        np.testing.assert_array_equal(
+            agg_expr.expressed_gene_indices, fed_expr.expressed_gene_indices
+        )
+        np.testing.assert_array_equal(
+            agg_expr.expression_counts, fed_expr.expression_counts
+        )
+        np.testing.assert_array_equal(
+            agg_expr.global_row_index, fed_expr.global_row_index
+        )
 
     def test_expression_distribution_consistency(
         self,
@@ -177,15 +207,13 @@ class TestAggregateFederatedEquivalence:
         """Distribution of expressed gene counts is consistent across readers."""
         indices = _sample_100_indices(meta, seed=99)
 
-        agg_cells = agg_executor.read_cells(indices)
-        fed_cells = fed_executor.read_cells(indices)
+        agg_expr = agg_executor.read_expression_batch(indices)
+        fed_expr = fed_executor.read_expression_batch(indices)
 
-        agg_n_genes = [len(c.expressed_gene_indices) for c in agg_cells]
-        fed_n_genes = [len(c.expressed_gene_indices) for c in fed_cells]
-
-        assert agg_n_genes == fed_n_genes, (
-            "Expressed gene counts differ between aggregate and federated readers"
-        )
+        # row_offsets encode per-cell gene counts
+        agg_n_genes = np.diff(agg_expr.row_offsets)
+        fed_n_genes = np.diff(fed_expr.row_offsets)
+        np.testing.assert_array_equal(agg_n_genes, fed_n_genes)
 
     def test_large_consistent_batch(
         self,
@@ -195,14 +223,20 @@ class TestAggregateFederatedEquivalence:
     ):
         """A larger batch (200 cells) is consistent between readers."""
         indices = _sample_100_indices(meta, seed=7) + _sample_100_indices(meta, seed=77)
-        indices = sorted(set(indices))  # dedupe
+        indices = sorted(set(indices))
 
-        agg_cells = agg_executor.read_cells(indices)
-        fed_cells = fed_executor.read_cells(indices)
+        agg_batch = agg_executor.read_batch(indices)
+        fed_batch = fed_executor.read_batch(indices)
 
-        for a, f in zip(agg_cells, fed_cells):
-            assert a.expressed_gene_indices == f.expressed_gene_indices
-            assert a.expression_counts == f.expression_counts
+        np.testing.assert_array_equal(
+            agg_batch["expressed_gene_indices"], fed_batch["expressed_gene_indices"]
+        )
+        np.testing.assert_array_equal(
+            agg_batch["expression_counts"], fed_batch["expression_counts"]
+        )
+        np.testing.assert_array_equal(
+            agg_batch["row_offsets"], fed_batch["row_offsets"]
+        )
 
 
 # ===================================================================
@@ -211,55 +245,67 @@ class TestAggregateFederatedEquivalence:
 
 
 class TestDeterministicReproducibility:
-    """Validate that repeated reads produce identical results."""
+    """Validate that repeated read_batch calls produce identical results."""
 
     def test_aggregate_deterministic(
         self, agg_executor: BatchExecutor, meta: MetadataIndex
     ):
-        """Aggregate reader: 100 indices, 3 repeated reads, identical results."""
+        """Aggregate reader: 100 indices, 3 repeated read_batch calls, identical results."""
         indices = _sample_100_indices(meta, seed=42)
-        ref_cells = agg_executor.read_cells(indices)
+        ref_batch = agg_executor.read_batch(indices)
 
         for run in range(3):
-            cells = agg_executor.read_cells(indices)
-            for i, (ref, cur) in enumerate(zip(ref_cells, cells)):
-                assert ref.expressed_gene_indices == cur.expressed_gene_indices, (
-                    f"run {run}, index {i}"
-                )
-                assert ref.expression_counts == cur.expression_counts, (
-                    f"run {run}, index {i}"
-                )
+            batch = agg_executor.read_batch(indices)
+            np.testing.assert_array_equal(
+                ref_batch["expressed_gene_indices"], batch["expressed_gene_indices"]
+            )
+            np.testing.assert_array_equal(
+                ref_batch["expression_counts"], batch["expression_counts"]
+            )
+            np.testing.assert_array_equal(
+                ref_batch["row_offsets"], batch["row_offsets"]
+            )
+            assert ref_batch["dataset_id"] == batch["dataset_id"]
 
     def test_federated_deterministic(
         self, fed_executor: BatchExecutor, meta: MetadataIndex
     ):
-        """Federated reader: 100 indices, 3 repeated reads, identical results."""
+        """Federated reader: 100 indices, 3 repeated read_batch calls, identical results."""
         indices = _sample_100_indices(meta, seed=42)
-        ref_cells = fed_executor.read_cells(indices)
+        ref_batch = fed_executor.read_batch(indices)
 
         for run in range(3):
-            cells = fed_executor.read_cells(indices)
-            for i, (ref, cur) in enumerate(zip(ref_cells, cells)):
-                assert ref.expressed_gene_indices == cur.expressed_gene_indices, (
-                    f"run {run}, index {i}"
-                )
-                assert ref.expression_counts == cur.expression_counts, (
-                    f"run {run}, index {i}"
-                )
+            batch = fed_executor.read_batch(indices)
+            np.testing.assert_array_equal(
+                ref_batch["expressed_gene_indices"], batch["expressed_gene_indices"]
+            )
+            np.testing.assert_array_equal(
+                ref_batch["expression_counts"], batch["expression_counts"]
+            )
+            np.testing.assert_array_equal(
+                ref_batch["row_offsets"], batch["row_offsets"]
+            )
+            assert ref_batch["dataset_id"] == batch["dataset_id"]
 
-    def test_collate_deterministic(
+    def test_expression_batch_deterministic(
         self, agg_executor: BatchExecutor, meta: MetadataIndex
     ):
-        """collate_sparse_batch produces identical payloads on repeated calls."""
+        """read_expression_batch produces identical ExpressionBatch on repeated calls."""
         indices = _sample_100_indices(meta, seed=42)
-        ref_payload = agg_executor.collate_sparse_batch(indices)
+        ref_expr = agg_executor.read_expression_batch(indices)
 
         for run in range(3):
-            payload = agg_executor.collate_sparse_batch(indices)
-            assert np.array_equal(ref_payload.expressed_gene_indices, payload.expressed_gene_indices)
-            assert np.array_equal(ref_payload.expression_counts, payload.expression_counts)
-            assert np.array_equal(ref_payload.row_offsets, payload.row_offsets)
-            assert ref_payload.batch_size == payload.batch_size
+            expr = agg_executor.read_expression_batch(indices)
+            np.testing.assert_array_equal(
+                ref_expr.expressed_gene_indices, expr.expressed_gene_indices
+            )
+            np.testing.assert_array_equal(
+                ref_expr.expression_counts, expr.expression_counts
+            )
+            np.testing.assert_array_equal(
+                ref_expr.row_offsets, expr.row_offsets
+            )
+            assert ref_expr.batch_size == expr.batch_size
 
 
 # ===================================================================
@@ -272,10 +318,9 @@ class TestIndexCorrectness:
 
     def test_no_oor_on_boundary(self, agg_executor: BatchExecutor):
         """Read exactly at the boundary does not raise out-of-range."""
-        # Last valid index
-        cells = agg_executor.read_cells([124999])
-        assert len(cells) == 1
-        assert cells[0].global_row_index == 124999
+        batch = agg_executor.read_batch([124999])
+        assert batch["batch_size"] == 1
+        assert batch["global_row_index"][0] == 124999
 
     def test_no_crash_large_random_batch(
         self, agg_executor: BatchExecutor, meta: MetadataIndex
@@ -283,37 +328,35 @@ class TestIndexCorrectness:
         """A large random batch across the full range does not crash."""
         sampled = meta.sample(500, seed=123)
         indices = sampled["global_row_index"].to_list()
-        cells = agg_executor.read_cells(indices)
-        assert len(cells) == 500
+        batch = agg_executor.read_batch(indices)
+        assert batch["batch_size"] == 500
 
     def test_no_crash_interleaved_large(
-        self, fed_executor: BatchExecutor, meta: MetadataIndex
+        self, fed_executor: BatchExecutor
     ):
         """Large interleaved batch via federated reader does not crash."""
         rng = np.random.default_rng(42)
-        # Mix dummy_00 and dummy_01 indices
         d00 = rng.integers(0, 50_000, size=100).tolist()
         d01 = rng.integers(50_000, 125_000, size=100).tolist()
         all_indices = d00 + d01
         rng.shuffle(all_indices)
-        cells = fed_executor.read_cells(all_indices)
-        assert len(cells) == 200
+        batch = fed_executor.read_batch(all_indices)
+        assert batch["batch_size"] == 200
 
-    def test_sequential_indices(
-        self, agg_executor: BatchExecutor
-    ):
+    def test_sequential_indices(self, agg_executor: BatchExecutor):
         """Sequential indices across the full range work correctly."""
-        indices = list(range(0, 100))  # first 100
-        cells = agg_executor.read_cells(indices)
-        assert len(cells) == 100
-        for i, c in enumerate(cells):
-            assert c.global_row_index == i
+        indices = list(range(0, 100))
+        batch = agg_executor.read_batch(indices)
+        assert batch["batch_size"] == 100
+        np.testing.assert_array_equal(
+            batch["global_row_index"],
+            np.arange(100, dtype=np.int64),
+        )
 
-    def test_sequential_mid_range(
-        self, fed_executor: BatchExecutor
-    ):
-        """Sequential indices in the middle of dummy_01."""
+    def test_sequential_mid_range(self, fed_executor: BatchExecutor):
+        """Sequential indices in the middle of dummy_01 via federated reader."""
         indices = list(range(60000, 60100))
-        cells = fed_executor.read_cells(indices)
-        assert len(cells) == 100
-        assert all(c.dataset_id == "dummy_01" for c in cells)
+        batch = fed_executor.read_batch(indices)
+        assert batch["batch_size"] == 100
+        for ds_id in batch["dataset_id"]:
+            assert ds_id == "dummy_01"
