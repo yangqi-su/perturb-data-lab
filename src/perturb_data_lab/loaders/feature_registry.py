@@ -11,11 +11,14 @@ per cell from each cell's own dataset's valid gene pool (uniform sampling).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import polars as pl
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "FeatureRegistry",
@@ -69,10 +72,48 @@ class FeatureRegistry:
         # ---- Pass 1: discover all unique feature_ids and assign global IDs ----
         self._feature_id_to_global: dict[str, int] = {}
         self._dataset_var_entries: dict[int, list[dict[str, Any]]] = {}
+        # Per-dataset local HVG flags (None = no HVG column found)
+        self._dataset_local_hvg: dict[int, np.ndarray | None] = {}
+
+        _hvg_column_names = ("is_hvg", "highly_variable", "hvg", "is_highly_variable")
 
         for ds_idx, ds_id in enumerate(self._dataset_ids):
             var_df = named_var_dfs[ds_id]
             self._validate_var_df(var_df, ds_id)
+
+            # Detect HVG column (case-insensitive)
+            hvg_col: str | None = None
+            for candidate in _hvg_column_names:
+                for col in var_df.columns:
+                    if col.lower() == candidate.lower():
+                        hvg_col = col
+                        break
+                if hvg_col is not None:
+                    break
+
+            local_hvg: np.ndarray | None = None
+            if hvg_col is not None:
+                try:
+                    hvg_values = var_df[hvg_col].to_numpy()
+                except Exception:
+                    hvg_values = np.array(var_df[hvg_col].to_list())
+                # Treat truthy values as HVG (supports bool, int 0/1, float)
+                local_hvg = np.asarray(hvg_values, dtype=bool)
+                if local_hvg.shape[0] != len(var_df):
+                    logger.warning(
+                        "Dataset '%s': HVG column '%s' length mismatch (%d vs %d); "
+                        "HVG mask disabled.",
+                        ds_id, hvg_col, local_hvg.shape[0], len(var_df),
+                    )
+                    local_hvg = None
+            if local_hvg is None and hvg_col is not None:
+                logger.warning(
+                    "Dataset '%s': HVG column '%s' found but could not be parsed; "
+                    "HVG mask disabled.",
+                    ds_id, hvg_col,
+                )
+            self._dataset_local_hvg[ds_idx] = local_hvg
+
             entries: list[dict[str, Any]] = []
             for row in var_df.iter_rows(named=True):
                 origin_idx = int(row["origin_index"])
@@ -115,6 +156,10 @@ class FeatureRegistry:
 
         # ---- Precompute dense (n_datasets, max_local_vocab) mapping tensor ----
         self._dense_map: np.ndarray = self._build_dense_map()
+
+        # ---- Build HVG mask from per-dataset local HVG flags ----
+        self._hvg_mask: np.ndarray | None = None
+        self._build_hvg_mask()
 
         # Lazy-computed fields
         self._dataset_has_gene: np.ndarray | None = None
@@ -233,6 +278,7 @@ class FeatureRegistry:
         # Invalidate lazy caches
         self._dataset_has_gene = None
         self._dataset_gene_prob = None
+        self._hvg_mask = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -292,6 +338,18 @@ class FeatureRegistry:
         assert self._dataset_gene_prob is not None
         return self._dataset_gene_prob
 
+    @property
+    def hvg_mask(self) -> np.ndarray:
+        """Per-dataset HVG mask ``(n_datasets, global_vocab_size)`` bool.
+
+        ``True`` where a global gene is classified as highly variable for a
+        given dataset.  All-zero when no var table contains an HVG column.
+        """
+        if self._hvg_mask is None:
+            self._build_hvg_mask()
+        assert self._hvg_mask is not None
+        return self._hvg_mask
+
     def _compute_masks(self) -> None:
         """Build dataset_has_gene and dataset_gene_prob arrays."""
         has_gene = np.zeros(
@@ -313,6 +371,44 @@ class FeatureRegistry:
 
         self._dataset_has_gene = has_gene
         self._dataset_gene_prob = prob
+
+    def _build_hvg_mask(self) -> None:
+        """Build per-dataset HVG mask ``(n_datasets, global_vocab_size)`` bool.
+
+        Uses per-dataset local HVG flags (captured in ``__init__``) mapped
+        through the local→global mapping.  If no dataset has an HVG column,
+        the mask is all-zeros.
+        """
+        any_hvg = any(
+            local_hvg is not None for local_hvg in self._dataset_local_hvg.values()
+        )
+        if not any_hvg:
+            self._hvg_mask = np.zeros(
+                (self._n_datasets, self._global_vocab_size), dtype=bool
+            )
+            return
+
+        hvg_mask = np.zeros(
+            (self._n_datasets, self._global_vocab_size), dtype=bool
+        )
+        for ds_idx in range(self._n_datasets):
+            local_hvg = self._dataset_local_hvg.get(ds_idx)
+            if local_hvg is None:
+                continue
+            local_to_global = self._local_to_global[ds_idx]
+            n_vars = len(local_to_global)
+            if len(local_hvg) > n_vars:
+                local_hvg = local_hvg[:n_vars]
+            elif len(local_hvg) < n_vars:
+                local_hvg_padded = np.zeros(n_vars, dtype=bool)
+                local_hvg_padded[:len(local_hvg)] = local_hvg
+                local_hvg = local_hvg_padded
+
+            hvg_local_ids = local_to_global[local_hvg]
+            valid = hvg_local_ids >= 0
+            hvg_mask[ds_idx, hvg_local_ids[valid]] = True
+
+        self._hvg_mask = hvg_mask
 
     # ------------------------------------------------------------------
     # Reverse lookup helpers

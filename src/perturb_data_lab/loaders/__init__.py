@@ -34,6 +34,7 @@ from .loaders import (
     GlobalFeatureResolver,
     GPUSparseRuntimePath,
     HVGRandomSampler,
+    PerturbBatchDataset,
     PerturbDataLoader,
     PerturbIterableDataset,
     RandomContextSampler,
@@ -41,6 +42,8 @@ from .loaders import (
     SamplerState,
     SparseBatchCollator,
     SparseBatchPayload,
+    collate_batch_dict,
+    cpu_parallel_collate_fn,
 )
 from .corpus import (
     read_raw_obs_parquet,
@@ -93,9 +96,8 @@ __all__ = [
     "CorpusRandomBatchSampler",
     "DatasetBatchSampler",
     "DatasetContextBatchSampler",
-    # Phase 3 — Runtime paths
-    "CPUDenseRuntimePath",
-    "GPUSparseRuntimePath",
+    # Phase 3 — Runtime paths (CPUDenseRuntimePath / GPUSparseRuntimePath
+    # are deprecated — import from .loaders directly if still needed)
     "SamplerState",
     # Phase 3 — Sampler modes
     "RandomContextSampler",
@@ -104,6 +106,9 @@ __all__ = [
     # Phase 3 — Data loaders
     "PerturbDataLoader",
     "PerturbIterableDataset",
+    "PerturbBatchDataset",
+    "collate_batch_dict",
+    "cpu_parallel_collate_fn",
     # Phase 2 — Feature Registry
     "FeatureRegistry",
     "GlobalGeneSampler",

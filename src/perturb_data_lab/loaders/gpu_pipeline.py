@@ -72,8 +72,14 @@ class GPUSparsePipeline:
         self._local_to_global_np = registry.local_to_global_map
         self._gene_prob_np = registry.dataset_gene_prob
         self._has_gene_np = registry.dataset_has_gene
+        self._hvg_mask_np = registry.hvg_mask
         self._max_local_vocab = registry.max_local_vocab
         self._global_vocab = registry.global_vocab_size
+
+        # Per-instance device tensor caches (fork-safe:
+        # class-level CUDA tensor dicts would leak across forked
+        # DataLoader workers, causing invalid CUDA context errors).
+        self._device_caches: dict[str, dict[str, torch.Tensor]] = {}
 
     @property
     def seq_len(self) -> int:
@@ -84,14 +90,13 @@ class GPUSparsePipeline:
         return self._registry
 
     # ------------------------------------------------------------------
-    # Device-side tensor caches (lazy, one per device)
+    # Device-side tensor caches (lazy, per-instance, one device key)
     # ------------------------------------------------------------------
-    _DEVICE_CACHES: dict[str, dict[str, torch.Tensor]] = {}
 
     def _cached_tensors(self, device: torch.device) -> dict[str, torch.Tensor]:
         key = str(device)
-        if key not in self._DEVICE_CACHES:
-            self._DEVICE_CACHES[key] = {
+        if key not in self._device_caches:
+            self._device_caches[key] = {
                 "local_to_global": torch.as_tensor(
                     self._local_to_global_np, dtype=torch.long, device=device
                 ),
@@ -101,8 +106,88 @@ class GPUSparsePipeline:
                 "has_gene": torch.as_tensor(
                     self._has_gene_np, dtype=torch.bool, device=device
                 ),
+                "hvg_mask": torch.as_tensor(
+                    self._hvg_mask_np, dtype=torch.bool, device=device
+                ),
             }
-        return self._DEVICE_CACHES[key]
+        return self._device_caches[key]
+
+    # ------------------------------------------------------------------
+    # Weighted probability construction
+    # ------------------------------------------------------------------
+
+    def _build_weighted_probs(
+        self,
+        device: torch.device,
+        bsz: int,
+        dataset_indices: torch.Tensor,
+        global_genes_sorted: torch.Tensor | None = None,
+        *,
+        sampling_mode: str = "uniform",
+        expressed_weight: float = 3.0,
+        hvg_weight: float = 3.0,
+        gene_prob_t: torch.Tensor | None = None,
+        hvg_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Build per-cell probability tensors for weighted ``multinomial`` sampling.
+
+        Returns ``(bsz, global_vocab)`` float32 tensor where each row sums to 1.0.
+        """
+        if sampling_mode == "uniform":
+            # Uniform probabilities over each cell's dataset valid gene pool
+            if gene_prob_t is None:
+                raise ValueError("gene_prob_t required for uniform mode")
+            return gene_prob_t[dataset_indices]  # (bsz, global_vocab)
+
+        if sampling_mode == "expressed":
+            # Expressed-biased: expressed genes get weight bonus
+            if global_genes_sorted is None:
+                raise ValueError("global_genes_sorted required for expressed mode")
+
+            max_nnz = global_genes_sorted.shape[1]
+
+            # Build (bsz, global_vocab) binary mask efficiently using scatter
+            valid_positions = global_genes_sorted < self._global_vocab  # (bsz, max_nnz)
+            n_valid = int(valid_positions.sum().item())
+
+            if n_valid > 0:
+                row_indices = (
+                    torch.arange(bsz, device=device)
+                    .unsqueeze(1)
+                    .expand(-1, max_nnz)
+                )  # (bsz, max_nnz)
+                valid_rows = row_indices[valid_positions]  # (n_valid,)
+                valid_cols = global_genes_sorted[valid_positions]  # (n_valid,)
+            else:
+                valid_rows = torch.empty(0, dtype=torch.long, device=device)
+                valid_cols = torch.empty(0, dtype=torch.long, device=device)
+
+            probs = torch.ones(
+                (bsz, self._global_vocab), dtype=torch.float32, device=device
+            )
+            # Expressed genes get expressed_weight bonus on top of base 1.0
+            if n_valid > 0:
+                probs[valid_rows, valid_cols] += float(expressed_weight)
+            probs /= probs.sum(dim=1, keepdim=True)
+            return probs
+
+        if sampling_mode == "hvg":
+            # HVG-biased: HVG genes get weight bonus per dataset
+            if hvg_t is None:
+                raise ValueError("hvg_t required for hvg mode")
+
+            hvgs = hvg_t[dataset_indices]  # (bsz, global_vocab) bool
+            probs = torch.ones(
+                (bsz, self._global_vocab), dtype=torch.float32, device=device
+            )
+            probs += hvgs.float() * float(hvg_weight)
+            probs /= probs.sum(dim=1, keepdim=True)
+            return probs
+
+        raise ValueError(
+            f"Unknown sampling_mode: {sampling_mode!r}. "
+            f"Valid options: 'uniform', 'expressed', 'hvg'."
+        )
 
     # ------------------------------------------------------------------
     # process_batch
@@ -115,6 +200,9 @@ class GPUSparsePipeline:
         device: torch.device | str | None = None,
         generator: torch.Generator | None = None,
         sampled_gene_ids: torch.Tensor | None = None,
+        sampling_mode: str = "uniform",
+        expressed_weight: float = 3.0,
+        hvg_weight: float = 3.0,
     ) -> dict[str, Any]:
         """Process a flat batch dict into dense ``(batch_size, seq_len)`` tensors.
 
@@ -133,6 +221,16 @@ class GPUSparsePipeline:
             Pre-computed ``(batch_size, seq_len)`` tensor of global gene IDs.
             When provided, skips ``multinomial`` sampling and uses these IDs.
             Useful for deterministic equivalence testing.
+        sampling_mode : str, default "uniform"
+            Gene sampling strategy: ``"uniform"`` (all genes equal weight),
+            ``"expressed"`` (expressed genes get ``expressed_weight`` bonus),
+            or ``"hvg"`` (highly-variable genes get ``hvg_weight`` bonus).
+        expressed_weight : float, default 3.0
+            Weight bonus for expressed genes in ``"expressed"`` mode.
+            Expressed genes receive base 1.0 + ``expressed_weight``.
+        hvg_weight : float, default 3.0
+            Weight bonus for HVG genes in ``"hvg"`` mode.
+            HVG genes receive base 1.0 + ``hvg_weight``.
 
         Returns
         -------
@@ -156,6 +254,7 @@ class GPUSparsePipeline:
         local_to_global_t = cached["local_to_global"]
         gene_prob_t = cached["gene_prob"]
         has_gene_t = cached["has_gene"]
+        hvg_t = cached["hvg_mask"]
 
         # ---- Move flat arrays to device ----
         flat_gene_indices = torch.as_tensor(
@@ -220,6 +319,76 @@ class GPUSparsePipeline:
 
         max_nnz = int(padded_local_genes.shape[1])
 
+        # ---- Short-circuit when all cells have zero expressed genes ----
+        if max_nnz == 0:
+            # Sample gene IDs from per-dataset probability pools
+            if sampled_gene_ids is not None:
+                sampled_gids = sampled_gene_ids.to(
+                    dtype=torch.long, device=device, non_blocking=True
+                )
+                if sampled_gids.shape != (bsz, self._seq_len):
+                    raise ValueError(
+                        f"sampled_gene_ids shape {tuple(sampled_gids.shape)} "
+                        f"!= expected ({bsz}, {self._seq_len})"
+                    )
+            else:
+                probs = self._build_weighted_probs(
+                    device,
+                    bsz,
+                    dataset_indices,
+                    # No expressed genes, so expressed mode degrades
+                    # to per-dataset uniform (global_genes_sorted=None).
+                    sampling_mode=sampling_mode,
+                    expressed_weight=expressed_weight,
+                    hvg_weight=hvg_weight,
+                    gene_prob_t=gene_prob_t,
+                    hvg_t=hvg_t,
+                )
+                sampled_gids = torch.multinomial(
+                    probs,
+                    num_samples=self._seq_len,
+                    replacement=False,
+                    generator=generator,
+                )
+
+            # No expressed genes → all exact_match False, all counts 0
+            exact_match = torch.zeros(
+                (bsz, self._seq_len), dtype=torch.bool, device=device
+            )
+            sampled_counts = torch.zeros(
+                (bsz, self._seq_len), dtype=torch.float32, device=device
+            )
+
+            # Valid mask from dataset_has_gene
+            valid_rows = has_gene_t[dataset_indices]
+            safe_gids = sampled_gids.clamp(0, self._global_vocab - 1)
+            in_vocab = (sampled_gids >= 0) & (sampled_gids < self._global_vocab)
+            valid_mask = valid_rows.gather(1, safe_gids) & in_vocab
+
+            # Replace invalid positions with sentinels
+            final_gene_ids = torch.where(
+                valid_mask,
+                sampled_gids,
+                torch.full_like(sampled_gids, self._pad_token_id),
+            )
+            final_counts = torch.where(
+                valid_mask,
+                sampled_counts,
+                torch.full_like(sampled_counts, self._invalid_count_value),
+            )
+
+            return {
+                "batch_size": bsz,
+                "seq_len": self._seq_len,
+                "sampled_gene_ids": final_gene_ids,
+                "sampled_counts": final_counts,
+                "valid_mask": valid_mask,
+                "exact_match_mask": exact_match,
+                "dataset_index": dataset_indices,
+                "global_row_index": global_row_index,
+                "size_factor": size_factor,
+            }
+
         # ---- Local→Global resolution ----
         is_padding = padded_local_genes >= self._max_local_vocab
 
@@ -242,7 +411,10 @@ class GPUSparsePipeline:
         )
 
         # ---- Sort global genes (and counts) for searchsorted ----
-        global_genes_sorted, sort_idx = global_genes.sort(dim=1)
+        # Use stable sort so that duplicate global gene IDs (from two local
+        # genes mapping to the same global gene) maintain consistent ordering
+        # with the CPU path (np.argsort(kind="stable")).
+        global_genes_sorted, sort_idx = global_genes.sort(dim=1, stable=True)
         counts_sorted = padded_counts.gather(1, sort_idx)
 
         # ---- Sample global gene IDs from per-dataset probability pools ----
@@ -256,14 +428,26 @@ class GPUSparsePipeline:
                     f"!= expected ({bsz}, {self._seq_len})"
                 )
         else:
-            # probs: (batch_size, global_vocab)
-            probs = gene_prob_t[dataset_indices]
+            # Build weighted probabilities based on sampling mode
+            probs = self._build_weighted_probs(
+                device,
+                bsz,
+                dataset_indices,
+                global_genes_sorted=global_genes_sorted,
+                sampling_mode=sampling_mode,
+                expressed_weight=expressed_weight,
+                hvg_weight=hvg_weight,
+                gene_prob_t=gene_prob_t,
+                hvg_t=hvg_t,
+            )
             sampled_gids = torch.multinomial(
                 probs,
                 num_samples=self._seq_len,
-                replacement=True,
+                replacement=False,
                 generator=generator,
             )  # (batch_size, seq_len)
+            # Free probability tensor (may be large for expressed mode)
+            del probs
 
         # ---- searchsorted + gather in global gene space ----
         search_positions = torch.searchsorted(

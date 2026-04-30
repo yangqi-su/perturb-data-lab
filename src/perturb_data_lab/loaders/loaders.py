@@ -10,11 +10,13 @@ This module implements:
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 import numpy as np
 import polars as pl
+import torch
 
 __all__ = [
     "CellState",
@@ -36,6 +38,9 @@ __all__ = [
     "HVGRandomSampler",
     "PerturbDataLoader",
     "PerturbIterableDataset",
+    "PerturbBatchDataset",
+    "collate_batch_dict",
+    "cpu_parallel_collate_fn",
 ]
 
 
@@ -573,9 +578,22 @@ class DatasetContextBatchSampler:
 
 
 class CPUDenseRuntimePath:
-    """Baseline runtime path that resolves sparse rows, then densifies on CPU."""
+    """Baseline runtime path that resolves sparse rows, then densifies on CPU.
+
+    .. deprecated::
+        Use ``GPUSparsePipeline`` or ``CPUPipeline`` with ``FeatureRegistry``
+        instead.  ``CPUDenseRuntimePath`` relies on ``GlobalFeatureResolver``
+        and is superseded by the newer pipeline architecture.
+    """
 
     def __init__(self, resolver: GlobalFeatureResolver, *, total_features: int | None = None):
+        warnings.warn(
+            "CPUDenseRuntimePath is deprecated and will be removed in a "
+            "future version. Use GPUSparsePipeline or CPUPipeline with "
+            "FeatureRegistry instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.resolver = resolver
         self.total_features = int(
             resolver.total_features if total_features is None else total_features
@@ -625,9 +643,22 @@ class CPUDenseRuntimePath:
 
 
 class GPUSparseRuntimePath:
-    """Sparse runtime path that keeps flat payloads plus offsets in the hot path."""
+    """Sparse runtime path that keeps flat payloads plus offsets in the hot path.
+
+    .. deprecated::
+        Use ``GPUSparsePipeline`` with ``FeatureRegistry`` instead.
+        ``GPUSparseRuntimePath`` relies on ``GlobalFeatureResolver`` and
+        is superseded by the newer GPU pipeline architecture.
+    """
 
     def __init__(self, resolver: GlobalFeatureResolver):
+        warnings.warn(
+            "GPUSparseRuntimePath is deprecated and will be removed in a "
+            "future version. Use GPUSparsePipeline with FeatureRegistry "
+            "instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.resolver = resolver
 
     def resolve_batch(self, payload: SparseBatchPayload) -> ResolvedSparseBatch:
@@ -1051,3 +1082,230 @@ class PerturbDataLoader:
                 "canonical_context": cell.canonical_context,
             })
         return results
+
+
+# ---------------------------------------------------------------------------
+# PerturbBatchDataset — production-facing Dataset for DataLoader + GPU pipeline
+# ---------------------------------------------------------------------------
+
+
+class PerturbBatchDataset:
+    """Map-style Dataset bridging ``BatchExecutor.read_batch()`` with the GPU pipeline.
+
+    Designed for use with ``torch.utils.data.DataLoader`` and a batch
+    sampler that yields lists of corpus-global cell indices.  The
+    ``__getitems__`` method calls ``executor.read_batch(indices)`` and
+    returns a flat batch dict with **zero** per-cell Python objects.
+
+    The Dataset does **not** call ``GPUSparsePipeline.process_batch()``.
+    Sampling parameters (``seq_len``, ``sampling_mode``, etc.) are
+    stored for informational purposes and should be forwarded to the
+    pipeline in the training loop.
+
+    Parameters
+    ----------
+    executor : BatchExecutor
+        Corpus-level batch reader providing ``read_batch()``.
+    seq_len : int, optional
+        Number of genes to sample per cell (forwarded to the pipeline;
+        not used by the Dataset itself).
+    sampling_mode : str, default "uniform"
+        Sampling strategy (``"uniform"``, ``"expressed"``, ``"hvg"``).
+    expressed_weight : float, default 3.0
+        Weight bonus for expressed genes in ``"expressed"`` mode.
+    hvg_weight : float, default 3.0
+        Weight bonus for HVG genes in ``"hvg"`` mode.
+    """
+
+    def __init__(
+        self,
+        executor: "BatchExecutor",
+        seq_len: int | None = None,
+        *,
+        sampling_mode: str = "uniform",
+        expressed_weight: float = 3.0,
+        hvg_weight: float = 3.0,
+    ):
+        self._exec = executor
+        self._seq_len = seq_len
+        self._sampling_mode = sampling_mode
+        self._expressed_weight = float(expressed_weight)
+        self._hvg_weight = float(hvg_weight)
+
+    # -- Properties ---------------------------------------------------------
+
+    @property
+    def executor(self) -> "BatchExecutor":
+        return self._exec
+
+    @property
+    def seq_len(self) -> int | None:
+        return self._seq_len
+
+    @property
+    def sampling_mode(self) -> str:
+        return self._sampling_mode
+
+    @property
+    def expressed_weight(self) -> float:
+        return self._expressed_weight
+
+    @property
+    def hvg_weight(self) -> float:
+        return self._hvg_weight
+
+    # -- Map-style interface -------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self._exec)
+
+    def __getitems__(self, indices: Sequence[int]) -> list[dict[str, Any]]:
+        """Read a batch of cells and return the flat batch dict.
+
+        Parameters
+        ----------
+        indices : sequence of int
+            Corpus-global cell indices for this batch.
+
+        Returns
+        -------
+        list[dict]
+            Single-element list containing the flat batch dict from
+            ``BatchExecutor.read_batch()``.  All values are numpy arrays
+            (no GPU tensors, no ``CellState`` objects).
+        """
+        batch = self._exec.read_batch(list(indices))
+        return [batch]
+
+
+def collate_batch_dict(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate ``PerturbBatchDataset.__getitems__`` output into a batch dict.
+
+    Converts numpy arrays to CPU tensors so that ``DataLoader(pin_memory=True)``
+    can perform asynchronous host→device transfers.  Non-array fields
+    (``dataset_id``, ``cell_id``, ``canonical_perturbation``,
+    ``canonical_context``) are passed through unchanged.
+
+    Parameters
+    ----------
+    items : list[dict]
+        Single-element list from ``PerturbBatchDataset.__getitems__``.
+
+    Returns
+    -------
+    dict
+        Flat batch dict with numpy arrays replaced by CPU tensors.
+        Compatible with ``GPUSparsePipeline.process_batch()`` and
+        ``CPUPipeline.process_batch()``.
+    """
+    if not items:
+        raise ValueError("collate_batch_dict received empty list")
+    batch = items[0]
+
+    return {
+        "batch_size": batch["batch_size"],
+        "global_row_index": torch.as_tensor(
+            batch["global_row_index"], dtype=torch.long
+        ),
+        "row_offsets": torch.as_tensor(
+            batch["row_offsets"], dtype=torch.long
+        ),
+        "expressed_gene_indices": torch.as_tensor(
+            batch["expressed_gene_indices"], dtype=torch.long
+        ),
+        "expression_counts": torch.as_tensor(
+            batch["expression_counts"], dtype=torch.float32
+        ),
+        "dataset_index": torch.as_tensor(
+            batch["dataset_index"], dtype=torch.long
+        ),
+        "size_factor": torch.as_tensor(
+            batch["size_factor"], dtype=torch.float32
+        ),
+        "local_row_index": torch.as_tensor(
+            batch.get("local_row_index", batch["global_row_index"]),
+            dtype=torch.long,
+        ),
+        # Non-tensor fields: pass through unchanged
+        "dataset_id": batch.get("dataset_id", ()),
+        "cell_id": batch.get("cell_id", ()),
+        "canonical_perturbation": batch.get("canonical_perturbation", ()),
+        "canonical_context": batch.get("canonical_context", ()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CPU-parallel collate function for worker-side compute
+# ---------------------------------------------------------------------------
+
+# Per-worker flag to ensure torch.set_num_threads(1) is called exactly once.
+# Set to True on first invocation in each worker process.
+_cpu_collate_threads_initialized: bool = False
+
+
+def cpu_parallel_collate_fn(
+    items: list[dict[str, Any]],
+    pipeline: "GPUSparsePipeline",
+    sampling_mode: str = "uniform",
+    *,
+    expressed_weight: float = 3.0,
+    hvg_weight: float = 3.0,
+    generator: torch.Generator | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Worker-safe collate function that runs the full pipeline on CPU.
+
+    Designed for use with ``torch.utils.data.DataLoader`` and
+    ``PerturbBatchDataset``.  The pipeline runs inside each DataLoader
+    worker with ``device="cpu"``, so all heavy compute (local→global
+    resolution, sort, weighted sampling, searchsorted+gather) is
+    parallelized across workers via CPU vectorized ops.
+
+    Parameters
+    ----------
+    items : list[dict]
+        Single-element list from ``PerturbBatchDataset.__getitems__``.
+        The batch dict contains numpy arrays from the I/O layer.
+    pipeline : GPUSparsePipeline
+        Pipeline instance providing ``process_batch()``.  Must be
+        picklable (no pre-created CUDA tensors).
+    sampling_mode : str, default "uniform"
+        Gene sampling strategy: ``"uniform"``, ``"expressed"``, or ``"hvg"``.
+    expressed_weight : float, default 3.0
+        Weight bonus for expressed genes in ``"expressed"`` mode.
+    hvg_weight : float, default 3.0
+        Weight bonus for HVG genes in ``"hvg"`` mode.
+    generator : torch.Generator, optional
+        Torch RNG generator for reproducible sampling.
+    **kwargs
+        Forwarded to ``pipeline.process_batch()``.
+
+    Returns
+    -------
+    dict
+        Fully processed batch dict with all tensors on CPU device.
+        Keys: ``sampled_gene_ids``, ``sampled_counts``, ``valid_mask``,
+        ``exact_match_mask``, ``dataset_index``, ``global_row_index``,
+        ``size_factor``, ``batch_size``, ``seq_len``.
+    """
+    global _cpu_collate_threads_initialized
+
+    # Prevent OpenMP thread explosion: each worker uses 1 thread.
+    # Parallelism comes from multiple workers, not intra-op threading.
+    if not _cpu_collate_threads_initialized:
+        torch.set_num_threads(1)
+        _cpu_collate_threads_initialized = True
+
+    if not items:
+        raise ValueError("cpu_parallel_collate_fn received empty list")
+    batch = items[0]
+
+    return pipeline.process_batch(
+        batch,
+        device="cpu",
+        sampling_mode=sampling_mode,
+        expressed_weight=expressed_weight,
+        hvg_weight=hvg_weight,
+        generator=generator,
+        **kwargs,
+    )
