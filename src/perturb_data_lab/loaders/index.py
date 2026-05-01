@@ -109,8 +109,18 @@ class MetadataIndex:
     def from_parquet_files(
         cls,
         corpus_index_path: str | Path,
+        *,
+        use_canonical: bool = False,
     ) -> "MetadataIndex":
         """Load from a corpus-index YAML and per-dataset parquet files.
+
+        When ``use_canonical=False`` (default), reads raw obs sidecars
+        (``{release_id}-raw-obs.parquet``) with ``raw_fields`` JSON parsing
+        and ``raw_``-prefixed columns.
+
+        When ``use_canonical=True``, reads canonical obs sidecars
+        (``{release_id}-canonical-obs.parquet``) with already-flat
+        canonical columns.  No JSON parsing needed.
 
         Expected YAML structure (list of dataset entries)::
 
@@ -120,12 +130,14 @@ class MetadataIndex:
                 obs_path: /path/to/raw-obs.parquet
                 size_factor_path: /path/to/size-factor.parquet
                 n_obs: 50000
-              - ...
+              - ...   (canonical_obs_path: /path/to/canonical-obs.parquet)
 
         Parameters
         ----------
         corpus_index_path:
             Path to a YAML file describing the corpus.
+        use_canonical:
+            When ``True``, reads canonical obs parquets.
         """
         import yaml
 
@@ -140,25 +152,56 @@ class MetadataIndex:
 
         entries = []
         for ds in datasets:
+            obs_path = (
+                ds.get("canonical_obs_path", ds["obs_path"])
+                if use_canonical
+                else ds["obs_path"]
+            )
             entries.append(
                 {
                     "dataset_id": ds["dataset_id"],
                     "release_id": ds.get(
                         "release_id", f"{ds['dataset_id']}-release"
                     ),
-                    "obs_path": ds["obs_path"],
-                    "size_factor_path": ds["size_factor_path"],
+                    "obs_path": obs_path,
+                    "size_factor_path": ds.get("size_factor_path"),
                     "n_obs": ds.get("n_obs"),
                 }
             )
+
+        if use_canonical:
+            return cls._from_canonical_dataset_entries(entries)
         return cls._from_dataset_entries(entries)
 
     @classmethod
-    def from_dummy_data(cls) -> "MetadataIndex":
+    def from_dummy_data(cls, use_canonical: bool = False) -> "MetadataIndex":
         """Convenience factory for the synthetic dummy_00 + dummy_01 corpus.
 
         Reads from the known Stage 2 lance-federated output paths.
+        When ``use_canonical=True``, reads canonical obs parquets from
+        Phase 2 outputs.
         """
+        if use_canonical:
+            _PLAN_RUN = (
+                Path("/autofs/projects-t3/lilab/yangqisu/repos/data_perturb_v2")
+                / "copilot/plans/active/plans-20260430-canonicalization-module-and-loader-adaptation"
+                / "outputs"
+            )
+            entries = []
+            for ds_id, info in sorted(_DUMMY_DATASETS.items()):
+                entries.append(
+                    {
+                        "dataset_id": ds_id,
+                        "release_id": info["release_id"],
+                        "obs_path": str(
+                            _PLAN_RUN / ds_id / f"{info['release_id']}-canonical-obs.parquet"
+                        ),
+                        "size_factor_path": None,  # size_factor is inline in canonical
+                        "n_obs": info["n_obs"],
+                    }
+                )
+            return cls._from_canonical_dataset_entries(entries)
+
         entries = []
         for ds_id, info in sorted(_DUMMY_DATASETS.items()):
             ds_dir = _LANCE_FEDERATED_BASE / ds_id / "metadata"
@@ -277,6 +320,127 @@ class MetadataIndex:
         )
         col_order = fixed_cols + raw_cols
         combined = combined.select(col_order)
+
+        return cls(combined)
+
+    # ------------------------------------------------------------------
+    # Canonical parquet loading (use_canonical=True)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _from_canonical_dataset_entries(
+        cls, entries: list[dict[str, Any]]
+    ) -> "MetadataIndex":
+        """Build a MetadataIndex from canonical obs parquets (already flat).
+
+        Canonical obs parquets have all columns as flat strings — no
+        ``raw_fields`` JSON parsing or ``raw_`` prefixing needed.
+
+        Size factors are already inline in the canonical parquet (no
+        separate join required).
+
+        Column reordering and global_row_index validation still apply.
+        """
+        processed_dfs: list[pl.DataFrame] = []
+        global_row_offset = 0
+
+        for ds_idx, entry in enumerate(entries):
+            obs_path = entry["obs_path"]
+            dataset_id = entry["dataset_id"]
+            release_id = entry["release_id"]
+
+            df = pl.read_parquet(obs_path)
+            n_obs = len(df)
+
+            # The canonical obs columns may arrive as strings; cast numeric
+            # identity columns to proper types for downstream consumers.
+            _cast_map: dict[str, pl.DataType] = {
+                "global_row_index": pl.Int64,
+                "dataset_index": pl.Int32,
+                "local_row_index": pl.Int64,
+                "size_factor": pl.Float64,
+            }
+            for col_name, dtype in _cast_map.items():
+                if col_name in df.columns:
+                    try:
+                        df = df.with_columns(pl.col(col_name).cast(dtype))
+                    except Exception:
+                        # If casting fails (e.g. "NA" strings), keep as string
+                        pass
+
+            # Ensure dataset_index and dataset_release are correct
+            if "dataset_index" in df.columns:
+                df = df.with_columns(
+                    pl.lit(ds_idx, dtype=pl.Int32).alias("dataset_index")
+                )
+            else:
+                df = df.with_columns(
+                    pl.lit(ds_idx, dtype=pl.Int32).alias("dataset_index")
+                )
+            if "dataset_release" not in df.columns:
+                df = df.with_columns(
+                    pl.lit(release_id, dtype=pl.Utf8).alias("dataset_release")
+                )
+
+            # Override global_row_index with corpus-global range
+            local_range = pl.int_range(0, n_obs, dtype=pl.Int64)
+            df = df.with_columns(
+                (local_range + global_row_offset).alias("global_row_index")
+            )
+
+            # Ensure local_row_index is correct
+            if "local_row_index" in df.columns:
+                df = df.with_columns(
+                    pl.int_range(0, n_obs, dtype=pl.Int64).alias("local_row_index")
+                )
+
+            global_row_offset += n_obs
+            processed_dfs.append(df)
+
+        # Concatenate all datasets (diagonal_relaxed fills missing columns)
+        combined = pl.concat(processed_dfs, how="diagonal_relaxed")
+
+        # Ensure all must-have canonical obs columns exist
+        _canonical_cols = [
+            "global_row_index", "cell_id", "dataset_id", "dataset_release",
+            "dataset_index", "local_row_index", "size_factor",
+            "perturb_label", "perturb_type", "dose", "dose_unit",
+            "timepoint", "timepoint_unit", "cell_context", "cell_line_or_type",
+            "species", "tissue", "assay", "condition", "batch_id",
+            "donor_id", "sex", "disease_state",
+        ]
+        for col in _canonical_cols:
+            if col not in combined.columns:
+                combined = combined.with_columns(
+                    pl.lit(None, dtype=pl.Utf8).alias(col)
+                )
+
+        # Sort by global_row_index
+        combined = combined.sort("global_row_index")
+
+        # Reorder: structural columns first, then canonical content, then extensible
+        structural = [
+            "global_row_index", "cell_id", "dataset_id", "dataset_release",
+            "dataset_index", "local_row_index", "size_factor",
+        ]
+        content = [
+            c for c in _canonical_cols
+            if c not in structural and c in combined.columns
+        ]
+        # Keep raw_ columns that may have been carried forward as extensible
+        extensible = sorted(
+            c for c in combined.columns
+            if c not in structural and c not in content and not c.startswith("raw_")
+        )
+        raw_cols = sorted(
+            c for c in combined.columns
+            if c.startswith("raw_")
+        )
+        col_order = structural + content + extensible + raw_cols
+        combined = combined.select(col_order)
+
+        # Validate contiguous
+        cls._validate_contiguous(combined)
 
         return cls(combined)
 

@@ -42,6 +42,11 @@ class FeatureRegistry:
     Assigns consecutive global integer IDs to unique ``feature_id`` values
     and produces dense mapping tensors suitable for GPU gather operations.
 
+    When built from canonical var parquets (via ``from_canonical_var_parquets``),
+    uses ``canonical_gene_id`` instead of ``feature_id`` for the global
+    vocabulary, so ``global_vocab_size`` reflects canonical (harmonized) gene
+    identifiers rather than raw feature IDs.
+
     Parameters
     ----------
     named_var_dfs : dict[str, pl.DataFrame]
@@ -57,6 +62,66 @@ class FeatureRegistry:
     max_local_vocab : int
         Maximum number of local genes (``n_vars``) across all datasets.
     """
+
+    @classmethod
+    def from_canonical_var_parquets(
+        cls,
+        named_var_paths: dict[str, str | Path],
+    ) -> "FeatureRegistry":
+        """Build a FeatureRegistry from canonical var parquet files.
+
+        Reads ``{release_id}-canonical-var.parquet`` files produced by the
+        canonicalization runner (Phase 2).  Uses ``canonical_gene_id``
+        instead of raw ``feature_id`` as the global vocabulary key, so
+        ``global_vocab_size`` reflects harmonized gene identifiers.
+
+        The canonical var parquet must contain columns: ``origin_index``,
+        ``gene_id``, ``canonical_gene_id``, ``global_id``.
+
+        Parameters
+        ----------
+        named_var_paths : dict[str, str | Path]
+            Mapping ``dataset_id → path`` to canonical var parquet files.
+
+        Returns
+        -------
+        FeatureRegistry
+            Registry with canonically-mapped gene identities.
+        """
+        from pathlib import Path
+
+        named_var_dfs: dict[str, pl.DataFrame] = {}
+        for ds_id, path in named_var_paths.items():
+            df = pl.read_parquet(str(path))
+
+            required = {"origin_index", "canonical_gene_id"}
+            missing = required - set(df.columns)
+            if missing:
+                raise ValueError(
+                    f"Canonical var parquet for dataset '{ds_id}' missing "
+                    f"columns: {sorted(missing)}"
+                )
+
+            # Canonical parquets store all columns as strings; cast to proper types
+            if "origin_index" in df.columns and df["origin_index"].dtype == pl.Utf8:
+                df = df.with_columns(
+                    pl.col("origin_index").cast(pl.Int32)
+                )
+            if "global_id" in df.columns and df["global_id"].dtype == pl.Utf8:
+                df = df.with_columns(
+                    pl.col("global_id").cast(pl.Int32)
+                )
+
+            # Sort by origin_index to ensure contiguity
+            df = df.sort("origin_index")
+
+            # Rename canonical_gene_id → feature_id for internal compatibility
+            if "canonical_gene_id" in df.columns and "feature_id" not in df.columns:
+                df = df.rename({"canonical_gene_id": "feature_id"})
+
+            named_var_dfs[ds_id] = df
+
+        return cls(named_var_dfs)
 
     def __init__(
         self,
@@ -115,9 +180,15 @@ class FeatureRegistry:
             self._dataset_local_hvg[ds_idx] = local_hvg
 
             entries: list[dict[str, Any]] = []
+            # Determine gene identifier column: prefer canonical_gene_id if present
+            gene_id_col = (
+                "canonical_gene_id"
+                if "canonical_gene_id" in var_df.columns
+                else "feature_id"
+            )
             for row in var_df.iter_rows(named=True):
                 origin_idx = int(row["origin_index"])
-                feature_id = str(row["feature_id"])
+                feature_id = str(row[gene_id_col])
                 if feature_id not in self._feature_id_to_global:
                     self._feature_id_to_global[feature_id] = len(
                         self._feature_id_to_global
@@ -171,13 +242,22 @@ class FeatureRegistry:
 
     @staticmethod
     def _validate_var_df(var_df: pl.DataFrame, ds_id: str) -> None:
-        """Validate that the var DataFrame has required columns."""
-        required = {"origin_index", "feature_id"}
-        missing = required - set(var_df.columns)
-        if missing:
+        """Validate that the var DataFrame has required columns.
+
+        Accepts either ``feature_id`` or ``canonical_gene_id`` as the
+        gene identifier column.
+        """
+        has_feature_id = "feature_id" in var_df.columns
+        has_canonical = "canonical_gene_id" in var_df.columns
+        if not has_feature_id and not has_canonical:
             raise ValueError(
                 f"var DataFrame for dataset '{ds_id}' is missing "
-                f"required columns: {sorted(missing)}"
+                f"a gene identifier column (need 'feature_id' or 'canonical_gene_id')"
+            )
+        if "origin_index" not in var_df.columns:
+            raise ValueError(
+                f"var DataFrame for dataset '{ds_id}' is missing "
+                f"required column: 'origin_index'"
             )
         # Check that origin_index is contiguous 0..n_vars-1
         n = len(var_df)
@@ -235,11 +315,17 @@ class FeatureRegistry:
         self._validate_var_df(var_df, dataset_id)
         ds_idx = self._n_datasets
 
+        # Determine gene identifier column
+        gene_id_col = (
+            "canonical_gene_id"
+            if "canonical_gene_id" in var_df.columns
+            else "feature_id"
+        )
         # Process new dataset entries, extending global vocab
         entries: list[dict[str, Any]] = []
         for row in var_df.iter_rows(named=True):
             origin_idx = int(row["origin_index"])
-            feature_id = str(row["feature_id"])
+            feature_id = str(row[gene_id_col])
             if feature_id not in self._feature_id_to_global:
                 self._feature_id_to_global[feature_id] = len(
                     self._feature_id_to_global

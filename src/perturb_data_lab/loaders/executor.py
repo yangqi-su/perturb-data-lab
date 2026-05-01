@@ -8,6 +8,10 @@ Key design rules:
 - Metadata comes from ``MetadataIndex``, **not** from expression readers.
 - Expression readers return only the 3-field ``ExpressionRow``.
 - ``read_batch()`` returns flat dicts with zero per-cell Python objects.
+- When ``use_canonical=True``, canonical columns are read directly from the
+  ``MetadataIndex`` DataFrame — no per-row dict extraction.
+- Backward-compatible: ``use_canonical=False`` preserves raw-column extraction
+  via the ``raw_`` prefix convention.
 """
 
 from __future__ import annotations
@@ -28,7 +32,23 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# Default mappings: which raw_ columns map to canonical_perturbation / context
+# Canonical field groupings (used when use_canonical=True)
+# ---------------------------------------------------------------------------
+
+_CANONICAL_PERTURBATION_FIELDS: tuple[str, ...] = (
+    "perturb_label", "perturb_type", "dose", "dose_unit",
+    "timepoint", "timepoint_unit",
+)
+
+_CANONICAL_CONTEXT_FIELDS: tuple[str, ...] = (
+    "cell_context", "cell_line_or_type", "species", "tissue",
+    "assay", "condition", "batch_id", "donor_id", "sex",
+    "disease_state",
+)
+
+
+# ---------------------------------------------------------------------------
+# Default raw mappings (used when use_canonical=False)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_PERTURBATION_KEYS: tuple[str, ...] = (
@@ -55,11 +75,17 @@ class BatchExecutor:
     metadata_index : MetadataIndex
         Polars-backed metadata index with flat columnar schema.
     perturbation_raw_keys : iterable of str, optional
-        ``raw_``-column stems that map to ``canonical_perturbation`` dict.
+        When ``use_canonical=False``, ``raw_``-column stems that map to
+        ``canonical_perturbation`` dict.
         Default: ``("guide_1","guide_2","treatment","site","genotype")``.
     context_raw_keys : iterable of str, optional
-        ``raw_``-column stems that map to ``canonical_context`` dict.
+        When ``use_canonical=False``, ``raw_``-column stems that map to
+        ``canonical_context`` dict.
         Default: ``("cell_type","cellline","donor_id","batch","passage")``.
+    use_canonical : bool, optional
+        When ``True``, reads canonical columns directly from the
+        ``MetadataIndex`` DataFrame.  No per-row raw-column extraction.
+        Default: ``False``.
     """
 
     def __init__(
@@ -69,9 +95,11 @@ class BatchExecutor:
         *,
         perturbation_raw_keys: Sequence[str] | None = None,
         context_raw_keys: Sequence[str] | None = None,
+        use_canonical: bool = False,
     ):
         self._reader = expression_reader
         self._meta = metadata_index
+        self._use_canonical = use_canonical
 
         self._perturbation_keys: frozenset[str] = frozenset(
             perturbation_raw_keys if perturbation_raw_keys is not None
@@ -82,7 +110,13 @@ class BatchExecutor:
             else _DEFAULT_CONTEXT_KEYS
         )
 
-        # Note: raw_ columns are extracted on-demand via _extract_canonical
+        # Canonical field sets (precomputed for speed)
+        self._canonical_pert_fields: frozenset[str] = frozenset(
+            _CANONICAL_PERTURBATION_FIELDS
+        )
+        self._canonical_ctx_fields: frozenset[str] = frozenset(
+            _CANONICAL_CONTEXT_FIELDS
+        )
 
     # ------------------------------------------------------------------
     # Public API — flat-batch, zero per-cell Python objects
@@ -160,6 +194,9 @@ class BatchExecutor:
         tuples.  Canonical perturbation and context dicts are still
         per-cell tuples of dicts (metadata, not GPU data).
 
+        When ``use_canonical=True``, reads canonical columns directly;
+        when ``False``, extracts from ``raw_``-prefixed columns.
+
         Parameters
         ----------
         global_indices : sequence of int
@@ -198,16 +235,15 @@ class BatchExecutor:
         dataset_id = tuple(df["dataset_id"].to_list())
         cell_id = tuple(df["cell_id"].to_list())
 
-        # Canonical dicts: extracted per-row (metadata, not GPU data)
-        canonical_perturbation: list[dict[str, str]] = []
-        canonical_context: list[dict[str, str]] = []
-        for i in range(n):
-            row = df.row(i, named=True)
-            canonical_perturbation.append(
-                self._extract_canonical(row, self._perturbation_keys)
+        # Build canonical_perturbation and canonical_context dicts
+        if self._use_canonical:
+            canonical_perturbation, canonical_context = (
+                self._build_canonical_dicts(df, n)
             )
-            canonical_context.append(
-                self._extract_canonical(row, self._context_keys)
+        else:
+            # Legacy path: extract from raw_ columns
+            canonical_perturbation, canonical_context = (
+                self._build_dicts_from_raw(df, n)
             )
 
         return {
@@ -291,21 +327,77 @@ class BatchExecutor:
         return len(self._meta)
 
     # ------------------------------------------------------------------
-    # Internal: composition
+    # Internal: canonical dict builders
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_canonical(row: dict[str, Any], keys: frozenset[str]) -> dict[str, str]:
-        """Extract canonical dict from a metadata row.
+    def _build_canonical_dicts(
+        self, df: "pl.DataFrame", n: int
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        """Build canonical_perturbation and canonical_context from flat columns.
+
+        Reads canonical columns directly from the DataFrame (no ``raw_``
+        prefix, no per-row extraction).  Skips ``None`` and ``NA`` values.
+        """
+        pert_cols = [
+            c for c in _CANONICAL_PERTURBATION_FIELDS
+            if c in df.columns
+        ]
+        ctx_cols = [
+            c for c in _CANONICAL_CONTEXT_FIELDS
+            if c in df.columns
+        ]
+
+        pert_list: list[dict[str, str]] = []
+        ctx_list: list[dict[str, str]] = []
+        for i in range(n):
+            row = df.row(i, named=True)
+            pert = {}
+            for col in pert_cols:
+                val = row.get(col)
+                if val is not None and str(val) != "NA":
+                    pert[col] = str(val)
+            ctx = {}
+            for col in ctx_cols:
+                val = row.get(col)
+                if val is not None and str(val) != "NA":
+                    ctx[col] = str(val)
+            pert_list.append(pert)
+            ctx_list.append(ctx)
+
+        return pert_list, ctx_list
+
+    def _build_dicts_from_raw(
+        self, df: "pl.DataFrame", n: int
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        """Build canonical dicts from ``raw_``-prefixed columns (legacy path).
 
         Looks for ``raw_<key>`` columns and maps them to ``{key: value}``.
-        Skips None values.
+        Skips None and NA values.
         """
+        pert_list: list[dict[str, str]] = []
+        ctx_list: list[dict[str, str]] = []
+        for i in range(n):
+            row = df.row(i, named=True)
+            pert_list.append(
+                self._dict_from_raw(row, self._perturbation_keys)
+            )
+            ctx_list.append(
+                self._dict_from_raw(row, self._context_keys)
+            )
+        return pert_list, ctx_list
+
+    @staticmethod
+    def _dict_from_raw(
+        row: dict[str, Any], keys: frozenset[str]
+    ) -> dict[str, str]:
+        """Extract ``{key: value}`` from ``raw_<key>`` columns."""
         result: dict[str, str] = {}
         for key in keys:
             col = f"raw_{key}"
             if col in row and row[col] is not None:
-                result[key] = str(row[col])
+                val = str(row[col])
+                if val != "NA":
+                    result[key] = val
         return result
 
 

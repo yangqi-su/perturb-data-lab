@@ -593,6 +593,78 @@ The target architecture therefore treats canonicalization as a downstream enrich
 
 Basic materialization and basic loading must still stand on their own.
 
+### Canonicalization Stage (Post-Materialization)
+
+Canonicalization runs as a separate, guided, offline step **after** all datasets have been materialized (Stage 2).  It consumes the raw obs/var sidecars written during materialization and produces pre-computed canonical metadata files that the loader can read directly, eliminating all per-row transform overhead at training time.
+
+**Position in the pipeline**:
+
+```
+Stage 1  →  Stage 2  →  Canonicalization  →  Stage 3.1/3.2
+(inspect)  (materialize)  (this stage)          (load)
+```
+
+**Inputs**:
+
+- Per-dataset raw obs sidecar (`{release_id}-raw-obs.parquet`)
+- Per-dataset raw var sidecar (`{release_id}-raw-var.parquet`)
+- Per-dataset `canonicalization-schema.yaml` (human-authored transform config)
+- Per-dataset size factor sidecar (`{release_id}-size-factor.parquet`)
+
+**Outputs**:
+
+- Per-dataset `{release_id}-canonical-obs.parquet` — canonical cell metadata with all must-have columns plus declared extensible columns
+- Per-dataset `{release_id}-canonical-var.parquet` — canonical feature metadata with `origin_index`, `gene_id`, `canonical_gene_id`, and `global_id`
+- Corpus-level `canonical-vocab.yaml` — deduplicated, sorted values per canonical category across all datasets
+- Corpus-level `canonical-gene-mappings.yaml` — global `gene_id → canonical_gene_id` mapping
+
+**Canonical obs contract** (must-have columns):
+
+```
+global_row_index, cell_id, dataset_id, dataset_index, local_row_index,
+size_factor, perturb_label, perturb_type, dose, dose_unit, timepoint,
+timepoint_unit, cell_context, cell_line_or_type, species, tissue, assay,
+condition, batch_id, donor_id, sex, disease_state
+```
+
+Extensible columns may be added from raw obs or external metadata files;
+all missing values become `NA` in the global frame.
+
+**Canonical var contract** (must-have columns):
+
+```
+origin_index, gene_id, canonical_gene_id, global_id
+```
+
+**Gene ID mapping** uses `gget` (pluggable, configurable per dataset) to
+convert dataset-local gene identifiers (`gene_id`) into canonical identifiers
+(`canonical_gene_id`).  When mapping is disabled or the dataset gene names are
+already in the target namespace, the mapping is identity.  A `mapping_file`
+override is supported for explicit tabular mapping.
+
+**Control representation**: control conditions are represented via the
+`perturb_type` field (e.g., `"control"`, `"non-targeting"`) rather than a
+separate boolean `control_flag`.  This keeps the schema flat and avoids
+implicit boolean semantics.
+
+**Relationship to extant schema artifacts**:
+
+The `canonicalization-schema.yaml` is a new artifact, separate from the
+inspection-stage `SchemaDocument`.  The inspection schema maps raw fields to
+canonical fields during materialization; the canonicalization schema maps raw
+*sidecar* columns to final canonical parquet columns after materialization.
+The two artifacts serve different stages and are not coupled.
+
+**Canonicalization schema YAML format** is defined in
+`perturb_data_lab.canonical.contract.CanonicalizationSchema`.  It is flat and
+explicit: each canonical column has a single strategy (`source-field`,
+`literal`, `passthrough`, `row-index`, `null`, `gene-mapping`, or `auto`),
+an ordered list of value transforms (from `inspectors/transforms.py`), and a
+fallback value.  No nested conditionals or implicit defaults are supported.
+
+Example per-dataset schemas live alongside the plan run directory (e.g.,
+`copilot/plans/<plan-id>/schemas/<dataset_id>/canonicalization-schema.yaml`).
+
 ## Corpus Tracking Object
 
 The design assumes one authoritative corpus tracking object.
@@ -642,15 +714,19 @@ Inspect one `.h5ad`, summarize dimensions and metadata, audit count sources, and
 
 ### Stage 2
 
-Materialize integer counts into a chosen backend and topology, preserve raw metadata and feature metadata, compute HVGs, emit a proposed canonicalization scaffold, and append the dataset to the corpus ledger.
+Materialize integer counts into a chosen backend and topology, preserve raw metadata and feature metadata, compute HVGs, and append the dataset to the corpus ledger.
+
+### Canonicalization
+
+Run per-dataset canonicalization using human-authored `canonicalization-schema.yaml` files and the `canonical/` runner.  Produce canonical obs/var parquets and a corpus-level `canonical-vocab.yaml`.  Gene ID mapping uses `gget` (pluggable, configurable per dataset).
 
 ### Stage 3.1
 
-Make all backends loadable for basic row-level and batch-level access with simple sampling and sparse batch collation.
+Make all backends loadable for basic row-level and batch-level access with simple sampling and sparse batch collation.  Loaders can read canonical metadata when available via a `use_canonical=True` flag, falling back to raw sidecars when canonical files are absent.
 
 ### Stage 3.2
 
-Settle feature-space semantics and make all advanced dataloading methods work correctly, including HVG-aware and global-feature-aware paths where needed.
+Settle feature-space semantics and make all advanced dataloading methods work correctly, including HVG-aware and global-feature-aware paths where needed.  Loaders read canonical var metadata directly, using `canonical_gene_id` for global-feature-space sampling.
 
 ## Final Design Intent
 
@@ -658,6 +734,6 @@ Settle feature-space semantics and make all advanced dataloading methods work co
 
 The intended sentence is:
 
-"Inspect a dataset to approve its count source, materialize it into a backend while preserving raw metadata and feature truth, register it in a corpus ledger, and then load it through simple or advanced dataloaders depending on whether only local feature space or full canonicalized global feature space is required."
+"Inspect a dataset to approve its count source, materialize it into a backend while preserving raw metadata and feature truth, register it in a corpus ledger, canonicalize metadata via human-authored transform schemas, and then load it through simple or advanced dataloaders that read canonical files directly — depending on whether only local feature space or full canonicalized global feature space is required."
 
 If later implementation plans do not reinforce that sentence, they are pushing the repository away from this design.
