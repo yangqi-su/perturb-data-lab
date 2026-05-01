@@ -766,7 +766,10 @@ class CorpusLedgerEntry:
     def validate(self) -> None:
         if self.join_mode not in {"create_new", "append_routed"}:
             raise ValueError(f"invalid join_mode: {self.join_mode}")
-        if self.backend not in {"arrow-hf", "webdataset", "zarr", "lance"}:
+        if self.backend not in {
+            "arrow-hf", "arrow-parquet", "arrow-ipc",
+            "webdataset", "zarr", "lance",
+        }:
             raise ValueError(f"invalid backend: {self.backend}")
         if self.topology not in {"federated", "aggregate"}:
             raise ValueError(f"invalid topology: {self.topology}")

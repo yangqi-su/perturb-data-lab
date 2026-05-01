@@ -132,6 +132,28 @@ class Stage2Materializer:
         after successful materialization. Requires ``corpus_index_path`` to be set.
         When True, the returned manifest's ``corpus_registration`` field is
         populated and the manifest YAML is rewritten with registration metadata.
+    mode : str, default "create"
+        Materialization mode: ``"create"`` (first dataset in a new corpus) or
+        ``"append"`` (subsequent dataset appended to an existing corpus).
+        Controls the manifest ``route`` field and the ledger ``join_mode``.
+        ``"create"`` produces ``route="create_new"``; ``"append"`` produces
+        ``route="append_routed"``.
+    dataset_index : int, default 0
+        Position of this dataset in the corpus (0-based). Used for global row
+        range computation in aggregate topology.
+    global_row_start : int, default 0
+        Starting row index in the global corpus for this dataset's cells.
+        Pre-computed by the corpus-level orchestrator to ensure contiguous
+        global row indices in aggregate topology.
+    writer_state : dict | None, default None
+        Opaque writer state carried across datasets in aggregate topology.
+        The corpus-level orchestrator reads this from the previous dataset's
+        materializer and passes it to the next. None on the first dataset.
+        Only meaningful for aggregate topology backends (lance, zarr, webdataset).
+    _is_last_dataset : bool, default False
+        When True, signals to the aggregate backend that this is the final
+        dataset in the series, triggering backend finalization.
+        Only meaningful for aggregate topology.
 
     Contract
     --------
@@ -164,9 +186,16 @@ class Stage2Materializer:
         corpus_index_path: str | None = None,
         corpus_id: str | None = None,
         register: bool = False,
+        mode: str = "create",
         dataset_index: int = 0,
         global_row_start: int = 0,
+        writer_state: dict | None = None,
+        _is_last_dataset: bool = False,
     ):
+        if mode not in ("create", "append"):
+            raise ValueError(
+                f"mode must be 'create' or 'append', got {mode!r}"
+            )
         self.source_path = source_path
         self.review_bundle_path = review_bundle_path
         self.output_roots = output_roots
@@ -180,10 +209,11 @@ class Stage2Materializer:
         self.corpus_index_path = corpus_index_path
         self.corpus_id = corpus_id
         self.register = register
+        self.mode = mode
         self.dataset_index = dataset_index
         self.global_row_start = global_row_start
-        self.writer_state: dict | None = None
-        self._is_last_dataset: bool = False
+        self.writer_state = writer_state
+        self._is_last_dataset = _is_last_dataset
         if register and corpus_index_path is None:
             raise ValueError(
                 "register=True requires corpus_index_path to be set; "
@@ -319,7 +349,7 @@ class Stage2Materializer:
                 contract_version=CONTRACT_VERSION,
                 dataset_id=self.dataset_id,
                 release_id=self.release_id,
-                route="create_new",
+                route="create_new" if self.mode == "create" else "append_routed",
                 backend=self.backend,
                 topology=self.topology,
                 count_source=count_source,

@@ -261,16 +261,17 @@ class TestMaterializationManifest:
     def test_manifest_round_trip(self):
         manifest = MaterializationManifest(
             kind="materialization-manifest",
-            contract_version="0.2.0",
+            contract_version="0.3.0",
             dataset_id="test_ds",
             release_id="v0.1",
             route="create_new",
             backend="arrow-parquet",
+            topology="federated",
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             provenance=ProvenanceSpec(
                 source_path="/data/test.h5ad",
-                schema="/reviewed-schema.yaml",
+                review_bundle="/reviewed-schema.yaml",
             ),
             integer_verified=True,
         )
@@ -281,3 +282,297 @@ class TestMaterializationManifest:
             assert loaded.dataset_id == "test_ds"
             assert loaded.route == "create_new"
             assert loaded.integer_verified is True
+
+    def test_manifest_append_routed_round_trip(self):
+        """Manifest with append_routed route round-trips correctly."""
+        manifest = MaterializationManifest(
+            kind="materialization-manifest",
+            contract_version="0.3.0",
+            dataset_id="ds_appended",
+            release_id="v0.2",
+            route="append_routed",
+            backend="lance",
+            topology="aggregate",
+            count_source=CountSourceSpec(selected=".X", integer_only=True),
+            outputs=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
+            provenance=ProvenanceSpec(
+                source_path="/data/appended.h5ad",
+                review_bundle="/reviewed-schema.yaml",
+            ),
+            integer_verified=True,
+            cell_count=500,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "manifest-append.yaml"
+            manifest.write_yaml(path)
+            loaded = MaterializationManifest.from_yaml_file(path)
+            assert loaded.dataset_id == "ds_appended"
+            assert loaded.route == "append_routed"
+            assert loaded.topology == "aggregate"
+            assert loaded.cell_count == 500
+
+
+class TestManifestToJoinRecordRoute:
+    """Test manifest route propagation to DatasetJoinRecord and corpus ledger."""
+
+    def test_create_new_route_propagates_to_join_record(self):
+        """manifest_to_join_record preserves create_new route."""
+        from perturb_data_lab.materializers import manifest_to_join_record
+
+        manifest = MaterializationManifest(
+            kind="materialization-manifest",
+            contract_version="0.3.0",
+            dataset_id="ds_create",
+            release_id="v0.1",
+            route="create_new",
+            backend="lance",
+            topology="aggregate",
+            count_source=CountSourceSpec(selected=".X", integer_only=True),
+            outputs=OutputRoots(metadata_root="/meta/create", matrix_root="/matrix/create"),
+            provenance=ProvenanceSpec(
+                source_path="/data/create.h5ad",
+                review_bundle="/reviewed-schema.yaml",
+            ),
+            raw_cell_meta_path="/meta/create/meta.parquet",
+            provenance_spec_path="/meta/create/prov.parquet",
+            cell_count=1000,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            corpus_root = Path(tmpdir) / "corpus"
+            corpus_root.mkdir()
+            record = manifest_to_join_record(manifest, corpus_root)
+            assert record.join_mode == "create_new"
+            assert record.dataset_id == "ds_create"
+
+    def test_append_routed_route_propagates_to_join_record(self):
+        """manifest_to_join_record preserves append_routed route."""
+        from perturb_data_lab.materializers import manifest_to_join_record
+
+        manifest = MaterializationManifest(
+            kind="materialization-manifest",
+            contract_version="0.3.0",
+            dataset_id="ds_append",
+            release_id="v0.2",
+            route="append_routed",
+            backend="lance",
+            topology="aggregate",
+            count_source=CountSourceSpec(selected=".X", integer_only=True),
+            outputs=OutputRoots(metadata_root="/meta/append", matrix_root="/matrix/append"),
+            provenance=ProvenanceSpec(
+                source_path="/data/append.h5ad",
+                review_bundle="/reviewed-schema.yaml",
+            ),
+            raw_cell_meta_path="/meta/append/meta.parquet",
+            provenance_spec_path="/meta/append/prov.parquet",
+            cell_count=500,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            corpus_root = Path(tmpdir) / "corpus"
+            corpus_root.mkdir()
+            record = manifest_to_join_record(manifest, corpus_root)
+            assert record.join_mode == "append_routed"
+            assert record.dataset_id == "ds_append"
+
+    def test_corpus_ledger_writes_append_routed_join_mode(self):
+        """Corpus ledger YAML and Parquet record append_routed for appended datasets."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            idx_path = Path(tmpdir) / "corpus-index.yaml"
+
+            # Create corpus with first dataset
+            record1 = DatasetJoinRecord(
+                dataset_id="ds_first",
+                release_id="v0.1",
+                join_mode="create_new",
+                manifest_path="ds_first/manifest.yaml",
+                cell_count=1000,
+            )
+            update_corpus_index(idx_path, record1, backend="lance", topology="aggregate")
+
+            # Append second dataset
+            record2 = DatasetJoinRecord(
+                dataset_id="ds_second",
+                release_id="v0.2",
+                join_mode="append_routed",
+                manifest_path="ds_second/manifest.yaml",
+                cell_count=500,
+            )
+            updated = update_corpus_index(idx_path, record2, backend="lance", topology="aggregate")
+
+            # Verify YAML index
+            assert len(updated.datasets) == 2
+            assert updated.datasets[0].join_mode == "create_new"
+            assert updated.datasets[1].join_mode == "append_routed"
+
+            # Verify Parquet ledger
+            import pyarrow.parquet as pq
+            ledger_path = Path(tmpdir) / "corpus-ledger.parquet"
+            assert ledger_path.exists()
+            table = pq.read_table(str(ledger_path))
+            join_modes = table.column("join_mode").to_pylist()
+            assert join_modes == ["create_new", "append_routed"]
+
+
+class TestStage2MaterializerConstructorApi:
+    """Test Stage2Materializer constructor accepts mode, writer_state, _is_last_dataset."""
+
+    def test_constructor_accepts_mode_create_default(self):
+        """Default mode is 'create' and is stored as instance attribute."""
+        try:
+            from perturb_data_lab.materializers import Stage2Materializer
+        except ImportError:
+            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+        from perturb_data_lab.materializers.models import OutputRoots
+
+        mat = Stage2Materializer(
+            source_path="/fake/source.h5ad",
+            review_bundle_path="/fake/bundle.yaml",
+            output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
+            release_id="v0",
+            dataset_id="ds_test",
+        )
+        assert mat.mode == "create"
+
+    def test_constructor_accepts_mode_append(self):
+        """mode='append' is accepted and stored."""
+        try:
+            from perturb_data_lab.materializers import Stage2Materializer
+        except ImportError:
+            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+        from perturb_data_lab.materializers.models import OutputRoots
+
+        mat = Stage2Materializer(
+            source_path="/fake/source.h5ad",
+            review_bundle_path="/fake/bundle.yaml",
+            output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
+            release_id="v0",
+            dataset_id="ds_test",
+            mode="append",
+        )
+        assert mat.mode == "append"
+
+    def test_constructor_rejects_invalid_mode(self):
+        """Invalid mode raises ValueError."""
+        try:
+            from perturb_data_lab.materializers import Stage2Materializer
+        except ImportError:
+            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+        from perturb_data_lab.materializers.models import OutputRoots
+
+        with pytest.raises(ValueError, match="mode must be 'create' or 'append'"):
+            Stage2Materializer(
+                source_path="/fake/source.h5ad",
+                review_bundle_path="/fake/bundle.yaml",
+                output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
+                release_id="v0",
+                dataset_id="ds_test",
+                mode="invalid",
+            )
+
+    def test_constructor_accepts_writer_state(self):
+        """writer_state parameter is stored as instance attribute."""
+        try:
+            from perturb_data_lab.materializers import Stage2Materializer
+        except ImportError:
+            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+        from perturb_data_lab.materializers.models import OutputRoots
+
+        state = {"lance_path": "/corpus/cells.lance", "initialized": True}
+        mat = Stage2Materializer(
+            source_path="/fake/source.h5ad",
+            review_bundle_path="/fake/bundle.yaml",
+            output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
+            release_id="v0",
+            dataset_id="ds_test",
+            writer_state=state,
+        )
+        assert mat.writer_state == state
+
+    def test_constructor_accepts_writer_state_none_default(self):
+        """writer_state defaults to None."""
+        try:
+            from perturb_data_lab.materializers import Stage2Materializer
+        except ImportError:
+            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+        from perturb_data_lab.materializers.models import OutputRoots
+
+        mat = Stage2Materializer(
+            source_path="/fake/source.h5ad",
+            review_bundle_path="/fake/bundle.yaml",
+            output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
+            release_id="v0",
+            dataset_id="ds_test",
+        )
+        assert mat.writer_state is None
+
+    def test_constructor_accepts_is_last_dataset(self):
+        """_is_last_dataset parameter is stored."""
+        try:
+            from perturb_data_lab.materializers import Stage2Materializer
+        except ImportError:
+            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+        from perturb_data_lab.materializers.models import OutputRoots
+
+        mat = Stage2Materializer(
+            source_path="/fake/source.h5ad",
+            review_bundle_path="/fake/bundle.yaml",
+            output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
+            release_id="v0",
+            dataset_id="ds_test",
+            _is_last_dataset=True,
+        )
+        assert mat._is_last_dataset is True
+
+    def test_constructor_is_last_dataset_default_false(self):
+        """_is_last_dataset defaults to False."""
+        try:
+            from perturb_data_lab.materializers import Stage2Materializer
+        except ImportError:
+            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+        from perturb_data_lab.materializers.models import OutputRoots
+
+        mat = Stage2Materializer(
+            source_path="/fake/source.h5ad",
+            review_bundle_path="/fake/bundle.yaml",
+            output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
+            release_id="v0",
+            dataset_id="ds_test",
+        )
+        assert mat._is_last_dataset is False
+
+    def test_dataset_index_and_global_row_start_defaults(self):
+        """dataset_index and global_row_start have sensible defaults."""
+        try:
+            from perturb_data_lab.materializers import Stage2Materializer
+        except ImportError:
+            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+        from perturb_data_lab.materializers.models import OutputRoots
+
+        mat = Stage2Materializer(
+            source_path="/fake/source.h5ad",
+            review_bundle_path="/fake/bundle.yaml",
+            output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
+            release_id="v0",
+            dataset_id="ds_test",
+        )
+        assert mat.dataset_index == 0
+        assert mat.global_row_start == 0
+
+    def test_constructor_accepts_dataset_index_and_global_row_start(self):
+        """dataset_index and global_row_start can be set via constructor."""
+        try:
+            from perturb_data_lab.materializers import Stage2Materializer
+        except ImportError:
+            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+        from perturb_data_lab.materializers.models import OutputRoots
+
+        mat = Stage2Materializer(
+            source_path="/fake/source.h5ad",
+            review_bundle_path="/fake/bundle.yaml",
+            output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
+            release_id="v0",
+            dataset_id="ds_test",
+            dataset_index=3,
+            global_row_start=1500,
+        )
+        assert mat.dataset_index == 3
+        assert mat.global_row_start == 1500
