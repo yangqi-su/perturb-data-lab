@@ -57,20 +57,6 @@ _EXPORT_MAP = {
     "corpus_exists": (".registration", "corpus_exists"),
     "get_corpus_summary": (".registration", "get_corpus_summary"),
     "manifest_to_join_record": (".registration", "manifest_to_join_record"),
-    # Phase 4 canonicalize-meta
-    "CanonicalizeMetaRoute": (".canonicalize_meta", "CanonicalizeMetaRoute"),
-    "CorpusCellIndexRange": (".canonicalize_meta", "CorpusCellIndexRange"),
-    "CanonicalizeMetaResult": (".canonicalize_meta", "CanonicalizeMetaResult"),
-    "run_canonicalize_meta": (".canonicalize_meta", "run_canonicalize_meta"),
-    # Validation
-    "validate_schema_readiness": (".validation", "validate_schema_readiness"),
-    # Schema execution
-    "SchemaExecutionResult": (".schema_execution", "SchemaExecutionResult"),
-    "resolve_field_entry": (".schema_execution", "resolve_field_entry"),
-    "resolve_cell_row": (".schema_execution", "resolve_cell_row"),
-    "resolve_feature_row": (".schema_execution", "resolve_feature_row"),
-    "resolve_all_cell_rows": (".schema_execution", "resolve_all_cell_rows"),
-    "resolve_all_feature_rows": (".schema_execution", "resolve_all_feature_rows"),
 }
 
 
@@ -124,18 +110,4 @@ __all__ = [
     "corpus_exists",
     "get_corpus_summary",
     "manifest_to_join_record",
-    # Phase 4 canonicalize-meta
-    "CanonicalizeMetaRoute",
-    "CorpusCellIndexRange",
-    "CanonicalizeMetaResult",
-    "run_canonicalize_meta",
-    # Validation
-    "validate_schema_readiness",
-    # Schema execution
-    "SchemaExecutionResult",
-    "resolve_field_entry",
-    "resolve_cell_row",
-    "resolve_feature_row",
-    "resolve_all_cell_rows",
-    "resolve_all_feature_rows",
 ]

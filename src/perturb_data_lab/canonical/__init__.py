@@ -6,6 +6,7 @@ Provides:
 - ``CanonicalVocab`` — corpus-global vocabulary container
 - ``CanonicalizationRunner`` — transforms raw sidecars into canonical parquets
 - ``build_canonical_vocab`` — merges per-dataset vocabs into corpus-level vocab
+- ``draft_canonicalization_schema`` — AI-assisted schema drafting helper
 """
 
 from .contract import (
@@ -21,6 +22,7 @@ from .contract import (
     TransformRule,
     GeneMappingConfig,
 )
+from .drafting import draft_canonicalization_schema
 from .runner import (
     CanonicalizationResult,
     CanonicalizationRunner,
@@ -43,5 +45,6 @@ __all__ = [
     "TransformRule",
     "VarColumnMapping",
     "build_canonical_vocab",
+    "draft_canonicalization_schema",
     "run_canonicalization",
 ]

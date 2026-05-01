@@ -19,8 +19,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .inspectors.models import InspectionBatchConfig, SchemaDocument
-from .inspectors.schema_utils import explain_schema, preview_cell_row, preview_feature_row
+from .inspectors.models import InspectionBatchConfig
 from .inspectors.workflow import run_batch
 
 
@@ -47,167 +46,6 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
     print(
         f"[inspect] wrote manifest {Path(manifest.output_root) / 'inspection-manifest.yaml'}"
     )
-
-
-# ---------------------------------------------------------------------------
-# schema validate
-# ---------------------------------------------------------------------------
-
-
-def _add_schema_validate_args(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument(
-        "schema_path",
-        help="Path to the schema YAML file to validate.",
-    )
-    sub.add_argument(
-        "--corpus-namespace",
-        default=None,
-        help="Optional corpus namespace to also check namespace compatibility against.",
-    )
-
-
-def _cmd_schema_validate(args: argparse.Namespace) -> None:
-    from .materializers.validation import validate_schema_readiness
-    from .inspectors.models import SchemaDocument
-
-    schema_path = Path(args.schema_path)
-    if not schema_path.exists():
-        print(f"[error] schema not found: {schema_path}", file=sys.stderr)
-        sys.exit(1)
-
-    schema = SchemaDocument.from_yaml_file(schema_path)
-    result = validate_schema_readiness(str(schema_path))
-
-    if result.valid:
-        print(f"[schema validate] PASS — {schema_path} is ready for materialization")
-    else:
-        print(f"[schema validate] FAIL — {schema_path}", file=sys.stderr)
-        for v in result.violations:
-            print(f"  [{v.section}.{v.field}] {v.reason}", file=sys.stderr)
-        sys.exit(1)
-
-    # Optional namespace compatibility check
-    if args.corpus_namespace:
-        from .schema_utils import check_namespace_compatibility
-
-        ok, reason = check_namespace_compatibility(schema, args.corpus_namespace)
-        if ok:
-            print(
-                f"[namespace] OK — schema namespace '{schema.feature_tokenization.namespace}' "
-                f"is compatible with corpus namespace '{args.corpus_namespace}'"
-            )
-        else:
-            print(
-                f"[namespace] INCOMPATIBLE — schema namespace "
-                f"'{schema.feature_tokenization.namespace}' != corpus namespace "
-                f"'{args.corpus_namespace}'",
-                file=sys.stderr,
-            )
-            print(f"  {reason}", file=sys.stderr)
-            sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# schema preview
-# ---------------------------------------------------------------------------
-
-
-def _add_schema_preview_args(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument(
-        "schema_path",
-        help="Path to the schema YAML file.",
-    )
-    sub.add_argument(
-        "--sample",
-        default=None,
-        help=(
-            "Path to a small h5ad file to sample rows from for preview. "
-            "If not provided, uses example values from the schema."
-        ),
-    )
-    sub.add_argument(
-        "--n-rows",
-        type=int,
-        default=5,
-        help="Number of rows to sample from the h5ad for preview. Default: 5.",
-    )
-
-
-def _cmd_schema_preview(args: argparse.Namespace) -> None:
-    import anndata as ad
-    import pandas as pd
-
-    schema_path = Path(args.schema_path)
-    if not schema_path.exists():
-        print(f"[error] schema not found: {schema_path}", file=sys.stderr)
-        sys.exit(1)
-
-    schema = SchemaDocument.from_yaml_file(schema_path)
-
-    # Print schema explanation
-    exp = explain_schema(schema)
-    print(f"\n=== Schema Explanation: {exp.dataset_id} ===")
-    print(f"Status     : {exp.status}")
-    print(f"Namespace  : {exp.namespace} ({exp.namespace_status})")
-    if exp.namespace_issue:
-        print(f"  {exp.namespace_issue}")
-    print(f"Fields     : {exp.field_count} total, {exp.resolved_count} resolved, "
-          f"{exp.unresolved_count} unresolved, {exp.null_required_count} null+required")
-    if exp.readiness_blockers:
-        print("Blockers:")
-        for b in exp.readiness_blockers:
-            print(f"  - {b}")
-
-    print(f"\n--- Per-field status ---")
-    for fe in exp.field_explanations:
-        status_mark = "✓" if fe.status == "resolved" else "✗"
-        null_note = " [null+required]" if (fe.status == "null_strategy" and fe.required) else ""
-        print(f"  {status_mark} [{fe.section}.{fe.field}] strategy={fe.strategy}  "
-              f"confidence={fe.confidence} sources={fe.source_fields}{null_note}")
-        if fe.issue and (fe.status != "resolved" or fe.required):
-            print(f"      issue: {fe.issue}")
-        if fe.resolution_hint and fe.status != "resolved":
-            print(f"      hint: {fe.resolution_hint}")
-
-    # If a sample h5ad is provided, show resolved values on real rows
-    if args.sample:
-        sample_path = Path(args.sample)
-        if not sample_path.exists():
-            print(f"\n[error] sample h5ad not found: {sample_path}", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"\n--- Sample row preview (from {sample_path.name}) ---")
-        adata = ad.read_h5ad(str(sample_path), backed="r")
-        obs_mem = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
-        n_rows = min(args.n_rows, len(obs_mem))
-
-        # Sample evenly spaced rows
-        indices = list(range(0, len(obs_mem), max(1, len(obs_mem) // n_rows)))[:n_rows]
-
-        for i in indices:
-            obs_row = obs_mem.iloc[i].to_dict()
-            cell_id = str(obs_mem.index[i])
-            result = preview_cell_row(schema, obs_row)
-            print(f"\n  cell_id={cell_id}")
-            for section_name, fields in [("perturbation", result["perturbation"])]:
-                for k, v in fields.items():
-                    print(f"    {section_name}.{k} = {v}")
-
-        if hasattr(adata, "file") and adata.file is not None:
-            adata.file.close()
-
-        # Also preview feature rows if var is available
-        var_mem = adata.var.to_memory() if hasattr(adata.var, "to_memory") else adata.var
-        print(f"\n--- Sample feature rows ---")
-        n_feat = min(args.n_rows, len(var_mem))
-        feat_indices = list(range(0, len(var_mem), max(1, len(var_mem) // n_feat)))[:n_feat]
-        for i in feat_indices:
-            var_row = var_mem.iloc[i].to_dict()
-            feat_id = str(var_mem.index[i])
-            result = preview_feature_row(schema, var_row)
-            print(f"\n  feature={feat_id}")
-            for k, v in result.items():
-                print(f"    feature.{k} = {v}")
 
 
 # ---------------------------------------------------------------------------
@@ -554,40 +392,6 @@ def _cmd_corpus_validate(args: argparse.Namespace) -> None:
         print(f"\n[corpus validate] PASS")
 
 
-# ---------------------------------------------------------------------------
-# canonicalize-meta
-# ---------------------------------------------------------------------------
-
-
-def _add_canonicalize_meta_args(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument(
-        "--corpus-index",
-        required=True,
-        help="Path to the corpus-index.yaml.",
-    )
-
-
-def _cmd_canonicalize_meta(args: argparse.Namespace) -> None:
-    from .materializers import run_canonicalize_meta
-
-    corpus_index_path = Path(args.corpus_index)
-    if not corpus_index_path.exists():
-        print(f"[error] corpus-index not found: {corpus_index_path}", file=sys.stderr)
-        sys.exit(1)
-
-    result = run_canonicalize_meta(corpus_index_path)
-
-    print(f"[canonicalize-meta] done — {result.corpus_id}")
-    print(f"  datasets      : {result.datasets}")
-    print(f"  total_cells   : {result.total_cells}")
-    print(f"  cell_ranges   : {len(result.cell_ranges)} datasets with global ranges")
-    for r in result.cell_ranges:
-        print(f"    {r.dataset_id}/{r.release_id}: [{r.global_start}, {r.global_end}) count={r.count}")
-    print(f"  corpus_cell_meta    : {result.corpus_cell_meta_path}")
-    print(f"  corpus_feature_meta : {result.corpus_feature_meta_path}")
-    print(f"  feature_set         : {result.feature_set_path}")
-
-
 def _add_stage2_materialize_args(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
         "--source",
@@ -747,14 +551,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_inspect = sub.add_parser("inspect", help="Run h5ad inspection batch.")
     _add_inspect_args(p_inspect)
 
-    # schema validate
-    p_sv = sub.add_parser("schema-validate", help="Validate schema for materialization readiness.")
-    _add_schema_validate_args(p_sv)
-
-    # schema preview
-    p_sp = sub.add_parser("schema-preview", help="Preview resolved canonical values from a schema.")
-    _add_schema_preview_args(p_sp)
-
     # materialize
     p_mat = sub.add_parser("materialize", help="Materialize a dataset into a backend storage format.")
     _add_materialize_args(p_mat)
@@ -770,10 +566,6 @@ def build_parser() -> argparse.ArgumentParser:
     # corpus validate
     p_cv = sub.add_parser("corpus-validate", help="Validate a corpus for logical completeness.")
     _add_corpus_validate_args(p_cv)
-
-    # canonicalize-meta
-    p_cm = sub.add_parser("canonicalize-meta", help="Rebuild corpus canonical metadata from raw artifacts.")
-    _add_canonicalize_meta_args(p_cm)
 
     # stage2-materialize — schema-independent, Stage-1-gated path
     p_s2 = sub.add_parser(
@@ -794,10 +586,6 @@ def main() -> None:
 
     if args.command == "inspect":
         _cmd_inspect(args)
-    elif args.command == "schema-validate":
-        _cmd_schema_validate(args)
-    elif args.command == "schema-preview":
-        _cmd_schema_preview(args)
     elif args.command == "materialize":
         _cmd_materialize(args)
     elif args.command == "corpus-create":
@@ -806,8 +594,6 @@ def main() -> None:
         _cmd_corpus_append(args)
     elif args.command == "corpus-validate":
         _cmd_corpus_validate(args)
-    elif args.command == "canonicalize-meta":
-        _cmd_canonicalize_meta(args)
     elif args.command == "stage2-materialize":
         _cmd_stage2_materialize(args)
     else:

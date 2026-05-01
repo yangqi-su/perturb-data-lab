@@ -79,10 +79,8 @@ from .models import (
     SizeFactorManifest,
     SizeFactorEntry,
 )
-from .schema_execution import resolve_all_cell_rows, resolve_all_feature_rows
-from .validation import validate_schema_readiness
 from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
-from ..inspectors.models import DatasetSummaryDocument, SchemaDocument
+from ..inspectors.models import DatasetSummaryDocument
 
 
 # ---------------------------------------------------------------------------

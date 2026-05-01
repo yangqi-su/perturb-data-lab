@@ -174,7 +174,7 @@ def build_phase1_blueprint() -> Phase1Blueprint:
                 name="schema",
                 scope="dataset",
                 review_format="yaml",
-                runtime_model="SchemaDocument",
+                runtime_model="CanonicalizationSchema",
                 owner_repo="perturb-data-lab",
                 purpose="Maps raw source fields into canonical cell and feature fields with inline null markers for unresolved entries.",
             ),

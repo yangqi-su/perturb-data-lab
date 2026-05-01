@@ -2,9 +2,32 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any, Mapping
 
-from .models import TransformCatalogEntry, TransformSpec
 from ..contracts import MISSING_VALUE_LITERAL
+
+
+@dataclass(frozen=True)
+class TransformCatalogEntry:
+    name: str
+    description: str
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TransformCatalogEntry":
+        return cls(
+            name=str(data["name"]),
+            description=str(data.get("description", "")),
+        )
+
+
+@dataclass(frozen=True)
+class TransformSpec:
+    name: str
+    args: dict[str, Any]
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TransformSpec":
+        return cls(name=str(data["name"]), args=dict(data.get("args", {})))
 
 
 TRANSFORM_CATALOG = (

@@ -3,7 +3,6 @@
 Tests cover:
 - Reverse-normalization recovery via expm1/size_factor path
 - CountSourceDecision.uses_recovery flag
-- FeatureTokenizationSpec.is_compatible_for_append() namespace check
 - Bin-named sources are included in both direct and recovery checks
 - Largest-passing-source selection with direct-vs-recovered tie-breaking
 - Source-order tie-breaking when size and pass mode are equal
@@ -29,8 +28,6 @@ from scipy.sparse import csr_matrix
 from perturb_data_lab.inspectors.models import (
     CountSourceDecision,
     CountSourceSpec,
-    FeatureTokenizationSpec,
-    SchemaDocument,
 )
 from perturb_data_lab.inspectors.workflow import (
     _attempt_reverse_normalization,
@@ -311,29 +308,6 @@ def test_count_source_decision_from_dict_without_uses_recovery():
     }
     decision = CountSourceDecision.from_dict(data)
     assert decision.uses_recovery is False
-
-
-# ---------------------------------------------------------------------------
-# FeatureTokenizationSpec.append_compatibility tests
-# ---------------------------------------------------------------------------
-
-
-def test_feature_tokenization_is_compatible_for_append_matches():
-    """Namespace match returns True for append compatibility."""
-    spec = FeatureTokenizationSpec(selected="gene_symbol", namespace="gene_symbol")
-    assert spec.is_compatible_for_append("gene_symbol") is True
-
-
-def test_feature_tokenization_is_compatible_for_append_mismatch():
-    """Namespace mismatch returns False."""
-    spec = FeatureTokenizationSpec(selected="gene_symbol", namespace="gene_symbol")
-    assert spec.is_compatible_for_append("ensembl") is False
-
-
-def test_feature_tokenization_is_compatible_for_append_unknown_namespace():
-    """Unknown or unset namespace returns False."""
-    spec = FeatureTokenizationSpec(selected="set-manually", namespace="unknown")
-    assert spec.is_compatible_for_append("gene_symbol") is False
 
 
 # ---------------------------------------------------------------------------

@@ -42,21 +42,6 @@ class TestParserConstruction:
         assert ns.config == "c.yaml"
         assert ns.workers == 2
 
-    def test_schema_validate_subcommand(self):
-        parser = build_parser()
-        ns = parser.parse_args(["schema-validate", "schema.yaml", "--corpus-namespace", "ensembl"])
-        assert ns.command == "schema-validate"
-        assert ns.schema_path == "schema.yaml"
-        assert ns.corpus_namespace == "ensembl"
-
-    def test_schema_preview_subcommand(self):
-        parser = build_parser()
-        ns = parser.parse_args(["schema-preview", "schema.yaml", "--sample", "data.h5ad", "--n-rows", "3"])
-        assert ns.command == "schema-preview"
-        assert ns.schema_path == "schema.yaml"
-        assert ns.sample == "data.h5ad"
-        assert ns.n_rows == 3
-
     def test_materialize_subcommand(self):
         parser = build_parser()
         ns = parser.parse_args([
@@ -113,73 +98,6 @@ class TestParserConstruction:
         parser = build_parser()
         with pytest.raises(SystemExit):
             parser.parse_args(["unknown-cmd"])
-
-
-# ---------------------------------------------------------------------------
-# Schema validation command tests
-# ---------------------------------------------------------------------------
-
-
-class TestSchemaValidateCmd:
-    """Test schema-validate command output and exit codes."""
-
-    def test_validate_rejects_missing_file(self, tmp_path: Path, capsys):
-        from perturb_data_lab.cli import _cmd_schema_validate
-
-        args = argparse.Namespace(
-            schema_path=str(tmp_path / "nonexistent.yaml"),
-            corpus_namespace=None,
-        )
-        with pytest.raises(SystemExit) as exc_info:
-            _cmd_schema_validate(args)
-        assert exc_info.value.code == 1
-
-    def test_validate_rejects_invalid_schema_kind(self, tmp_path: Path, capsys):
-        from perturb_data_lab.cli import _cmd_schema_validate
-
-        # Write a YAML that is valid YAML and a dict, but has wrong kind
-        bad_schema = tmp_path / "bad-schema.yaml"
-        bad_schema.write_text(
-            "kind: wrong-kind\ncontract_version: 0.2.0\ndataset_id: x\n",
-            encoding="utf-8",
-        )
-        args = argparse.Namespace(schema_path=str(bad_schema), corpus_namespace=None)
-        with pytest.raises((SystemExit, ValueError, KeyError)):
-            _cmd_schema_validate(args)
-
-    def test_validate_rejects_draft_status(self, tmp_path: Path, capsys):
-        from perturb_data_lab.cli import _cmd_schema_validate
-        from perturb_data_lab.inspectors.models import SchemaDocument, SchemaFieldEntry
-
-        # Write a schema with status=draft that will fail readiness
-        schema_dict = {
-            "kind": "schema",
-            "contract_version": "0.2.0",
-            "dataset_id": "test",
-            "source_path": "/fake.h5ad",
-            "status": "draft",
-            "dataset_metadata": {},
-            "perturbation_fields": {
-                "perturbation_label": {
-                    "source_fields": (),
-                    "strategy": "null",
-                    "transforms": (),
-                    "confidence": "low",
-                    "required": True,
-                },
-            },
-            "context_fields": {},
-            "feature_fields": {},
-            "count_source": {"selected": ".X", "integer_only": True},
-            "feature_tokenization": {"selected": "gene_id", "namespace": "ensembl"},
-            "transform_catalog": [],
-        }
-        draft_schema = tmp_path / "draft-schema.yaml"
-        draft_schema.write_text(yaml.safe_dump(schema_dict), encoding="utf-8")
-        args = argparse.Namespace(schema_path=str(draft_schema), corpus_namespace=None)
-        with pytest.raises(SystemExit) as exc_info:
-            _cmd_schema_validate(args)
-        assert exc_info.value.code == 1
 
 
 # ---------------------------------------------------------------------------
@@ -408,5 +326,5 @@ class TestCLIHelp:
             parser.parse_args(["--help"])
         captured = capsys.readouterr()
         # All commands should appear in help
-        for cmd in ["inspect", "schema-validate", "schema-preview", "materialize", "corpus-create", "corpus-append", "corpus-validate"]:
+        for cmd in ["inspect", "materialize", "corpus-create", "corpus-append", "corpus-validate", "stage2-materialize"]:
             assert cmd in captured.out
