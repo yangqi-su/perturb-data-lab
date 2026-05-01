@@ -1,22 +1,27 @@
-"""Phase 6 CLI: top-level multi-command interface for the perturb-data-lab workflow.
+"""CLI: top-level multi-command interface for the perturb-data-lab workflow.
 
 Commands
 --------
-inspect batch   Run h5ad inspection over a batch config.
-schema validate Validate a schema YAML for materialization readiness.
-schema preview  Preview resolved canonical values on sampled rows from a schema.
-materialize    Materialize a single dataset into a backend storage format.
-corpus create  Create a new corpus with a declared backend.
-corpus append  Append a materialized dataset to an existing corpus.
-corpus validate  Validate a corpus for logical completeness.
+inspect          Run h5ad inspection over a batch config.
+materialize      Materialize datasets with --mode {create,append} into a backend.
+                 Supports single (--source) and bulk (--input-dir, --input-list)
+                 input. Outputs go under --output-corpus.
+corpus-validate  Validate a corpus for logical completeness.
+corpus-gc        Garbage-collect orphaned Lance fragments not in the corpus ledger.
 
-All subcommands are thin wrappers over the existing typed API.
+Removed (Phase 2 consolidation):
+  stage2-materialize → merged into materialize
+  corpus-create → merged into materialize --mode create
+  corpus-append  → merged into materialize --mode append
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from .inspectors.models import InspectionBatchConfig
@@ -24,7 +29,187 @@ from .inspectors.workflow import run_batch
 
 
 # ---------------------------------------------------------------------------
-# inspect batch
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+BACKEND_CHOICES = ["arrow-parquet", "arrow-ipc", "webdataset", "zarr", "lance"]
+TOPOLOGY_CHOICES = ["federated", "aggregate"]
+
+
+@dataclass(frozen=True)
+class _DatasetInput:
+    """A single dataset input parsed from CLI flags."""
+    source: str
+    dataset_id: str
+    release_id: str
+    review_bundle: str
+
+
+def _parse_input_list_csv(csv_path: Path) -> list[_DatasetInput]:
+    """Parse a CSV input list with columns: source, dataset_id, review_bundle[, release_id]."""
+    inputs: list[_DatasetInput] = []
+    with open(csv_path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV file {csv_path} has no header row")
+        missing = {"source", "dataset_id", "review_bundle"} - set(reader.fieldnames)
+        if missing:
+            raise ValueError(
+                f"CSV missing required columns: {', '.join(sorted(missing))}"
+            )
+        for row in reader:
+            release_id = row.get("release_id", "v0.1").strip() or "v0.1"
+            inputs.append(
+                _DatasetInput(
+                    source=row["source"].strip(),
+                    dataset_id=row["dataset_id"].strip(),
+                    release_id=release_id,
+                    review_bundle=row["review_bundle"].strip(),
+                )
+            )
+    if not inputs:
+        raise ValueError(f"CSV file {csv_path} contains no dataset rows")
+    return inputs
+
+
+def _scan_input_dir(
+    input_dir: Path,
+    *,
+    review_bundle_dir: Path | None = None,
+) -> list[_DatasetInput]:
+    """Scan a directory for .h5ad files and build _DatasetInput entries.
+
+    dataset_id is derived from the filename stem
+    (e.g. dummy_00_counts -> dummy_00_counts).
+    Review bundles are expected at:
+        {review_bundle_dir or input_dir}/{dataset_id}-summary.yaml
+    """
+    h5ad_files = sorted(p for p in input_dir.iterdir() if p.suffix == ".h5ad")
+    if not h5ad_files:
+        raise FileNotFoundError(f"No .h5ad files found in {input_dir}")
+
+    bundle_dir = review_bundle_dir or input_dir
+    inputs: list[_DatasetInput] = []
+    for h5ad_path in h5ad_files:
+        dataset_id = h5ad_path.stem
+        bundle_path = bundle_dir / f"{dataset_id}-summary.yaml"
+        if not bundle_path.exists():
+            raise FileNotFoundError(
+                f"Review bundle not found for {dataset_id}: expected {bundle_path}. "
+                "Use --review-bundle-dir to specify an alternate location, "
+                "or use --rerun-stage1 to run inspection as preflight."
+            )
+        inputs.append(
+            _DatasetInput(
+                source=str(h5ad_path),
+                dataset_id=dataset_id,
+                release_id="v0.1",
+                review_bundle=str(bundle_path),
+            )
+        )
+    return inputs
+
+
+def _resolve_inputs(args: argparse.Namespace) -> list[_DatasetInput]:
+    """Resolve and validate the dataset inputs from CLI flags.
+
+    Returns a list of _DatasetInput entries in processing order.
+    """
+    sources: list[_DatasetInput] = []
+    has_single = getattr(args, "source", None) is not None
+    has_input_list = getattr(args, "input_list", None) is not None
+    has_input_dir = getattr(args, "input_dir", None) is not None
+
+    n_input_modes = sum([bool(has_single), bool(has_input_list), bool(has_input_dir)])
+    if n_input_modes == 0:
+        print(
+            "[error] must specify one of: --source, --input-list, or --input-dir",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if n_input_modes > 1:
+        print(
+            "[error] only one of --source, --input-list, --input-dir may be used at a time",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if has_single:
+        if not getattr(args, "dataset_id", None):
+            print("[error] --dataset-id is required with --source", file=sys.stderr)
+            sys.exit(1)
+        review_bundle = getattr(args, "review_bundle", None)
+        if not review_bundle:
+            print("[error] --review-bundle is required with --source", file=sys.stderr)
+            sys.exit(1)
+        sources.append(
+            _DatasetInput(
+                source=args.source,
+                dataset_id=args.dataset_id,
+                release_id=getattr(args, "release_id", "v0.1") or "v0.1",
+                review_bundle=review_bundle,
+            )
+        )
+    elif has_input_list:
+        list_path = Path(args.input_list)
+        if not list_path.exists():
+            print(f"[error] input list not found: {list_path}", file=sys.stderr)
+            sys.exit(1)
+        sources = _parse_input_list_csv(list_path)
+    elif has_input_dir:
+        input_dir = Path(args.input_dir)
+        if not input_dir.is_dir():
+            print(f"[error] input directory not found: {input_dir}", file=sys.stderr)
+            sys.exit(1)
+        bundle_dir = (
+            Path(args.review_bundle_dir)
+            if getattr(args, "review_bundle_dir", None)
+            else None
+        )
+        sources = _scan_input_dir(input_dir, review_bundle_dir=bundle_dir)
+
+    # Validate each source exists
+    for ds in sources:
+        src = Path(ds.source)
+        if not src.exists():
+            print(f"[error] source h5ad not found: {src}", file=sys.stderr)
+            sys.exit(1)
+        if not getattr(args, "rerun_stage1", False):
+            bundle = Path(ds.review_bundle)
+            if not bundle.exists():
+                print(
+                    f"[error] review bundle not found: {bundle}; "
+                    "pass --rerun-stage1 to run Stage 1 as preflight",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+    # Check for duplicate dataset_ids within the batch
+    seen_ids: set[str] = set()
+    for ds in sources:
+        if ds.dataset_id in seen_ids:
+            print(
+                f"[error] duplicate dataset_id in inputs: {ds.dataset_id}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        seen_ids.add(ds.dataset_id)
+
+    return sources
+
+
+def _is_aggregate(backend: str, topology: str) -> bool:
+    """Determine if the combination implies aggregate topology."""
+    if topology == "aggregate":
+        return True
+    # Default: lance implies aggregate per contract
+    if topology == "federated" and backend == "lance":
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# inspect
 # ---------------------------------------------------------------------------
 
 
@@ -44,83 +229,115 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
     config = InspectionBatchConfig.from_yaml_file(Path(args.config))
     manifest = run_batch(config, workers=args.workers)
     print(
-        f"[inspect] wrote manifest {Path(manifest.output_root) / 'inspection-manifest.yaml'}"
+        f"[inspect] wrote manifest "
+        f"{Path(manifest.output_root) / 'inspection-manifest.yaml'}"
     )
 
 
 # ---------------------------------------------------------------------------
-# materialize
+# materialize (unified create / append)
 # ---------------------------------------------------------------------------
 
 
 def _add_materialize_args(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
-        "--source",
+        "--mode",
         required=True,
-        help="Path to the source h5ad file.",
-    )
-    sub.add_argument(
-        "--review-bundle",
-        required=True,
+        choices=["create", "append"],
         help=(
-            "Path to the Stage 1 dataset-summary.yaml that gates this materialization. "
-            "This is the only required gating artifact; no schema.yaml is used."
+            "Materialization mode. 'create' starts a new corpus and materializes "
+            "the first dataset (plus any subsequent ones). 'append' adds datasets "
+            "to an existing corpus."
+        ),
+    )
+
+    # Input group
+    input_group = sub.add_argument_group("input source (choose one)")
+    input_group.add_argument(
+        "--source",
+        default=None,
+        help="Path to a single source h5ad file.",
+    )
+    input_group.add_argument(
+        "--input-list",
+        default=None,
+        help=(
+            "Path to a CSV file listing datasets to materialize. "
+            "Required columns: source, dataset_id, review_bundle. "
+            "Optional: release_id (default: v0.1)."
+        ),
+    )
+    input_group.add_argument(
+        "--input-dir",
+        default=None,
+        help=(
+            "Directory to scan for .h5ad files. Review bundles are expected "
+            "alongside as {stem}-summary.yaml. Use --review-bundle-dir for "
+            "alternate locations."
         ),
     )
     sub.add_argument(
+        "--review-bundle-dir",
+        default=None,
+        help="Directory containing review bundles when using --input-dir.",
+    )
+
+    # Single-dataset identifiers (only used with --source)
+    sub.add_argument(
+        "--dataset-id",
+        default=None,
+        help="Stable dataset identifier (required with --source).",
+    )
+    sub.add_argument(
+        "--release-id",
+        default="v0.1",
+        help="Release identifier for this dataset version (default: v0.1).",
+    )
+
+    # Review bundle for single dataset mode
+    sub.add_argument(
+        "--review-bundle",
+        default=None,
+        help="Path to the Stage 1 dataset-summary.yaml (required with --source).",
+    )
+
+    # Corpus output
+    sub.add_argument(
+        "--output-corpus",
+        required=True,
+        help=(
+            "Root directory for the corpus "
+            "(contains corpus-index.yaml, datasets, and matrix artifacts)."
+        ),
+    )
+
+    # Backend / topology
+    sub.add_argument(
         "--backend",
         required=True,
-        choices=["arrow-parquet", "arrow-ipc", "webdataset", "zarr", "lance"],
+        choices=BACKEND_CHOICES,
         help="Storage backend for this materialization.",
     )
     sub.add_argument(
         "--topology",
         default="federated",
-        choices=["federated", "aggregate"],
-        help="Corpus topology. Default: federated.",
+        choices=TOPOLOGY_CHOICES,
+        help="Corpus topology (default: federated).",
     )
-    sub.add_argument(
-        "--release-id",
-        required=True,
-        help="Release identifier for this dataset version (e.g., v0.1).",
-    )
-    sub.add_argument(
-        "--dataset-id",
-        required=True,
-        help="Stable dataset identifier.",
-    )
-    sub.add_argument(
-        "--output-root",
-        required=True,
-        help="Root directory for all metadata and matrix outputs.",
-    )
-    sub.add_argument(
-        "--corpus-index",
-        default=None,
-        help=(
-            "Path to corpus-index.yaml for corpus registration. "
-            "If provided with --register, the dataset is registered with the corpus "
-            "after materialization. If not provided, --register cannot be used."
-        ),
-    )
+
+    # Optional corpus identifier
     sub.add_argument(
         "--corpus-id",
-        default=None,
-        help="Corpus identifier. Required when registering a new corpus.",
+        default="perturb-data-lab-v0",
+        help="Corpus identifier (default: perturb-data-lab-v0).",
     )
-    sub.add_argument(
-        "--register",
-        action="store_true",
-        help=(
-            "If set, automatically register this dataset with the corpus ledger "
-            "after successful materialization. Requires --corpus-index to be set."
-        ),
-    )
+
+    # Materializer options
     sub.add_argument(
         "--rerun-stage1",
         action="store_true",
         help=(
-            "If set, rerun Stage 1 inspection before materialization as a preflight step "
+            "If set, rerun Stage 1 inspection before materialization as a preflight "
             "and use the resulting dataset-summary.yaml as the gating artifact."
         ),
     )
@@ -128,195 +345,238 @@ def _add_materialize_args(sub: argparse.ArgumentParser) -> None:
         "--n-hvg",
         type=int,
         default=2000,
-        help="Number of top-dispersion genes to select as HVGs. Default: 2000.",
+        help="Number of top-dispersion genes to select as HVGs (default: 2000).",
+    )
+
+    # Dry-run
+    sub.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate inputs and print the execution plan without writing any data.",
     )
 
 
-def _cmd_materialize(args: argparse.Namespace) -> None:
+def _materialize_dataset(
+    ds: _DatasetInput,
+    args: argparse.Namespace,
+    *,
+    corpus_root: Path,
+    mode: str,
+    dataset_index: int,
+    global_row_start: int,
+    writer_state: dict | None,
+    is_last_dataset: bool,
+    total_datasets: int,
+    dry_run: bool,
+) -> tuple[int, dict | None]:
+    """Materialize a single dataset and return (next_global_row_start, next_writer_state).
+
+    In aggregate mode, writer_state is carried between calls.
+    """
     from .materializers import Stage2Materializer
     from .materializers.models import OutputRoots
 
-    source_path = Path(args.source)
-    if not source_path.exists():
-        print(f"[error] source h5ad not found: {source_path}", file=sys.stderr)
-        sys.exit(1)
-
-    review_bundle_path = Path(args.review_bundle)
-    if not args.rerun_stage1 and not review_bundle_path.exists():
+    if dry_run:
         print(
-            f"[error] review bundle not found: {review_bundle_path}; "
-            "pass --rerun-stage1 to run Stage 1 as preflight",
-            file=sys.stderr,
+            f"  [{dataset_index + 1}/{total_datasets}] DRY-RUN: "
+            f"{ds.dataset_id}/{ds.release_id} source={ds.source}"
         )
-        sys.exit(1)
+        # Simulate a cell count of 0 for dry-run planning
+        return (global_row_start, writer_state)
 
+    # Build output roots under corpus
+    output_root = corpus_root / ds.dataset_id / ds.release_id
     output_roots = OutputRoots(
-        metadata_root=str(Path(args.output_root) / "meta"),
-        matrix_root=str(Path(args.output_root) / "matrix"),
+        metadata_root=str(output_root / "meta"),
+        matrix_root=str(output_root / "matrix"),
     )
 
-    if args.register and args.corpus_index is None:
-        print(
-            "[error] --register requires --corpus-index to be set",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    corpus_index_path = str(corpus_root / "corpus-index.yaml")
+
+    print(
+        f"\n  [{dataset_index + 1}/{total_datasets}] materializing "
+        f"{ds.dataset_id}/{ds.release_id}"
+    )
+    print(f"    source: {ds.source}")
+    print(f"    mode: {mode}")
 
     materializer = Stage2Materializer(
-        source_path=str(source_path),
-        review_bundle_path=str(review_bundle_path),
+        source_path=ds.source,
+        review_bundle_path=ds.review_bundle,
         output_roots=output_roots,
-        release_id=args.release_id,
-        dataset_id=args.dataset_id,
+        release_id=ds.release_id,
+        dataset_id=ds.dataset_id,
         backend=args.backend,
         topology=args.topology,
         rerun_stage1=args.rerun_stage1,
-        n_hvg=args.n_hvg,
-        corpus_index_path=args.corpus_index,
+        n_hvg=getattr(args, "n_hvg", 2000),
+        corpus_index_path=corpus_index_path,
         corpus_id=args.corpus_id,
-        register=args.register,
+        register=True,
+        mode=mode,
+        dataset_index=dataset_index,
+        global_row_start=global_row_start,
+        writer_state=writer_state,
+        _is_last_dataset=is_last_dataset,
     )
 
     manifest = materializer.materialize()
 
-    print(f"[materialize] done — {args.dataset_id}/{args.release_id}")
-    print(f"  backend     : {manifest.backend}")
-    print(f"  topology     : {manifest.topology}")
-    print(f"  count source: {manifest.count_source.selected}")
-    print(f"  integer_verified: {manifest.integer_verified}")
-    print(f"  cell_count  : {manifest.cell_count}")
-    print(f"  feature_count: {manifest.feature_count}")
-    print(f"  manifest    : {Path(manifest.outputs.metadata_root) / 'materialization-manifest.yaml'}")
+    print(f"    cell_count: {manifest.cell_count}")
+    print(f"    feature_count: {manifest.feature_count}")
+    print(f"    route: {manifest.route}")
     if manifest.corpus_registration is not None:
         reg = manifest.corpus_registration
-        print(f"  corpus_id   : {reg.corpus_id}")
-        print(f"  is_create   : {reg.is_create}")
-        print(f"  dataset_index: {reg.dataset_index}")
-        print(f"  global range: [{reg.global_start}, {reg.global_end})")
-        print(f"  ledger      : {reg.ledger_path}")
+        print(f"    corpus registration: {reg.corpus_id} is_create={reg.is_create}")
+        print(f"    global range: [{reg.global_start}, {reg.global_end})")
+
+    # Return updated state
+    next_global_start = global_row_start + manifest.cell_count
+    next_writer_state = materializer.writer_state
+    return (next_global_start, next_writer_state)
 
 
-# ---------------------------------------------------------------------------
-# corpus create
-# ---------------------------------------------------------------------------
+def _cmd_materialize(args: argparse.Namespace) -> None:
+    """Unified materialize command supporting create/append, single/bulk, dry-run."""
+    from .materializers.registration import corpus_exists as _corpus_exists
 
-
-def _add_corpus_create_args(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument(
-        "--backend",
-        required=True,
-        choices=["arrow-parquet", "arrow-ipc", "webdataset", "zarr", "lance"],
-        help="Backend for this corpus.",
-    )
-    sub.add_argument(
-        "--output",
-        required=True,
-        help="Output path for corpus-index.yaml.",
-    )
-    sub.add_argument(
-        "--corpus-id",
-        default=None,
-        help="Optional corpus identifier. Defaults to a generated ID.",
+    # --- Resolve and validate inputs ---
+    sources = _resolve_inputs(args)
+    total = len(sources)
+    sources_note = (
+        f"{total} dataset(s): {', '.join(d.dataset_id for d in sources)}"
     )
 
+    # --- Resolve corpus root ---
+    corpus_root = Path(args.output_corpus).resolve()
+    corpus_index_path = corpus_root / "corpus-index.yaml"
 
-def _cmd_corpus_create(args: argparse.Namespace) -> None:
-    from .materializers import update_corpus_index
-    from .materializers.models import DatasetJoinRecord, GlobalMetadataDocument
-    from .materializers.emission_spec import CorpusEmissionSpec
-    from .contracts import CONTRACT_VERSION
+    aggregate = _is_aggregate(args.backend, args.topology)
 
-    output_path = Path(args.output)
-    if output_path.exists():
-        print(f"[error] corpus-index already exists: {output_path}", file=sys.stderr)
-        sys.exit(1)
+    # --- Determine actual mode based on corpus existence ---
+    effective_mode: str
+    if args.mode == "create":
+        if _corpus_exists(corpus_root):
+            print(
+                f"[error] --mode create but corpus already exists at {corpus_root}. "
+                "Use --mode append to add datasets, or remove the existing corpus.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        effective_mode = "create"
+    else:  # append
+        if not _corpus_exists(corpus_root):
+            print(
+                f"[error] --mode append but no corpus found at {corpus_root}. "
+                "Use --mode create to create a new corpus.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        effective_mode = "append"
 
-    # Create an empty corpus index (no placeholder records).
-    # The first real dataset is added via `materialize --corpus-index` in create_new mode.
-    # An empty index still records the corpus backend declaration.
-    corpus_id = args.corpus_id or "perturb-data-lab-v0"
-    updated = update_corpus_index(
-        output_path,
-        DatasetJoinRecord(
-            dataset_id="__placeholder__must_materialize_first__",
-            release_id="__placeholder__",
-            join_mode="create_new",
-            manifest_path="/dev/null",
-            cell_count=0,
-        ),
-        backend=args.backend,
+    # --- Check for duplicate dataset_ids against existing corpus (append mode) ---
+    if effective_mode == "append":
+        from .materializers.models import CorpusIndexDocument
+
+        existing = CorpusIndexDocument.from_yaml_file(corpus_index_path)
+        existing_ids = {d.dataset_id for d in existing.datasets}
+        for ds in sources:
+            if ds.dataset_id in existing_ids:
+                print(
+                    f"[error] dataset_id '{ds.dataset_id}' already exists in corpus at "
+                    f"{corpus_root}. Refusing to overwrite.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+    # --- Print execution plan ---
+    print(
+        f"[materialize] mode={effective_mode}  backend={args.backend}  "
+        f"topology={args.topology}"
     )
-    # Immediately overwrite with a clean empty index (no placeholder record)
-    from .materializers.models import CorpusIndexDocument
-    empty = CorpusIndexDocument(
-        kind="corpus-index",
-        contract_version=CONTRACT_VERSION,
-        corpus_id=corpus_id,
-        global_metadata={"backend": args.backend},
-        datasets=(),
-    )
-    empty.write_yaml(output_path)
+    print(f"  corpus: {corpus_root}")
+    print(f"  inputs: {sources_note}")
+    if aggregate:
+        print("  aggregate topology: writer_state will be passed between datasets")
 
-    print(f"[corpus create] {corpus_id} backend={args.backend}")
-    print(f"  corpus-index: {output_path}")
-    print(f"  note: no datasets yet — run 'materialize --corpus-index {output_path}' to add the first dataset")
+    if args.dry_run:
+        print("\n[dry-run] execution plan validated -- no data will be written")
+        print(f"  Would materialize {total} dataset(s) into {corpus_root}")
+        print(f"  Corpus ID: {args.corpus_id}")
+        # Walk through and validate
+        next_global = 0
+        writer_state: dict | None = None
+        for i, ds in enumerate(sources):
+            mode_name = "create" if i == 0 and effective_mode == "create" else "append"
+            is_last = aggregate and (i == total - 1)
+            next_global, writer_state = _materialize_dataset(
+                ds, args,
+                corpus_root=corpus_root,
+                mode=mode_name,
+                dataset_index=i,
+                global_row_start=next_global,
+                writer_state=writer_state,
+                is_last_dataset=is_last,
+                total_datasets=total,
+                dry_run=True,
+            )
+        print(f"  Estimated total cells: {next_global}")
+        return
 
-    # Write initial emission spec
-    emission_spec = CorpusEmissionSpec(corpus_id=corpus_id)
-    emission_spec_path = output_path.parent / "corpus-emission-spec.yaml"
-    emission_spec.write_yaml(emission_spec_path)
-    print(f"  emission-spec: {emission_spec_path}")
+    # --- Execute materialization ---
+    corpus_root.mkdir(parents=True, exist_ok=True)
+    next_global = 0
+    writer_state: dict | None = None
+    success_count = 0
 
+    for i, ds in enumerate(sources):
+        mode_name = "create" if i == 0 and effective_mode == "create" else "append"
+        is_last = aggregate and (i == total - 1)
+        try:
+            next_global, writer_state = _materialize_dataset(
+                ds, args,
+                corpus_root=corpus_root,
+                mode=mode_name,
+                dataset_index=i,
+                global_row_start=next_global,
+                writer_state=writer_state,
+                is_last_dataset=is_last,
+                total_datasets=total,
+                dry_run=False,
+            )
+            success_count += 1
+        except Exception as e:
+            print(
+                f"\n[materialize] ERROR materializing "
+                f"{ds.dataset_id}/{ds.release_id}: {e}",
+                file=sys.stderr,
+            )
+            print(
+                f"[materialize] {success_count}/{total} dataset(s) succeeded before "
+                "failure. Prior datasets remain registered and valid. "
+                "Orphaned Lance fragments (if any) can be cleaned up with 'corpus-gc'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
-# ---------------------------------------------------------------------------
-# corpus append
-# ---------------------------------------------------------------------------
-
-
-def _add_corpus_append_args(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument(
-        "--corpus-index",
-        required=True,
-        help="Path to the corpus-index.yaml.",
-    )
-    sub.add_argument(
-        "--manifest",
-        required=True,
-        help="Path to the dataset's materialization-manifest.yaml.",
-    )
-
-
-def _cmd_corpus_append(args: argparse.Namespace) -> None:
-    from .materializers import update_corpus_index
-    from .materializers.models import MaterializationManifest, DatasetJoinRecord
-
-    corpus_index_path = Path(args.corpus_index)
-    if not corpus_index_path.exists():
-        print(f"[error] corpus-index not found: {corpus_index_path}", file=sys.stderr)
-        sys.exit(1)
-
-    manifest_path = Path(args.manifest)
-    if not manifest_path.exists():
-        print(f"[error] manifest not found: {manifest_path}", file=sys.stderr)
-        sys.exit(1)
-
-    manifest = MaterializationManifest.from_yaml_file(manifest_path)
-    record = DatasetJoinRecord(
-        dataset_id=manifest.dataset_id,
-        release_id=manifest.release_id,
-        join_mode="append_routed",
-        manifest_path=str(manifest_path),
-        cell_count=manifest.cell_count,
-    )
-    updated = update_corpus_index(corpus_index_path, record)  # backend already set in corpus
-    print(f"[corpus append] done")
+    # --- Summary ---
+    print(f"\n[materialize] done -- {success_count}/{total} dataset(s) materialized")
+    print(f"  corpus: {corpus_root}")
     print(f"  corpus-index: {corpus_index_path}")
-    print(f"  added       : {manifest.dataset_id}/{manifest.release_id}")
-    print(f"  datasets    : {[d.dataset_id for d in updated.datasets]}")
+    print(f"  total cells: {next_global}")
+
+    # Write emission spec if this was a create
+    if effective_mode == "create":
+        from .materializers.emission_spec import CorpusEmissionSpec
+
+        spec = CorpusEmissionSpec(corpus_id=args.corpus_id)
+        spec_path = corpus_root / "corpus-emission-spec.yaml"
+        spec.write_yaml(spec_path)
+        print(f"  emission-spec: {spec_path}")
 
 
 # ---------------------------------------------------------------------------
-# corpus validate
+# corpus-validate (kept)
 # ---------------------------------------------------------------------------
 
 
@@ -327,7 +587,7 @@ def _add_corpus_validate_args(sub: argparse.ArgumentParser) -> None:
     )
     sub.add_argument(
         "--backend",
-        choices=["arrow-parquet", "arrow-ipc", "webdataset", "zarr", "lance"],
+        choices=BACKEND_CHOICES,
         help="Optional: verify the corpus backend matches this value.",
     )
 
@@ -350,10 +610,12 @@ def _cmd_corpus_validate(args: argparse.Namespace) -> None:
 
     for ds in corpus.datasets:
         manifest_path = corpus_root / ds.manifest_path
-        exists = "✓" if manifest_path.exists() else "✗ MISSING"
+        exists = "\u2713" if manifest_path.exists() else "\u2717 MISSING"
         print(f"  {exists} {ds.dataset_id}/{ds.release_id}  [{ds.join_mode}]")
         if not manifest_path.exists():
-            violations.append(f"manifest missing for {ds.dataset_id}: {ds.manifest_path}")
+            violations.append(
+                f"manifest missing for {ds.dataset_id}: {ds.manifest_path}"
+            )
 
         # Validate manifest if it exists
         if manifest_path.exists() and manifest_path.name.endswith("-manifest.yaml"):
@@ -361,7 +623,10 @@ def _cmd_corpus_validate(args: argparse.Namespace) -> None:
                 from .materializers.models import MaterializationManifest
 
                 mnf = MaterializationManifest.from_yaml_file(manifest_path)
-                print(f"         backend={mnf.backend}  count={mnf.count_source.selected}")
+                print(
+                    f"         backend={mnf.backend}  "
+                    f"count={mnf.count_source.selected}"
+                )
 
                 # Backend consistency check
                 if args.backend and mnf.backend != args.backend:
@@ -370,169 +635,131 @@ def _cmd_corpus_validate(args: argparse.Namespace) -> None:
                         f"expected {args.backend}, got {mnf.backend}"
                     )
             except Exception as e:
-                violations.append(f"failed to load manifest for {ds.dataset_id}: {e}")
+                violations.append(
+                    f"failed to load manifest for {ds.dataset_id}: {e}"
+                )
 
-    # Check tokenizer (Phase 3: tokenizer is no longer required for corpus validation)
+    # Check tokenizer
     tokenizer_path = corpus_root / "tokenizer.json"
     tokenizer_exists = tokenizer_path.exists()
-    print(f"\nTokenizer: {'✓' if tokenizer_exists else '✗ (optional since Phase 3)'} {tokenizer_path}")
-    # Tokenizer is optional — corpus feature set is now maintained by canonicalize-meta
+    tokenizer_status = "\u2713" if tokenizer_exists else "\u2717 (optional since Phase 3)"
+    print(f"\nTokenizer: {tokenizer_status} {tokenizer_path}")
 
     # Check emission spec
     emission_spec_path = corpus_root / "corpus-emission-spec.yaml"
     emission_exists = emission_spec_path.exists()
-    print(f"Emission spec: {'✓' if emission_exists else '✗ MISSING'} {emission_spec_path}")
+    emission_status = "\u2713" if emission_exists else "\u2717 MISSING"
+    print(f"Emission spec: {emission_status} {emission_spec_path}")
 
     if violations:
-        print(f"\n[corpus validate] FAIL — {len(violations)} issue(s):")
+        print(f"\n[corpus validate] FAIL -- {len(violations)} issue(s):")
         for v in violations:
             print(f"  - {v}")
         sys.exit(1)
     else:
-        print(f"\n[corpus validate] PASS")
+        print("\n[corpus validate] PASS")
 
 
-def _add_stage2_materialize_args(sub: argparse.ArgumentParser) -> None:
+# ---------------------------------------------------------------------------
+# corpus-gc (new)
+# ---------------------------------------------------------------------------
+
+
+def _add_corpus_gc_args(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
-        "--source",
-        required=True,
-        help="Path to the source h5ad file.",
+        "corpus_root",
+        help="Path to the corpus root directory (containing corpus-index.yaml).",
     )
     sub.add_argument(
-        "--review-bundle",
-        required=True,
-        help=(
-            "Path to the Stage 1 dataset-summary.yaml that gates this materialization. "
-            "This is the only required gating artifact; no schema.yaml is used."
-        ),
-    )
-    sub.add_argument(
-        "--output-root",
-        required=True,
-        help="Root directory for all metadata and matrix outputs.",
-    )
-    sub.add_argument(
-        "--release-id",
-        required=True,
-        help="Release identifier for this dataset version (e.g., v0.1).",
-    )
-    sub.add_argument(
-        "--dataset-id",
-        required=True,
-        help="Stable dataset identifier.",
-    )
-    sub.add_argument(
-        "--backend",
-        default="arrow-parquet",
-        choices=["arrow-parquet", "arrow-ipc", "webdataset", "zarr", "lance"],
-        help="Storage backend for this materialization. Default: arrow-parquet.",
-    )
-    sub.add_argument(
-        "--topology",
-        default="federated",
-        choices=["federated", "aggregate"],
-        help="Corpus topology. Default: federated.",
-    )
-    sub.add_argument(
-        "--rerun-stage1",
+        "--dry-run",
         action="store_true",
-        help=(
-            "If set, rerun Stage 1 inspection before materialization as a preflight step "
-            "and use the resulting dataset-summary.yaml as the gating artifact."
-        ),
-    )
-    sub.add_argument(
-        "--n-hvg",
-        type=int,
-        default=2000,
-        help="Number of top-dispersion genes to select as HVGs. Default: 2000.",
-    )
-    sub.add_argument(
-        "--corpus-index",
-        default=None,
-        help=(
-            "Path to corpus-index.yaml for corpus registration. "
-            "If provided with --register, the dataset is registered with the corpus "
-            "after materialization. If not provided, --register cannot be used."
-        ),
-    )
-    sub.add_argument(
-        "--corpus-id",
-        default=None,
-        help="Corpus identifier. Required when registering a new corpus.",
-    )
-    sub.add_argument(
-        "--register",
-        action="store_true",
-        help=(
-            "If set, automatically register this dataset with the corpus ledger "
-            "after successful materialization. Requires --corpus-index to be set."
-        ),
+        help="Only report orphaned fragments; do not delete anything.",
     )
 
 
-def _cmd_stage2_materialize(args: argparse.Namespace) -> None:
-    from .materializers import Stage2Materializer
-    from .materializers.models import OutputRoots
+def _cmd_corpus_gc(args: argparse.Namespace) -> None:
+    """Garbage-collect orphaned Lance fragments not in the corpus ledger.
 
-    source_path = Path(args.source)
-    if not source_path.exists():
-        print(f"[error] source h5ad not found: {source_path}", file=sys.stderr)
+    Lance writes incremental fragments (data/defragmentation files) that may
+    become orphaned if a materialization fails mid-bulk-append. This command:
+    1. Loads the corpus ledger to identify all registered datasets.
+    2. Scans the corpus root for dataset directories not in the ledger.
+    3. Reports (and optionally removes) orphaned dataset directories.
+
+    This is a conservative GC: only per-dataset directories (with meta/ or
+    matrix/) that do not appear in the corpus index are considered orphaned.
+    Lance internal fragment files within a registered dataset are left alone.
+    """
+    corpus_root = Path(args.corpus_root).resolve()
+    corpus_index_path = corpus_root / "corpus-index.yaml"
+    if not corpus_index_path.exists():
+        print(f"[error] corpus-index not found at {corpus_index_path}", file=sys.stderr)
         sys.exit(1)
 
-    review_bundle_path = Path(args.review_bundle)
-    if not args.rerun_stage1 and not review_bundle_path.exists():
+    from .materializers.models import CorpusIndexDocument
+
+    corpus = CorpusIndexDocument.from_yaml_file(corpus_index_path)
+    registered_ids = {d.dataset_id for d in corpus.datasets}
+
+    print(f"[corpus-gc] scanning {corpus_root}")
+    print(f"  registered datasets: {len(registered_ids)}")
+    if registered_ids:
+        for rid in sorted(registered_ids):
+            print(f"    - {rid}")
+
+    # Scan for dataset directories not in the ledger
+    orphaned: list[Path] = []
+    known_metadata = {
+        "corpus-index.yaml", "corpus-ledger.parquet",
+        "global-metadata.yaml", "corpus-emission-spec.yaml",
+        "tokenizer.json",
+    }
+
+    for entry in sorted(corpus_root.iterdir()):
+        if not entry.is_dir():
+            continue
+        entry_name = entry.name
+
+        # Skip known metadata files
+        if entry_name in known_metadata or entry_name.startswith("."):
+            continue
+
+        if entry_name in registered_ids:
+            continue
+
+        # Check if it looks like a dataset directory
+        has_meta = (entry / "meta").is_dir()
+        has_matrix = (entry / "matrix").is_dir()
+        if has_meta or has_matrix:
+            orphaned.append(entry)
+
+    if not orphaned:
+        print("\n[corpus-gc] no orphaned dataset directories found")
+        return
+
+    print(f"\n[corpus-gc] found {len(orphaned)} orphaned dataset directories:")
+    for op in orphaned:
+        print(f"  - {op}")
+
+    if args.dry_run:
         print(
-            f"[error] review bundle not found: {review_bundle_path}; "
-            "pass --rerun-stage1 to run Stage 1 as preflight",
-            file=sys.stderr,
+            "\n[corpus-gc] dry-run: no directories were deleted. "
+            "Run without --dry-run to remove orphaned entries."
         )
-        sys.exit(1)
+        return
 
-    output_roots = OutputRoots(
-        metadata_root=str(Path(args.output_root) / "meta"),
-        matrix_root=str(Path(args.output_root) / "matrix"),
-    )
+    # Remove orphaned directories
+    for op in orphaned:
+        try:
+            shutil.rmtree(op)
+            print(f"[corpus-gc] removed: {op}")
+        except Exception as e:
+            print(
+                f"[corpus-gc] WARNING: failed to remove {op}: {e}",
+                file=sys.stderr,
+            )
 
-    if args.register and args.corpus_index is None:
-        print(
-            "[error] --register requires --corpus-index to be set",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    materializer = Stage2Materializer(
-        source_path=str(source_path),
-        review_bundle_path=str(review_bundle_path),
-        output_roots=output_roots,
-        release_id=args.release_id,
-        dataset_id=args.dataset_id,
-        backend=args.backend,
-        topology=args.topology,
-        rerun_stage1=args.rerun_stage1,
-        n_hvg=args.n_hvg,
-        corpus_index_path=args.corpus_index,
-        corpus_id=args.corpus_id,
-        register=args.register,
-    )
-
-    manifest = materializer.materialize()
-
-    print(f"[stage2-materialize] done — {args.dataset_id}/{args.release_id}")
-    print(f"  backend     : {manifest.backend}")
-    print(f"  topology    : {manifest.topology}")
-    print(f"  count source: {manifest.count_source.selected}")
-    print(f"  integer_verified: {manifest.integer_verified}")
-    print(f"  cell_count  : {manifest.cell_count}")
-    print(f"  feature_count: {manifest.feature_count}")
-    print(f"  manifest    : {Path(manifest.outputs.metadata_root) / 'materialization-manifest.yaml'}")
-    if manifest.corpus_registration is not None:
-        reg = manifest.corpus_registration
-        print(f"  corpus_id   : {reg.corpus_id}")
-        print(f"  is_create   : {reg.is_create}")
-        print(f"  dataset_index: {reg.dataset_index}")
-        print(f"  global range: [{reg.global_start}, {reg.global_end})")
-        print(f"  ledger      : {reg.ledger_path}")
+    print(f"\n[corpus-gc] done -- removed {len(orphaned)} orphaned directories")
 
 
 # ---------------------------------------------------------------------------
@@ -542,40 +769,36 @@ def _cmd_stage2_materialize(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="perturb-data-lab: inspect, materialize, and validate multi-dataset corpora.",
+        description=(
+            "perturb-data-lab: inspect, materialize, and validate "
+            "multi-dataset corpora."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
 
-    # inspect batch
+    # inspect
     p_inspect = sub.add_parser("inspect", help="Run h5ad inspection batch.")
     _add_inspect_args(p_inspect)
 
-    # materialize
-    p_mat = sub.add_parser("materialize", help="Materialize a dataset into a backend storage format.")
+    # materialize (unified create/append)
+    p_mat = sub.add_parser(
+        "materialize",
+        help="Materialize datasets into a backend storage format (create or append).",
+    )
     _add_materialize_args(p_mat)
 
-    # corpus create
-    p_ccreate = sub.add_parser("corpus-create", help="Create a new empty corpus with a declared backend.")
-    _add_corpus_create_args(p_ccreate)
-
-    # corpus append
-    p_cap = sub.add_parser("corpus-append", help="Append a materialized dataset to a corpus.")
-    _add_corpus_append_args(p_cap)
-
-    # corpus validate
-    p_cv = sub.add_parser("corpus-validate", help="Validate a corpus for logical completeness.")
+    # corpus-validate (kept)
+    p_cv = sub.add_parser(
+        "corpus-validate", help="Validate a corpus for logical completeness."
+    )
     _add_corpus_validate_args(p_cv)
 
-    # stage2-materialize — schema-independent, Stage-1-gated path
-    p_s2 = sub.add_parser(
-        "stage2-materialize",
-        help=(
-            "Materialize a dataset using the Stage 2 schema-independent path "
-            "(gated by Stage 1 dataset-summary.yaml, no schema.yaml required)."
-        ),
+    # corpus-gc (new)
+    p_gc = sub.add_parser(
+        "corpus-gc", help="Garbage-collect orphaned dataset directories from a corpus."
     )
-    _add_stage2_materialize_args(p_s2)
+    _add_corpus_gc_args(p_gc)
 
     return parser
 
@@ -588,14 +811,10 @@ def main() -> None:
         _cmd_inspect(args)
     elif args.command == "materialize":
         _cmd_materialize(args)
-    elif args.command == "corpus-create":
-        _cmd_corpus_create(args)
-    elif args.command == "corpus-append":
-        _cmd_corpus_append(args)
     elif args.command == "corpus-validate":
         _cmd_corpus_validate(args)
-    elif args.command == "stage2-materialize":
-        _cmd_stage2_materialize(args)
+    elif args.command == "corpus-gc":
+        _cmd_corpus_gc(args)
     else:
         parser.print_help()
         sys.exit(1)
