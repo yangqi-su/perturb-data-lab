@@ -13,7 +13,7 @@ No per-writer CSR logic, no legacy fallback, no ``_is_csr_dataset()``, no
 are always dataset-local.
 
 Produces:
-- {release_id}-cells.parquet: heavy-row Arrow table (global_row_index,
+- {dataset_id}-cells.parquet: heavy-row Arrow table (global_row_index,
   expressed_gene_indices LIST<INT32>, expression_counts LIST<INT32>)
 - Caller (Stage2Materializer) writes the separate size-factor Parquet sidecar.
 
