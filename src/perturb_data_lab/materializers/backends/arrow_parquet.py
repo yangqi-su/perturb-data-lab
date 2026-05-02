@@ -35,7 +35,7 @@ from ..chunk_translation import ChunkBundle
 
 def write_arrow_parquet_federated(
     bundle: ChunkBundle,
-    release_id: str,
+    dataset_id: str,
     matrix_root: Path,
     *,
     _writer_state: dict[str, Any] | None = None,
@@ -51,8 +51,8 @@ def write_arrow_parquet_federated(
     ----------
     bundle : ChunkBundle
         The translated chunk bundle from ``_translate_chunk()``.
-    release_id : str
-        Release identifier used for output file naming.
+    dataset_id : str
+        Dataset identifier used for output file naming.
     matrix_root : Path
         Output directory for matrix artifacts.
     _writer_state : dict | None
@@ -68,7 +68,7 @@ def write_arrow_parquet_federated(
         On last chunk the second element is None.
     """
     matrix_root.mkdir(parents=True, exist_ok=True)
-    cell_path = matrix_root / f"{release_id}-cells.parquet"
+    cell_path = matrix_root / f"{dataset_id}-cells.parquet"
 
     if _writer_state is None:
         # First chunk: open writer
@@ -116,4 +116,3 @@ def read_arrow_parquet_cell(
         )
 
     return (tuple(indices), tuple(counts), sf)
-
