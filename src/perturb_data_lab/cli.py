@@ -28,6 +28,7 @@ from pathlib import Path
 
 from .inspectors.models import InspectionBatchConfig
 from .inspectors.workflow import run_batch
+from .materializers.paths import resolve_corpus_paths
 
 
 # ---------------------------------------------------------------------------
@@ -43,12 +44,11 @@ class _DatasetInput:
     """A single dataset input parsed from CLI flags."""
     source: str
     dataset_id: str
-    release_id: str
     review_bundle: str
 
 
 def _parse_input_list_csv(csv_path: Path) -> list[_DatasetInput]:
-    """Parse a CSV input list with columns: source, dataset_id, review_bundle[, release_id]."""
+    """Parse a CSV input list with columns: source, dataset_id, review_bundle."""
     inputs: list[_DatasetInput] = []
     with open(csv_path, newline="") as fh:
         reader = csv.DictReader(fh)
@@ -60,12 +60,10 @@ def _parse_input_list_csv(csv_path: Path) -> list[_DatasetInput]:
                 f"CSV missing required columns: {', '.join(sorted(missing))}"
             )
         for row in reader:
-            release_id = row.get("release_id", "v0.1").strip() or "v0.1"
             inputs.append(
                 _DatasetInput(
                     source=row["source"].strip(),
                     dataset_id=row["dataset_id"].strip(),
-                    release_id=release_id,
                     review_bundle=row["review_bundle"].strip(),
                 )
             )
@@ -105,7 +103,6 @@ def _scan_input_dir(
             _DatasetInput(
                 source=str(h5ad_path),
                 dataset_id=dataset_id,
-                release_id="v0.1",
                 review_bundle=str(bundle_path),
             )
         )
@@ -148,7 +145,6 @@ def _resolve_inputs(args: argparse.Namespace) -> list[_DatasetInput]:
             _DatasetInput(
                 source=args.source,
                 dataset_id=args.dataset_id,
-                release_id=getattr(args, "release_id", "v0.1") or "v0.1",
                 review_bundle=review_bundle,
             )
         )
@@ -265,8 +261,7 @@ def _add_materialize_args(sub: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Path to a CSV file listing datasets to materialize. "
-            "Required columns: source, dataset_id, review_bundle. "
-            "Optional: release_id (default: v0.1)."
+            "Required columns: source, dataset_id, review_bundle."
         ),
     )
     input_group.add_argument(
@@ -290,12 +285,6 @@ def _add_materialize_args(sub: argparse.ArgumentParser) -> None:
         default=None,
         help="Stable dataset identifier (required with --source).",
     )
-    sub.add_argument(
-        "--release-id",
-        default="v0.1",
-        help="Release identifier for this dataset version (default: v0.1).",
-    )
-
     # Review bundle for single dataset mode
     sub.add_argument(
         "--review-bundle",
@@ -381,23 +370,27 @@ def _materialize_dataset(
     if dry_run:
         print(
             f"  [{dataset_index + 1}/{total_datasets}] DRY-RUN: "
-            f"{ds.dataset_id}/{ds.release_id} source={ds.source}"
+            f"{ds.dataset_id} source={ds.source}"
         )
         # Simulate a cell count of 0 for dry-run planning
         return (global_row_start, writer_state)
 
     # Build output roots under corpus
-    output_root = corpus_root / ds.dataset_id / ds.release_id
+    resolved_paths = resolve_corpus_paths(
+        topology=args.topology,
+        corpus_root=corpus_root,
+        dataset_id=ds.dataset_id,
+    )
     output_roots = OutputRoots(
-        metadata_root=str(output_root / "meta"),
-        matrix_root=str(output_root / "matrix"),
+        metadata_root=str(resolved_paths.meta_root),
+        matrix_root=str(resolved_paths.matrix_root),
     )
 
     corpus_index_path = str(corpus_root / "corpus-index.yaml")
 
     print(
         f"\n  [{dataset_index + 1}/{total_datasets}] materializing "
-        f"{ds.dataset_id}/{ds.release_id}"
+        f"{ds.dataset_id}"
     )
     print(f"    source: {ds.source}")
     print(f"    mode: {mode}")
@@ -406,7 +399,6 @@ def _materialize_dataset(
         source_path=ds.source,
         review_bundle_path=ds.review_bundle,
         output_roots=output_roots,
-        release_id=ds.release_id,
         dataset_id=ds.dataset_id,
         backend=args.backend,
         topology=args.topology,
@@ -550,7 +542,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
         except Exception as e:
             print(
                 f"\n[materialize] ERROR materializing "
-                f"{ds.dataset_id}/{ds.release_id}: {e}",
+                f"{ds.dataset_id}: {e}",
                 file=sys.stderr,
             )
             print(
@@ -613,7 +605,7 @@ def _cmd_corpus_validate(args: argparse.Namespace) -> None:
     for ds in corpus.datasets:
         manifest_path = corpus_root / ds.manifest_path
         exists = "\u2713" if manifest_path.exists() else "\u2717 MISSING"
-        print(f"  {exists} {ds.dataset_id}/{ds.release_id}  [{ds.join_mode}]")
+        print(f"  {exists} {ds.dataset_id}  [{ds.join_mode}]")
         if not manifest_path.exists():
             violations.append(
                 f"manifest missing for {ds.dataset_id}: {ds.manifest_path}"
