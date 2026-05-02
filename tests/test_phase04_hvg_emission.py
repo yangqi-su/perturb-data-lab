@@ -318,7 +318,6 @@ class TestEmissionSpecLoaderIntegration:
         sf_manifest = SizeFactorManifest(
             kind="size-factor-manifest",
             contract_version=CONTRACT_VERSION,
-            release_id="v0",
             method="sum",
             entries=tuple(sf_entries),
         )
