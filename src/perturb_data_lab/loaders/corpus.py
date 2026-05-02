@@ -31,9 +31,9 @@ def read_raw_obs_parquet(parquet_path: Path) -> list[dict[str, Any]]:
     Parameters
     ----------
     parquet_path : Path
-        Path to ``{release_id}-raw-obs.parquet`` written by ``Stage2Materializer``.
-        Schema: cell_id (string), dataset_id (string), dataset_release (string),
-        raw_obs (string, JSON-serialized dict).
+        Path to ``raw-obs.parquet`` written by ``Stage2Materializer``.
+        Schema: cell_id (string), dataset_id (string),
+        raw_fields (string, JSON-serialized dict).
 
     Returns
     -------
@@ -46,8 +46,7 @@ def read_raw_obs_parquet(parquet_path: Path) -> list[dict[str, Any]]:
         result.append({
             "cell_id": str(row["cell_id"]),
             "dataset_id": str(row["dataset_id"]),
-            "dataset_release": str(row["dataset_release"]),
-            "raw_fields": json.loads(row["raw_obs"]),
+            "raw_fields": json.loads(row["raw_fields"]),
         })
     return result
 
@@ -58,7 +57,7 @@ def read_raw_var_parquet(parquet_path: Path) -> list[dict[str, Any]]:
     Parameters
     ----------
     parquet_path : Path
-        Path to ``{release_id}-raw-var.parquet`` written by ``Stage2Materializer``.
+        Path to ``raw-var.parquet`` written by ``Stage2Materializer``.
         Schema: origin_index (int32), feature_id (string),
         raw_var (string, JSON-serialized dict).
 
