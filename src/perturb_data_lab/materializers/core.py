@@ -102,8 +102,6 @@ class Stage2Materializer:
         This is the only required gating artifact; no ``schema.yaml`` is accepted.
     output_roots : OutputRoots
         ``metadata_root`` and ``matrix_root`` for this dataset's outputs.
-    release_id : str
-        Immutable release identifier for this dataset version.
     dataset_id : str
         Stable dataset identifier.
     backend : str
@@ -176,7 +174,6 @@ class Stage2Materializer:
         source_path: str,
         review_bundle_path: str,
         output_roots: OutputRoots,
-        release_id: str,
         dataset_id: str,
         backend: str = "arrow-parquet",
         topology: str = "federated",
@@ -199,7 +196,6 @@ class Stage2Materializer:
         self.source_path = source_path
         self.review_bundle_path = review_bundle_path
         self.output_roots = output_roots
-        self.release_id = release_id
         self.dataset_id = dataset_id
         self.backend = backend
         self.topology = topology
@@ -336,7 +332,6 @@ class Stage2Materializer:
             qa_manifest = QAManifest(
                 kind="qa-manifest",
                 contract_version=CONTRACT_VERSION,
-                release_id=self.release_id,
                 metrics=qa_metrics,
                 all_passed=all_passed,
             )
@@ -348,7 +343,6 @@ class Stage2Materializer:
                 kind="materialization-manifest",
                 contract_version=CONTRACT_VERSION,
                 dataset_id=self.dataset_id,
-                release_id=self.release_id,
                 route="create_new" if self.mode == "create" else "append_routed",
                 backend=self.backend,
                 topology=self.topology,
@@ -410,7 +404,6 @@ class Stage2Materializer:
                     kind=manifest.kind,
                     contract_version=manifest.contract_version,
                     dataset_id=manifest.dataset_id,
-                    release_id=manifest.release_id,
                     route=manifest.route,
                     backend=manifest.backend,
                     topology=manifest.topology,
@@ -454,7 +447,7 @@ class Stage2Materializer:
 
         # Construct a temporary InspectionTarget for the rerun
         source_h5ad = Path(self.source_path)
-        source_release = self.release_id
+        source_release = self.dataset_id
 
         target = InspectionTarget(
             dataset_id=dataset_id,
@@ -493,7 +486,6 @@ class Stage2Materializer:
         Each row contains:
         - cell_id: the obs index value (string)
         - dataset_id: stable dataset identifier
-        - dataset_release: immutable release identifier
         - raw_fields: JSON string of all obs fields for this cell
 
         This is the Stage 2 Parquet replacement for the legacy SQLite
@@ -502,13 +494,12 @@ class Stage2Materializer:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        parquet_path = meta_root / f"{self.release_id}-raw-obs.parquet"
+        parquet_path = meta_root / "raw-obs.parquet"
         obs = adata.obs
         n = len(obs)
 
         cell_ids = [str(idx) for idx in obs.index]
         dataset_ids = [self.dataset_id] * n
-        dataset_releases = [self.release_id] * n
 
         # Efficiently build raw_fields as JSON strings per row.
         # Use Series.to_list() for each column and avoid iterrows().
@@ -523,7 +514,6 @@ class Stage2Materializer:
         table = pa.table({
             "cell_id": pa.array(cell_ids, type=pa.string()),
             "dataset_id": pa.array(dataset_ids, type=pa.string()),
-            "dataset_release": pa.array(dataset_releases, type=pa.string()),
             "raw_fields": pa.array(raw_fields, type=pa.string()),
         })
         pq.write_table(table, parquet_path)
@@ -544,7 +534,7 @@ class Stage2Materializer:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        parquet_path = meta_root / f"{self.release_id}-raw-var.parquet"
+        parquet_path = meta_root / "raw-var.parquet"
         n = len(var_mem)
 
         origin_indices = list(range(n))
@@ -596,7 +586,6 @@ class Stage2Materializer:
             kind="dataset-metadata-summary",
             contract_version=CONTRACT_VERSION,
             dataset_id=self.dataset_id,
-            release_id=self.release_id,
             source_path=self.source_path,
             obs_field_count=len(obs.columns),
             var_field_count=len(var_mem.columns),
@@ -613,7 +602,7 @@ class Stage2Materializer:
             ),
         )
 
-        summary_path = meta_root / f"{self.release_id}-metadata-summary.yaml"
+        summary_path = meta_root / "metadata-summary.yaml"
         summary.write_yaml(summary_path)
         return summary_path
 
@@ -634,7 +623,7 @@ class Stage2Materializer:
         import pyarrow as pa
         import pyarrow.parquet as pq
 
-        parquet_path = meta_root / f"{self.release_id}-feature-provenance.parquet"
+        parquet_path = meta_root / "feature-provenance.parquet"
 
         origin_indices = list(range(n_vars))
         feature_ids = [str(var_index[i]) for i in range(n_vars)]
@@ -662,7 +651,7 @@ class Stage2Materializer:
 
         The array must already be normalized (median-normalized, clamped).
         """
-        parquet_path = meta_root / f"{self.release_id}-size-factor.parquet"
+        parquet_path = meta_root / "size-factor.parquet"
         table = pa.table({
             "cell_id": pa.array([str(c) for c in cell_ids], type=pa.string()),
             "size_factor": pa.array(size_factors.tolist(), type=pa.float64()),
@@ -802,7 +791,7 @@ class Stage2Materializer:
 
             paths, writer_state = backend_fn(
                 bundle=bundle,
-                release_id=self.release_id,
+                dataset_id=self.dataset_id,
                 matrix_root=matrix_root,
                 _writer_state=writer_state,
                 _is_last_chunk=is_last,
@@ -937,7 +926,7 @@ class Stage2Materializer:
 
             paths, writer_state = backend_fn(
                 bundle=bundle,
-                release_id=self.release_id,
+                dataset_id=self.dataset_id,
                 matrix_root=matrix_root,
                 _writer_state=writer_state,
                 _is_last_chunk=is_last_chunk,
@@ -1099,7 +1088,7 @@ def update_corpus_index(
         if new_dataset_record.dataset_id in existing_ids:
             raise ValueError(
                 f"dataset {new_dataset_record.dataset_id} already exists in corpus index; "
-                "use a different release_id or dataset_id to avoid duplication."
+                "use a different dataset_id to avoid duplication."
             )
         # Compute total cells in existing corpus
         total_existing_cells = sum(d.cell_count for d in corpus.datasets)
@@ -1110,7 +1099,6 @@ def update_corpus_index(
         new_record = DatasetJoinRecord(
             dataset_id=new_dataset_record.dataset_id,
             dataset_index=len(corpus.datasets),
-            release_id=new_dataset_record.release_id,
             join_mode=new_dataset_record.join_mode,
             manifest_path=str(manifest_path_relative),
             cell_count=new_dataset_record.cell_count,
@@ -1125,7 +1113,6 @@ def update_corpus_index(
         new_record = DatasetJoinRecord(
             dataset_id=new_dataset_record.dataset_id,
             dataset_index=0,
-            release_id=new_dataset_record.release_id,
             join_mode=new_dataset_record.join_mode,
             manifest_path=str(manifest_path_relative),
             cell_count=new_dataset_record.cell_count,
@@ -1223,7 +1210,6 @@ def _write_corpus_ledger_parquet(
         entry = CorpusLedgerEntry(
             corpus_id=corpus.corpus_id,
             dataset_id=d.dataset_id,
-            release_id=d.release_id,
             dataset_index=d.dataset_index,
             join_mode=d.join_mode,
             manifest_path=d.manifest_path,
@@ -1244,7 +1230,6 @@ def _write_corpus_ledger_parquet(
     table = pa.table({
         "corpus_id": pa.array([e["corpus_id"] for e in entries], type=pa.string()),
         "dataset_id": pa.array([e["dataset_id"] for e in entries], type=pa.string()),
-        "release_id": pa.array([e["release_id"] for e in entries], type=pa.string()),
         "dataset_index": pa.array([e["dataset_index"] for e in entries], type=pa.int32()),
         "join_mode": pa.array([e["join_mode"] for e in entries], type=pa.string()),
         "manifest_path": pa.array([e["manifest_path"] for e in entries], type=pa.string()),
