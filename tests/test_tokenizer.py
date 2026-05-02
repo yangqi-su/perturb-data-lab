@@ -365,9 +365,11 @@ class TestUpdateCorpusIndexWithTokenizer:
 
             record = DatasetJoinRecord(
                 dataset_id="ds_001",
-                release_id="v0.1",
                 join_mode="create_new",
                 manifest_path="/meta/v0.1-manifest.yaml",
+                cell_count=10,
+                global_start=0,
+                global_end=10,
             )
             # tokenizer_path is set via GlobalMetadataDocument in Phase 3 architecture
             global_meta_with_tokenizer = GlobalMetadataDocument(
@@ -412,18 +414,22 @@ class TestUpdateCorpusIndexWithTokenizer:
             )
             record1 = DatasetJoinRecord(
                 dataset_id="ds_001",
-                release_id="v0.1",
                 join_mode="create_new",
                 manifest_path="/meta/v0.1.yaml",
+                cell_count=10,
+                global_start=0,
+                global_end=10,
             )
             update_corpus_index(idx_path, record1, global_metadata=global_meta)
 
             # Append second dataset
             record2 = DatasetJoinRecord(
                 dataset_id="ds_002",
-                release_id="v0.2",
                 join_mode="append_routed",
                 manifest_path="/meta/v0.2.yaml",
+                cell_count=10,
+                global_start=10,
+                global_end=20,
             )
             update_corpus_index(idx_path, record2, global_metadata=None)
 
@@ -447,12 +453,15 @@ class TestMaterializationManifestTokenizerPath:
             kind="materialization-manifest",
             contract_version="0.2.0",
             dataset_id="test_ds",
-            release_id="v0.1",
             route="create_new",
-            backend="arrow-hf",
+            backend="arrow-parquet",
+            topology="federated",
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
-            provenance=ProvenanceSpec(source_path="/data/test.h5ad", schema="/schema.yaml"),
+            provenance=ProvenanceSpec(
+                source_path="/data/test.h5ad",
+                review_bundle="/review/dataset-summary.yaml",
+            ),
         )
         d = manifest.to_dict()
         # tokenizer_path is not produced by the manifest in Phase 3 (tokenizer-free)
