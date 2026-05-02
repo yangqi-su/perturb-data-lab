@@ -2,12 +2,12 @@
 
 Commands
 --------
-inspect          Run h5ad inspection over a batch config.
+inspect          Run h5ad inspection over a batch config, or directly for one dataset.
 materialize      Materialize datasets with --mode {create,append} into a backend.
                  Supports single (--source) and bulk (--input-dir, --input-list)
                  input. Outputs go under --output-corpus.
-canonicalize     Transform raw obs/var sidecars into canonical parquet files.
-                 Supports bulk (--schema-dir) and incremental (--dataset-id) modes.
+draft-schema     Auto-draft canonicalization schemas from corpus-local inspection summaries.
+canonicalize     Canonicalize using corpus-local final schemas.
 corpus-validate  Validate a corpus for logical completeness.
 corpus-gc        Garbage-collect orphaned Lance fragments not in the corpus ledger.
 
@@ -221,7 +221,24 @@ def _resolve_effective_topology(backend: str, topology: str) -> str:
 
 def _add_inspect_args(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
-        "--config", required=True, help="Path to the YAML batch inspection config."
+        "--config",
+        default=None,
+        help="Path to the YAML batch inspection config.",
+    )
+    sub.add_argument(
+        "--source",
+        default=None,
+        help="Path to a single source h5ad file (direct mode).",
+    )
+    sub.add_argument(
+        "--dataset-id",
+        default=None,
+        help="Stable dataset identifier (direct mode).",
+    )
+    sub.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory where direct inspect writes dataset-summary.yaml.",
     )
     sub.add_argument(
         "--workers",
@@ -232,12 +249,52 @@ def _add_inspect_args(sub: argparse.ArgumentParser) -> None:
 
 
 def _cmd_inspect(args: argparse.Namespace) -> None:
-    config = InspectionBatchConfig.from_yaml_file(Path(args.config))
-    manifest = run_batch(config, workers=args.workers)
-    print(
-        f"[inspect] wrote manifest "
-        f"{Path(manifest.output_root) / 'inspection-manifest.yaml'}"
+    from .inspectors.workflow import inspect_target
+    from .inspectors.models import InspectionTarget
+
+    has_config = args.config is not None
+    has_direct_flags = any(
+        value is not None for value in (args.source, args.dataset_id, args.output_dir)
     )
+
+    if has_config and has_direct_flags:
+        print(
+            "[inspect] use either --config (batch mode) or "
+            "--source/--dataset-id/--output-dir (direct mode), not both.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if has_config:
+        config = InspectionBatchConfig.from_yaml_file(Path(args.config))
+        manifest = run_batch(config, workers=args.workers)
+        print(
+            f"[inspect] wrote manifest "
+            f"{Path(manifest.output_root) / 'inspection-manifest.yaml'}"
+        )
+        return
+
+    if not (args.source and args.dataset_id and args.output_dir):
+        print(
+            "[inspect] direct mode requires --source, --dataset-id, and --output-dir",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    source = Path(args.source)
+    if not source.exists():
+        print(f"[inspect] source h5ad not found: {source}", file=sys.stderr)
+        sys.exit(1)
+
+    artifacts = inspect_target(
+        InspectionTarget(
+            dataset_id=args.dataset_id,
+            source_path=str(source),
+            source_release=args.dataset_id,
+        ),
+        Path(args.output_dir),
+    )
+    print(f"[inspect] wrote review bundle {artifacts.review_bundle}")
 
 
 # ---------------------------------------------------------------------------
@@ -313,15 +370,20 @@ def _add_materialize_args(sub: argparse.ArgumentParser) -> None:
     # Backend / topology
     sub.add_argument(
         "--backend",
-        required=True,
+        default=None,
         choices=BACKEND_CHOICES,
-        help="Storage backend for this materialization.",
+        help=(
+            "Storage backend for this materialization. Required for --mode create; "
+            "auto-detected from corpus-index.yaml for --mode append when omitted."
+        ),
     )
     sub.add_argument(
         "--topology",
-        default="federated",
+        default=None,
         choices=TOPOLOGY_CHOICES,
-        help="Corpus topology (default: federated).",
+        help=(
+            "Corpus topology. Optional for --mode append (auto-detected from corpus metadata)."
+        ),
     )
 
     # Optional corpus identifier
@@ -359,6 +421,7 @@ def _materialize_dataset(
     ds: _DatasetInput,
     args: argparse.Namespace,
     *,
+    backend: str,
     corpus_root: Path,
     effective_topology: str,
     mode: str,
@@ -409,7 +472,7 @@ def _materialize_dataset(
         review_bundle_path=ds.review_bundle,
         output_roots=output_roots,
         dataset_id=ds.dataset_id,
-        backend=args.backend,
+        backend=backend,
         topology=effective_topology,
         rerun_stage1=args.rerun_stage1,
         n_hvg=getattr(args, "n_hvg", 2000),
@@ -439,6 +502,41 @@ def _materialize_dataset(
     return (next_global_start, next_writer_state)
 
 
+def _load_corpus_index(corpus_root: Path):
+    from .materializers.models import CorpusIndexDocument
+
+    corpus_index_path = corpus_root / "corpus-index.yaml"
+    if not corpus_index_path.exists():
+        raise FileNotFoundError(f"corpus-index.yaml not found at {corpus_index_path}")
+    return CorpusIndexDocument.from_yaml_file(corpus_index_path)
+
+
+def _infer_backend_topology_from_corpus(corpus_root: Path) -> tuple[str, str]:
+    from .materializers.models import MaterializationManifest
+
+    corpus = _load_corpus_index(corpus_root)
+    gmeta = corpus.global_metadata or {}
+
+    backend = gmeta.get("backend")
+    topology = gmeta.get("topology")
+
+    if (backend is None or topology is None) and corpus.datasets:
+        first_manifest_path = corpus_root / corpus.datasets[0].manifest_path
+        if first_manifest_path.exists():
+            manifest = MaterializationManifest.from_yaml_file(first_manifest_path)
+            backend = backend or manifest.backend
+            topology = topology or manifest.topology
+
+    if backend is None:
+        raise ValueError(
+            f"cannot auto-detect backend from {corpus_root / 'corpus-index.yaml'}"
+        )
+    if topology is None:
+        topology = "aggregate" if backend == "lance" else "federated"
+
+    return str(backend), str(topology)
+
+
 def _cmd_materialize(args: argparse.Namespace) -> None:
     """Unified materialize command supporting create/append, single/bulk, dry-run."""
     from .materializers.registration import corpus_exists as _corpus_exists
@@ -453,13 +551,18 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
     # --- Resolve corpus root ---
     corpus_root = Path(args.output_corpus).resolve()
     corpus_index_path = corpus_root / "corpus-index.yaml"
-
-    effective_topology = _resolve_effective_topology(args.backend, args.topology)
-    aggregate = _is_aggregate(args.backend, args.topology)
+    effective_backend: str
+    effective_topology: str
 
     # --- Determine actual mode based on corpus existence ---
     effective_mode: str
     if args.mode == "create":
+        if args.backend is None:
+            print(
+                "[error] --backend is required with --mode create",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if _corpus_exists(corpus_root):
             print(
                 f"[error] --mode create but corpus already exists at {corpus_root}. "
@@ -468,6 +571,12 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
         effective_mode = "create"
+        effective_backend = args.backend
+        requested_topology = args.topology or "federated"
+        effective_topology = _resolve_effective_topology(
+            effective_backend,
+            requested_topology,
+        )
     else:  # append
         if not _corpus_exists(corpus_root):
             print(
@@ -477,6 +586,30 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
         effective_mode = "append"
+        detected_backend, detected_topology = _infer_backend_topology_from_corpus(
+            corpus_root
+        )
+        if args.backend is not None and args.backend != detected_backend:
+            print(
+                f"[error] --backend={args.backend} does not match existing corpus backend "
+                f"{detected_backend}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.topology is not None and args.topology != detected_topology:
+            print(
+                f"[error] --topology={args.topology} does not match existing corpus topology "
+                f"{detected_topology}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        effective_backend = detected_backend
+        effective_topology = _resolve_effective_topology(
+            detected_backend,
+            detected_topology,
+        )
+
+    aggregate = _is_aggregate(effective_backend, effective_topology)
 
     # --- Check for duplicate dataset_ids against existing corpus (append mode) ---
     if effective_mode == "append":
@@ -495,7 +628,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
 
     # --- Print execution plan ---
     print(
-        f"[materialize] mode={effective_mode}  backend={args.backend}  "
+        f"[materialize] mode={effective_mode}  backend={effective_backend}  "
         f"topology={effective_topology}"
     )
     print(f"  corpus: {corpus_root}")
@@ -515,6 +648,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
             is_last = aggregate and (i == total - 1)
             next_global, writer_state = _materialize_dataset(
                 ds, args,
+                backend=effective_backend,
                 corpus_root=corpus_root,
                 effective_topology=effective_topology,
                 mode=mode_name,
@@ -540,6 +674,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
         try:
             next_global, writer_state = _materialize_dataset(
                 ds, args,
+                backend=effective_backend,
                 corpus_root=corpus_root,
                 effective_topology=effective_topology,
                 mode=mode_name,
@@ -769,79 +904,114 @@ def _cmd_corpus_gc(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# canonicalize (new — Phase 3)
+# draft-schema (Phase 3)
 # ---------------------------------------------------------------------------
 
 
-def _add_canonicalize_args(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument(
-        "--schema-dir",
-        default=None,
-        help=(
-            "Directory containing finalized canonicalization-schema YAML files "
-            "(bulk mode). Each schema's dataset_id is read from the YAML and "
-            "matched against the corpus index; raw sidecar paths are discovered "
-            "automatically from each dataset's materialization-manifest.yaml."
-        ),
-    )
-    sub.add_argument(
-        "--dataset-id",
-        default=None,
-        help="Single dataset identifier (incremental mode; requires --schema).",
-    )
-    sub.add_argument(
-        "--schema",
-        default=None,
-        help=(
-            "Path to a single canonicalization-schema.yaml "
-            "(incremental mode; requires --dataset-id)."
-        ),
-    )
+def _add_draft_schema_args(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
         "--corpus",
         required=True,
         help="Path to the corpus root directory (containing corpus-index.yaml).",
     )
     sub.add_argument(
-        "--output-dir",
+        "--force-all",
+        action="store_true",
+        help="Redraft even if draft-schema.yaml already exists.",
+    )
+
+
+def _dataset_paths_for_topology(
+    *,
+    corpus_root: Path,
+    topology: str,
+    dataset_id: str,
+) -> tuple[Path, Path]:
+    resolved = resolve_corpus_paths(
+        topology=topology,
+        corpus_root=corpus_root,
+        dataset_id=dataset_id,
+    )
+    return resolved.meta_root, resolved.canonical_meta_root
+
+
+def _cmd_draft_schema(args: argparse.Namespace) -> None:
+    from .canonical import draft_canonicalization_schema
+    from .inspectors.models import DatasetSummaryDocument
+
+    corpus_root = Path(args.corpus).resolve()
+    corpus = _load_corpus_index(corpus_root)
+    _, topology = _infer_backend_topology_from_corpus(corpus_root)
+
+    drafted = 0
+    skipped_existing = 0
+    skipped_canonicalized = 0
+
+    for ds in corpus.datasets:
+        dataset_id = ds.dataset_id
+        meta_root, canonical_meta_root = _dataset_paths_for_topology(
+            corpus_root=corpus_root,
+            topology=topology,
+            dataset_id=dataset_id,
+        )
+        canonical_obs = canonical_meta_root / "canonical-obs.parquet"
+        canonical_var = canonical_meta_root / "canonical-var.parquet"
+        if canonical_obs.exists() and canonical_var.exists():
+            skipped_canonicalized += 1
+            continue
+
+        summary_path = meta_root / "dataset-summary.yaml"
+        draft_path = meta_root / "draft-schema.yaml"
+
+        if not summary_path.exists():
+            print(
+                f"[draft-schema] missing dataset summary for {dataset_id}: {summary_path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if draft_path.exists() and not args.force_all:
+            skipped_existing += 1
+            continue
+
+        summary = DatasetSummaryDocument.from_yaml_file(summary_path)
+        schema = draft_canonicalization_schema(
+            dataset_id=dataset_id,
+            obs_columns=[field.name for field in summary.obs_fields],
+            var_columns=[field.name for field in summary.var_fields],
+        )
+        schema.write_yaml(draft_path)
+        drafted += 1
+        print(f"[draft-schema] wrote {draft_path}")
+
+    print(
+        f"[draft-schema] done — drafted={drafted} "
+        f"skipped_existing={skipped_existing} "
+        f"skipped_canonicalized={skipped_canonicalized}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# canonicalize (Phase 3 simplified CLI)
+# ---------------------------------------------------------------------------
+
+
+def _add_canonicalize_args(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "--corpus",
         required=True,
-        help="Directory where canonical parquet files will be written.",
+        help="Path to the corpus root directory (containing corpus-index.yaml).",
+    )
+    sub.add_argument(
+        "--dataset-id",
+        default=None,
+        help="Optional single dataset identifier; if omitted, canonicalize all with final-schema.yaml.",
     )
     sub.add_argument(
         "--dry-run",
         action="store_true",
         help="Discover schemas and validate inputs without running canonicalization.",
     )
-
-
-def _discover_schemas_from_dir(schema_dir: Path) -> list[tuple[str, Path]]:
-    """Scan *schema_dir* for ``*canonicalization-schema.yaml`` files.
-
-    Returns a list of ``(dataset_id, schema_path)`` pairs sorted by
-    dataset_id.  The ``dataset_id`` is read from each schema's YAML
-    content, not from the filename.
-    """
-    from .canonical import CanonicalizationSchema
-
-    candidates = sorted(schema_dir.glob("*canonicalization-schema.yaml"))
-    if not candidates:
-        raise FileNotFoundError(
-            f"No *canonicalization-schema.yaml files found in {schema_dir}"
-        )
-    schemas: list[tuple[str, Path]] = []
-    seen: set[str] = set()
-    for sp in candidates:
-        schema = CanonicalizationSchema.from_yaml_file(sp)
-        if schema.dataset_id in seen:
-            print(
-                f"[canonicalize] WARNING: duplicate dataset_id '{schema.dataset_id}' "
-                f"in {sp}; skipping duplicate schema",
-                file=sys.stderr,
-            )
-            continue
-        seen.add(schema.dataset_id)
-        schemas.append((schema.dataset_id, sp))
-    return schemas
 
 
 def _resolve_sidecars_from_corpus(
@@ -885,7 +1055,20 @@ def _resolve_sidecars_from_corpus(
                 raise ValueError(
                     f"raw_feature_meta_path missing in manifest for {dataset_id}"
                 )
-            return (raw_obs, raw_var, size_factor)
+            raw_obs_path = Path(raw_obs)
+            raw_var_path = Path(raw_var)
+            size_factor_path = Path(size_factor) if size_factor else None
+            if not raw_obs_path.is_absolute():
+                raw_obs_path = corpus_root / raw_obs_path
+            if not raw_var_path.is_absolute():
+                raw_var_path = corpus_root / raw_var_path
+            if size_factor_path is not None and not size_factor_path.is_absolute():
+                size_factor_path = corpus_root / size_factor_path
+            return (
+                str(raw_obs_path),
+                str(raw_var_path),
+                str(size_factor_path) if size_factor_path is not None else None,
+            )
 
     raise ValueError(
         f"dataset_id '{dataset_id}' not found in corpus index at {corpus_index_path}"
@@ -896,75 +1079,60 @@ def _cmd_canonicalize(args: argparse.Namespace) -> None:
     """Execute the canonicalize command (bulk or incremental)."""
     from .canonical import (
         CanonicalizationResult,
-        CanonicalVocab,
         build_canonical_vocab,
         run_canonicalization,
     )
 
     corpus_root = Path(args.corpus).resolve()
-    output_dir = Path(args.output_dir).resolve()
+    corpus = _load_corpus_index(corpus_root)
+    _, topology = _infer_backend_topology_from_corpus(corpus_root)
 
-    # --- Resolve mode ---
-    has_schema_dir = args.schema_dir is not None
-    has_dataset_id = args.dataset_id is not None
-    has_schema = args.schema is not None
-
-    if has_schema_dir:
-        if has_dataset_id or has_schema:
+    all_dataset_ids = [ds.dataset_id for ds in corpus.datasets]
+    if args.dataset_id is not None:
+        if args.dataset_id not in set(all_dataset_ids):
             print(
-                "[canonicalize] --schema-dir is for bulk mode and cannot be "
-                "combined with --dataset-id/--schema.",
+                f"[canonicalize] dataset_id '{args.dataset_id}' not found in corpus",
                 file=sys.stderr,
             )
             sys.exit(1)
-        schema_dir = Path(args.schema_dir)
-        if not schema_dir.is_dir():
-            print(
-                f"[canonicalize] schema directory not found: {schema_dir}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        schemas = _discover_schemas_from_dir(schema_dir)
-        print(
-            f"[canonicalize] bulk mode: discovered {len(schemas)} schema(s) "
-            f"in {schema_dir}"
-        )
-    elif has_dataset_id and has_schema:
-        schema_path = Path(args.schema)
-        if not schema_path.exists():
-            print(
-                f"[canonicalize] schema file not found: {schema_path}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        schemas = [(args.dataset_id, schema_path)]
-        print(
-            f"[canonicalize] incremental mode: dataset_id={args.dataset_id} "
-            f"schema={schema_path}"
-        )
+        dataset_ids = [args.dataset_id]
     else:
+        dataset_ids = all_dataset_ids
+
+    schemas: list[tuple[str, Path, Path]] = []
+    for dataset_id in dataset_ids:
+        meta_root, canonical_meta_root = _dataset_paths_for_topology(
+            corpus_root=corpus_root,
+            topology=topology,
+            dataset_id=dataset_id,
+        )
+        schema_path = meta_root / "final-schema.yaml"
+        if schema_path.exists():
+            schemas.append((dataset_id, schema_path, canonical_meta_root))
+            continue
+        if args.dataset_id is not None:
+            print(
+                f"[canonicalize] final schema not found for {dataset_id}: {schema_path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if not schemas:
         print(
-            "[canonicalize] must specify either --schema-dir (bulk) or "
-            "both --dataset-id and --schema (incremental).",
+            "[canonicalize] no finalized schemas found (expected meta/<dataset>/final-schema.yaml)",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    # --- Print plan ---
     print(f"  corpus: {corpus_root}")
-    print(f"  output-dir: {output_dir}")
     print(f"  dry-run: {args.dry_run}")
-    if schemas:
-        ds_ids = [s[0] for s in schemas]
-        print(f"  datasets ({len(ds_ids)}): {', '.join(ds_ids)}")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  datasets ({len(schemas)}): {', '.join(s[0] for s in schemas)}")
 
     # --- Process each dataset ---
     results: list[CanonicalizationResult] = []
     failures: list[tuple[str, str]] = []
 
-    for dataset_id, schema_path in schemas:
+    for dataset_id, schema_path, output_root in schemas:
         print(f"\n  [{dataset_id}]")
         try:
             raw_obs, raw_var, size_factor = _resolve_sidecars_from_corpus(
@@ -976,9 +1144,11 @@ def _cmd_canonicalize(args: argparse.Namespace) -> None:
                 print(f"    size_factor: {size_factor}")
             else:
                 print("    size_factor: (none — defaults to 1.0)")
+            print(f"    final_schema: {schema_path}")
+            print(f"    canonical_output: {output_root}")
 
             if args.dry_run:
-                print(f"    [dry-run] would canonicalize → {output_dir}")
+                print(f"    [dry-run] would canonicalize → {output_root}")
                 continue
 
             result = run_canonicalization(
@@ -987,7 +1157,7 @@ def _cmd_canonicalize(args: argparse.Namespace) -> None:
                 raw_var_path=raw_var,
                 size_factor_path=size_factor,
                 schema_path=schema_path,
-                output_root=output_dir,
+                output_root=output_root,
             )
             results.append(result)
             print(
@@ -1006,7 +1176,7 @@ def _cmd_canonicalize(args: argparse.Namespace) -> None:
     # --- Merge and write corpus-level vocab ---
     if not args.dry_run and results:
         per_dataset_vocabs = [r.vocab for r in results]
-        corpus_vocab_path = output_dir / "corpus-vocab.yaml"
+        corpus_vocab_path = corpus_root / "corpus-vocab.yaml"
         merged = build_canonical_vocab(
             per_dataset_vocabs,
             output_path=corpus_vocab_path,
@@ -1054,6 +1224,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_materialize_args(p_mat)
 
+    # draft-schema
+    p_draft = sub.add_parser(
+        "draft-schema",
+        help="Auto-draft canonicalization schemas from corpus-local inspection summaries.",
+    )
+    _add_draft_schema_args(p_draft)
+
     # canonicalize (new — Phase 3)
     p_can = sub.add_parser(
         "canonicalize",
@@ -1084,6 +1261,8 @@ def main() -> None:
         _cmd_inspect(args)
     elif args.command == "materialize":
         _cmd_materialize(args)
+    elif args.command == "draft-schema":
+        _cmd_draft_schema(args)
     elif args.command == "canonicalize":
         _cmd_canonicalize(args)
     elif args.command == "corpus-validate":
