@@ -997,7 +997,6 @@ class CanonicalCellRecord:
     expression_counts: tuple[int, ...]
     cell_id: str
     dataset_id: str
-    dataset_release: str
     size_factor: float
     canonical_perturbation: dict[str, str]
     canonical_context: dict[str, str]
