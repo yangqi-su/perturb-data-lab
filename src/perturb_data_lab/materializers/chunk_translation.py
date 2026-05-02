@@ -240,7 +240,7 @@ class ChunkBundle:
     -----
     The ``metadata_table`` field has been removed. Per-cell metadata is written by
     the caller (``Stage2Materializer``) as a separate Parquet sidecar
-    (``{release_id}-raw-obs.parquet``). The ``_build_metadata_table()`` helper remains
+    (``raw-obs.parquet``). The ``_build_metadata_table()`` helper remains
     available for callers that need a ``METADATA_SCHEMA`` table from obs data.
 
     The ``indptr``, ``indices``, and ``counts`` arrays are raw CSR components.
