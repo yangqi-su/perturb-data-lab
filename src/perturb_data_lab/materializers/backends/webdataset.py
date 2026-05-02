@@ -30,7 +30,7 @@ from ..chunk_translation import ChunkBundle
 
 def write_webdataset_federated(
     bundle: ChunkBundle,
-    release_id: str,
+    dataset_id: str,
     matrix_root: Path,
     cell_ids: tuple[str, ...] | None = None,
     *,
@@ -53,8 +53,8 @@ def write_webdataset_federated(
     ----------
     bundle : ChunkBundle
         The translated chunk bundle from ``_translate_chunk()``.
-    release_id : str
-        Release identifier used for shard file naming.
+    dataset_id : str
+        Dataset identifier used for shard file naming.
     matrix_root : Path
         Output directory for shard artifacts.
     cell_ids : tuple[str, ...] | None
@@ -76,7 +76,7 @@ def write_webdataset_federated(
     import tarfile
 
     matrix_root.mkdir(parents=True, exist_ok=True)
-    shard_path = matrix_root / f"{release_id}-cells.tar"
+    shard_path = matrix_root / f"{dataset_id}-cells.tar"
 
     if _writer_state is None:
         _writer_state = {
@@ -153,7 +153,7 @@ _AGGREGATE_SHARD_SIZE = 10_000
 
 def write_webdataset_aggregate(
     bundle: ChunkBundle,
-    release_id: str,
+    dataset_id: str,
     matrix_root: Path,
     *,
     _writer_state: dict[str, Any] | None = None,
@@ -173,8 +173,8 @@ def write_webdataset_aggregate(
     ----------
     bundle : ChunkBundle
         The translated chunk bundle from ``_translate_chunk()``.
-    release_id : str
-        Release identifier (used for metadata context only).
+    dataset_id : str
+        Dataset identifier (unused in aggregate write path).
     matrix_root : Path
         Output directory for shard artifacts.
     _writer_state : dict | None
