@@ -5,10 +5,10 @@ directly. No per-writer CSR logic, no legacy fallback, no ``_is_csr_dataset()``.
 Gene indices in ``ChunkBundle.indices`` are always dataset-local.
 
 Zarr layout (federated):
-- {release_id}-indices.zarr: 1D flat buffer of all gene indices
-- {release_id}-counts.zarr: 1D flat buffer of all counts
-- {release_id}-row-offsets.zarr: row offset boundaries
-- {release_id}-meta.json: cell metadata + size_factor path reference
+- {dataset_id}-indices.zarr: 1D flat buffer of all gene indices
+- {dataset_id}-counts.zarr: 1D flat buffer of all counts
+- {dataset_id}-row-offsets.zarr: row offset boundaries
+- {dataset_id}-meta.json: cell metadata + size_factor path reference
 
 Zarr layout (aggregate):
 - aggregated-indices.zarr: 1D flat buffer of all gene indices across datasets
@@ -33,7 +33,7 @@ from ..chunk_translation import ChunkBundle
 
 def write_zarr_federated(
     bundle: ChunkBundle,
-    release_id: str,
+    dataset_id: str,
     matrix_root: Path,
     *,
     _writer_state: dict[str, Any] | None = None,
@@ -55,8 +55,8 @@ def write_zarr_federated(
     ----------
     bundle : ChunkBundle
         The translated chunk bundle from ``_translate_chunk()``.
-    release_id : str
-        Release identifier used for output file naming.
+    dataset_id : str
+        Dataset identifier used for output file naming.
     matrix_root : Path
         Output directory for matrix artifacts.
     _writer_state : dict | None
@@ -75,9 +75,9 @@ def write_zarr_federated(
     import zarr
 
     matrix_root.mkdir(parents=True, exist_ok=True)
-    indices_path = matrix_root / f"{release_id}-indices.zarr"
-    counts_path = matrix_root / f"{release_id}-counts.zarr"
-    row_offsets_path = matrix_root / f"{release_id}-row-offsets.zarr"
+    indices_path = matrix_root / f"{dataset_id}-indices.zarr"
+    counts_path = matrix_root / f"{dataset_id}-counts.zarr"
+    row_offsets_path = matrix_root / f"{dataset_id}-row-offsets.zarr"
 
     if _writer_state is None:
         # First chunk: create zarr arrays with initial size.
@@ -136,7 +136,7 @@ def write_zarr_federated(
         "indices": indices_path,
         "counts": counts_path,
         "row_offsets": row_offsets_path,
-        "meta": matrix_root / f"{release_id}-meta.json",
+        "meta": matrix_root / f"{dataset_id}-meta.json",
     }
 
     if _is_last_chunk:
@@ -148,9 +148,9 @@ def write_zarr_federated(
         )
 
         # Write meta.json with final dimensions.
-        with open(matrix_root / f"{release_id}-meta.json", "w") as f:
+        with open(matrix_root / f"{dataset_id}-meta.json", "w") as f:
             json.dump({
-                "release_id": release_id,
+                "dataset_id": dataset_id,
                 "n_obs": _writer_state["row_count"],
                 "nnz": _writer_state["global_nnz"],
                 "indices_path": str(indices_path),
@@ -208,7 +208,7 @@ def read_zarr_cell(
 
 def write_zarr_aggregate(
     bundle: ChunkBundle,
-    release_id: str,
+    dataset_id: str,
     matrix_root: Path,
     *,
     _writer_state: dict[str, Any] | None = None,
@@ -231,8 +231,8 @@ def write_zarr_aggregate(
     ----------
     bundle : ChunkBundle
         The translated chunk bundle from ``_translate_chunk()``.
-    release_id : str
-        Release identifier (used for metadata context only).
+    dataset_id : str
+        Dataset identifier (unused in aggregate write path).
     matrix_root : Path
         Output directory for matrix artifacts.
     _writer_state : dict | None
