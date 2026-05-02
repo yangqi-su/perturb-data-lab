@@ -366,7 +366,7 @@ class TestUpdateCorpusIndexWithTokenizer:
             record = DatasetJoinRecord(
                 dataset_id="ds_001",
                 join_mode="create_new",
-                manifest_path="/meta/v0.1-manifest.yaml",
+                manifest_path="/meta/materialization-manifest.yaml",
                 cell_count=10,
                 global_start=0,
                 global_end=10,
@@ -415,7 +415,7 @@ class TestUpdateCorpusIndexWithTokenizer:
             record1 = DatasetJoinRecord(
                 dataset_id="ds_001",
                 join_mode="create_new",
-                manifest_path="/meta/v0.1.yaml",
+                manifest_path="/meta/ds_001-manifest.yaml",
                 cell_count=10,
                 global_start=0,
                 global_end=10,
