@@ -41,6 +41,27 @@ _PLAN_RUN = (
     / "outputs"
 )
 
+_PLAN_RUN_ARCHIVE = (
+    Path("/autofs/projects-t3/lilab/yangqisu/repos/data_perturb_v2")
+    / "copilot/plans/archive/plans-20260430-canonicalization-module-and-loader-adaptation"
+    / "outputs"
+)
+
+
+def _resolve_canonical_var_path(dataset_id: str) -> str:
+    for base in (_PLAN_RUN, _PLAN_RUN_ARCHIVE):
+        candidates = [
+            base / dataset_id / "canonical-var.parquet",
+            base / dataset_id / f"{dataset_id}-canonical-var.parquet",
+            base / dataset_id / f"{dataset_id}-release-canonical-var.parquet",
+            base / f"{dataset_id}-canonical-var.parquet",
+            base / f"{dataset_id}-release-canonical-var.parquet",
+        ]
+        for path in candidates:
+            if path.exists():
+                return str(path)
+    raise FileNotFoundError(f"canonical var parquet not found for {dataset_id}")
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -252,12 +273,8 @@ class TestFeatureRegistryCanonical:
 
     def test_from_canonical_var_parquets_loads(self):
         var_paths = {
-            "dummy_00": str(
-                _PLAN_RUN / "dummy_00" / "dummy_00-release-canonical-var.parquet"
-            ),
-            "dummy_01": str(
-                _PLAN_RUN / "dummy_01" / "dummy_01-release-canonical-var.parquet"
-            ),
+            "dummy_00": _resolve_canonical_var_path("dummy_00"),
+            "dummy_01": _resolve_canonical_var_path("dummy_01"),
         }
         reg = FeatureRegistry.from_canonical_var_parquets(var_paths)
         assert len(reg.dataset_ids) == 2
@@ -266,12 +283,8 @@ class TestFeatureRegistryCanonical:
 
     def test_global_vocab_size(self):
         var_paths = {
-            "dummy_00": str(
-                _PLAN_RUN / "dummy_00" / "dummy_00-release-canonical-var.parquet"
-            ),
-            "dummy_01": str(
-                _PLAN_RUN / "dummy_01" / "dummy_01-release-canonical-var.parquet"
-            ),
+            "dummy_00": _resolve_canonical_var_path("dummy_00"),
+            "dummy_01": _resolve_canonical_var_path("dummy_01"),
         }
         reg = FeatureRegistry.from_canonical_var_parquets(var_paths)
         # 22652 unique canonical_gene_ids across both datasets
@@ -279,21 +292,15 @@ class TestFeatureRegistryCanonical:
 
     def test_max_local_vocab(self):
         var_paths = {
-            "dummy_00": str(
-                _PLAN_RUN / "dummy_00" / "dummy_00-release-canonical-var.parquet"
-            ),
-            "dummy_01": str(
-                _PLAN_RUN / "dummy_01" / "dummy_01-release-canonical-var.parquet"
-            ),
+            "dummy_00": _resolve_canonical_var_path("dummy_00"),
+            "dummy_01": _resolve_canonical_var_path("dummy_01"),
         }
         reg = FeatureRegistry.from_canonical_var_parquets(var_paths)
         assert reg.max_local_vocab == 15000
 
     def test_local_to_global_map(self):
         var_paths = {
-            "dummy_00": str(
-                _PLAN_RUN / "dummy_00" / "dummy_00-release-canonical-var.parquet"
-            ),
+            "dummy_00": _resolve_canonical_var_path("dummy_00"),
         }
         reg = FeatureRegistry.from_canonical_var_parquets(var_paths)
         m = reg.local_to_global_map
@@ -323,8 +330,8 @@ class TestFeatureRegistryCanonical:
         raw_reg = FeatureRegistry({"dummy_00": raw_df_00, "dummy_01": raw_df_01})
         # For dummy data with identity mapping, canonical == raw vocab size
         var_paths = {
-            "dummy_00": str(_PLAN_RUN / "dummy_00" / "dummy_00-release-canonical-var.parquet"),
-            "dummy_01": str(_PLAN_RUN / "dummy_01" / "dummy_01-release-canonical-var.parquet"),
+            "dummy_00": _resolve_canonical_var_path("dummy_00"),
+            "dummy_01": _resolve_canonical_var_path("dummy_01"),
         }
         canon_reg = FeatureRegistry.from_canonical_var_parquets(var_paths)
 
