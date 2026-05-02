@@ -35,7 +35,6 @@ class TestCanonicalCellRecord:
             expression_counts=(5, 2, 8),
             cell_id="cell_001",
             dataset_id="test_ds",
-            dataset_release="v0",
             size_factor=1.0,
             canonical_perturbation={},
             canonical_context={},
@@ -49,7 +48,6 @@ class TestCanonicalCellRecord:
             expression_counts=(5.0, 2.1),  # non-integer
             cell_id="cell_001",
             dataset_id="test_ds",
-            dataset_release="v0",
             size_factor=1.0,
             canonical_perturbation={},
             canonical_context={},
@@ -63,7 +61,6 @@ class TestCanonicalCellRecord:
             expression_counts=(3, 7, 1),
             cell_id="cell_001",
             dataset_id="test_ds",
-            dataset_release="v0",
             size_factor=1.5,
             canonical_perturbation={},
             canonical_context={},
@@ -160,9 +157,8 @@ class TestCorpusIndexUpdate:
             idx_path = Path(tmpdir) / "corpus-index.yaml"
             record = DatasetJoinRecord(
                 dataset_id="ds_001",
-                release_id="v0.1",
                 join_mode="create_new",
-                manifest_path="/tmp/meta/v0.1-manifest.yaml",
+                manifest_path="/tmp/meta/materialization-manifest.yaml",
                 cell_count=1000,
             )
             updated = update_corpus_index(idx_path, record)
@@ -181,9 +177,8 @@ class TestCorpusIndexUpdate:
             # Create initial index with cell_count
             record1 = DatasetJoinRecord(
                 dataset_id="ds_001",
-                release_id="v0.1",
                 join_mode="create_new",
-                manifest_path="/tmp/v0.1.yaml",
+                manifest_path="/tmp/ds_001.yaml",
                 cell_count=500,
             )
             updated1 = update_corpus_index(idx_path, record1)
@@ -193,9 +188,8 @@ class TestCorpusIndexUpdate:
             # Append second dataset — global range is computed from existing total
             record2 = DatasetJoinRecord(
                 dataset_id="ds_002",
-                release_id="v0.2",
                 join_mode="append_routed",
-                manifest_path="/tmp/v0.2.yaml",
+                manifest_path="/tmp/ds_002.yaml",
                 cell_count=300,
             )
             updated2 = update_corpus_index(idx_path, record2)
@@ -211,18 +205,16 @@ class TestCorpusIndexUpdate:
             idx_path = Path(tmpdir) / "corpus-index.yaml"
             record = DatasetJoinRecord(
                 dataset_id="ds_001",
-                release_id="v0.1",
                 join_mode="create_new",
-                manifest_path="/tmp/v0.1.yaml",
+                manifest_path="/tmp/ds_001.yaml",
                 cell_count=1000,
             )
             update_corpus_index(idx_path, record)
 
             duplicate = DatasetJoinRecord(
                 dataset_id="ds_001",
-                release_id="v0.2",
                 join_mode="append_routed",
-                manifest_path="/tmp/v0.2.yaml",
+                manifest_path="/tmp/ds_001_dup.yaml",
                 cell_count=500,
             )
             with pytest.raises(ValueError, match="already exists in corpus index"):
@@ -236,9 +228,8 @@ class TestCorpusIndexUpdate:
             for i, cc in enumerate(cell_counts):
                 record = DatasetJoinRecord(
                     dataset_id=f"ds_{i:03d}",
-                    release_id=f"v{i}",
                     join_mode="create_new" if i == 0 else "append_routed",
-                    manifest_path=f"/tmp/v{i}.yaml",
+                    manifest_path=f"/tmp/ds_{i:03d}.yaml",
                     cell_count=cc,
                 )
                 update_corpus_index(idx_path, record)
@@ -263,7 +254,6 @@ class TestMaterializationManifest:
             kind="materialization-manifest",
             contract_version="0.3.0",
             dataset_id="test_ds",
-            release_id="v0.1",
             route="create_new",
             backend="arrow-parquet",
             topology="federated",
@@ -289,7 +279,6 @@ class TestMaterializationManifest:
             kind="materialization-manifest",
             contract_version="0.3.0",
             dataset_id="ds_appended",
-            release_id="v0.2",
             route="append_routed",
             backend="lance",
             topology="aggregate",
@@ -323,7 +312,6 @@ class TestManifestToJoinRecordRoute:
             kind="materialization-manifest",
             contract_version="0.3.0",
             dataset_id="ds_create",
-            release_id="v0.1",
             route="create_new",
             backend="lance",
             topology="aggregate",
@@ -352,7 +340,6 @@ class TestManifestToJoinRecordRoute:
             kind="materialization-manifest",
             contract_version="0.3.0",
             dataset_id="ds_append",
-            release_id="v0.2",
             route="append_routed",
             backend="lance",
             topology="aggregate",
@@ -381,7 +368,6 @@ class TestManifestToJoinRecordRoute:
             # Create corpus with first dataset
             record1 = DatasetJoinRecord(
                 dataset_id="ds_first",
-                release_id="v0.1",
                 join_mode="create_new",
                 manifest_path="ds_first/manifest.yaml",
                 cell_count=1000,
@@ -391,7 +377,6 @@ class TestManifestToJoinRecordRoute:
             # Append second dataset
             record2 = DatasetJoinRecord(
                 dataset_id="ds_second",
-                release_id="v0.2",
                 join_mode="append_routed",
                 manifest_path="ds_second/manifest.yaml",
                 cell_count=500,
@@ -427,7 +412,6 @@ class TestStage2MaterializerConstructorApi:
             source_path="/fake/source.h5ad",
             review_bundle_path="/fake/bundle.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
-            release_id="v0",
             dataset_id="ds_test",
         )
         assert mat.mode == "create"
@@ -444,7 +428,6 @@ class TestStage2MaterializerConstructorApi:
             source_path="/fake/source.h5ad",
             review_bundle_path="/fake/bundle.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
-            release_id="v0",
             dataset_id="ds_test",
             mode="append",
         )
@@ -463,7 +446,6 @@ class TestStage2MaterializerConstructorApi:
                 source_path="/fake/source.h5ad",
                 review_bundle_path="/fake/bundle.yaml",
                 output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
-                release_id="v0",
                 dataset_id="ds_test",
                 mode="invalid",
             )
@@ -481,7 +463,6 @@ class TestStage2MaterializerConstructorApi:
             source_path="/fake/source.h5ad",
             review_bundle_path="/fake/bundle.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
-            release_id="v0",
             dataset_id="ds_test",
             writer_state=state,
         )
@@ -499,7 +480,6 @@ class TestStage2MaterializerConstructorApi:
             source_path="/fake/source.h5ad",
             review_bundle_path="/fake/bundle.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
-            release_id="v0",
             dataset_id="ds_test",
         )
         assert mat.writer_state is None
@@ -516,7 +496,6 @@ class TestStage2MaterializerConstructorApi:
             source_path="/fake/source.h5ad",
             review_bundle_path="/fake/bundle.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
-            release_id="v0",
             dataset_id="ds_test",
             _is_last_dataset=True,
         )
@@ -534,7 +513,6 @@ class TestStage2MaterializerConstructorApi:
             source_path="/fake/source.h5ad",
             review_bundle_path="/fake/bundle.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
-            release_id="v0",
             dataset_id="ds_test",
         )
         assert mat._is_last_dataset is False
@@ -551,7 +529,6 @@ class TestStage2MaterializerConstructorApi:
             source_path="/fake/source.h5ad",
             review_bundle_path="/fake/bundle.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
-            release_id="v0",
             dataset_id="ds_test",
         )
         assert mat.dataset_index == 0
@@ -569,7 +546,6 @@ class TestStage2MaterializerConstructorApi:
             source_path="/fake/source.h5ad",
             review_bundle_path="/fake/bundle.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
-            release_id="v0",
             dataset_id="ds_test",
             dataset_index=3,
             global_row_start=1500,
