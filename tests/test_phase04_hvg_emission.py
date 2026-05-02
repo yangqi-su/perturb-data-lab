@@ -177,9 +177,9 @@ class TestMaterializationManifestHVGPath:
             kind="materialization-manifest",
             contract_version=CONTRACT_VERSION,
             dataset_id="ds1",
-            release_id="v0",
             route="create_new",
-            backend="arrow-hf",
+            backend="arrow-parquet",
+            topology="federated",
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=OutputRoots(
                 metadata_root=str(tmp_path / "meta"),
@@ -187,7 +187,7 @@ class TestMaterializationManifestHVGPath:
             ),
             provenance=ProvenanceSpec(
                 source_path="/path/to/source.h5ad",
-                schema="/path/to/schema.yaml",
+                review_bundle="/path/to/dataset-summary.yaml",
             ),
             hvg_sidecar_path=str(tmp_path / "meta/hvg_sidecar"),
         )
@@ -353,9 +353,11 @@ class TestUpdateCorpusIndexWithEmissionSpec:
         corpus_index = tmp_path / "corpus-index.yaml"
         dataset_record = DatasetJoinRecord(
             dataset_id="ds1",
-            release_id="v0",
             join_mode="create_new",
             manifest_path="meta/materialization-manifest.yaml",
+            cell_count=100,
+            global_start=0,
+            global_end=100,
         )
         update_corpus_index(
             corpus_index_path=corpus_index,
@@ -390,14 +392,14 @@ class TestMaterializationManifestHVGPath:
             kind="materialization-manifest",
             contract_version=CONTRACT_VERSION,
             dataset_id="syn-ds",
-            release_id="syn-v0",
             route="create_new",
             backend="arrow-parquet",
+            topology="federated",
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=output_roots,
             provenance=ProvenanceSpec(
                 source_path="/fake/source.h5ad",
-                schema="/fake/schema.yaml",
+                review_bundle="/fake/dataset-summary.yaml",
             ),
             hvg_sidecar_path=str(tmp_path / "meta/hvg_sidecar"),
         )
