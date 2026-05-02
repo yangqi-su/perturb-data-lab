@@ -12,7 +12,7 @@ no ``use_translation_layer`` conditionals. Gene indices in ``ChunkBundle.indices
 are always dataset-local.
 
 Produces:
-- {release_id}-cells.arrow: heavy-row Arrow IPC file (global_row_index,
+- {dataset_id}-cells.arrow: heavy-row Arrow IPC file (global_row_index,
   expressed_gene_indices LIST<INT32>, expression_counts LIST<INT32>)
 - Caller writes the separate size-factor Parquet sidecar.
 
