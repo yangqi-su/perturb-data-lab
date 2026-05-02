@@ -124,7 +124,6 @@ class RawCellMetadataRecord:
 
     cell_id: str
     dataset_id: str
-    dataset_release: str
     raw_fields: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
@@ -135,7 +134,6 @@ class RawCellMetadataRecord:
         return cls(
             cell_id=str(data["cell_id"]),
             dataset_id=str(data["dataset_id"]),
-            dataset_release=str(data["dataset_release"]),
             raw_fields=dict(data.get("raw_fields", {})),
         )
 
@@ -243,7 +241,6 @@ class MaterializationManifest(YamlDocument):
     kind: str
     contract_version: str
     dataset_id: str
-    release_id: str
     route: str  # create_new | append_routed
     backend: str  # arrow-hf | webdataset | zarr | lance (legacy names normalized on read)
     topology: str  # federated | aggregate (Stage 2 contract: backend and topology are separate)
@@ -318,7 +315,6 @@ class MaterializationManifest(YamlDocument):
             kind=str(data["kind"]),
             contract_version=str(data["contract_version"]),
             dataset_id=str(data["dataset_id"]),
-            release_id=str(data["release_id"]),
             route=route_normalized,
             backend=backend_normalized,
             topology=topo_normalized,
@@ -419,7 +415,6 @@ class FeatureRegistryManifest(YamlDocument):
 class SizeFactorManifest(YamlDocument):
     kind: str
     contract_version: str
-    release_id: str
     method: str  # e.g. sum, median
     entries: tuple[SizeFactorEntry, ...]
 
@@ -428,7 +423,6 @@ class SizeFactorManifest(YamlDocument):
         return cls(
             kind=str(data["kind"]),
             contract_version=str(data["contract_version"]),
-            release_id=str(data["release_id"]),
             method=str(data.get("method", "sum")),
             entries=tuple(
                 SizeFactorEntry.from_dict(e) for e in data.get("entries", [])
@@ -444,7 +438,6 @@ class SizeFactorManifest(YamlDocument):
 class QAManifest(YamlDocument):
     kind: str
     contract_version: str
-    release_id: str
     metrics: tuple[QAMetric, ...]
     all_passed: bool
 
@@ -455,7 +448,6 @@ class QAManifest(YamlDocument):
         return cls(
             kind=str(data["kind"]),
             contract_version=str(data["contract_version"]),
-            release_id=str(data["release_id"]),
             metrics=metrics,
             all_passed=all_passed,
         )
@@ -478,7 +470,6 @@ class DatasetMetadataSummary(YamlDocument):
     kind: str
     contract_version: str
     dataset_id: str
-    release_id: str
     source_path: str
     obs_field_count: int
     var_field_count: int
@@ -504,7 +495,6 @@ class DatasetMetadataSummary(YamlDocument):
             kind=str(data["kind"]),
             contract_version=str(data["contract_version"]),
             dataset_id=str(data["dataset_id"]),
-            release_id=str(data["release_id"]),
             source_path=str(data["source_path"]),
             obs_field_count=int(data.get("obs_field_count", 0)),
             var_field_count=int(data.get("var_field_count", 0)),
@@ -532,7 +522,6 @@ class FeatureProvenanceSpec(YamlDocument):
     feature set without requiring a tokenizer.
     """
 
-    release_id: str
     feature_count: int
     source_path: str
     schema_path: str
@@ -543,7 +532,6 @@ class FeatureProvenanceSpec(YamlDocument):
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "FeatureProvenanceSpec":
         return cls(
-            release_id=str(data["release_id"]),
             feature_count=int(data.get("feature_count", 0)),
             source_path=str(data.get("source_path", "")),
             schema_path=str(data.get("schema_path", "")),
@@ -560,7 +548,6 @@ class FeatureProvenanceSpec(YamlDocument):
 class CellMetadataRecord:
     cell_id: str
     dataset_id: str
-    dataset_release: str
     raw_fields: dict[str, Any]
     canonical_perturbation: dict[str, str]
     canonical_context: dict[str, str]
@@ -574,7 +561,6 @@ class CellMetadataRecord:
         return cls(
             cell_id=str(data["cell_id"]),
             dataset_id=str(data["dataset_id"]),
-            dataset_release=str(data["dataset_release"]),
             raw_fields=dict(data.get("raw_fields", {})),
             canonical_perturbation=dict(data.get("canonical_perturbation", {})),
             canonical_context=dict(data.get("canonical_context", {})),
@@ -591,7 +577,6 @@ class DatasetJoinRecord:
 
     Fields required for correct routing:
     - ``dataset_id`` — stable dataset identifier
-    - ``release_id`` — immutable processed release identifier
     - ``join_mode`` — ``create_new`` or ``append_routed``
     - ``manifest_path`` — relative path from corpus root to the dataset's manifest
     - ``cell_count`` — number of cells in this dataset (used for global range computation)
@@ -611,7 +596,6 @@ class DatasetJoinRecord:
     """
 
     dataset_id: str
-    release_id: str
     join_mode: str
     manifest_path: str
     dataset_index: int = 0
@@ -643,7 +627,6 @@ class DatasetJoinRecord:
         return cls(
             dataset_id=str(data["dataset_id"]),
             dataset_index=int(data.get("dataset_index", 0)),
-            release_id=str(data["release_id"]),
             join_mode=str(data["join_mode"]),
             manifest_path=str(data["manifest_path"]),
             cell_count=int(data.get("cell_count", 0)),
@@ -721,6 +704,7 @@ class GlobalMetadataDocument(YamlDocument):
             ),
             raw_field_policy=str(data.get("raw_field_policy", "preserve-unchanged")),
             backend=data.get("backend"),  # may be None for backward compat with older files
+            topology=data.get("topology"),
             tokenizer_path=data.get("tokenizer_path"),
             emission_spec_path=data.get("emission_spec_path"),
             notes=tuple(str(item) for item in data.get("notes", [])),
@@ -751,7 +735,6 @@ class CorpusLedgerEntry:
 
     corpus_id: str
     dataset_id: str
-    release_id: str
     dataset_index: int
     join_mode: str  # create_new | append_routed
     manifest_path: str  # relative path from corpus root
@@ -795,7 +778,6 @@ class CorpusLedgerEntry:
         return cls(
             corpus_id=str(data["corpus_id"]),
             dataset_id=str(data["dataset_id"]),
-            release_id=str(data["release_id"]),
             dataset_index=int(data["dataset_index"]),
             join_mode=str(data["join_mode"]),
             manifest_path=str(data["manifest_path"]),
