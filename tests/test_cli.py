@@ -11,6 +11,7 @@ import yaml
 
 from perturb_data_lab.cli import (
     _DatasetInput,
+    _infer_backend_topology_from_corpus,
     _materialize_dataset,
     _parse_input_list_csv,
     _resolve_effective_topology,
@@ -42,6 +43,19 @@ class TestParserConstruction:
         assert ns.config == "c.yaml"
         assert ns.workers == 2
 
+    def test_inspect_direct_subcommand(self):
+        parser = build_parser()
+        ns = parser.parse_args([
+            "inspect",
+            "--source", "/data/test.h5ad",
+            "--dataset-id", "dummy_00",
+            "--output-dir", "/inspection",
+        ])
+        assert ns.command == "inspect"
+        assert ns.source == "/data/test.h5ad"
+        assert ns.dataset_id == "dummy_00"
+        assert ns.output_dir == "/inspection"
+
     def test_materialize_single_dataset(self):
         parser = build_parser()
         ns = parser.parse_args([
@@ -60,8 +74,21 @@ class TestParserConstruction:
         assert ns.review_bundle == "/data/summary.yaml"
         assert ns.output_corpus == "/corpus"
         assert ns.backend == "arrow-parquet"
-        assert ns.topology == "federated"
+        assert ns.topology is None
         assert ns.dry_run is False
+
+    def test_materialize_append_can_omit_backend_and_topology(self):
+        parser = build_parser()
+        ns = parser.parse_args([
+            "materialize",
+            "--mode", "append",
+            "--input-list", "/data/datasets.csv",
+            "--output-corpus", "/corpus",
+        ])
+        assert ns.command == "materialize"
+        assert ns.mode == "append"
+        assert ns.backend is None
+        assert ns.topology is None
 
     def test_materialize_with_input_list(self):
         parser = build_parser()
@@ -219,6 +246,7 @@ class TestMaterializeDatasetRouting:
         next_global, next_writer_state = _materialize_dataset(
             ds,
             args,
+            backend="lance",
             corpus_root=corpus_root,
             effective_topology=_resolve_effective_topology(args.backend, args.topology),
             mode="append",
@@ -641,7 +669,7 @@ class TestCLIHelp:
             parser.parse_args(["--help"])
         captured = capsys.readouterr()
         # Current commands should appear
-        for cmd in ["inspect", "materialize", "canonicalize", "corpus-validate", "corpus-gc"]:
+        for cmd in ["inspect", "materialize", "draft-schema", "canonicalize", "corpus-validate", "corpus-gc"]:
             assert cmd in captured.out
         # Removed commands should NOT appear
         for cmd in ["stage2-materialize", "corpus-create", "corpus-append"]:
@@ -657,47 +685,35 @@ class TestCanonicalizeParser:
     """Verify the canonicalize CLI parser accepts all expected flag combinations."""
 
     def test_canonicalize_bulk_mode(self):
-        """Bulk mode with --schema-dir."""
+        """Bulk mode with only --corpus."""
         parser = build_parser()
         ns = parser.parse_args([
             "canonicalize",
-            "--schema-dir", "/schemas/final/",
             "--corpus", "/corpus",
-            "--output-dir", "/canonical",
         ])
         assert ns.command == "canonicalize"
-        assert ns.schema_dir == "/schemas/final/"
         assert ns.corpus == "/corpus"
-        assert ns.output_dir == "/canonical"
         assert ns.dataset_id is None
-        assert ns.schema is None
         assert ns.dry_run is False
 
     def test_canonicalize_incremental_mode(self):
-        """Incremental mode with --dataset-id and --schema."""
+        """Incremental mode with --dataset-id."""
         parser = build_parser()
         ns = parser.parse_args([
             "canonicalize",
             "--dataset-id", "dummy_00",
-            "--schema", "/schemas/dummy_00-schema.yaml",
             "--corpus", "/corpus",
-            "--output-dir", "/canonical",
         ])
         assert ns.command == "canonicalize"
         assert ns.dataset_id == "dummy_00"
-        assert ns.schema == "/schemas/dummy_00-schema.yaml"
         assert ns.corpus == "/corpus"
-        assert ns.output_dir == "/canonical"
-        assert ns.schema_dir is None
 
     def test_canonicalize_bulk_with_dry_run(self):
         """Bulk mode with --dry-run."""
         parser = build_parser()
         ns = parser.parse_args([
             "canonicalize",
-            "--schema-dir", "/schemas/",
             "--corpus", "/corpus",
-            "--output-dir", "/canonical",
             "--dry-run",
         ])
         assert ns.dry_run is True
@@ -708,9 +724,7 @@ class TestCanonicalizeParser:
         ns = parser.parse_args([
             "canonicalize",
             "--dataset-id", "dummy_00",
-            "--schema", "/schemas/schema.yaml",
             "--corpus", "/corpus",
-            "--output-dir", "/canonical",
             "--dry-run",
         ])
         assert ns.dry_run is True
@@ -721,115 +735,112 @@ class TestCanonicalizeParser:
         parser = build_parser()
         ns = parser.parse_args([
             "canonicalize",
-            "--schema-dir", "/schemas/",
             "--corpus", "/corpus",
-            "--output-dir", "/canonical",
         ])
         assert ns.dry_run is False
 
-    def test_canonicalize_parser_accepts_all_combined(self):
-        """Parser accepts --schema-dir + --dataset-id at parse time
-        (validation happens in _cmd_canonicalize)."""
+    def test_canonicalize_rejects_missing_corpus(self):
         parser = build_parser()
-        ns = parser.parse_args([
-            "canonicalize",
-            "--schema-dir", "/schemas/",
-            "--dataset-id", "dummy_00",
-            "--schema", "/schemas/schema.yaml",
-            "--corpus", "/corpus",
-            "--output-dir", "/canonical",
-        ])
-        assert ns.schema_dir == "/schemas/"
-        assert ns.dataset_id == "dummy_00"
-        assert ns.schema == "/schemas/schema.yaml"
+        with pytest.raises(SystemExit):
+            parser.parse_args(["canonicalize"])
+
+
+class TestDraftSchemaParser:
+    """Verify draft-schema parser behavior."""
+
+    def test_draft_schema_basic(self):
+        parser = build_parser()
+        ns = parser.parse_args(["draft-schema", "--corpus", "/corpus"])
+        assert ns.command == "draft-schema"
+        assert ns.corpus == "/corpus"
+        assert ns.force_all is False
+
+    def test_draft_schema_force_all(self):
+        parser = build_parser()
+        ns = parser.parse_args(["draft-schema", "--corpus", "/corpus", "--force-all"])
+        assert ns.force_all is True
 
 
 class TestCanonicalizeDiscovery:
-    """Test schema discovery and sidecar resolution helpers."""
+    """Test corpus metadata and sidecar resolution helpers."""
 
-    def test_discover_schemas_from_dir(self, tmp_path: Path):
-        from perturb_data_lab.cli import _discover_schemas_from_dir
+    def test_infer_backend_topology_from_global_metadata(self, tmp_path: Path):
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+        (corpus_root / "corpus-index.yaml").write_text(yaml.safe_dump({
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {
+                "backend": "lance",
+                "topology": "aggregate",
+            },
+            "datasets": [],
+        }))
 
-        schema_dir = tmp_path / "schemas"
-        schema_dir.mkdir()
+        backend, topology = _infer_backend_topology_from_corpus(corpus_root)
+        assert backend == "lance"
+        assert topology == "aggregate"
 
-        # Write two schemas with different dataset_ids
-        (schema_dir / "final-dummy_00-canonicalization-schema.yaml").write_text(
-            yaml.safe_dump({
-                "kind": "canonicalization-schema",
-                "contract_version": "0.3.0",
+    def test_infer_backend_topology_falls_back_to_manifest(self, tmp_path: Path):
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+
+        manifest_dir = corpus_root / "meta" / "dummy_00"
+        manifest_dir.mkdir(parents=True)
+        manifest_path = manifest_dir / "materialization-manifest.yaml"
+        manifest_path.write_text(yaml.safe_dump({
+            "kind": "materialization-manifest",
+            "contract_version": "0.3.0",
+            "dataset_id": "dummy_00",
+            "route": "create_new",
+            "backend": "lance",
+            "topology": "aggregate",
+            "count_source": {"selected": ".X", "integer_only": True},
+            "outputs": {
+                "metadata_root": str(manifest_dir),
+                "matrix_root": str(corpus_root / "matrix"),
+            },
+            "provenance": {
+                "source_path": "/fake.h5ad",
+                "review_bundle": "/fake.yaml",
+            },
+            "raw_cell_meta_path": str(manifest_dir / "raw-obs.parquet"),
+            "raw_feature_meta_path": str(manifest_dir / "raw-var.parquet"),
+        }))
+
+        (corpus_root / "corpus-index.yaml").write_text(yaml.safe_dump({
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {},
+            "datasets": [{
                 "dataset_id": "dummy_00",
-                "status": "ready",
-                "description": "",
-                "gene_mapping": {"enabled": False, "engine": "identity"},
-            })
-        )
-        (schema_dir / "final-dummy_01-canonicalization-schema.yaml").write_text(
-            yaml.safe_dump({
-                "kind": "canonicalization-schema",
-                "contract_version": "0.3.0",
-                "dataset_id": "dummy_01",
-                "status": "ready",
-                "description": "",
-                "gene_mapping": {"enabled": False, "engine": "identity"},
-            })
-        )
-        # Non-schema files should be ignored
-        (schema_dir / "notes.txt").write_text("ignored")
+                "join_mode": "create_new",
+                "manifest_path": str(manifest_path.relative_to(corpus_root)),
+                "dataset_index": 0,
+                "cell_count": 100,
+                "global_start": 0,
+                "global_end": 100,
+            }],
+        }))
 
-        schemas = _discover_schemas_from_dir(schema_dir)
-        assert len(schemas) == 2
-        assert schemas[0][0] == "dummy_00"
-        assert schemas[1][0] == "dummy_01"
+        backend, topology = _infer_backend_topology_from_corpus(corpus_root)
+        assert backend == "lance"
+        assert topology == "aggregate"
 
-    def test_discover_schemas_skips_duplicate_dataset_id(self, tmp_path: Path, capsys):
-        from perturb_data_lab.cli import _discover_schemas_from_dir
-
-        schema_dir = tmp_path / "schemas"
-        schema_dir.mkdir()
-
-        # Two schema files with the same dataset_id
-        (schema_dir / "dummy_00-a-canonicalization-schema.yaml").write_text(
-            yaml.safe_dump({
-                "kind": "canonicalization-schema",
-                "contract_version": "0.3.0",
-                "dataset_id": "dummy_00",
-                "status": "ready",
-                "description": "",
-                "gene_mapping": {"enabled": False, "engine": "identity"},
-            })
-        )
-        (schema_dir / "dummy_00-b-canonicalization-schema.yaml").write_text(
-            yaml.safe_dump({
-                "kind": "canonicalization-schema",
-                "contract_version": "0.3.0",
-                "dataset_id": "dummy_00",
-                "status": "ready",
-                "description": "",
-                "gene_mapping": {"enabled": False, "engine": "identity"},
-            })
-        )
-
-        schemas = _discover_schemas_from_dir(schema_dir)
-        assert len(schemas) == 1
-        captured = capsys.readouterr()
-        assert "duplicate dataset_id" in captured.err.lower()
-
-    def test_discover_schemas_raises_on_empty_dir(self, tmp_path: Path):
-        from perturb_data_lab.cli import _discover_schemas_from_dir
-
-        schema_dir = tmp_path / "empty"
-        schema_dir.mkdir()
-
-        with pytest.raises(FileNotFoundError, match="No .*canonicalization-schema.yaml"):
-            _discover_schemas_from_dir(schema_dir)
-
-    def test_discover_schemas_raises_on_nonexistent_dir(self, tmp_path: Path):
-        from perturb_data_lab.cli import _discover_schemas_from_dir
-
-        schema_dir = tmp_path / "nonexistent"
-        with pytest.raises(FileNotFoundError):
-            _discover_schemas_from_dir(schema_dir)
+    def test_infer_backend_topology_raises_when_unknown(self, tmp_path: Path):
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+        (corpus_root / "corpus-index.yaml").write_text(yaml.safe_dump({
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {},
+            "datasets": [],
+        }))
+        with pytest.raises(ValueError, match="cannot auto-detect backend"):
+            _infer_backend_topology_from_corpus(corpus_root)
 
     def test_resolve_sidecars_from_corpus(self, tmp_path: Path):
         from perturb_data_lab.cli import _resolve_sidecars_from_corpus
@@ -1010,32 +1021,52 @@ class TestCanonicalizeDiscovery:
 class TestCanonicalizeCmd:
     """Test _cmd_canonicalize behavior via direct invocation."""
 
-    def test_cmd_rejects_no_mode(self, tmp_path: Path, capsys):
-        """Neither --schema-dir nor --dataset-id+--schema."""
+    def test_cmd_rejects_when_no_final_schemas_discovered(self, tmp_path: Path, capsys):
         from perturb_data_lab.cli import _cmd_canonicalize
 
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+        (corpus_root / "corpus-index.yaml").write_text(yaml.safe_dump({
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {"backend": "lance", "topology": "aggregate"},
+            "datasets": [{
+                "dataset_id": "dummy_00",
+                "join_mode": "create_new",
+                "manifest_path": "meta/dummy_00/materialization-manifest.yaml",
+                "dataset_index": 0,
+                "cell_count": 100,
+                "global_start": 0,
+                "global_end": 100,
+            }],
+        }))
+
         args = argparse.Namespace(
-            schema_dir=None,
             dataset_id=None,
-            schema=None,
-            corpus=str(tmp_path),
-            output_dir=str(tmp_path / "output"),
+            corpus=str(corpus_root),
             dry_run=False,
         )
         with pytest.raises(SystemExit) as exc_info:
             _cmd_canonicalize(args)
         assert exc_info.value.code == 1
 
-    def test_cmd_rejects_schema_dir_plus_dataset_id(self, tmp_path: Path, capsys):
-        """--schema-dir combined with --dataset-id."""
+    def test_cmd_rejects_unknown_dataset_id(self, tmp_path: Path, capsys):
         from perturb_data_lab.cli import _cmd_canonicalize
 
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+        (corpus_root / "corpus-index.yaml").write_text(yaml.safe_dump({
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {"backend": "lance", "topology": "aggregate"},
+            "datasets": [],
+        }))
+
         args = argparse.Namespace(
-            schema_dir=str(tmp_path),
-            dataset_id="dummy_00",
-            schema=None,
-            corpus=str(tmp_path),
-            output_dir=str(tmp_path / "output"),
+            dataset_id="missing_ds",
+            corpus=str(corpus_root),
             dry_run=False,
         )
         with pytest.raises(SystemExit) as exc_info:
@@ -1043,11 +1074,8 @@ class TestCanonicalizeCmd:
         assert exc_info.value.code == 1
 
     def test_cmd_accepts_incremental_mode_flags(self, tmp_path: Path, capsys):
-        """Incremental mode validates schema existence."""
+        """Incremental mode with final-schema in corpus meta succeeds in dry-run."""
         from perturb_data_lab.cli import _cmd_canonicalize
-
-        schema_dir = tmp_path / "schemas"
-        schema_dir.mkdir()
 
         # Create manifest and corpus needed for sidecar resolution
         corpus_root = tmp_path / "corpus"
@@ -1080,7 +1108,7 @@ class TestCanonicalizeCmd:
             "kind": "corpus-index",
             "contract_version": "0.3.0",
             "corpus_id": "test-v0",
-            "global_metadata": {},
+            "global_metadata": {"backend": "lance", "topology": "aggregate"},
             "datasets": [{
                 "dataset_id": "dummy_00",
                 "join_mode": "create_new",
@@ -1092,7 +1120,7 @@ class TestCanonicalizeCmd:
             }],
         }))
 
-        schema_path = schema_dir / "dummy_00-canonicalization-schema.yaml"
+        schema_path = manifest_dir / "final-schema.yaml"
         schema_path.write_text(yaml.safe_dump({
             "kind": "canonicalization-schema",
             "contract_version": "0.3.0",
@@ -1102,48 +1130,211 @@ class TestCanonicalizeCmd:
             "gene_mapping": {"enabled": False, "engine": "identity"},
         }))
 
-        output_dir = tmp_path / "output"
         args = argparse.Namespace(
-            schema_dir=None,
             dataset_id="dummy_00",
-            schema=str(schema_path),
             corpus=str(corpus_root),
-            output_dir=str(output_dir),
             dry_run=True,
         )
         # Should not raise - dry-run succeeds without actual sidecar files
         _cmd_canonicalize(args)
         captured = capsys.readouterr()
-        assert "incremental mode" in captured.out
         assert "dry-run" in captured.out.lower()
         assert "dummy_00" in captured.out
 
-    def test_cmd_rejects_missing_schema_dir(self, tmp_path: Path, capsys):
-        from perturb_data_lab.cli import _cmd_canonicalize
+
+class TestInspectCmd:
+    """Test _cmd_inspect behavior for batch and direct modes."""
+
+    def test_cmd_inspect_rejects_mixed_batch_and_direct_flags(self):
+        from perturb_data_lab.cli import _cmd_inspect
 
         args = argparse.Namespace(
-            schema_dir=str(tmp_path / "nonexistent"),
-            dataset_id=None,
-            schema=None,
-            corpus=str(tmp_path),
-            output_dir=str(tmp_path / "output"),
-            dry_run=False,
-        )
-        with pytest.raises(SystemExit) as exc_info:
-            _cmd_canonicalize(args)
-        assert exc_info.value.code == 1
-
-    def test_cmd_rejects_missing_schema_file(self, tmp_path: Path, capsys):
-        from perturb_data_lab.cli import _cmd_canonicalize
-
-        args = argparse.Namespace(
-            schema_dir=None,
+            config="/tmp/config.yaml",
+            source="/tmp/source.h5ad",
             dataset_id="dummy_00",
-            schema=str(tmp_path / "nonexistent.yaml"),
-            corpus=str(tmp_path),
-            output_dir=str(tmp_path / "output"),
-            dry_run=False,
+            output_dir="/tmp/out",
+            workers=1,
         )
         with pytest.raises(SystemExit) as exc_info:
-            _cmd_canonicalize(args)
+            _cmd_inspect(args)
         assert exc_info.value.code == 1
+
+    def test_cmd_inspect_direct_mode(self, tmp_path: Path, monkeypatch):
+        from perturb_data_lab.cli import _cmd_inspect
+
+        source = tmp_path / "dummy.h5ad"
+        source.write_text("not-real-h5ad")
+
+        captured: dict[str, object] = {}
+
+        class _Artifacts:
+            review_bundle = tmp_path / "out" / "dummy_00" / "dataset-summary.yaml"
+
+        def _fake_inspect_target(target, output_root):
+            captured["dataset_id"] = target.dataset_id
+            captured["source_path"] = target.source_path
+            captured["source_release"] = target.source_release
+            captured["output_root"] = output_root
+            return _Artifacts()
+
+        monkeypatch.setattr(
+            "perturb_data_lab.inspectors.workflow.inspect_target",
+            _fake_inspect_target,
+        )
+
+        args = argparse.Namespace(
+            config=None,
+            source=str(source),
+            dataset_id="dummy_00",
+            output_dir=str(tmp_path / "out"),
+            workers=1,
+        )
+        _cmd_inspect(args)
+
+        assert captured["dataset_id"] == "dummy_00"
+        assert captured["source_path"] == str(source)
+        assert captured["source_release"] == "dummy_00"
+        assert str(captured["output_root"]) == str(tmp_path / "out")
+
+
+class TestDraftSchemaCmd:
+    """Test draft-schema command behavior."""
+
+    def test_cmd_draft_schema_writes_draft_for_uncanonicalized_dataset(
+        self,
+        tmp_path: Path,
+    ):
+        from perturb_data_lab.cli import _cmd_draft_schema
+
+        corpus_root = tmp_path / "corpus"
+        meta_root = corpus_root / "meta" / "dummy_00"
+        meta_root.mkdir(parents=True)
+
+        (meta_root / "dataset-summary.yaml").write_text(yaml.safe_dump({
+            "kind": "dataset-summary",
+            "contract_version": "0.3.0",
+            "dataset": {
+                "dataset_id": "dummy_00",
+                "source_release": "dummy_00",
+                "source_path": "/fake.h5ad",
+                "obs_rows": 10,
+                "var_rows": 5,
+                "obs_index_name": "index",
+                "var_index_name": "index",
+            },
+            "structure": {
+                "has_raw": False,
+                "raw_var_rows": 0,
+                "layers": [],
+            },
+            "obs_fields": [
+                {
+                    "name": "cell_id",
+                    "dtype": "object",
+                    "null_count": 0,
+                    "sampled_unique_values": 2,
+                    "examples": ["c1", "c2"],
+                }
+            ],
+            "var_fields": [
+                {
+                    "name": "gene_id",
+                    "dtype": "object",
+                    "null_count": 0,
+                    "sampled_unique_values": 2,
+                    "examples": ["g1", "g2"],
+                }
+            ],
+            "count_source_candidates": [],
+            "count_source_decision": {
+                "selected_candidate": ".X",
+                "status": "pass",
+                "confidence": "high",
+                "recovery_policy": "not-needed",
+                "rationale": "test",
+                "uses_recovery": False,
+            },
+            "materialization_readiness": "pass",
+            "inspector_notes": [],
+        }))
+
+        (corpus_root / "corpus-index.yaml").write_text(yaml.safe_dump({
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {"backend": "lance", "topology": "aggregate"},
+            "datasets": [{
+                "dataset_id": "dummy_00",
+                "join_mode": "create_new",
+                "manifest_path": "meta/dummy_00/materialization-manifest.yaml",
+                "dataset_index": 0,
+                "cell_count": 10,
+                "global_start": 0,
+                "global_end": 10,
+            }],
+        }))
+
+        args = argparse.Namespace(corpus=str(corpus_root), force_all=False)
+        _cmd_draft_schema(args)
+
+        assert (meta_root / "draft-schema.yaml").exists()
+
+
+class TestMaterializeCmd:
+    """Test _cmd_materialize backend/topology auto-detection behavior."""
+
+    def test_cmd_materialize_append_autodetects_backend_and_topology(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        from perturb_data_lab.cli import _cmd_materialize
+
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+        (corpus_root / "corpus-index.yaml").write_text(yaml.safe_dump({
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {"backend": "lance", "topology": "aggregate"},
+            "datasets": [],
+        }))
+
+        h5ad = tmp_path / "dummy_00.h5ad"
+        h5ad.write_text("fake")
+        review = tmp_path / "dummy_00-summary.yaml"
+        review.write_text("kind: dataset-summary")
+
+        args = argparse.Namespace(
+            mode="append",
+            source=str(h5ad),
+            input_list=None,
+            input_dir=None,
+            dataset_id="dummy_00",
+            review_bundle=str(review),
+            review_bundle_dir=None,
+            output_corpus=str(corpus_root),
+            backend=None,
+            topology=None,
+            corpus_id="test-v0",
+            rerun_stage1=False,
+            n_hvg=2000,
+            dry_run=True,
+        )
+
+        captured: dict[str, object] = {}
+
+        def _fake_materialize_dataset(ds, parsed_args, **kwargs):
+            captured["backend"] = kwargs["backend"]
+            captured["effective_topology"] = kwargs["effective_topology"]
+            return (0, None)
+
+        monkeypatch.setattr(
+            "perturb_data_lab.cli._materialize_dataset",
+            _fake_materialize_dataset,
+        )
+
+        _cmd_materialize(args)
+
+        assert captured["backend"] == "lance"
+        assert captured["effective_topology"] == "aggregate"
