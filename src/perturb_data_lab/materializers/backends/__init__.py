@@ -53,7 +53,7 @@ from .lance import write_lance_aggregate
 
 def materialize_arrow_parquet(
     bundle: Any,
-    release_id: str,
+    dataset_id: str,
     matrix_root: Path,
     *,
     _writer_state: dict[str, Any] | None = None,
@@ -67,7 +67,7 @@ def materialize_arrow_parquet(
     """
     return write_arrow_parquet_federated(
         bundle=bundle,
-        release_id=release_id,
+        dataset_id=dataset_id,
         matrix_root=matrix_root,
         _writer_state=_writer_state,
         _is_last_chunk=_is_last_chunk,
@@ -76,7 +76,7 @@ def materialize_arrow_parquet(
 
 def materialize_arrow_ipc(
     bundle: Any,
-    release_id: str,
+    dataset_id: str,
     matrix_root: Path,
     *,
     _writer_state: dict[str, Any] | None = None,
@@ -90,7 +90,7 @@ def materialize_arrow_ipc(
     """
     return write_arrow_ipc_federated(
         bundle=bundle,
-        release_id=release_id,
+        dataset_id=dataset_id,
         matrix_root=matrix_root,
         _writer_state=_writer_state,
         _is_last_chunk=_is_last_chunk,
@@ -99,7 +99,7 @@ def materialize_arrow_ipc(
 
 def materialize_webdataset(
     bundle: Any,
-    release_id: str,
+    dataset_id: str,
     matrix_root: Path,
     *,
     _writer_state: dict[str, Any] | None = None,
@@ -114,7 +114,7 @@ def materialize_webdataset(
     """
     return write_webdataset_federated(
         bundle=bundle,
-        release_id=release_id,
+        dataset_id=dataset_id,
         matrix_root=matrix_root,
         cell_ids=cell_ids,
         _writer_state=_writer_state,
@@ -124,7 +124,7 @@ def materialize_webdataset(
 
 def materialize_zarr(
     bundle: Any,
-    release_id: str,
+    dataset_id: str,
     matrix_root: Path,
     *,
     _writer_state: dict[str, Any] | None = None,
@@ -138,7 +138,7 @@ def materialize_zarr(
     """
     return write_zarr_federated(
         bundle=bundle,
-        release_id=release_id,
+        dataset_id=dataset_id,
         matrix_root=matrix_root,
         _writer_state=_writer_state,
         _is_last_chunk=_is_last_chunk,
@@ -147,7 +147,7 @@ def materialize_zarr(
 
 def materialize_lance(
     bundle: Any,
-    release_id: str,
+    dataset_id: str,
     matrix_root: Path,
     *,
     _writer_state: dict[str, Any] | None = None,
@@ -162,7 +162,7 @@ def materialize_lance(
     """
     return write_lance_federated(
         bundle=bundle,
-        release_id=release_id,
+        dataset_id=dataset_id,
         matrix_root=matrix_root,
         dataset_id=dataset_id,
         _lance_writer_state=_writer_state,
