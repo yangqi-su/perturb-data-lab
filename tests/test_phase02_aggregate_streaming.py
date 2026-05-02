@@ -133,7 +133,7 @@ class TestLanceAggregateStreaming:
             )
             paths, writer_state = write_lance_aggregate(
                 bundle=bundle,
-                release_id="test_agg",
+                dataset_id="dummy_00",
                 matrix_root=matrix_root,
                 _writer_state=writer_state,
                 _is_last_chunk=False,
@@ -156,7 +156,7 @@ class TestLanceAggregateStreaming:
             )
             paths, writer_state = write_lance_aggregate(
                 bundle=bundle,
-                release_id="test_agg",
+                dataset_id="dummy_01",
                 matrix_root=matrix_root,
                 _writer_state=writer_state,
                 _is_last_chunk=is_last,
@@ -270,7 +270,7 @@ class TestZarrAggregateStreaming:
             )
             paths, writer_state = write_zarr_aggregate(
                 bundle=bundle,
-                release_id="test_agg",
+                dataset_id="dummy_00",
                 matrix_root=matrix_root,
                 _writer_state=writer_state,
                 _is_last_chunk=False,
@@ -293,7 +293,7 @@ class TestZarrAggregateStreaming:
             )
             paths, writer_state = write_zarr_aggregate(
                 bundle=bundle,
-                release_id="test_agg",
+                dataset_id="dummy_01",
                 matrix_root=matrix_root,
                 _writer_state=writer_state,
                 _is_last_chunk=is_last,
@@ -401,7 +401,7 @@ class TestWebDatasetAggregateStreaming:
             )
             paths, writer_state = write_webdataset_aggregate(
                 bundle=bundle,
-                release_id="test_agg",
+                dataset_id="dummy_00",
                 matrix_root=matrix_root,
                 _writer_state=writer_state,
                 _is_last_chunk=False,
@@ -424,7 +424,7 @@ class TestWebDatasetAggregateStreaming:
             )
             paths, writer_state = write_webdataset_aggregate(
                 bundle=bundle,
-                release_id="test_agg",
+                dataset_id="dummy_01",
                 matrix_root=matrix_root,
                 _writer_state=writer_state,
                 _is_last_chunk=is_last,
