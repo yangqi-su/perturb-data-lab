@@ -11,7 +11,9 @@ import yaml
 
 from perturb_data_lab.cli import (
     _DatasetInput,
+    _materialize_dataset,
     _parse_input_list_csv,
+    _resolve_effective_topology,
     _scan_input_dir,
     _resolve_inputs,
     build_parser,
@@ -163,6 +165,77 @@ class TestParserConstruction:
         assert "stage2-materialize" not in choices
         assert "corpus-create" not in choices
         assert "corpus-append" not in choices
+
+
+class TestEffectiveTopologyResolution:
+    """Ensure backend/topology routing resolves aggregate correctly."""
+
+    def test_lance_forces_aggregate_even_if_requested_federated(self):
+        assert _resolve_effective_topology("lance", "federated") == "aggregate"
+
+    def test_non_lance_respects_requested_topology(self):
+        assert _resolve_effective_topology("arrow-parquet", "federated") == "federated"
+        assert _resolve_effective_topology("arrow-parquet", "aggregate") == "aggregate"
+
+
+class TestMaterializeDatasetRouting:
+    """Verify _materialize_dataset routes aggregate matrix_root correctly."""
+
+    def test_lance_uses_corpus_wide_matrix_root(self, tmp_path: Path, monkeypatch):
+        import perturb_data_lab.materializers as materializers_mod
+
+        captured: dict[str, object] = {}
+
+        class _DummyMaterializer:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.writer_state = {"dummy": "state"}
+
+            def materialize(self):
+                class _Manifest:
+                    cell_count = 7
+                    feature_count = 3
+                    route = "append_routed"
+                    corpus_registration = None
+
+                return _Manifest()
+
+        monkeypatch.setattr(materializers_mod, "Stage2Materializer", _DummyMaterializer)
+
+        ds = _DatasetInput(
+            source=str(tmp_path / "dummy.h5ad"),
+            dataset_id="dummy_00",
+            review_bundle=str(tmp_path / "dummy-summary.yaml"),
+        )
+        args = argparse.Namespace(
+            backend="lance",
+            topology="federated",  # parser default
+            rerun_stage1=False,
+            n_hvg=2000,
+            corpus_id="test-corpus",
+        )
+        corpus_root = tmp_path / "corpus"
+
+        next_global, next_writer_state = _materialize_dataset(
+            ds,
+            args,
+            corpus_root=corpus_root,
+            effective_topology=_resolve_effective_topology(args.backend, args.topology),
+            mode="append",
+            dataset_index=1,
+            global_row_start=10,
+            writer_state={"prev": "state"},
+            is_last_dataset=False,
+            total_datasets=2,
+            dry_run=False,
+        )
+
+        output_roots = captured["output_roots"]
+        assert str(output_roots.matrix_root) == str(corpus_root / "matrix")
+        assert str(output_roots.metadata_root) == str(corpus_root / "meta" / "dummy_00")
+        assert captured["topology"] == "aggregate"
+        assert next_global == 17
+        assert next_writer_state == {"dummy": "state"}
 
 
 # ---------------------------------------------------------------------------
