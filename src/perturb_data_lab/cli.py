@@ -198,12 +198,20 @@ def _resolve_inputs(args: argparse.Namespace) -> list[_DatasetInput]:
 
 def _is_aggregate(backend: str, topology: str) -> bool:
     """Determine if the combination implies aggregate topology."""
-    if topology == "aggregate":
-        return True
-    # Default: lance implies aggregate per contract
-    if topology == "federated" and backend == "lance":
-        return True
-    return False
+    return _resolve_effective_topology(backend, topology) == "aggregate"
+
+
+def _resolve_effective_topology(backend: str, topology: str) -> str:
+    """Resolve the effective topology from backend + requested topology.
+
+    Lance is contractually aggregate-only in Stage 2 corpus materialization.
+    If the caller keeps the parser default (``topology='federated'``) while
+    selecting ``backend='lance'``, we route as aggregate to ensure all datasets
+    append into ``{corpus}/matrix/aggregated-cells.lance``.
+    """
+    if backend == "lance":
+        return "aggregate"
+    return topology
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +360,7 @@ def _materialize_dataset(
     args: argparse.Namespace,
     *,
     corpus_root: Path,
+    effective_topology: str,
     mode: str,
     dataset_index: int,
     global_row_start: int,
@@ -377,7 +386,7 @@ def _materialize_dataset(
 
     # Build output roots under corpus
     resolved_paths = resolve_corpus_paths(
-        topology=args.topology,
+        topology=effective_topology,
         corpus_root=corpus_root,
         dataset_id=ds.dataset_id,
     )
@@ -401,7 +410,7 @@ def _materialize_dataset(
         output_roots=output_roots,
         dataset_id=ds.dataset_id,
         backend=args.backend,
-        topology=args.topology,
+        topology=effective_topology,
         rerun_stage1=args.rerun_stage1,
         n_hvg=getattr(args, "n_hvg", 2000),
         corpus_index_path=corpus_index_path,
@@ -445,6 +454,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
     corpus_root = Path(args.output_corpus).resolve()
     corpus_index_path = corpus_root / "corpus-index.yaml"
 
+    effective_topology = _resolve_effective_topology(args.backend, args.topology)
     aggregate = _is_aggregate(args.backend, args.topology)
 
     # --- Determine actual mode based on corpus existence ---
@@ -486,7 +496,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
     # --- Print execution plan ---
     print(
         f"[materialize] mode={effective_mode}  backend={args.backend}  "
-        f"topology={args.topology}"
+        f"topology={effective_topology}"
     )
     print(f"  corpus: {corpus_root}")
     print(f"  inputs: {sources_note}")
@@ -506,6 +516,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
             next_global, writer_state = _materialize_dataset(
                 ds, args,
                 corpus_root=corpus_root,
+                effective_topology=effective_topology,
                 mode=mode_name,
                 dataset_index=i,
                 global_row_start=next_global,
@@ -530,6 +541,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
             next_global, writer_state = _materialize_dataset(
                 ds, args,
                 corpus_root=corpus_root,
+                effective_topology=effective_topology,
                 mode=mode_name,
                 dataset_index=i,
                 global_row_start=next_global,
