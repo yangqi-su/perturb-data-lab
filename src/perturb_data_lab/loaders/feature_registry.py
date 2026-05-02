@@ -70,7 +70,7 @@ class FeatureRegistry:
     ) -> "FeatureRegistry":
         """Build a FeatureRegistry from canonical var parquet files.
 
-        Reads ``{release_id}-canonical-var.parquet`` files produced by the
+        Reads ``canonical-var.parquet`` files produced by the
         canonicalization runner (Phase 2).  Uses ``canonical_gene_id``
         instead of raw ``feature_id`` as the global vocabulary key, so
         ``global_vocab_size`` reflects harmonized gene identifiers.
