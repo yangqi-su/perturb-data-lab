@@ -71,7 +71,6 @@ def manifest_to_join_record(
 
     return DatasetJoinRecord(
         dataset_id=manifest.dataset_id,
-        release_id=manifest.release_id,
         join_mode=manifest.route,
         manifest_path=str(manifest_path_relative),
         cell_count=manifest.cell_count,
@@ -209,13 +208,13 @@ def register_materialization(
     # Find the record that was just added
     registered_record = None
     for ds in updated_corpus.datasets:
-        if ds.dataset_id == manifest.dataset_id and ds.release_id == manifest.release_id:
+        if ds.dataset_id == manifest.dataset_id:
             registered_record = ds
             break
 
     if registered_record is None:
         raise RuntimeError(
-            f"register_materialization: dataset {manifest.dataset_id}/{manifest.release_id} "
+            f"register_materialization: dataset {manifest.dataset_id} "
             "was not found in updated corpus index after update_corpus_index returned"
         )
 
