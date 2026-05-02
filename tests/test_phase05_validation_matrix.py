@@ -48,6 +48,14 @@ def _translate_full_chunk(adata: Any, dataset_id: str, dataset_index: int, start
     return _translate_chunk(dataset=spec, matrix_chunk=csr, chunk_start=0)
 
 
+def _write_size_factor_parquet(path: Path, n_rows: int) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.table({"size_factor": pa.array(np.ones(n_rows, dtype=np.float64))})
+    pq.write_table(table, str(path))
+
+
 class TestFederatedWriters:
     DUMMY_00_PATH = Path(
         "/autofs/projects-t3/lilab/yangqisu/repos/data_perturb_v2/dummy_data/dummy_00_counts.h5ad"
@@ -76,7 +84,13 @@ class TestFederatedWriters:
         )
         assert state is None
         assert paths["cells"].exists()
-        idx, counts, sf = read_arrow_parquet_cell(paths["cells"], 0)
+        sf_path = matrix_root / "dummy_00-size-factor.parquet"
+        _write_size_factor_parquet(sf_path, dummy_00.n_obs)
+        idx, counts, sf = read_arrow_parquet_cell(
+            paths["cells"],
+            0,
+            size_factor_path=sf_path,
+        )
         assert len(idx) > 0
         assert len(idx) == len(counts)
         assert sf > 0
