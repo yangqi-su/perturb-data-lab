@@ -36,6 +36,25 @@ _DUMMY_DATASETS = {
 }
 
 
+def _resolve_existing_path(
+    candidates: list[Path],
+    *,
+    context: str,
+) -> Path:
+    """Return the first existing path from candidates, else raise.
+
+    This keeps loader fixtures compatible across release-prefixed and
+    release-free artifact naming conventions.
+    """
+    for path in candidates:
+        if path.exists():
+            return path
+    candidate_str = "\n".join(f"- {p}" for p in candidates)
+    raise FileNotFoundError(
+        f"No artifact found for {context}. Tried:\n{candidate_str}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -175,19 +194,34 @@ class MetadataIndex:
         Phase 2 outputs.
         """
         if use_canonical:
-            _PLAN_RUN = (
-                Path("/autofs/projects-t3/lilab/yangqisu/repos/data_perturb_v2")
-                / "copilot/plans/active/plans-20260430-canonicalization-module-and-loader-adaptation"
-                / "outputs"
+            _plan_root = Path(
+                "/autofs/projects-t3/lilab/yangqisu/repos/data_perturb_v2"
             )
+            _plan_runs = [
+                _plan_root
+                / "copilot/plans/active/plans-20260430-canonicalization-module-and-loader-adaptation/outputs",
+                _plan_root
+                / "copilot/plans/archive/plans-20260430-canonicalization-module-and-loader-adaptation/outputs",
+            ]
             entries = []
             for ds_id, info in sorted(_DUMMY_DATASETS.items()):
+                obs_candidates: list[Path] = []
+                for base in _plan_runs:
+                    obs_candidates.extend([
+                        base / ds_id / "canonical-obs.parquet",
+                        base / ds_id / f"{ds_id}-canonical-obs.parquet",
+                        base / ds_id / f"{ds_id}-release-canonical-obs.parquet",
+                        base / f"{ds_id}-canonical-obs.parquet",
+                        base / f"{ds_id}-release-canonical-obs.parquet",
+                    ])
+                obs_path = _resolve_existing_path(
+                    obs_candidates,
+                    context=f"canonical obs for dataset '{ds_id}'",
+                )
                 entries.append(
                     {
                         "dataset_id": ds_id,
-                        "obs_path": str(
-                            _PLAN_RUN / ds_id / "canonical-obs.parquet"
-                        ),
+                        "obs_path": str(obs_path),
                         "size_factor_path": None,  # size_factor is inline in canonical
                         "n_obs": info["n_obs"],
                     }
@@ -197,15 +231,27 @@ class MetadataIndex:
         entries = []
         for ds_id, info in sorted(_DUMMY_DATASETS.items()):
             ds_dir = _LANCE_FEDERATED_BASE / ds_id / "metadata"
+            obs_path = _resolve_existing_path(
+                [
+                    ds_dir / "raw-obs.parquet",
+                    ds_dir / f"{ds_id}-raw-obs.parquet",
+                    ds_dir / f"{ds_id}-release-raw-obs.parquet",
+                ],
+                context=f"raw obs for dataset '{ds_id}'",
+            )
+            sf_path = _resolve_existing_path(
+                [
+                    ds_dir / "size-factor.parquet",
+                    ds_dir / f"{ds_id}-size-factor.parquet",
+                    ds_dir / f"{ds_id}-release-size-factor.parquet",
+                ],
+                context=f"size factor for dataset '{ds_id}'",
+            )
             entries.append(
                 {
                     "dataset_id": ds_id,
-                    "obs_path": str(
-                        ds_dir / "raw-obs.parquet"
-                    ),
-                    "size_factor_path": str(
-                        ds_dir / "size-factor.parquet"
-                    ),
+                    "obs_path": str(obs_path),
+                    "size_factor_path": str(sf_path),
                     "n_obs": info["n_obs"],
                 }
             )
