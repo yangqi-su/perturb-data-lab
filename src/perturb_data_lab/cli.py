@@ -6,6 +6,8 @@ inspect          Run h5ad inspection over a batch config.
 materialize      Materialize datasets with --mode {create,append} into a backend.
                  Supports single (--source) and bulk (--input-dir, --input-list)
                  input. Outputs go under --output-corpus.
+canonicalize     Transform raw obs/var sidecars into canonical parquet files.
+                 Supports bulk (--schema-dir) and incremental (--dataset-id) modes.
 corpus-validate  Validate a corpus for logical completeness.
 corpus-gc        Garbage-collect orphaned Lance fragments not in the corpus ledger.
 
@@ -763,6 +765,266 @@ def _cmd_corpus_gc(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# canonicalize (new — Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def _add_canonicalize_args(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "--schema-dir",
+        default=None,
+        help=(
+            "Directory containing finalized canonicalization-schema YAML files "
+            "(bulk mode). Each schema's dataset_id is read from the YAML and "
+            "matched against the corpus index; raw sidecar paths are discovered "
+            "automatically from each dataset's materialization-manifest.yaml."
+        ),
+    )
+    sub.add_argument(
+        "--dataset-id",
+        default=None,
+        help="Single dataset identifier (incremental mode; requires --schema).",
+    )
+    sub.add_argument(
+        "--schema",
+        default=None,
+        help=(
+            "Path to a single canonicalization-schema.yaml "
+            "(incremental mode; requires --dataset-id)."
+        ),
+    )
+    sub.add_argument(
+        "--corpus",
+        required=True,
+        help="Path to the corpus root directory (containing corpus-index.yaml).",
+    )
+    sub.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory where canonical parquet files will be written.",
+    )
+    sub.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Discover schemas and validate inputs without running canonicalization.",
+    )
+
+
+def _discover_schemas_from_dir(schema_dir: Path) -> list[tuple[str, Path]]:
+    """Scan *schema_dir* for ``*canonicalization-schema.yaml`` files.
+
+    Returns a list of ``(dataset_id, schema_path)`` pairs sorted by
+    dataset_id.  The ``dataset_id`` is read from each schema's YAML
+    content, not from the filename.
+    """
+    from .canonical import CanonicalizationSchema
+
+    candidates = sorted(schema_dir.glob("*canonicalization-schema.yaml"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No *canonicalization-schema.yaml files found in {schema_dir}"
+        )
+    schemas: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for sp in candidates:
+        schema = CanonicalizationSchema.from_yaml_file(sp)
+        if schema.dataset_id in seen:
+            print(
+                f"[canonicalize] WARNING: duplicate dataset_id '{schema.dataset_id}' "
+                f"in {sp}; skipping duplicate schema",
+                file=sys.stderr,
+            )
+            continue
+        seen.add(schema.dataset_id)
+        schemas.append((schema.dataset_id, sp))
+    return schemas
+
+
+def _resolve_sidecars_from_corpus(
+    dataset_id: str,
+    corpus_root: Path,
+) -> tuple[str, str, str | None]:
+    """Look up *dataset_id* in the corpus index and return raw sidecar paths.
+
+    Returns ``(raw_obs_path, raw_var_path, size_factor_path)`` where
+    the paths are read from the dataset's ``materialization-manifest.yaml``.
+    """
+    from .materializers.models import (
+        CorpusIndexDocument,
+        MaterializationManifest,
+    )
+
+    corpus_index_path = corpus_root / "corpus-index.yaml"
+    if not corpus_index_path.exists():
+        raise FileNotFoundError(
+            f"corpus-index.yaml not found at {corpus_index_path}"
+        )
+
+    corpus = CorpusIndexDocument.from_yaml_file(corpus_index_path)
+    for ds in corpus.datasets:
+        if ds.dataset_id == dataset_id:
+            manifest_path = corpus_root / ds.manifest_path
+            if not manifest_path.exists():
+                raise FileNotFoundError(
+                    f"materialization manifest not found: {manifest_path}"
+                )
+            manifest = MaterializationManifest.from_yaml_file(manifest_path)
+            raw_obs = manifest.raw_cell_meta_path
+            raw_var = manifest.raw_feature_meta_path
+            size_factor = manifest.size_factor_parquet_path
+
+            if not raw_obs:
+                raise ValueError(
+                    f"raw_cell_meta_path missing in manifest for {dataset_id}"
+                )
+            if not raw_var:
+                raise ValueError(
+                    f"raw_feature_meta_path missing in manifest for {dataset_id}"
+                )
+            return (raw_obs, raw_var, size_factor)
+
+    raise ValueError(
+        f"dataset_id '{dataset_id}' not found in corpus index at {corpus_index_path}"
+    )
+
+
+def _cmd_canonicalize(args: argparse.Namespace) -> None:
+    """Execute the canonicalize command (bulk or incremental)."""
+    from .canonical import (
+        CanonicalizationResult,
+        CanonicalVocab,
+        build_canonical_vocab,
+        run_canonicalization,
+    )
+
+    corpus_root = Path(args.corpus).resolve()
+    output_dir = Path(args.output_dir).resolve()
+
+    # --- Resolve mode ---
+    has_schema_dir = args.schema_dir is not None
+    has_dataset_id = args.dataset_id is not None
+    has_schema = args.schema is not None
+
+    if has_schema_dir:
+        if has_dataset_id or has_schema:
+            print(
+                "[canonicalize] --schema-dir is for bulk mode and cannot be "
+                "combined with --dataset-id/--schema.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        schema_dir = Path(args.schema_dir)
+        if not schema_dir.is_dir():
+            print(
+                f"[canonicalize] schema directory not found: {schema_dir}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        schemas = _discover_schemas_from_dir(schema_dir)
+        print(
+            f"[canonicalize] bulk mode: discovered {len(schemas)} schema(s) "
+            f"in {schema_dir}"
+        )
+    elif has_dataset_id and has_schema:
+        schema_path = Path(args.schema)
+        if not schema_path.exists():
+            print(
+                f"[canonicalize] schema file not found: {schema_path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        schemas = [(args.dataset_id, schema_path)]
+        print(
+            f"[canonicalize] incremental mode: dataset_id={args.dataset_id} "
+            f"schema={schema_path}"
+        )
+    else:
+        print(
+            "[canonicalize] must specify either --schema-dir (bulk) or "
+            "both --dataset-id and --schema (incremental).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # --- Print plan ---
+    print(f"  corpus: {corpus_root}")
+    print(f"  output-dir: {output_dir}")
+    print(f"  dry-run: {args.dry_run}")
+    if schemas:
+        ds_ids = [s[0] for s in schemas]
+        print(f"  datasets ({len(ds_ids)}): {', '.join(ds_ids)}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Process each dataset ---
+    results: list[CanonicalizationResult] = []
+    failures: list[tuple[str, str]] = []
+
+    for dataset_id, schema_path in schemas:
+        print(f"\n  [{dataset_id}]")
+        try:
+            raw_obs, raw_var, size_factor = _resolve_sidecars_from_corpus(
+                dataset_id, corpus_root
+            )
+            print(f"    raw_obs: {raw_obs}")
+            print(f"    raw_var: {raw_var}")
+            if size_factor:
+                print(f"    size_factor: {size_factor}")
+            else:
+                print("    size_factor: (none — defaults to 1.0)")
+
+            if args.dry_run:
+                print(f"    [dry-run] would canonicalize → {output_dir}")
+                continue
+
+            result = run_canonicalization(
+                dataset_id=dataset_id,
+                raw_obs_path=raw_obs,
+                raw_var_path=raw_var,
+                size_factor_path=size_factor,
+                schema_path=schema_path,
+                output_root=output_dir,
+            )
+            results.append(result)
+            print(
+                f"    OK  obs={result.obs_rows} rows  var={result.var_rows} rows  "
+                f"vocab_size={result.vocab.global_vocab_size}"
+            )
+            if result.warnings:
+                for w in result.warnings:
+                    print(f"    WARNING: {w}")
+        except Exception as exc:
+            print(f"    FAILED: {exc}", file=sys.stderr)
+            failures.append((dataset_id, str(exc)))
+            # Continue with remaining datasets on failure (bulk mode resilience)
+            continue
+
+    # --- Merge and write corpus-level vocab ---
+    if not args.dry_run and results:
+        per_dataset_vocabs = [r.vocab for r in results]
+        corpus_vocab_path = output_dir / "corpus-vocab.yaml"
+        merged = build_canonical_vocab(
+            per_dataset_vocabs,
+            output_path=corpus_vocab_path,
+        )
+        print(
+            f"\n[canonicalize] merged vocab: {corpus_vocab_path}  "
+            f"global_vocab_size={merged.global_vocab_size}"
+        )
+
+    # --- Summary ---
+    succeeded = len(results)
+    failed = len(failures)
+    total = succeeded + failed
+    print(f"\n[canonicalize] done — {succeeded}/{total} dataset(s) canonicalized")
+    if failures:
+        print(f"  {failed} dataset(s) failed:")
+        for ds_id, err in failures:
+            print(f"    - {ds_id}: {err}")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Main CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -788,6 +1050,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_materialize_args(p_mat)
 
+    # canonicalize (new — Phase 3)
+    p_can = sub.add_parser(
+        "canonicalize",
+        help="Transform raw obs/var sidecars into canonical parquet files.",
+    )
+    _add_canonicalize_args(p_can)
+
     # corpus-validate (kept)
     p_cv = sub.add_parser(
         "corpus-validate", help="Validate a corpus for logical completeness."
@@ -811,6 +1080,8 @@ def main() -> None:
         _cmd_inspect(args)
     elif args.command == "materialize":
         _cmd_materialize(args)
+    elif args.command == "canonicalize":
+        _cmd_canonicalize(args)
     elif args.command == "corpus-validate":
         _cmd_corpus_validate(args)
     elif args.command == "corpus-gc":

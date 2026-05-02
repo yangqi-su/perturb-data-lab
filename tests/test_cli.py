@@ -600,8 +600,517 @@ class TestCLIHelp:
             parser.parse_args(["--help"])
         captured = capsys.readouterr()
         # Current commands should appear
-        for cmd in ["inspect", "materialize", "corpus-validate", "corpus-gc"]:
+        for cmd in ["inspect", "materialize", "canonicalize", "corpus-validate", "corpus-gc"]:
             assert cmd in captured.out
         # Removed commands should NOT appear
         for cmd in ["stage2-materialize", "corpus-create", "corpus-append"]:
             assert cmd not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Canonicalize CLI tests (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+class TestCanonicalizeParser:
+    """Verify the canonicalize CLI parser accepts all expected flag combinations."""
+
+    def test_canonicalize_bulk_mode(self):
+        """Bulk mode with --schema-dir."""
+        parser = build_parser()
+        ns = parser.parse_args([
+            "canonicalize",
+            "--schema-dir", "/schemas/final/",
+            "--corpus", "/corpus",
+            "--output-dir", "/canonical",
+        ])
+        assert ns.command == "canonicalize"
+        assert ns.schema_dir == "/schemas/final/"
+        assert ns.corpus == "/corpus"
+        assert ns.output_dir == "/canonical"
+        assert ns.dataset_id is None
+        assert ns.schema is None
+        assert ns.dry_run is False
+
+    def test_canonicalize_incremental_mode(self):
+        """Incremental mode with --dataset-id and --schema."""
+        parser = build_parser()
+        ns = parser.parse_args([
+            "canonicalize",
+            "--dataset-id", "dummy_00",
+            "--schema", "/schemas/dummy_00-schema.yaml",
+            "--corpus", "/corpus",
+            "--output-dir", "/canonical",
+        ])
+        assert ns.command == "canonicalize"
+        assert ns.dataset_id == "dummy_00"
+        assert ns.schema == "/schemas/dummy_00-schema.yaml"
+        assert ns.corpus == "/corpus"
+        assert ns.output_dir == "/canonical"
+        assert ns.schema_dir is None
+
+    def test_canonicalize_bulk_with_dry_run(self):
+        """Bulk mode with --dry-run."""
+        parser = build_parser()
+        ns = parser.parse_args([
+            "canonicalize",
+            "--schema-dir", "/schemas/",
+            "--corpus", "/corpus",
+            "--output-dir", "/canonical",
+            "--dry-run",
+        ])
+        assert ns.dry_run is True
+
+    def test_canonicalize_incremental_with_dry_run(self):
+        """Incremental mode with --dry-run."""
+        parser = build_parser()
+        ns = parser.parse_args([
+            "canonicalize",
+            "--dataset-id", "dummy_00",
+            "--schema", "/schemas/schema.yaml",
+            "--corpus", "/corpus",
+            "--output-dir", "/canonical",
+            "--dry-run",
+        ])
+        assert ns.dry_run is True
+        assert ns.dataset_id == "dummy_00"
+
+    def test_canonicalize_default_dry_run_false(self):
+        """--dry-run defaults to False."""
+        parser = build_parser()
+        ns = parser.parse_args([
+            "canonicalize",
+            "--schema-dir", "/schemas/",
+            "--corpus", "/corpus",
+            "--output-dir", "/canonical",
+        ])
+        assert ns.dry_run is False
+
+    def test_canonicalize_parser_accepts_all_combined(self):
+        """Parser accepts --schema-dir + --dataset-id at parse time
+        (validation happens in _cmd_canonicalize)."""
+        parser = build_parser()
+        ns = parser.parse_args([
+            "canonicalize",
+            "--schema-dir", "/schemas/",
+            "--dataset-id", "dummy_00",
+            "--schema", "/schemas/schema.yaml",
+            "--corpus", "/corpus",
+            "--output-dir", "/canonical",
+        ])
+        assert ns.schema_dir == "/schemas/"
+        assert ns.dataset_id == "dummy_00"
+        assert ns.schema == "/schemas/schema.yaml"
+
+
+class TestCanonicalizeDiscovery:
+    """Test schema discovery and sidecar resolution helpers."""
+
+    def test_discover_schemas_from_dir(self, tmp_path: Path):
+        from perturb_data_lab.cli import _discover_schemas_from_dir
+
+        schema_dir = tmp_path / "schemas"
+        schema_dir.mkdir()
+
+        # Write two schemas with different dataset_ids
+        (schema_dir / "final-dummy_00-canonicalization-schema.yaml").write_text(
+            yaml.safe_dump({
+                "kind": "canonicalization-schema",
+                "contract_version": "0.3.0",
+                "dataset_id": "dummy_00",
+                "status": "ready",
+                "description": "",
+                "gene_mapping": {"enabled": False, "engine": "identity"},
+            })
+        )
+        (schema_dir / "final-dummy_01-canonicalization-schema.yaml").write_text(
+            yaml.safe_dump({
+                "kind": "canonicalization-schema",
+                "contract_version": "0.3.0",
+                "dataset_id": "dummy_01",
+                "status": "ready",
+                "description": "",
+                "gene_mapping": {"enabled": False, "engine": "identity"},
+            })
+        )
+        # Non-schema files should be ignored
+        (schema_dir / "notes.txt").write_text("ignored")
+
+        schemas = _discover_schemas_from_dir(schema_dir)
+        assert len(schemas) == 2
+        assert schemas[0][0] == "dummy_00"
+        assert schemas[1][0] == "dummy_01"
+
+    def test_discover_schemas_skips_duplicate_dataset_id(self, tmp_path: Path, capsys):
+        from perturb_data_lab.cli import _discover_schemas_from_dir
+
+        schema_dir = tmp_path / "schemas"
+        schema_dir.mkdir()
+
+        # Two schema files with the same dataset_id
+        (schema_dir / "dummy_00-a-canonicalization-schema.yaml").write_text(
+            yaml.safe_dump({
+                "kind": "canonicalization-schema",
+                "contract_version": "0.3.0",
+                "dataset_id": "dummy_00",
+                "status": "ready",
+                "description": "",
+                "gene_mapping": {"enabled": False, "engine": "identity"},
+            })
+        )
+        (schema_dir / "dummy_00-b-canonicalization-schema.yaml").write_text(
+            yaml.safe_dump({
+                "kind": "canonicalization-schema",
+                "contract_version": "0.3.0",
+                "dataset_id": "dummy_00",
+                "status": "ready",
+                "description": "",
+                "gene_mapping": {"enabled": False, "engine": "identity"},
+            })
+        )
+
+        schemas = _discover_schemas_from_dir(schema_dir)
+        assert len(schemas) == 1
+        captured = capsys.readouterr()
+        assert "duplicate dataset_id" in captured.err.lower()
+
+    def test_discover_schemas_raises_on_empty_dir(self, tmp_path: Path):
+        from perturb_data_lab.cli import _discover_schemas_from_dir
+
+        schema_dir = tmp_path / "empty"
+        schema_dir.mkdir()
+
+        with pytest.raises(FileNotFoundError, match="No .*canonicalization-schema.yaml"):
+            _discover_schemas_from_dir(schema_dir)
+
+    def test_discover_schemas_raises_on_nonexistent_dir(self, tmp_path: Path):
+        from perturb_data_lab.cli import _discover_schemas_from_dir
+
+        schema_dir = tmp_path / "nonexistent"
+        with pytest.raises(FileNotFoundError):
+            _discover_schemas_from_dir(schema_dir)
+
+    def test_resolve_sidecars_from_corpus(self, tmp_path: Path):
+        from perturb_data_lab.cli import _resolve_sidecars_from_corpus
+
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+
+        # Create manifest
+        manifest_dir = corpus_root / "meta" / "dummy_00"
+        manifest_dir.mkdir(parents=True)
+        manifest_path = manifest_dir / "materialization-manifest.yaml"
+        manifest_path.write_text(yaml.safe_dump({
+            "kind": "materialization-manifest",
+            "contract_version": "0.3.0",
+            "dataset_id": "dummy_00",
+            "release_id": "v0.1",
+            "route": "create_new",
+            "backend": "lance",
+            "topology": "aggregate",
+            "count_source": {"selected": ".X", "integer_only": True},
+            "outputs": {
+                "metadata_root": str(manifest_dir),
+                "matrix_root": str(corpus_root / "matrix"),
+            },
+            "provenance": {
+                "source_path": "/fake.h5ad",
+                "review_bundle": "/fake.yaml",
+            },
+            "raw_cell_meta_path": str(manifest_dir / "raw-obs.parquet"),
+            "raw_feature_meta_path": str(manifest_dir / "raw-var.parquet"),
+            "size_factor_parquet_path": str(manifest_dir / "size-factor.parquet"),
+        }), encoding="utf-8")
+
+        # Create corpus index
+        idx_path = corpus_root / "corpus-index.yaml"
+        idx_data = {
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {},
+            "datasets": [{
+                "dataset_id": "dummy_00",
+                "release_id": "v0.1",
+                "join_mode": "create_new",
+                "manifest_path": str(manifest_path.relative_to(corpus_root)),
+                "dataset_index": 0,
+                "cell_count": 100,
+                "global_start": 0,
+                "global_end": 100,
+            }],
+        }
+        idx_path.write_text(yaml.safe_dump(idx_data))
+
+        raw_obs, raw_var, size_factor = _resolve_sidecars_from_corpus(
+            "dummy_00", corpus_root
+        )
+        assert raw_obs == str(manifest_dir / "raw-obs.parquet")
+        assert raw_var == str(manifest_dir / "raw-var.parquet")
+        assert size_factor == str(manifest_dir / "size-factor.parquet")
+
+    def test_resolve_sidecars_no_size_factor(self, tmp_path: Path):
+        from perturb_data_lab.cli import _resolve_sidecars_from_corpus
+
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+
+        manifest_dir = corpus_root / "meta" / "dummy_00"
+        manifest_dir.mkdir(parents=True)
+        manifest_path = manifest_dir / "materialization-manifest.yaml"
+        manifest_path.write_text(yaml.safe_dump({
+            "kind": "materialization-manifest",
+            "contract_version": "0.3.0",
+            "dataset_id": "dummy_00",
+            "release_id": "v0.1",
+            "route": "create_new",
+            "backend": "lance",
+            "topology": "aggregate",
+            "count_source": {"selected": ".X", "integer_only": True},
+            "outputs": {
+                "metadata_root": str(manifest_dir),
+                "matrix_root": str(corpus_root / "matrix"),
+            },
+            "provenance": {
+                "source_path": "/fake.h5ad",
+                "review_bundle": "/fake.yaml",
+            },
+            "raw_cell_meta_path": str(manifest_dir / "raw-obs.parquet"),
+            "raw_feature_meta_path": str(manifest_dir / "raw-var.parquet"),
+        }), encoding="utf-8")
+
+        idx_path = corpus_root / "corpus-index.yaml"
+        idx_data = {
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {},
+            "datasets": [{
+                "dataset_id": "dummy_00",
+                "release_id": "v0.1",
+                "join_mode": "create_new",
+                "manifest_path": str(manifest_path.relative_to(corpus_root)),
+                "dataset_index": 0,
+                "cell_count": 100,
+                "global_start": 0,
+                "global_end": 100,
+            }],
+        }
+        idx_path.write_text(yaml.safe_dump(idx_data))
+
+        raw_obs, raw_var, size_factor = _resolve_sidecars_from_corpus(
+            "dummy_00", corpus_root
+        )
+        assert raw_obs == str(manifest_dir / "raw-obs.parquet")
+        assert raw_var == str(manifest_dir / "raw-var.parquet")
+        assert size_factor is None
+
+    def test_resolve_sidecars_raises_on_missing_corpus(self, tmp_path: Path):
+        from perturb_data_lab.cli import _resolve_sidecars_from_corpus
+
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+        # No corpus-index.yaml
+
+        with pytest.raises(FileNotFoundError, match="corpus-index.yaml not found"):
+            _resolve_sidecars_from_corpus("dummy_00", corpus_root)
+
+    def test_resolve_sidecars_raises_on_missing_dataset(self, tmp_path: Path):
+        from perturb_data_lab.cli import _resolve_sidecars_from_corpus
+
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+
+        idx_path = corpus_root / "corpus-index.yaml"
+        idx_data = {
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {},
+            "datasets": [{
+                "dataset_id": "dummy_00",
+                "release_id": "v0.1",
+                "join_mode": "create_new",
+                "manifest_path": "dummy_00/manifest.yaml",
+                "dataset_index": 0,
+                "cell_count": 100,
+                "global_start": 0,
+                "global_end": 100,
+            }],
+        }
+        idx_path.write_text(yaml.safe_dump(idx_data))
+
+        with pytest.raises(ValueError, match="not found in corpus"):
+            _resolve_sidecars_from_corpus("dummy_99", corpus_root)
+
+    def test_resolve_sidecars_raises_on_missing_manifest(self, tmp_path: Path):
+        from perturb_data_lab.cli import _resolve_sidecars_from_corpus
+
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+
+        idx_path = corpus_root / "corpus-index.yaml"
+        idx_data = {
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {},
+            "datasets": [{
+                "dataset_id": "dummy_00",
+                "release_id": "v0.1",
+                "join_mode": "create_new",
+                "manifest_path": "dummy_00/missing-manifest.yaml",
+                "dataset_index": 0,
+                "cell_count": 100,
+                "global_start": 0,
+                "global_end": 100,
+            }],
+        }
+        idx_path.write_text(yaml.safe_dump(idx_data))
+
+        with pytest.raises(FileNotFoundError, match="materialization manifest not found"):
+            _resolve_sidecars_from_corpus("dummy_00", corpus_root)
+
+
+class TestCanonicalizeCmd:
+    """Test _cmd_canonicalize behavior via direct invocation."""
+
+    def test_cmd_rejects_no_mode(self, tmp_path: Path, capsys):
+        """Neither --schema-dir nor --dataset-id+--schema."""
+        from perturb_data_lab.cli import _cmd_canonicalize
+
+        args = argparse.Namespace(
+            schema_dir=None,
+            dataset_id=None,
+            schema=None,
+            corpus=str(tmp_path),
+            output_dir=str(tmp_path / "output"),
+            dry_run=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _cmd_canonicalize(args)
+        assert exc_info.value.code == 1
+
+    def test_cmd_rejects_schema_dir_plus_dataset_id(self, tmp_path: Path, capsys):
+        """--schema-dir combined with --dataset-id."""
+        from perturb_data_lab.cli import _cmd_canonicalize
+
+        args = argparse.Namespace(
+            schema_dir=str(tmp_path),
+            dataset_id="dummy_00",
+            schema=None,
+            corpus=str(tmp_path),
+            output_dir=str(tmp_path / "output"),
+            dry_run=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _cmd_canonicalize(args)
+        assert exc_info.value.code == 1
+
+    def test_cmd_accepts_incremental_mode_flags(self, tmp_path: Path, capsys):
+        """Incremental mode validates schema existence."""
+        from perturb_data_lab.cli import _cmd_canonicalize
+
+        schema_dir = tmp_path / "schemas"
+        schema_dir.mkdir()
+
+        # Create manifest and corpus needed for sidecar resolution
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+        manifest_dir = corpus_root / "meta" / "dummy_00"
+        manifest_dir.mkdir(parents=True)
+        manifest_path = manifest_dir / "materialization-manifest.yaml"
+        manifest_path.write_text(yaml.safe_dump({
+            "kind": "materialization-manifest",
+            "contract_version": "0.3.0",
+            "dataset_id": "dummy_00",
+            "release_id": "v0.1",
+            "route": "create_new",
+            "backend": "lance",
+            "topology": "aggregate",
+            "count_source": {"selected": ".X", "integer_only": True},
+            "outputs": {
+                "metadata_root": str(manifest_dir),
+                "matrix_root": str(corpus_root / "matrix"),
+            },
+            "provenance": {
+                "source_path": "/fake.h5ad",
+                "review_bundle": "/fake.yaml",
+            },
+            "raw_cell_meta_path": str(manifest_dir / "raw-obs.parquet"),
+            "raw_feature_meta_path": str(manifest_dir / "raw-var.parquet"),
+        }), encoding="utf-8")
+
+        idx_path = corpus_root / "corpus-index.yaml"
+        idx_path.write_text(yaml.safe_dump({
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {},
+            "datasets": [{
+                "dataset_id": "dummy_00",
+                "release_id": "v0.1",
+                "join_mode": "create_new",
+                "manifest_path": str(manifest_path.relative_to(corpus_root)),
+                "dataset_index": 0,
+                "cell_count": 100,
+                "global_start": 0,
+                "global_end": 100,
+            }],
+        }))
+
+        schema_path = schema_dir / "dummy_00-canonicalization-schema.yaml"
+        schema_path.write_text(yaml.safe_dump({
+            "kind": "canonicalization-schema",
+            "contract_version": "0.3.0",
+            "dataset_id": "dummy_00",
+            "status": "ready",
+            "description": "",
+            "gene_mapping": {"enabled": False, "engine": "identity"},
+        }))
+
+        output_dir = tmp_path / "output"
+        args = argparse.Namespace(
+            schema_dir=None,
+            dataset_id="dummy_00",
+            schema=str(schema_path),
+            corpus=str(corpus_root),
+            output_dir=str(output_dir),
+            dry_run=True,
+        )
+        # Should not raise - dry-run succeeds without actual sidecar files
+        _cmd_canonicalize(args)
+        captured = capsys.readouterr()
+        assert "incremental mode" in captured.out
+        assert "dry-run" in captured.out.lower()
+        assert "dummy_00" in captured.out
+
+    def test_cmd_rejects_missing_schema_dir(self, tmp_path: Path, capsys):
+        from perturb_data_lab.cli import _cmd_canonicalize
+
+        args = argparse.Namespace(
+            schema_dir=str(tmp_path / "nonexistent"),
+            dataset_id=None,
+            schema=None,
+            corpus=str(tmp_path),
+            output_dir=str(tmp_path / "output"),
+            dry_run=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _cmd_canonicalize(args)
+        assert exc_info.value.code == 1
+
+    def test_cmd_rejects_missing_schema_file(self, tmp_path: Path, capsys):
+        from perturb_data_lab.cli import _cmd_canonicalize
+
+        args = argparse.Namespace(
+            schema_dir=None,
+            dataset_id="dummy_00",
+            schema=str(tmp_path / "nonexistent.yaml"),
+            corpus=str(tmp_path),
+            output_dir=str(tmp_path / "output"),
+            dry_run=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _cmd_canonicalize(args)
+        assert exc_info.value.code == 1
