@@ -34,9 +34,8 @@ def _import_lance():
 
 def write_lance_federated(
     bundle: ChunkBundle,
-    release_id: str,
+    dataset_id: str,
     matrix_root: Path,
-    dataset_id: str = "",
     *,
     _lance_writer_state: dict[str, Any] | None = None,
     _is_last_chunk: bool = False,
@@ -51,8 +50,8 @@ def write_lance_federated(
     ----------
     bundle : ChunkBundle
         The translated chunk bundle from ``_translate_chunk()``.
-    release_id : str
-        Release identifier used for output file naming.
+    dataset_id : str
+        Dataset identifier used for output file naming.
     matrix_root : Path
         Output directory for matrix artifacts.
     dataset_id : str, optional
@@ -70,7 +69,7 @@ def write_lance_federated(
     """
     lance = _import_lance()
     matrix_root.mkdir(parents=True, exist_ok=True)
-    lance_path = matrix_root / f"{release_id}.lance"
+    lance_path = matrix_root / f"{dataset_id}.lance"
 
     if _lance_writer_state is None:
         mode = "create"
@@ -125,7 +124,7 @@ def read_lance_cell(
 
 def write_lance_aggregate(
     bundle: ChunkBundle,
-    release_id: str,
+    dataset_id: str,
     matrix_root: Path,
     *,
     _writer_state: dict[str, Any] | None = None,
@@ -142,8 +141,8 @@ def write_lance_aggregate(
     ----------
     bundle : ChunkBundle
         The translated chunk bundle from ``_translate_chunk()``.
-    release_id : str
-        Release identifier (used for metadata context only).
+    dataset_id : str
+        Dataset identifier (unused in aggregate write path).
     matrix_root : Path
         Output directory for matrix artifacts.
     _writer_state : dict | None
