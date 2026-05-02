@@ -29,11 +29,9 @@ _LANCE_FEDERATED_BASE = (
 _DUMMY_DATASETS = {
     "dummy_00": {
         "n_obs": 50_000,
-        "release_id": "dummy_00-release",
     },
     "dummy_01": {
         "n_obs": 75_000,
-        "release_id": "dummy_01-release",
     },
 }
 
@@ -54,7 +52,6 @@ class MetadataRow:
     global_row_index: int
     cell_id: str
     dataset_id: str
-    dataset_release: str
     dataset_index: int
     local_row_index: int
     size_factor: float
@@ -77,7 +74,7 @@ class MetadataIndex:
     ----------
     df : pl.DataFrame
         The underlying DataFrame with a flat schema. Must contain at least
-        ``global_row_index``, ``cell_id``, ``dataset_id``, ``dataset_release``,
+        ``global_row_index``, ``cell_id``, ``dataset_id``,
         ``dataset_index``, ``local_row_index``, and ``size_factor``.
     """
 
@@ -115,18 +112,17 @@ class MetadataIndex:
         """Load from a corpus-index YAML and per-dataset parquet files.
 
         When ``use_canonical=False`` (default), reads raw obs sidecars
-        (``{release_id}-raw-obs.parquet``) with ``raw_fields`` JSON parsing
+        (``raw-obs.parquet``) with ``raw_fields`` JSON parsing
         and ``raw_``-prefixed columns.
 
         When ``use_canonical=True``, reads canonical obs sidecars
-        (``{release_id}-canonical-obs.parquet``) with already-flat
+        (``canonical-obs.parquet``) with already-flat
         canonical columns.  No JSON parsing needed.
 
         Expected YAML structure (list of dataset entries)::
 
             datasets:
               - dataset_id: dummy_00
-                release_id: dummy_00-release
                 obs_path: /path/to/raw-obs.parquet
                 size_factor_path: /path/to/size-factor.parquet
                 n_obs: 50000
@@ -160,9 +156,6 @@ class MetadataIndex:
             entries.append(
                 {
                     "dataset_id": ds["dataset_id"],
-                    "release_id": ds.get(
-                        "release_id", f"{ds['dataset_id']}-release"
-                    ),
                     "obs_path": obs_path,
                     "size_factor_path": ds.get("size_factor_path"),
                     "n_obs": ds.get("n_obs"),
@@ -192,9 +185,8 @@ class MetadataIndex:
                 entries.append(
                     {
                         "dataset_id": ds_id,
-                        "release_id": info["release_id"],
                         "obs_path": str(
-                            _PLAN_RUN / ds_id / f"{info['release_id']}-canonical-obs.parquet"
+                            _PLAN_RUN / ds_id / "canonical-obs.parquet"
                         ),
                         "size_factor_path": None,  # size_factor is inline in canonical
                         "n_obs": info["n_obs"],
@@ -208,12 +200,11 @@ class MetadataIndex:
             entries.append(
                 {
                     "dataset_id": ds_id,
-                    "release_id": info["release_id"],
                     "obs_path": str(
-                        ds_dir / f"{info['release_id']}-raw-obs.parquet"
+                        ds_dir / "raw-obs.parquet"
                     ),
                     "size_factor_path": str(
-                        ds_dir / f"{info['release_id']}-size-factor.parquet"
+                        ds_dir / "size-factor.parquet"
                     ),
                     "n_obs": info["n_obs"],
                 }
@@ -231,7 +222,7 @@ class MetadataIndex:
         """Build a MetadataIndex from a list of dataset descriptor dicts.
 
         Each entry must contain:
-            dataset_id, release_id, obs_path, size_factor_path[, n_obs]
+            dataset_id, obs_path, size_factor_path[, n_obs]
         """
         # --- First pass: read all datasets and collect all unique raw_fields keys ---
         dataset_dfs: list[pl.DataFrame] = []
@@ -251,15 +242,14 @@ class MetadataIndex:
 
         for ds_idx, (entry, raw_df) in enumerate(zip(entries, dataset_dfs)):
             dataset_id = entry["dataset_id"]
-            release_id = entry["release_id"]
             n_obs = len(raw_df)
 
             # Parse JSON raw_fields into struct, unnest into columns
             df_flat = cls._flatten_json_fields(raw_df)
 
             # Ensure all known keys exist (fill missing with null).
-            # Skip keys that duplicate base columns (cell_id, dataset_id, dataset_release).
-            _base_cols = {"cell_id", "dataset_id", "dataset_release"}
+            # Skip keys that duplicate base columns (cell_id, dataset_id).
+            _base_cols = {"cell_id", "dataset_id"}
             existing_cols = set(df_flat.columns)
             for key in all_raw_keys:
                 col_name = f"raw_{key}"
@@ -280,7 +270,6 @@ class MetadataIndex:
             # Compute computed columns
             df_flat = df_flat.with_columns(
                 pl.lit(ds_idx, dtype=pl.Int64).alias("dataset_index"),
-                pl.lit(release_id, dtype=pl.Utf8).alias("dataset_release"),
             )
 
             # Add a temporary row index (local within dataset)
@@ -310,7 +299,6 @@ class MetadataIndex:
             "global_row_index",
             "cell_id",
             "dataset_id",
-            "dataset_release",
             "dataset_index",
             "local_row_index",
             "size_factor",
@@ -347,7 +335,6 @@ class MetadataIndex:
         for ds_idx, entry in enumerate(entries):
             obs_path = entry["obs_path"]
             dataset_id = entry["dataset_id"]
-            release_id = entry["release_id"]
 
             df = pl.read_parquet(obs_path)
             n_obs = len(df)
@@ -368,7 +355,7 @@ class MetadataIndex:
                         # If casting fails (e.g. "NA" strings), keep as string
                         pass
 
-            # Ensure dataset_index and dataset_release are correct
+            # Ensure dataset_index is correct
             if "dataset_index" in df.columns:
                 df = df.with_columns(
                     pl.lit(ds_idx, dtype=pl.Int32).alias("dataset_index")
@@ -376,10 +363,6 @@ class MetadataIndex:
             else:
                 df = df.with_columns(
                     pl.lit(ds_idx, dtype=pl.Int32).alias("dataset_index")
-                )
-            if "dataset_release" not in df.columns:
-                df = df.with_columns(
-                    pl.lit(release_id, dtype=pl.Utf8).alias("dataset_release")
                 )
 
             # Override global_row_index with corpus-global range
@@ -402,7 +385,7 @@ class MetadataIndex:
 
         # Ensure all must-have canonical obs columns exist
         _canonical_cols = [
-            "global_row_index", "cell_id", "dataset_id", "dataset_release",
+            "global_row_index", "cell_id", "dataset_id",
             "dataset_index", "local_row_index", "size_factor",
             "perturb_label", "perturb_type", "dose", "dose_unit",
             "timepoint", "timepoint_unit", "cell_context", "cell_line_or_type",
@@ -420,7 +403,7 @@ class MetadataIndex:
 
         # Reorder: structural columns first, then canonical content, then extensible
         structural = [
-            "global_row_index", "cell_id", "dataset_id", "dataset_release",
+            "global_row_index", "cell_id", "dataset_id",
             "dataset_index", "local_row_index", "size_factor",
         ]
         content = [
@@ -482,7 +465,7 @@ class MetadataIndex:
 
         # Columns that already exist as top-level columns in the raw-obs parquet.
         # These should NOT get a ``raw_`` prefix to avoid duplication.
-        base_cols = {"cell_id", "dataset_id", "dataset_release"}
+        base_cols = {"cell_id", "dataset_id"}
 
         # Only columns not in base_cols get the raw_ prefix
         json_cols = [c for c in parsed.columns if c not in base_cols]
@@ -661,7 +644,7 @@ class MetadataIndex:
         """
         known_scalars = {
             "global_row_index", "cell_id", "dataset_id",
-            "dataset_release", "dataset_index", "local_row_index",
+            "dataset_index", "local_row_index",
             "size_factor",
         }
 
@@ -675,7 +658,6 @@ class MetadataIndex:
             global_row_index=int(row["global_row_index"]),
             cell_id=str(row["cell_id"]),
             dataset_id=str(row["dataset_id"]),
-            dataset_release=str(row.get("dataset_release", "")),
             dataset_index=int(row["dataset_index"]),
             local_row_index=int(row["local_row_index"]),
             size_factor=float(row["size_factor"]),
