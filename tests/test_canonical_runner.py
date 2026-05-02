@@ -378,7 +378,6 @@ class TestCanonicalizationRunner:
             size_factor_path=sf_path,
             schema_path=schema_path,
             output_root=out_root,
-            release_id="test-release",
         )
         result = runner.run()
 
@@ -438,7 +437,6 @@ class TestCanonicalizationRunner:
             size_factor_path=sf_path,
             schema_path=schema_path,
             output_root=out_root,
-            release_id="test-release",
         )
         result = runner.run()
 
@@ -457,8 +455,8 @@ class TestCanonicalizationRunner:
         # global_id assigned consecutively to unique canonical_gene_ids
         assert var.column("global_id")[0].as_py() == "0"
 
-    def test_custom_release_id(self, tmp_path: Path):
-        """Custom release_id is used in output filenames."""
+    def test_release_free_output_filenames(self, tmp_path: Path):
+        """Canonical outputs use release-free filenames."""
         raw_obs = tmp_path / "raw-obs.parquet"
         raw_var = tmp_path / "raw-var.parquet"
         schema_path = tmp_path / "canonicalization-schema.yaml"
@@ -480,12 +478,11 @@ class TestCanonicalizationRunner:
             size_factor_path=sf_path,
             schema_path=schema_path,
             output_root=out_root,
-            release_id="my-custom-release",
         )
         result = runner.run()
 
-        assert "my-custom-release-canonical-obs.parquet" in str(result.obs_path)
-        assert "my-custom-release-canonical-var.parquet" in str(result.var_path)
+        assert result.obs_path.name == "canonical-obs.parquet"
+        assert result.var_path.name == "canonical-var.parquet"
 
     def test_missing_required_column_raises(self, tmp_path: Path):
         """Runner raises if a required canonical column is not produced."""
@@ -523,7 +520,6 @@ class TestCanonicalizationRunner:
             size_factor_path=sf_path,
             schema_path=schema_path,
             output_root=out_root,
-            release_id="test-release",
         )
         with pytest.raises(ValueError, match="Missing required canonical obs columns"):
             runner.run()
@@ -564,7 +560,6 @@ class TestCanonicalizationRunner:
             size_factor_path=sf_path,
             schema_path=schema_path,
             output_root=out_root,
-            release_id="test-release",
         )
         result = runner.run()
 
@@ -689,7 +684,6 @@ class TestRunCanonicalization:
             size_factor_path=sf_path,
             schema_path=schema_path,
             output_root=out_root,
-            release_id="test-release",
         )
         assert isinstance(result, CanonicalizationResult)
         assert result.dataset_id == "test"
