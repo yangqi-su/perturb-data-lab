@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -271,6 +272,12 @@ class Stage2Materializer:
             matrix_root = Path(self.output_roots.matrix_root)
             meta_root.mkdir(parents=True, exist_ok=True)
             matrix_root.mkdir(parents=True, exist_ok=True)
+
+            # Keep dataset meta self-contained by copying the authoritative
+            # Stage 1 inspection summary into meta_root/dataset-summary.yaml.
+            summary_copy_path = meta_root / "dataset-summary.yaml"
+            if summary_path.resolve() != summary_copy_path.resolve():
+                shutil.copy2(summary_path, summary_copy_path)
 
             # --- Write raw cell metadata (Parquet, not SQLite) ---
             raw_cell_meta_parquet_path = self._write_raw_cell_metadata_parquet(
