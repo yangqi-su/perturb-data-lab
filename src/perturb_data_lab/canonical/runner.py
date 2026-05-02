@@ -2,8 +2,8 @@
 
 ``CanonicalizationRunner`` reads raw parquet sidecars and a per-dataset
 ``canonicalization-schema.yaml``, applies the declared column mappings and
-transforms, and writes ``{release_id}-canonical-obs.parquet`` and
-``{release_id}-canonical-var.parquet``.
+transforms, and writes ``canonical-obs.parquet`` and
+``canonical-var.parquet``.
 """
 
 from __future__ import annotations
@@ -135,7 +135,6 @@ class CanonicalizationResult:
     """Summary of a single-dataset canonicalization run."""
 
     dataset_id: str
-    release_id: str
     obs_path: Path
     var_path: Path
     obs_rows: int
@@ -156,19 +155,16 @@ class CanonicalizationRunner:
     Parameters
     ----------
     raw_obs_path : str | Path
-        Path to the raw obs sidecar (``{release_id}-raw-obs.parquet``).
+        Path to the raw obs sidecar (``raw-obs.parquet``).
     raw_var_path : str | Path
-        Path to the raw var sidecar (``{release_id}-raw-var.parquet``).
+        Path to the raw var sidecar (``raw-var.parquet``).
     size_factor_path : str | Path | None
-        Path to the size-factor sidecar (``{release_id}-size-factor.parquet``).
+        Path to the size-factor sidecar (``size-factor.parquet``).
         When ``None``, size_factor defaults to 1.0.
     schema_path : str | Path
         Path to the per-dataset ``canonicalization-schema.yaml``.
     output_root : str | Path
         Directory where canonical parquets will be written.
-    release_id : str | None
-        Release identifier used in output filenames.  Defaults to
-        ``{dataset_id}-release``.
     """
 
     def __init__(
@@ -178,7 +174,6 @@ class CanonicalizationRunner:
         size_factor_path: str | Path | None,
         schema_path: str | Path,
         output_root: str | Path,
-        release_id: str | None = None,
     ):
         self._raw_obs_path = Path(raw_obs_path)
         self._raw_var_path = Path(raw_var_path)
@@ -187,7 +182,6 @@ class CanonicalizationRunner:
         self._output_root = Path(output_root)
 
         self._schema = CanonicalizationSchema.from_yaml_file(self._schema_path)
-        self._release_id = release_id or f"{self._schema.dataset_id}-release"
 
         self._warnings: list[str] = []
 
@@ -205,13 +199,13 @@ class CanonicalizationRunner:
 
         # --- Canonicalize obs ---
         obs_table = self._canonicalize_obs(obs_df, size_factors)
-        obs_path = self._output_root / f"{self._release_id}-canonical-obs.parquet"
+        obs_path = self._output_root / "canonical-obs.parquet"
         pq.write_table(obs_table, obs_path)
         logger.info("Wrote canonical obs: %s (%d rows)", obs_path, obs_table.num_rows)
 
         # --- Canonicalize var ---
         var_table = self._canonicalize_var(var_df)
-        var_path = self._output_root / f"{self._release_id}-canonical-var.parquet"
+        var_path = self._output_root / "canonical-var.parquet"
         pq.write_table(var_table, var_path)
         logger.info("Wrote canonical var: %s (%d rows)", var_path, var_table.num_rows)
 
@@ -220,7 +214,6 @@ class CanonicalizationRunner:
 
         result = CanonicalizationResult(
             dataset_id=self._schema.dataset_id,
-            release_id=self._release_id,
             obs_path=obs_path,
             var_path=var_path,
             obs_rows=obs_table.num_rows,
@@ -748,7 +741,6 @@ def run_canonicalization(
     size_factor_path: str | Path | None,
     schema_path: str | Path,
     output_root: str | Path,
-    release_id: str | None = None,
 ) -> CanonicalizationResult:
     """Single-dataset canonicalization entry point.
 
@@ -766,8 +758,6 @@ def run_canonicalization(
         ``canonicalization-schema.yaml`` for this dataset.
     output_root : Path
         Output directory for canonical parquets.
-    release_id : str or None
-        Release identifier for output naming.
     """
     runner = CanonicalizationRunner(
         raw_obs_path=raw_obs_path,
@@ -775,7 +765,6 @@ def run_canonicalization(
         size_factor_path=size_factor_path,
         schema_path=schema_path,
         output_root=output_root,
-        release_id=release_id,
     )
     return runner.run()
 
