@@ -796,7 +796,6 @@ class Stage2Materializer:
                 _writer_state=writer_state,
                 _is_last_chunk=is_last,
                 cell_ids=cell_ids_chunk,
-                dataset_id=self.dataset_id,
             )
 
             all_paths.update(paths)
@@ -931,7 +930,6 @@ class Stage2Materializer:
                 _writer_state=writer_state,
                 _is_last_chunk=is_last_chunk,
                 cell_ids=cell_ids_chunk,
-                dataset_id=self.dataset_id,
             )
 
             all_paths.update(paths)
