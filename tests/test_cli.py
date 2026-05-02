@@ -47,7 +47,6 @@ class TestParserConstruction:
             "--mode", "create",
             "--source", "/data/test.h5ad",
             "--dataset-id", "ds1",
-            "--release-id", "v0.1",
             "--review-bundle", "/data/summary.yaml",
             "--output-corpus", "/corpus",
             "--backend", "arrow-parquet",
@@ -56,7 +55,6 @@ class TestParserConstruction:
         assert ns.mode == "create"
         assert ns.source == "/data/test.h5ad"
         assert ns.dataset_id == "ds1"
-        assert ns.release_id == "v0.1"
         assert ns.review_bundle == "/data/summary.yaml"
         assert ns.output_corpus == "/corpus"
         assert ns.backend == "arrow-parquet"
@@ -178,34 +176,14 @@ class TestParseInputListCsv:
     def test_parses_basic_csv(self, tmp_path: Path):
         csv_path = tmp_path / "datasets.csv"
         csv_path.write_text(
-            "source,dataset_id,review_bundle,release_id\n"
-            "/data/ds1.h5ad,ds1,/reviews/ds1-summary.yaml,v0.1\n"
-            "/data/ds2.h5ad,ds2,/reviews/ds2-summary.yaml,v0.2\n"
+            "source,dataset_id,review_bundle\n"
+            "/data/ds1.h5ad,ds1,/reviews/ds1-summary.yaml\n"
+            "/data/ds2.h5ad,ds2,/reviews/ds2-summary.yaml\n"
         )
         inputs = _parse_input_list_csv(csv_path)
         assert len(inputs) == 2
         assert inputs[0].dataset_id == "ds1"
-        assert inputs[0].release_id == "v0.1"
         assert inputs[1].dataset_id == "ds2"
-        assert inputs[1].release_id == "v0.2"
-
-    def test_default_release_id(self, tmp_path: Path):
-        csv_path = tmp_path / "datasets.csv"
-        csv_path.write_text(
-            "source,dataset_id,review_bundle\n"
-            "/data/ds1.h5ad,ds1,/reviews/ds1-summary.yaml\n"
-        )
-        inputs = _parse_input_list_csv(csv_path)
-        assert inputs[0].release_id == "v0.1"
-
-    def test_empty_release_id_defaults(self, tmp_path: Path):
-        csv_path = tmp_path / "datasets.csv"
-        csv_path.write_text(
-            "source,dataset_id,review_bundle,release_id\n"
-            "/data/ds1.h5ad,ds1,/reviews/ds1-summary.yaml,\n"
-        )
-        inputs = _parse_input_list_csv(csv_path)
-        assert inputs[0].release_id == "v0.1"
 
     def test_raises_on_missing_columns(self, tmp_path: Path):
         csv_path = tmp_path / "bad.csv"
@@ -222,8 +200,8 @@ class TestParseInputListCsv:
     def test_strips_whitespace(self, tmp_path: Path):
         csv_path = tmp_path / "datasets.csv"
         csv_path.write_text(
-            "source,dataset_id,review_bundle,release_id\n"
-            " /data/ds1.h5ad , ds1 , /reviews/ds1-summary.yaml , v0.1 \n"
+            "source,dataset_id,review_bundle\n"
+            " /data/ds1.h5ad , ds1 , /reviews/ds1-summary.yaml \n"
         )
         inputs = _parse_input_list_csv(csv_path)
         assert inputs[0].source == "/data/ds1.h5ad"
@@ -245,7 +223,6 @@ class TestScanInputDir:
         inputs = _scan_input_dir(tmp_path)
         assert len(inputs) == 2
         assert {d.dataset_id for d in inputs} == {"ds_a", "ds_b"}
-        assert all(d.release_id == "v0.1" for d in inputs)
 
     def test_raises_when_review_bundle_missing(self, tmp_path: Path):
         (tmp_path / "ds_a.h5ad").touch()
@@ -293,7 +270,6 @@ class TestResolveInputs:
             input_list=None,
             input_dir=None,
             dataset_id="ds1",
-            release_id="v0.1",
             review_bundle=str(tmp_path / "summary.yaml"),
             rerun_stage1=False,
         )
@@ -311,7 +287,6 @@ class TestResolveInputs:
             input_list=None,
             input_dir=None,
             dataset_id="ds1",
-            release_id="v0.1",
             review_bundle=str(tmp_path / "nonexistent-summary.yaml"),
             rerun_stage1=False,
         )
@@ -329,7 +304,6 @@ class TestResolveInputs:
             input_list=None,
             input_dir=None,
             dataset_id="ds1",
-            release_id="v0.1",
             review_bundle=str(bundle_path),
             rerun_stage1=False,
         )
@@ -365,7 +339,6 @@ class TestResolveInputs:
             input_list=None,
             input_dir=None,
             dataset_id="ds1",
-            release_id="v0.1",
             review_bundle=str(tmp_path / "nonexistent-summary.yaml"),
             rerun_stage1=True,
         )
@@ -405,7 +378,6 @@ class TestCorpusValidateCmd:
             "datasets": [
                 {
                     "dataset_id": "ds1",
-                    "release_id": "v0.1",
                     "join_mode": "create_new",
                     "manifest_path": str(tmp_path / "missing-manifest.yaml"),
                 }
@@ -424,12 +396,11 @@ class TestCorpusValidateCmd:
         idx_path = tmp_path / "corpus-index.yaml"
 
         # Write a valid corpus index with a valid manifest
-        manifest_path = tmp_path / "v0.1-manifest.yaml"
+        manifest_path = tmp_path / "materialization-manifest.yaml"
         manifest_data = {
             "kind": "materialization-manifest",
             "contract_version": "0.3.0",
             "dataset_id": "ds1",
-            "release_id": "v0.1",
             "route": "create_new",
             "backend": "arrow-parquet",
             "topology": "federated",
@@ -453,7 +424,6 @@ class TestCorpusValidateCmd:
             "datasets": [
                 {
                     "dataset_id": "ds1",
-                    "release_id": "v0.1",
                     "join_mode": "create_new",
                     "manifest_path": str(manifest_path),
                 }
@@ -499,16 +469,15 @@ class TestCorpusGcCmd:
             "datasets": [
                 {
                     "dataset_id": "ds1",
-                    "release_id": "v0.1",
                     "join_mode": "create_new",
-                    "manifest_path": "ds1/v0.1/meta/materialization-manifest.yaml",
+                    "manifest_path": "ds1/meta/materialization-manifest.yaml",
                 }
             ],
         }
         idx_path.write_text(yaml.safe_dump(idx_data), encoding="utf-8")
 
         # Create the registered dataset directory
-        (tmp_path / "ds1" / "v0.1" / "meta").mkdir(parents=True)
+        (tmp_path / "ds1" / "meta").mkdir(parents=True)
 
         args = argparse.Namespace(corpus_root=str(tmp_path), dry_run=False)
         _cmd_corpus_gc(args)
@@ -528,16 +497,15 @@ class TestCorpusGcCmd:
             "datasets": [
                 {
                     "dataset_id": "ds1",
-                    "release_id": "v0.1",
                     "join_mode": "create_new",
-                    "manifest_path": "ds1/v0.1/manifest.yaml",
+                    "manifest_path": "ds1/meta/materialization-manifest.yaml",
                 }
             ],
         }
         idx_path.write_text(yaml.safe_dump(idx_data), encoding="utf-8")
 
         # Create registered dataset directory
-        (tmp_path / "ds1" / "v0.1" / "meta").mkdir(parents=True)
+        (tmp_path / "ds1" / "meta").mkdir(parents=True)
 
         # Create orphan directory
         orphan_dir = tmp_path / "ds_orphan"
@@ -804,7 +772,6 @@ class TestCanonicalizeDiscovery:
             "kind": "materialization-manifest",
             "contract_version": "0.3.0",
             "dataset_id": "dummy_00",
-            "release_id": "v0.1",
             "route": "create_new",
             "backend": "lance",
             "topology": "aggregate",
@@ -831,7 +798,6 @@ class TestCanonicalizeDiscovery:
             "global_metadata": {},
             "datasets": [{
                 "dataset_id": "dummy_00",
-                "release_id": "v0.1",
                 "join_mode": "create_new",
                 "manifest_path": str(manifest_path.relative_to(corpus_root)),
                 "dataset_index": 0,
@@ -862,7 +828,6 @@ class TestCanonicalizeDiscovery:
             "kind": "materialization-manifest",
             "contract_version": "0.3.0",
             "dataset_id": "dummy_00",
-            "release_id": "v0.1",
             "route": "create_new",
             "backend": "lance",
             "topology": "aggregate",
@@ -887,7 +852,6 @@ class TestCanonicalizeDiscovery:
             "global_metadata": {},
             "datasets": [{
                 "dataset_id": "dummy_00",
-                "release_id": "v0.1",
                 "join_mode": "create_new",
                 "manifest_path": str(manifest_path.relative_to(corpus_root)),
                 "dataset_index": 0,
@@ -929,7 +893,6 @@ class TestCanonicalizeDiscovery:
             "global_metadata": {},
             "datasets": [{
                 "dataset_id": "dummy_00",
-                "release_id": "v0.1",
                 "join_mode": "create_new",
                 "manifest_path": "dummy_00/manifest.yaml",
                 "dataset_index": 0,
@@ -957,7 +920,6 @@ class TestCanonicalizeDiscovery:
             "global_metadata": {},
             "datasets": [{
                 "dataset_id": "dummy_00",
-                "release_id": "v0.1",
                 "join_mode": "create_new",
                 "manifest_path": "dummy_00/missing-manifest.yaml",
                 "dataset_index": 0,
@@ -1024,7 +986,6 @@ class TestCanonicalizeCmd:
             "kind": "materialization-manifest",
             "contract_version": "0.3.0",
             "dataset_id": "dummy_00",
-            "release_id": "v0.1",
             "route": "create_new",
             "backend": "lance",
             "topology": "aggregate",
@@ -1049,7 +1010,6 @@ class TestCanonicalizeCmd:
             "global_metadata": {},
             "datasets": [{
                 "dataset_id": "dummy_00",
-                "release_id": "v0.1",
                 "join_mode": "create_new",
                 "manifest_path": str(manifest_path.relative_to(corpus_root)),
                 "dataset_index": 0,
