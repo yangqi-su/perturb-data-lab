@@ -152,7 +152,6 @@ def materialize_lance(
     *,
     _writer_state: dict[str, Any] | None = None,
     _is_last_chunk: bool = False,
-    dataset_id: str = "",
     **kwargs: Any,
 ) -> tuple[dict[str, Path], dict | None]:
     """Write using lance × federated backend.
@@ -164,7 +163,6 @@ def materialize_lance(
         bundle=bundle,
         dataset_id=dataset_id,
         matrix_root=matrix_root,
-        dataset_id=dataset_id,
         _lance_writer_state=_writer_state,
         _is_last_chunk=_is_last_chunk,
     )
