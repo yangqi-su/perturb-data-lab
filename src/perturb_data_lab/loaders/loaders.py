@@ -2,6 +2,8 @@
 
 This module implements:
 - ExpressionBatch container class (composed by BatchExecutor)
+- FastTrainingBatch — canonical minimal training batch contract (Phase 1)
+- BatchMetadata — columnar metadata container (Phase 1)
 - Shared batch samplers using MetadataIndex
 - Map-style PerturbBatchDataset wrapping BatchExecutor
 - Collation functions for DataLoader integration
@@ -9,7 +11,7 @@ This module implements:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 import numpy as np
@@ -18,6 +20,8 @@ import torch
 
 __all__ = [
     "ExpressionBatch",
+    "FastTrainingBatch",
+    "BatchMetadata",
     "CorpusRandomBatchSampler",
     "DatasetBatchSampler",
     "DatasetContextBatchSampler",
@@ -27,9 +31,134 @@ __all__ = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Flat expression batch — zero per-cell Python objects
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Phase 1 — Batch contract definitions
+# ===========================================================================
+# These types define the stable batch schemas for the fast training path
+# and columnar metadata extension.  Code in Phases 2–8 implements the
+# actual fast-path data assembly that populates them.
+
+
+@dataclass(frozen=True)
+class FastTrainingBatch:
+    """Canonical minimal training batch — only numeric fields for the GPU path.
+
+    This is the stable fast-path batch contract.  It contains every
+    numeric field consumed by ``GPUSparsePipeline.process_batch()`` and
+    none of the rich metadata (``canonical_perturbation``,
+    ``canonical_context``, ``cell_id``, ``dataset_id``).
+
+    Per the Phase 1 contract decisions:
+
+    * This is the **only** required batch shape for training.
+    * ``ExpressionRow`` objects must not be constructed in the fast path.
+    * ``canonical_perturbation`` / ``canonical_context`` per-row dicts
+      are DEPRECATED for training and may be unavailable when the fast
+      path is in use.  Use ``meta_columns`` (see ``BatchMetadata``) for
+      richer metadata access.
+
+    Fields
+    ------
+    batch_size : int
+        Number of cells in this batch.
+    global_row_index : np.ndarray
+        1-D int64 array of shape ``(batch_size,)``.
+        Corpus-global cell index.
+    dataset_index : np.ndarray
+        1-D int32 array of shape ``(batch_size,)``.
+        Which dataset each cell belongs to (0-based).
+    local_row_index : np.ndarray
+        1-D int64 array of shape ``(batch_size,)``.
+        Cell position within its dataset file.
+    size_factor : np.ndarray
+        1-D float32 array of shape ``(batch_size,)``.
+        Per-cell library-size normalization factor.
+    row_offsets : np.ndarray
+        1-D int64 array of shape ``(batch_size+1,)`` mapping row position
+        to a slice in the flat expression arrays.
+    expressed_gene_indices : np.ndarray
+        1-D int32 flat array of dataset-local gene indices.
+    expression_counts : np.ndarray
+        1-D int32 flat array of corresponding expression counts.
+    """
+
+    batch_size: int
+    global_row_index: np.ndarray  # (batch_size,) int64
+    dataset_index: np.ndarray     # (batch_size,) int32
+    local_row_index: np.ndarray   # (batch_size,) int64
+    size_factor: np.ndarray       # (batch_size,) float32
+    row_offsets: np.ndarray       # (batch_size+1,) int64
+    expressed_gene_indices: np.ndarray  # flat int32
+    expression_counts: np.ndarray       # flat int32
+
+    def row_slice(self, row_position: int) -> slice:
+        """Return the slice into the flat expression arrays for *row_position*."""
+        start = int(self.row_offsets[row_position])
+        stop = int(self.row_offsets[row_position + 1])
+        return slice(start, stop)
+
+    def row_gene_indices(self, row_position: int) -> np.ndarray:
+        """Return the expressed gene indices array for a single row."""
+        return self.expressed_gene_indices[self.row_slice(row_position)]
+
+    def row_counts(self, row_position: int) -> np.ndarray:
+        """Return the expression counts array for a single row."""
+        return self.expression_counts[self.row_slice(row_position)]
+
+
+@dataclass(frozen=True)
+class BatchMetadata:
+    """Columnar metadata for a batch — arrays, not per-cell dicts.
+
+    This is the canonical extended metadata representation defined in
+    Phase 1.  Instead of 128 individual dicts (one per cell), each
+    metadata column is a single array or tuple spanning the full batch.
+
+    Design rules:
+
+    * ``meta_columns`` is a dict mapping canonical field names to
+      columnar arrays (numeric/scalar) or tuples (string/object columns).
+    * String metadata stays CPU-side and is **never** moved to CUDA.
+    * This replaces the per-cell ``canonical_perturbation`` /
+      ``canonical_context`` dicts in the fast path.  Those dicts are
+      DEPRECATED and only available through an explicit opt-in
+      compatibility path (``include_legacy_dicts=True``).
+
+    Example::
+
+        meta = BatchMetadata({
+            "perturb_label": ("CRISPRi_TP53", "CRISPRa_MYC", ...),
+            "species": ("human", "human", ...),
+            "cell_line_or_type": np.array(["K562", "Jurkat", ...]),
+            "batch_id": ("b1", "b2", ...),
+        })
+
+    Fields
+    ------
+    meta_columns : dict[str, np.ndarray | tuple]
+        Columnar metadata.  Numeric columns are numpy arrays; string
+        columns are tuples (CPU-only).  Keys map to canonical field
+        names (see ``executor._CANONICAL_PERTURBATION_FIELDS`` and
+        ``executor._CANONICAL_CONTEXT_FIELDS`` for the baseline set).
+    """
+
+    meta_columns: dict[str, Any] = field(default_factory=dict)
+
+    def column(self, name: str) -> np.ndarray | tuple | None:
+        """Return a single metadata column by name, or None."""
+        return self.meta_columns.get(name)
+
+    def __len__(self) -> int:
+        """Number of metadata columns."""
+        return len(self.meta_columns)
+
+
+# ===========================================================================
+# Flat expression batch — zero per-cell Python objects (existing type)
+# ===========================================================================
+# ``ExpressionBatch`` remains as-is for backward compatibility during the
+# phase transition.  It will be replaced by ``FastTrainingBatch`` once
+# Phases 2–5 wire the fast path through all consumers.
 
 
 @dataclass(frozen=True)
@@ -81,10 +210,14 @@ class ExpressionBatch:
 
 
 class CorpusRandomBatchSampler:
-    """Yield corpus-global batches using ``MetadataIndex.sample()``.
+    """Yield corpus-global batches using direct integer sampling (numpy).
 
-    Each batch draws ``batch_size`` random cells from the full corpus.
-    Seed varies per epoch and batch to produce different draws.
+    Each batch draws ``batch_size`` random cells from the full corpus
+    via ``numpy.random`` without any Polars DataFrame ``.sample()``
+    overhead.  Seed varies per epoch and batch to produce different draws.
+
+    This replaces the earlier Polars-based path and is the only sampler
+    targeted by the Phase 6 fast-path optimization.
     """
 
     def __init__(
@@ -116,8 +249,11 @@ class CorpusRandomBatchSampler:
         num_batches = len(self)
         for batch_idx in range(num_batches):
             batch_seed = self.seed + self.epoch * 10000 + batch_idx
-            sampled = self._meta.sample(self.batch_size, seed=batch_seed)
-            yield sampled["global_row_index"].to_list()
+            rng = np.random.default_rng(batch_seed)
+            indices = rng.choice(
+                self.total_rows, size=self.batch_size, replace=False
+            )
+            yield sorted(indices.tolist())
 
 
 class DatasetBatchSampler:
@@ -264,6 +400,11 @@ class PerturbBatchDataset:
     ``__getitems__`` method calls ``executor.read_batch(indices)`` and
     returns a flat batch dict with **zero** per-cell Python objects.
 
+    When ``columnar=True``, metadata is returned as columnar arrays
+    (``meta_columns``) instead of per-cell ``canonical_perturbation`` /
+    ``canonical_context`` dicts.  This is the recommended fast training
+    path because it avoids building per-cell dict tuples.
+
     The Dataset does **not** call ``GPUSparsePipeline.process_batch()``.
     Sampling parameters (``seq_len``, ``sampling_mode``, etc.) are
     stored for informational purposes and should be forwarded to the
@@ -276,6 +417,11 @@ class PerturbBatchDataset:
     seq_len : int, optional
         Number of genes to sample per cell (forwarded to the pipeline;
         not used by the Dataset itself).
+    columnar : bool, default False
+        When ``True``, ``read_batch(columnar=True)`` is used, returning
+        ``meta_columns`` (columnar arrays/tuples) instead of per-cell
+        ``canonical_perturbation`` / ``canonical_context`` dicts.
+        Recommended for the GPU training fast path.
     sampling_mode : str, default "uniform"
         Sampling strategy (``"uniform"``, ``"expressed"``, ``"hvg"``).
     expressed_weight : float, default 3.0
@@ -289,12 +435,14 @@ class PerturbBatchDataset:
         executor: "BatchExecutor",
         seq_len: int | None = None,
         *,
+        columnar: bool = False,
         sampling_mode: str = "uniform",
         expressed_weight: float = 3.0,
         hvg_weight: float = 3.0,
     ):
         self._exec = executor
         self._seq_len = seq_len
+        self._columnar = bool(columnar)
         self._sampling_mode = sampling_mode
         self._expressed_weight = float(expressed_weight)
         self._hvg_weight = float(hvg_weight)
@@ -308,6 +456,10 @@ class PerturbBatchDataset:
     @property
     def seq_len(self) -> int | None:
         return self._seq_len
+
+    @property
+    def columnar(self) -> bool:
+        return self._columnar
 
     @property
     def sampling_mode(self) -> str:
@@ -341,7 +493,7 @@ class PerturbBatchDataset:
             ``BatchExecutor.read_batch()``.  All values are numpy arrays
             (no GPU tensors, no ``CellState`` objects).
         """
-        batch = self._exec.read_batch(list(indices))
+        batch = self._exec.read_batch(list(indices), columnar=self._columnar)
         return [batch]
 
 
@@ -349,9 +501,15 @@ def collate_batch_dict(items: list[dict[str, Any]]) -> dict[str, Any]:
     """Collate ``PerturbBatchDataset.__getitems__`` output into a batch dict.
 
     Converts numpy arrays to CPU tensors so that ``DataLoader(pin_memory=True)``
-    can perform asynchronous host→device transfers.  Non-array fields
+    can perform asynchronous host→device transfers.  Non-tensor fields
     (``dataset_id``, ``cell_id``, ``canonical_perturbation``,
-    ``canonical_context``) are passed through unchanged.
+    ``canonical_context``, ``meta_columns``) are passed through unchanged
+    and stay CPU-side.
+
+    When ``meta_columns`` is present (columnar mode), it replaces the
+    per-cell ``canonical_perturbation`` / ``canonical_context`` dicts.
+    String metadata in ``meta_columns`` is kept as tuples on CPU and
+    is **never** moved to CUDA.
 
     Parameters
     ----------
@@ -369,7 +527,7 @@ def collate_batch_dict(items: list[dict[str, Any]]) -> dict[str, Any]:
         raise ValueError("collate_batch_dict received empty list")
     batch = items[0]
 
-    return {
+    result = {
         "batch_size": batch["batch_size"],
         "global_row_index": torch.as_tensor(
             batch["global_row_index"], dtype=torch.long
@@ -393,12 +551,22 @@ def collate_batch_dict(items: list[dict[str, Any]]) -> dict[str, Any]:
             batch.get("local_row_index", batch["global_row_index"]),
             dtype=torch.long,
         ),
-        # Non-tensor fields: pass through unchanged
+        # Non-tensor fields: pass through unchanged (CPU-side)
         "dataset_id": batch.get("dataset_id", ()),
         "cell_id": batch.get("cell_id", ()),
-        "canonical_perturbation": batch.get("canonical_perturbation", ()),
-        "canonical_context": batch.get("canonical_context", ()),
     }
+
+    # Columnar metadata (fast path): pass through, never moved to CUDA
+    if "meta_columns" in batch:
+        result["meta_columns"] = batch["meta_columns"]
+    else:
+        # Legacy per-cell dict metadata (backward-compatible)
+        result["canonical_perturbation"] = batch.get(
+            "canonical_perturbation", ()
+        )
+        result["canonical_context"] = batch.get("canonical_context", ())
+
+    return result
 
 
 # ---------------------------------------------------------------------------

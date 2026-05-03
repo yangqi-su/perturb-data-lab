@@ -26,6 +26,8 @@ from .loaders import (
     DatasetBatchSampler,
     DatasetContextBatchSampler,
     ExpressionBatch,
+    FastTrainingBatch,
+    BatchMetadata,
     PerturbBatchDataset,
     collate_batch_dict,
     cpu_parallel_collate_fn,
@@ -37,6 +39,10 @@ from .corpus import (
 from .feature_registry import (
     FeatureRegistry,
     GlobalGeneSampler,
+)
+from .corpus_loader import (
+    Corpus,
+    load_corpus,
 )
 from .gpu_pipeline import (
     GPUSparsePipeline,
@@ -69,6 +75,9 @@ __all__ = [
     "BatchExecutor",
     # Phase 3 — Core types
     "ExpressionBatch",
+    # Phase 1 — Batch contracts (loader fast-path refactor)
+    "FastTrainingBatch",
+    "BatchMetadata",
     # Phase 3 — Samplers (MetadataIndex-backed)
     "CorpusRandomBatchSampler",
     "DatasetBatchSampler",
@@ -83,6 +92,9 @@ __all__ = [
     # Phase 3 — GPU Pipeline
     "GPUSparsePipeline",
     "CPUPipeline",
+    # Phase N — Corpus loader factory
+    "Corpus",
+    "load_corpus",
     # Utilities
     "read_raw_obs_parquet",
     "read_raw_var_parquet",

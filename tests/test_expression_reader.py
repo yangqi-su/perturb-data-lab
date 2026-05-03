@@ -2,6 +2,7 @@
 
 Validates:
 - AggregateLanceReader: chunking ≤2048, correct 3-field ExpressionRow
+- AggregateLanceReader fast path: flat read, equivalence, no ExpressionRow
 - FederatedLanceReader: order preservation across mixed-dataset batches
 - AggregateZarrReader: smoke test with CSR-format arrays
 - FederatedArrowIpcReader: smoke test as non-Lance backend
@@ -27,6 +28,7 @@ from perturb_data_lab.loaders.expression import (
     LanceDatasetEntry,
     ZarrDatasetEntry,
 )
+from perturb_data_lab.loaders.loaders import ExpressionBatch
 
 # ===================================================================
 # Constants — known paths for the synthetic corpus
@@ -458,3 +460,338 @@ class TestFederatedArrowIpcReader:
             assert len(r.expression_counts) == len(r.expressed_gene_indices)
             assert r.expressed_gene_indices.dtype == np.int32
             assert r.expression_counts.dtype == np.int32
+
+
+# ===================================================================
+# Phase 2 — AggregateLanceReader fast path tests
+# ===================================================================
+
+
+class TestAggregateLanceReaderFastPath:
+    """Tests for ``AggregateLanceReader.read_expression_flat()``.
+
+    Validates:
+    - No ``ExpressionRow`` objects are constructed.
+    - Output is an ``ExpressionBatch`` with correct shapes.
+    - Numerical equivalence with the legacy ``read_expression()`` path.
+    - Order preservation, chunking across boundaries, and error handling.
+    """
+
+    def test_no_expression_row_objects(self, agg_reader):
+        """Fast path does not return or construct ExpressionRow objects."""
+        batch = agg_reader.read_expression_flat([0, 1, 2])
+        assert isinstance(batch, ExpressionBatch)
+        assert not isinstance(batch, ExpressionRow)
+
+    def test_single_cell_shapes(self, agg_reader):
+        """Single cell returns correct shapes and dtypes."""
+        batch = agg_reader.read_expression_flat([0])
+        assert batch.batch_size == 1
+        assert batch.global_row_index.dtype == np.int64
+        assert batch.row_offsets.dtype == np.int64
+        assert batch.expressed_gene_indices.dtype == np.int32
+        assert batch.expression_counts.dtype == np.int32
+        assert len(batch.row_offsets) == 2  # batch_size+1
+        assert batch.row_offsets[0] == 0
+        assert batch.row_offsets[1] > 0  # non-empty cell
+
+    def test_empty_input(self, agg_reader):
+        """Empty input returns zero-size ExpressionBatch."""
+        batch = agg_reader.read_expression_flat([])
+        assert batch.batch_size == 0
+        assert len(batch.global_row_index) == 0
+        assert len(batch.row_offsets) == 1
+        assert batch.row_offsets[0] == 0
+        assert len(batch.expressed_gene_indices) == 0
+        assert len(batch.expression_counts) == 0
+
+    def test_order_preservation(self, agg_reader):
+        """Input order is preserved in global_row_index."""
+        indices = [100, 5, 50_000, 99_999]
+        batch = agg_reader.read_expression_flat(indices)
+        assert batch.global_row_index.tolist() == indices
+
+    def test_chunking_boundaries(self, agg_reader):
+        """Reads across the 2048-index chunk boundary."""
+        # 2049 indices triggers two take() calls
+        n = 2049
+        indices = list(range(n))
+        batch = agg_reader.read_expression_flat(indices)
+        assert batch.batch_size == n
+        assert batch.global_row_index[0] == 0
+        assert batch.global_row_index[-1] == n - 1
+        # Row offsets should have batch_size+1 entries
+        assert len(batch.row_offsets) == n + 1
+        # Offsets are strictly increasing
+        assert np.all(np.diff(batch.row_offsets) >= 0)
+
+    def test_out_of_range(self, agg_reader):
+        """Out-of-range indices raise IndexError.
+
+        The fast path validates against the Lance file row count (935 000),
+        not the registered dataset entry ranges.  So 125_000–934_999 are
+        valid Lance rows even though they're not in the dummy_00/dummy_01
+        entry ranges used by the test fixture.
+        """
+        with pytest.raises(IndexError):
+            agg_reader.read_expression_flat([-1])
+        # Past-end: the aggregate Lance file has 935 000 rows
+        with pytest.raises(IndexError):
+            agg_reader.read_expression_flat([935_000])
+        with pytest.raises(IndexError):
+            agg_reader.read_expression_flat([1_000_000])
+
+    @pytest.mark.parametrize("n", [0, 1, 5, 128, 1024, 2048, 2049, 3000])
+    def test_equivalence_with_legacy_path(self, agg_reader_full, n):
+        """Flat output is numerically equivalent to the legacy row-object path.
+
+        Compares the reconstructed flat arrays from ``read_expression()``
+        (which produces ``list[ExpressionRow]``) against the direct flat
+        output from ``read_expression_flat()``.
+        """
+        # Use contiguous and shuffled indices for thorough testing
+        indices = list(range(n)) if n <= 2048 else list(range(0, n * 2, 2))[:n]
+
+        # Fast path
+        batch = agg_reader_full.read_expression_flat(indices)
+
+        # Legacy path
+        rows = agg_reader_full.read_expression(indices)
+        # Reconstruct flat arrays the way BatchExecutor does
+        if n == 0:
+            legacy_row_offsets = np.array([0], dtype=np.int64)
+            legacy_egi = np.array([], dtype=np.int32)
+            legacy_ec = np.array([], dtype=np.int32)
+        else:
+            legacy_row_offsets = np.zeros(n + 1, dtype=np.int64)
+            for i, row in enumerate(rows):
+                legacy_row_offsets[i + 1] = (
+                    legacy_row_offsets[i] + len(row.expressed_gene_indices)
+                )
+            legacy_egi = np.concatenate([r.expressed_gene_indices for r in rows])
+            legacy_ec = np.concatenate([r.expression_counts for r in rows])
+
+        assert batch.batch_size == n
+        np.testing.assert_array_equal(
+            batch.global_row_index, np.array(indices, dtype=np.int64)
+        )
+        np.testing.assert_array_equal(batch.row_offsets, legacy_row_offsets)
+        np.testing.assert_array_equal(batch.expressed_gene_indices, legacy_egi)
+        np.testing.assert_array_equal(batch.expression_counts, legacy_ec)
+
+    def test_single_entry_mode(self, agg_reader_single_entry):
+        """Works with a single DatasetEntry covering all rows."""
+        batch = agg_reader_single_entry.read_expression_flat([0, 50_000, 99_999])
+        assert batch.batch_size == 3
+        assert batch.global_row_index.tolist() == [0, 50_000, 99_999]
+
+    def test_row_access_methods(self, agg_reader):
+        """ExpressionBatch row_slice, row_gene_indices, row_counts work."""
+        batch = agg_reader.read_expression_flat([2, 0])
+        # Row 0 (index 2) and row 1 (index 0) should exist
+        s = batch.row_slice(0)
+        assert s.start == 0
+        assert s.stop > 0
+        genes = batch.row_gene_indices(0)
+        counts = batch.row_counts(0)
+        assert len(genes) > 0
+        assert len(genes) == len(counts)
+        assert genes.dtype == np.int32
+        assert counts.dtype == np.int32
+
+    def test_large_shuffled_batch(self, agg_reader_full):
+        """Large shuffled batch across all 10 datasets."""
+        random.seed(42)
+        all_indices = list(range(935_000))
+        sample = random.sample(all_indices, 5000)
+        batch = agg_reader_full.read_expression_flat(sample)
+        assert batch.batch_size == 5000
+        assert batch.global_row_index.tolist() == sample
+        assert len(batch.row_offsets) == 5001
+        assert batch.row_offsets[-1] == len(batch.expressed_gene_indices)
+
+
+# ===================================================================
+# Phase 3 — FederatedLanceReader fast path tests
+# ===================================================================
+
+
+class TestFederatedLanceReaderFastPath:
+    """Tests for ``FederatedLanceReader.read_expression_flat()``.
+
+    Validates:
+    - No ``ExpressionRow`` objects are constructed.
+    - Output is an ``ExpressionBatch`` with correct shapes.
+    - Numerical equivalence with the legacy ``read_expression()`` path.
+    - Order preservation across mixed-dataset batches.
+    - Chunking across boundaries, error handling, and handle caching.
+    """
+
+    def test_no_expression_row_objects(self, fed_reader):
+        """Fast path does not return or construct ExpressionRow objects."""
+        batch = fed_reader.read_expression_flat([0, 1, 2])
+        assert isinstance(batch, ExpressionBatch)
+        assert not isinstance(batch, ExpressionRow)
+
+    def test_single_cell_shapes(self, fed_reader):
+        """Single cell returns correct shapes and dtypes."""
+        batch = fed_reader.read_expression_flat([0])
+        assert batch.batch_size == 1
+        assert batch.global_row_index.dtype == np.int64
+        assert batch.row_offsets.dtype == np.int64
+        assert batch.expressed_gene_indices.dtype == np.int32
+        assert batch.expression_counts.dtype == np.int32
+        assert len(batch.row_offsets) == 2  # batch_size+1
+        assert batch.row_offsets[0] == 0
+        assert batch.row_offsets[1] > 0  # non-empty cell
+
+    def test_empty_input(self, fed_reader):
+        """Empty input returns zero-size ExpressionBatch."""
+        batch = fed_reader.read_expression_flat([])
+        assert batch.batch_size == 0
+        assert len(batch.global_row_index) == 0
+        assert len(batch.row_offsets) == 1
+        assert batch.row_offsets[0] == 0
+        assert len(batch.expressed_gene_indices) == 0
+        assert len(batch.expression_counts) == 0
+
+    def test_order_preservation(self, fed_reader):
+        """Non-monotonic interleaved input order is preserved exactly."""
+        indices = [0, 50_000, 1, 50_001, 2, 50_002]
+        batch = fed_reader.read_expression_flat(indices)
+        assert batch.global_row_index.tolist() == indices
+
+    def test_alternating_order(self, fed_reader):
+        """Densely interleaved indices across two datasets."""
+        alt = [0, 50_000, 1, 50_001, 2, 50_002, 3, 50_003, 4, 50_004]
+        batch = fed_reader.read_expression_flat(alt)
+        assert batch.batch_size == len(alt)
+        assert batch.global_row_index.tolist() == alt
+
+    def test_all_from_first_dataset(self, fed_reader):
+        """Batch drawn entirely from the first dataset."""
+        indices = list(range(100))
+        batch = fed_reader.read_expression_flat(indices)
+        assert batch.batch_size == 100
+        assert batch.global_row_index.tolist() == indices
+        assert len(batch.row_offsets) == 101
+
+    def test_all_from_second_dataset(self, fed_reader):
+        """Batch drawn entirely from the second dataset."""
+        indices = list(range(50_000, 50_100))
+        batch = fed_reader.read_expression_flat(indices)
+        assert batch.batch_size == 100
+        assert batch.global_row_index.tolist() == indices
+        assert len(batch.row_offsets) == 101
+
+    def test_chunking_boundaries(self, fed_reader):
+        """Reads across the 2048-index chunk boundary in a single dataset."""
+        n = 3000
+        indices = list(range(n))
+        batch = fed_reader.read_expression_flat(indices)
+        assert batch.batch_size == n
+        assert batch.global_row_index[0] == 0
+        assert batch.global_row_index[-1] == n - 1
+        assert len(batch.row_offsets) == n + 1
+        # Row offsets are strictly increasing
+        assert np.all(np.diff(batch.row_offsets) >= 0)
+
+    def test_out_of_range(self, fed_reader):
+        """Out-of-range indices raise IndexError."""
+        with pytest.raises(IndexError):
+            fed_reader.read_expression_flat([-1])
+        with pytest.raises(IndexError):
+            fed_reader.read_expression_flat([125_000])
+
+    @pytest.mark.parametrize("n", [0, 1, 5, 128, 500, 1024, 2048, 3000])
+    def test_equivalence_with_legacy_path(self, fed_reader, n):
+        """Flat output is numerically equivalent to the legacy row-object path.
+
+        Compares the reconstructed flat arrays from ``read_expression()``
+        (which produces ``list[ExpressionRow]``) against the direct flat
+        output from ``read_expression_flat()``.
+        """
+        # Build a mixed-dataset index list for thorough testing.
+        # For n>0, interleave indices from both datasets.
+        if n == 0:
+            indices = []
+        else:
+            half = n // 2
+            ds0 = list(range(0, min(half, 1000)))
+            ds1 = list(range(50_000, 50_000 + n - len(ds0)))
+            merged = []
+            for i in range(max(len(ds0), len(ds1))):
+                if i < len(ds0):
+                    merged.append(ds0[i])
+                if i < len(ds1):
+                    merged.append(ds1[i])
+            indices = merged
+
+        # Fast path
+        batch = fed_reader.read_expression_flat(indices)
+
+        # Legacy path
+        rows = fed_reader.read_expression(indices)
+        # Reconstruct flat arrays the way BatchExecutor does
+        if n == 0:
+            legacy_row_offsets = np.array([0], dtype=np.int64)
+            legacy_egi = np.array([], dtype=np.int32)
+            legacy_ec = np.array([], dtype=np.int32)
+        else:
+            legacy_row_offsets = np.zeros(n + 1, dtype=np.int64)
+            for i, row in enumerate(rows):
+                legacy_row_offsets[i + 1] = (
+                    legacy_row_offsets[i] + len(row.expressed_gene_indices)
+                )
+            legacy_egi = np.concatenate([r.expressed_gene_indices for r in rows])
+            legacy_ec = np.concatenate([r.expression_counts for r in rows])
+
+        assert batch.batch_size == n
+        np.testing.assert_array_equal(
+            batch.global_row_index, np.array(indices, dtype=np.int64)
+        )
+        np.testing.assert_array_equal(batch.row_offsets, legacy_row_offsets)
+        np.testing.assert_array_equal(batch.expressed_gene_indices, legacy_egi)
+        np.testing.assert_array_equal(batch.expression_counts, legacy_ec)
+
+    def test_row_access_methods(self, fed_reader):
+        """ExpressionBatch row_slice, row_gene_indices, row_counts work."""
+        batch = fed_reader.read_expression_flat([2, 50_000, 0])
+        # Row 0 (index 2), row 1 (index 50000), row 2 (index 0)
+        s = batch.row_slice(0)
+        assert s.start == 0
+        assert s.stop > 0
+        genes = batch.row_gene_indices(0)
+        counts = batch.row_counts(0)
+        assert len(genes) > 0
+        assert len(genes) == len(counts)
+        assert genes.dtype == np.int32
+        assert counts.dtype == np.int32
+
+    def test_large_shuffled_mixed_order(self, fed_reader):
+        """Large shuffled batch preserves order across 2 datasets."""
+        random.seed(42)
+        base = list(range(0, 50_000, 10)) + list(range(50_000, 125_000, 10))
+        random.shuffle(base)
+        expected = list(base)
+        batch = fed_reader.read_expression_flat(base)
+        assert len(batch.global_row_index) == len(expected)
+        assert batch.global_row_index.tolist() == expected
+        assert len(batch.row_offsets) == len(expected) + 1
+        assert batch.row_offsets[-1] == len(batch.expressed_gene_indices)
+
+    def test_caching_reuses_handles(self, fed_reader):
+        """Calling read_expression_flat multiple times reuses cached handles."""
+        batch1 = fed_reader.read_expression_flat([0, 50_000])
+        batch2 = fed_reader.read_expression_flat([1, 50_001])
+        assert batch1.batch_size == 2
+        assert batch2.batch_size == 2
+        assert batch2.global_row_index.tolist() == [1, 50_001]
+
+    def test_expression_data_only(self, fed_reader):
+        """Fast path returns only expression data, no metadata leakage."""
+        batch = fed_reader.read_expression_flat([42])
+        assert not hasattr(batch, "size_factor")
+        assert not hasattr(batch, "canonical_perturbation")
+        assert not hasattr(batch, "canonical_context")
+        assert not hasattr(batch, "dataset_index")

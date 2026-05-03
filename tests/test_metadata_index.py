@@ -2,6 +2,7 @@
 
 import time
 
+import numpy as np
 import polars as pl
 
 from perturb_data_lab.loaders.index import MetadataIndex, MetadataRow
@@ -150,3 +151,194 @@ def test_getitem_latency():
     t1 = time.perf_counter()
     elapsed = t1 - t0
     assert elapsed < 0.001, f"__getitem__ took {elapsed:.3f}s, expected <1ms"
+
+
+# ===================================================================
+# Phase 4 — Hot-column caching and columnar gathering
+# ===================================================================
+
+
+def test_cache_hot_columns_all():
+    """Caching all columns stores correct shapes and types."""
+    meta = _meta()
+    meta.cache_hot_columns()  # cache all
+    assert len(meta._cache) > 10, f"Expected many cached columns, got {len(meta._cache)}"
+
+    # Numeric identity columns should be numpy arrays
+    for col in ["global_row_index", "dataset_index", "size_factor"]:
+        data = meta._cache.get(col)
+        assert isinstance(data, np.ndarray), f"{col} should be ndarray, got {type(data)}"
+        assert len(data) == len(meta), f"{col} len {len(data)} != {len(meta)}"
+
+    # String columns should be tuples
+    for col in ["dataset_id", "cell_id"]:
+        data = meta._cache.get(col)
+        assert isinstance(data, tuple), f"{col} should be tuple, got {type(data)}"
+        assert len(data) == len(meta), f"{col} len {len(data)} != {len(meta)}"
+
+
+def test_cache_hot_columns_subset():
+    """Caching only numeric columns works."""
+    meta = MetadataIndex.from_dummy_data()  # fresh instance to avoid cache pollution
+    meta.cache_hot_columns(["global_row_index", "dataset_index", "size_factor"])
+    assert "global_row_index" in meta._cache
+    assert "dataset_index" in meta._cache
+    assert "size_factor" in meta._cache
+    # String columns not cached since they weren't requested
+    assert "cell_id" not in meta._cache
+    # Verify cached data is correct
+    assert np.issubdtype(meta._cache["global_row_index"].dtype, np.integer)
+    assert np.issubdtype(meta._cache["dataset_index"].dtype, np.integer)
+    assert np.issubdtype(meta._cache["size_factor"].dtype, np.floating)
+
+
+def test_gather_columns_numeric():
+    """gather_columns returns correct numeric arrays for specific indices."""
+    meta = _meta()
+    meta.cache_hot_columns(["global_row_index", "dataset_index", "size_factor"])
+
+    indices = [0, 1, 50000, 99999]
+    gathered = meta.gather_columns(indices, ["global_row_index", "dataset_index"])
+
+    np.testing.assert_array_equal(
+        gathered["global_row_index"],
+        np.array(indices, dtype=np.int64),
+    )
+    # dataset_index: 0 for dummy_00 (indices 0-49999), 1 for dummy_01
+    assert gathered["dataset_index"][0] == 0
+    assert gathered["dataset_index"][1] == 0
+    assert gathered["dataset_index"][2] == 1
+    assert gathered["dataset_index"][3] == 1
+
+
+def test_gather_columns_string():
+    """gather_columns returns correct string tuples."""
+    meta = _meta()
+    meta.cache_hot_columns(["dataset_id", "cell_id"])
+
+    indices = [0, 1, 50000, 50001]
+    gathered = meta.gather_columns(indices, ["dataset_id"])
+
+    ds_ids = gathered["dataset_id"]
+    assert isinstance(ds_ids, tuple)
+    assert len(ds_ids) == 4
+    assert ds_ids[0] == "dummy_00"
+    assert ds_ids[1] == "dummy_00"
+    assert ds_ids[2] == "dummy_01"
+    assert ds_ids[3] == "dummy_01"
+
+
+def test_gather_columns_empty():
+    """gather_columns with empty indices returns empty results."""
+    meta = _meta()
+    meta.cache_hot_columns(["global_row_index", "dataset_id"])
+    gathered = meta.gather_columns([], ["global_row_index", "dataset_id"])
+    assert len(gathered["global_row_index"]) == 0
+    assert len(gathered["dataset_id"]) == 0
+
+
+def test_gather_columns_order():
+    """gather_columns preserves non-monotonic index order."""
+    meta = _meta()
+    meta.cache_hot_columns(["global_row_index", "dataset_id"])
+
+    indices = [50001, 1, 99999, 0]
+    gathered = meta.gather_columns(indices, ["global_row_index", "dataset_id"])
+
+    # global_row_index should match input order
+    np.testing.assert_array_equal(
+        gathered["global_row_index"],
+        np.array(indices, dtype=np.int64),
+    )
+    # dataset_id should match input order
+    assert gathered["dataset_id"][0] == "dummy_01"
+    assert gathered["dataset_id"][1] == "dummy_00"
+    assert gathered["dataset_id"][2] == "dummy_01"
+    assert gathered["dataset_id"][3] == "dummy_00"
+
+
+def test_gather_columns_uncached_fallback():
+    """gather_columns falls back to Polars for uncached columns."""
+    meta = _meta()
+    # Don't cache anything
+    indices = [0, 1, 2]
+    gathered = meta.gather_columns(indices, ["global_row_index", "cell_id"])
+
+    np.testing.assert_array_equal(
+        gathered["global_row_index"],
+        np.array(indices, dtype=np.int64),
+    )
+    assert isinstance(gathered["cell_id"], tuple)
+    assert len(gathered["cell_id"]) == 3
+
+
+def test_gather_columns_all_columns():
+    """gather_columns with columns=None returns all cached columns."""
+    meta = _meta()
+    meta.cache_hot_columns()  # cache all
+    indices = [0, 5, 10]
+    gathered = meta.gather_columns(indices)
+
+    # Should include all cached columns
+    assert len(gathered) == len(meta._cache)
+    for col, data in gathered.items():
+        if isinstance(data, np.ndarray):
+            assert len(data) == 3, f"{col} should have 3 entries"
+        else:
+            assert len(data) == 3, f"{col} should have 3 entries"
+
+
+def test_gather_columns_large_batch():
+    """gather_columns handles a 128-cell batch correctly."""
+    meta = _meta()
+    meta.cache_hot_columns(["global_row_index", "size_factor", "cell_id"])
+    rng = np.random.default_rng(42)
+    indices = sorted(rng.choice(len(meta), size=128, replace=False).tolist())
+    gathered = meta.gather_columns(indices)
+
+    assert len(gathered["global_row_index"]) == 128
+    assert len(gathered["size_factor"]) == 128
+    assert len(gathered["cell_id"]) == 128
+    np.testing.assert_array_equal(
+        gathered["global_row_index"],
+        np.array(indices, dtype=np.int64),
+    )
+
+
+def test_get_column():
+    """get_column returns cached or on-demand column data."""
+    meta = _meta()
+    # Access before caching — triggers lazy caching
+    gr = meta.get_column("global_row_index")
+    assert isinstance(gr, np.ndarray)
+    assert len(gr) == len(meta)
+    assert np.issubdtype(gr.dtype, np.integer)
+
+    ds_id = meta.get_column("dataset_id")
+    assert isinstance(ds_id, tuple)
+    assert len(ds_id) == len(meta)
+
+    # Nonexistent column
+    assert meta.get_column("nonexistent_column") is None
+
+
+def test_cache_hot_columns_latency():
+    """Caching all columns completes in <200ms for 125K rows."""
+    meta = _meta()
+    t0 = time.perf_counter()
+    meta.cache_hot_columns()
+    t1 = time.perf_counter()
+    elapsed = t1 - t0
+    assert elapsed < 0.2, f"Cache took {elapsed:.3f}s, expected <200ms"
+
+
+def test_gather_columns_latency():
+    """gather_columns for 128 indices with cached columns is <0.5ms."""
+    meta = _meta()
+    meta.cache_hot_columns()
+    indices = list(range(0, 128))
+    t0 = time.perf_counter()
+    _ = meta.gather_columns(indices)
+    t1 = time.perf_counter()
+    elapsed = t1 - t0
+    assert elapsed < 0.001, f"Gather took {elapsed:.4f}s, expected <1ms"

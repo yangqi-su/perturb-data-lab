@@ -23,6 +23,7 @@ import numpy as np
 from .index import MetadataIndex
 from .expression import ExpressionReader
 from .loaders import (
+    BatchMetadata,
     ExpressionBatch,
 )
 
@@ -127,9 +128,10 @@ class BatchExecutor:
     ) -> ExpressionBatch:
         """Read expression data as a flat ``ExpressionBatch``.
 
-        Unlike ``read_cells()``, this method produces **zero** per-cell
-        Python objects.  Expression data stays as numpy arrays from the
-        Lance reader through to the collator.
+        Uses the reader's native flat read path when available
+        (``read_expression_flat()`` for Lance-backed corpora), falling
+        back to the legacy ``ExpressionRow`` reconstruction path for
+        other backends.
 
         Parameters
         ----------
@@ -152,7 +154,13 @@ class BatchExecutor:
                 expression_counts=np.array([], dtype=np.int32),
             )
 
-        # Fetch expression rows (preserves order)
+        # Fast path: use reader's native flat expression method
+        # (Phase 2 aggregate Lance, Phase 3 federated Lance).
+        # Avoids ExpressionRow object construction and de-batch/re-batch.
+        if hasattr(self._reader, "read_expression_flat"):
+            return self._reader.read_expression_flat(indices)
+
+        # Legacy fallback: fetch ExpressionRow objects and reconstruct
         expr_rows = self._reader.read_expression(indices)
 
         # Compute row offsets and concatenate flat arrays
@@ -185,80 +193,189 @@ class BatchExecutor:
         )
 
     def read_metadata_batch(
-        self, global_indices: Sequence[int]
+        self,
+        global_indices: Sequence[int],
+        *,
+        columnar: bool = False,
     ) -> dict[str, Any]:
         """Read metadata as columnar numpy arrays without per-cell objects.
 
-        Each metadata column is extracted once (vectorized), not once per
-        cell.  String fields (``dataset_id``, ``cell_id``) are returned as
-        tuples.  Canonical perturbation and context dicts are still
-        per-cell tuples of dicts (metadata, not GPU data).
+        Each metadata column is extracted once (vectorized) via
+        ``MetadataIndex.gather_columns()``.  No per-row
+        ``df.row(i, named=True)`` calls are made in the default path.
 
-        When ``use_canonical=True``, reads canonical columns directly;
-        when ``False``, extracts from ``raw_``-prefixed columns.
+        String fields (``dataset_id``, ``cell_id``) are returned as
+        tuples.  When ``columnar=False`` (default), canonical perturbation
+        and context are still returned as per-cell tuples of dicts for
+        backward compatibility, but they are built from columnar arrays
+        rather than from per-row Polars access.
+
+        When ``columnar=True``, ``meta_columns`` is returned containing
+        columnar metadata arrays/tuples, and ``canonical_perturbation`` /
+        ``canonical_context`` are omitted.
 
         Parameters
         ----------
         global_indices : sequence of int
             Corpus-global cell indices.
+        columnar : bool, optional
+            If ``True``, return ``meta_columns`` dict instead of
+            per-cell ``canonical_perturbation`` / ``canonical_context``
+            dicts.  Default: ``False``.
 
         Returns
         -------
         dict
+            When ``columnar=False``:
             Keys: ``global_row_index``, ``dataset_index``, ``local_row_index``,
             ``size_factor``, ``dataset_id``, ``cell_id``,
             ``canonical_perturbation``, ``canonical_context``.
+
+            When ``columnar=True``:
+            Adds ``meta_columns`` (BatchedMetadata dict).  Omits
+            ``canonical_perturbation`` and ``canonical_context``.
         """
         indices = [int(i) for i in global_indices]
         n = len(indices)
         if n == 0:
-            return {
+            result: dict[str, Any] = {
                 "global_row_index": np.array([], dtype=np.int64),
                 "dataset_index": np.array([], dtype=np.int32),
                 "local_row_index": np.array([], dtype=np.int64),
                 "size_factor": np.array([], dtype=np.float32),
                 "dataset_id": (),
                 "cell_id": (),
-                "canonical_perturbation": (),
-                "canonical_context": (),
             }
+            if columnar:
+                result["meta_columns"] = {}
+            else:
+                result["canonical_perturbation"] = ()
+                result["canonical_context"] = ()
+            return result
 
-        # Get metadata subset preserving positional order
-        meta_subset = self._meta[indices]
-        df = meta_subset.df
+        # --- Gather all identity columns + canonical columns in one call ---
+        identity_cols = [
+            "global_row_index", "dataset_index", "local_row_index",
+            "size_factor", "dataset_id", "cell_id",
+        ]
 
-        # Extract scalar columns vectorized (one conversion per column)
-        global_row_index = df["global_row_index"].to_numpy().astype(np.int64)
-        dataset_index = df["dataset_index"].to_numpy().astype(np.int32)
-        local_row_index = df["local_row_index"].to_numpy().astype(np.int64)
-        size_factor = df["size_factor"].to_numpy().astype(np.float32)
-        dataset_id = tuple(df["dataset_id"].to_list())
-        cell_id = tuple(df["cell_id"].to_list())
-
-        # Build canonical_perturbation and canonical_context dicts
-        if self._use_canonical:
-            canonical_perturbation, canonical_context = (
-                self._build_canonical_dicts(df, n)
-            )
+        if columnar:
+            # Gather all canonical fields for meta_columns output
+            canonical_cols = []
+            if self._use_canonical:
+                canonical_cols = sorted(
+                    set(_CANONICAL_PERTURBATION_FIELDS)
+                    | set(_CANONICAL_CONTEXT_FIELDS)
+                )
+            else:
+                # Legacy raw mode: gather raw_<key> columns for canonical
+                canonical_cols = sorted(
+                    [f"raw_{k}" for k in self._perturbation_keys]
+                    + [f"raw_{k}" for k in self._context_keys]
+                )
+            all_cols = identity_cols + canonical_cols
         else:
-            # Legacy path: extract from raw_ columns
-            canonical_perturbation, canonical_context = (
-                self._build_dicts_from_raw(df, n)
-            )
+            # Default path: also gather canonical fields for dict building
+            if self._use_canonical:
+                canonical_cols = sorted(
+                    set(_CANONICAL_PERTURBATION_FIELDS)
+                    | set(_CANONICAL_CONTEXT_FIELDS)
+                )
+            else:
+                canonical_cols = sorted(
+                    [f"raw_{k}" for k in self._perturbation_keys]
+                    + [f"raw_{k}" for k in self._context_keys]
+                )
+            all_cols = identity_cols + canonical_cols
 
-        return {
+        # Single vectorized gather call — no per-row Polars access
+        gathered = self._meta.gather_columns(indices, all_cols)
+
+        # --- Identity columns ---
+        global_row_index = gathered.get(
+            "global_row_index",
+            np.array(indices, dtype=np.int64),
+        )
+        if global_row_index.dtype != np.int64:
+            global_row_index = global_row_index.astype(np.int64, copy=False)
+
+        dataset_index = gathered.get(
+            "dataset_index",
+            np.zeros(n, dtype=np.int32),
+        )
+        if dataset_index.dtype != np.int32:
+            dataset_index = dataset_index.astype(np.int32, copy=False)
+
+        local_row_index = gathered.get(
+            "local_row_index",
+            np.array(indices, dtype=np.int64),
+        )
+        if local_row_index.dtype != np.int64:
+            local_row_index = local_row_index.astype(np.int64, copy=False)
+
+        size_factor = gathered.get(
+            "size_factor",
+            np.ones(n, dtype=np.float32),
+        )
+        if size_factor.dtype != np.float32:
+            size_factor = size_factor.astype(np.float32, copy=False)
+
+        dataset_id = gathered.get("dataset_id", ())
+        cell_id = gathered.get("cell_id", ())
+
+        result = {
             "global_row_index": global_row_index,
             "dataset_index": dataset_index,
             "local_row_index": local_row_index,
             "size_factor": size_factor,
             "dataset_id": dataset_id,
             "cell_id": cell_id,
-            "canonical_perturbation": tuple(canonical_perturbation),
-            "canonical_context": tuple(canonical_context),
         }
 
+        if columnar:
+            # --- Columnar mode: meta_columns dict ---
+            meta_cols: dict[str, Any] = {}
+            if self._use_canonical:
+                for field in sorted(
+                    set(_CANONICAL_PERTURBATION_FIELDS)
+                    | set(_CANONICAL_CONTEXT_FIELDS)
+                ):
+                    if field in gathered:
+                        meta_cols[field] = gathered[field]
+            else:
+                for key in sorted(self._perturbation_keys):
+                    col = f"raw_{key}"
+                    if col in gathered:
+                        meta_cols[key] = gathered[col]
+                for key in sorted(self._context_keys):
+                    col = f"raw_{key}"
+                    if col in gathered:
+                        meta_cols[key] = gathered[col]
+            result["meta_columns"] = meta_cols
+        else:
+            # --- Backward-compatible: build dict tuples from columnar arrays ---
+            if self._use_canonical:
+                canonical_perturbation = self._build_canonical_from_columnar(
+                    gathered, _CANONICAL_PERTURBATION_FIELDS, n
+                )
+                canonical_context = self._build_canonical_from_columnar(
+                    gathered, _CANONICAL_CONTEXT_FIELDS, n
+                )
+            else:
+                canonical_perturbation = self._build_raw_from_columnar(
+                    gathered, self._perturbation_keys, n
+                )
+                canonical_context = self._build_raw_from_columnar(
+                    gathered, self._context_keys, n
+                )
+
+            result["canonical_perturbation"] = tuple(canonical_perturbation)
+            result["canonical_context"] = tuple(canonical_context)
+
+        return result
+
     def read_batch(
-        self, global_indices: Sequence[int]
+        self, global_indices: Sequence[int], *, columnar: bool = False
     ) -> dict[str, Any]:
         """Read expression + metadata as a GPU-ready dict.
 
@@ -273,11 +390,15 @@ class BatchExecutor:
         ----------
         global_indices : sequence of int
             Corpus-global cell indices.
+        columnar : bool, optional
+            Forwarded to ``read_metadata_batch()``.  When ``True``,
+            ``meta_columns`` is included and ``canonical_perturbation`` /
+            ``canonical_context`` are omitted.  Default: ``False``.
 
         Returns
         -------
         dict
-            Keys:
+            Keys when ``columnar=False``:
             - ``batch_size`` (int)
             - ``global_row_index`` (int64 array)
             - ``row_offsets`` (int64 array)
@@ -290,11 +411,15 @@ class BatchExecutor:
             - ``cell_id`` (tuple of str)
             - ``canonical_perturbation`` (tuple of dict)
             - ``canonical_context`` (tuple of dict)
+
+            When ``columnar=True``, ``canonical_perturbation`` and
+            ``canonical_context`` are replaced by ``meta_columns``
+            (dict of columnar arrays/tuples).
         """
         expr = self.read_expression_batch(global_indices)
-        meta = self.read_metadata_batch(global_indices)
+        meta = self.read_metadata_batch(global_indices, columnar=columnar)
 
-        return {
+        result: dict[str, Any] = {
             "batch_size": expr.batch_size,
             "global_row_index": expr.global_row_index,
             "row_offsets": expr.row_offsets,
@@ -305,9 +430,13 @@ class BatchExecutor:
             "size_factor": meta["size_factor"],
             "dataset_id": meta["dataset_id"],
             "cell_id": meta["cell_id"],
-            "canonical_perturbation": meta["canonical_perturbation"],
-            "canonical_context": meta["canonical_context"],
         }
+        if columnar:
+            result["meta_columns"] = meta.get("meta_columns", {})
+        else:
+            result["canonical_perturbation"] = meta["canonical_perturbation"]
+            result["canonical_context"] = meta["canonical_context"]
+        return result
 
     # ------------------------------------------------------------------
     # Properties
@@ -399,5 +528,89 @@ class BatchExecutor:
                 if val != "NA":
                     result[key] = val
         return result
+
+    # ------------------------------------------------------------------
+    # Internal: columnar dict builders (Phase 4 fast path)
+    # ------------------------------------------------------------------
+    # These replace ``_build_canonical_dicts()`` and
+    # ``_build_dicts_from_raw()`` in the hot path.  Instead of
+    # ``df.row(i, named=True)`` per cell, they iterate over pre-gathered
+    # columnar numpy arrays / tuples.  The old methods are preserved as
+    # backward-compatible fallbacks (not called in the default path).
+
+    @staticmethod
+    def _build_canonical_from_columnar(
+        gathered: dict[str, np.ndarray | tuple],
+        field_names: tuple[str, ...],
+        n: int,
+    ) -> list[dict[str, str]]:
+        """Build per-cell dicts from columnar canonical arrays.
+
+        Iterates row-by-row over numpy arrays and tuples (no Polars
+        DataFrame access).  Skips ``None`` and ``"NA"`` values.
+        """
+        # Pre-fetch column data for fields present in gathered
+        col_data: dict[str, np.ndarray | tuple] = {}
+        col_names: list[str] = []
+        for field in field_names:
+            if field in gathered:
+                col_data[field] = gathered[field]
+                col_names.append(field)
+
+        if not col_names:
+            return [{} for _ in range(n)]
+
+        result: list[dict[str, str]] = []
+        for i in range(n):
+            row_dict: dict[str, str] = {}
+            for field in col_names:
+                data = col_data[field]
+                val = data[i] if isinstance(data, (np.ndarray, list)) else data[i]  # type: ignore[index]
+                if val is not None and str(val) != "NA":
+                    row_dict[field] = str(val)
+            result.append(row_dict)
+        return result
+
+    @staticmethod
+    def _build_raw_from_columnar(
+        gathered: dict[str, np.ndarray | tuple],
+        keys: frozenset[str],
+        n: int,
+    ) -> list[dict[str, str]]:
+        """Build per-cell dicts from columnar ``raw_<key>`` arrays.
+
+        Analogous to ``_build_dicts_from_raw()`` but operates on
+        columnar data from ``gather_columns()`` instead of
+        ``df.row(i, named=True)``.
+        """
+        col_data: dict[str, np.ndarray | tuple] = {}
+        active_keys: list[str] = []
+        for key in sorted(keys):
+            col = f"raw_{key}"
+            if col in gathered:
+                col_data[key] = gathered[col]
+                active_keys.append(key)
+
+        if not active_keys:
+            return [{} for _ in range(n)]
+
+        result: list[dict[str, str]] = []
+        for i in range(n):
+            row_dict: dict[str, str] = {}
+            for key in active_keys:
+                data = col_data[key]
+                val = data[i]  # type: ignore[index]
+                if val is not None and str(val) != "NA":
+                    row_dict[key] = str(val)
+            result.append(row_dict)
+        return result
+
+    # ------------------------------------------------------------------
+    # Deprecated: row-by-row Polars dict builders (preserved for compat)
+    # ------------------------------------------------------------------
+    # DO NOT call these in the default hot path.  They are kept only
+    # for backward compatibility and are superseded by the columnar
+    # builders above (``_build_canonical_from_columnar``,
+    # ``_build_raw_from_columnar``) which avoid ``df.row(i, named=True)``.
 
 

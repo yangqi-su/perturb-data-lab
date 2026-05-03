@@ -101,6 +101,7 @@ class MetadataIndex:
         self._validate_flat_schema(df)
         self.df = df
         self._global_index = df["global_row_index"].to_numpy()
+        self._cache: dict[str, np.ndarray | tuple] = {}
 
     # ------------------------------------------------------------------
     # Schema validation
@@ -677,6 +678,153 @@ class MetadataIndex:
         ).sort("_order").drop("_order")
 
         return [self._row_to_metadata_row(r) for r in subset.to_dicts()]
+
+    # ------------------------------------------------------------------
+    # Hot-column cache and direct columnar gathering (Phase 4)
+    # ------------------------------------------------------------------
+
+    # Polars dtypes that can be converted to numpy numeric arrays.
+    _NUMERIC_DTYPES: set[pl.DataType] = {
+        pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+        pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+        pl.Float32, pl.Float64,
+        pl.Boolean,
+    }
+
+    # Polars dtypes that should become tuples of Python objects.
+    _STRING_DTYPES: set[pl.DataType] = {
+        pl.Utf8, pl.Categorical, pl.Enum,
+    }
+
+    def cache_hot_columns(self, columns: list[str] | None = None) -> None:
+        """Pre-extract columns as numpy arrays (or tuples for strings).
+
+        After calling this, ``gather_columns()`` uses the cached arrays
+        for O(1) positional lookup, avoiding Polars DataFrame subsetting
+        and repeated ``to_numpy()`` calls in the hot path.
+
+        Parameters
+        ----------
+        columns : list of str, optional
+            Column names to cache.  If ``None``, caches **all** columns
+            in the DataFrame.
+        """
+        if columns is None:
+            columns = list(self.df.columns)
+
+        for col_name in columns:
+            if col_name not in self.df.columns:
+                continue
+            dtype = self.df[col_name].dtype
+            if dtype in self._NUMERIC_DTYPES:
+                self._cache[col_name] = self.df[col_name].to_numpy()
+            elif dtype in self._STRING_DTYPES:
+                self._cache[col_name] = tuple(self.df[col_name].to_list())
+            else:
+                # Other dtypes (Date, Time, Duration, etc.) — try tuple
+                try:
+                    self._cache[col_name] = tuple(self.df[col_name].to_list())
+                except Exception:
+                    pass  # skip uncacheable columns silently
+
+    def get_column(self, col_name: str) -> np.ndarray | tuple | None:
+        """Return a column as numpy array or tuple, using the cache if available.
+
+        Parameters
+        ----------
+        col_name : str
+            Column name.
+
+        Returns
+        -------
+        np.ndarray, tuple, or None
+            The full column, or ``None`` if the column does not exist.
+        """
+        if col_name in self._cache:
+            return self._cache[col_name]
+        if col_name not in self.df.columns:
+            return None
+        dtype = self.df[col_name].dtype
+        if dtype in self._NUMERIC_DTYPES:
+            arr = self.df[col_name].to_numpy()
+            self._cache[col_name] = arr
+            return arr
+        elif dtype in self._STRING_DTYPES:
+            tup = tuple(self.df[col_name].to_list())
+            self._cache[col_name] = tup
+            return tup
+        else:
+            # Try tuple conversion for other dtypes
+            try:
+                tup = tuple(self.df[col_name].to_list())
+                self._cache[col_name] = tup
+                return tup
+            except Exception:
+                return None
+
+    def gather_columns(
+        self,
+        indices: list[int] | np.ndarray,
+        columns: list[str] | None = None,
+    ) -> dict[str, np.ndarray | tuple]:
+        """Gather column data for specific positional indices.
+
+        Since ``global_row_index`` is guaranteed to be contiguous
+        ``0..N-1`` and the DataFrame is sorted by it, positional
+        indices ARE global row indices.  This method uses cached
+        arrays when available for O(1) random access.
+
+        Parameters
+        ----------
+        indices : list of int or np.ndarray
+            Positional (global row) indices to gather.
+        columns : list of str, optional
+            Column names to gather.  If ``None``, gathers **all** columns
+            from the cache (or falls back to the DataFrame for uncached
+            columns).
+
+        Returns
+        -------
+        dict[str, np.ndarray | tuple]
+            Mapping from column name to gathered data:
+            - numpy array for numeric columns
+            - tuple of Python objects for string/object columns
+        """
+        indices_arr = np.asarray(indices, dtype=np.int64)
+        n = len(indices_arr)
+
+        # Determine which columns to gather
+        if columns is None:
+            # Gather all cacheable columns that exist
+            columns = [
+                c for c in sorted(self._cache.keys())
+                if c in self.df.columns
+            ]
+            if not columns:
+                columns = list(self.df.columns)
+
+        result: dict[str, np.ndarray | tuple] = {}
+        for col_name in columns:
+            if col_name in self._cache:
+                data = self._cache[col_name]
+                if isinstance(data, tuple):
+                    result[col_name] = tuple(data[i] for i in indices_arr)
+                else:
+                    # numpy fancy indexing — zero-copy view when possible
+                    result[col_name] = data[indices_arr]
+            elif col_name in self.df.columns:
+                # Fallback: extract from Polars and cache for reuse
+                self.cache_hot_columns([col_name])
+                data = self._cache.get(col_name)
+                if data is None:
+                    # skip uncacheable columns
+                    continue
+                if isinstance(data, tuple):
+                    result[col_name] = tuple(data[i] for i in indices_arr)
+                else:
+                    result[col_name] = data[indices_arr]
+
+        return result
 
     # ------------------------------------------------------------------
     # Internal row conversion

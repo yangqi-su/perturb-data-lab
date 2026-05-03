@@ -22,6 +22,8 @@ from typing import Iterator, List, Protocol, Sequence
 
 import numpy as np
 
+from .loaders import ExpressionBatch
+
 __all__ = [
     "ExpressionRow",
     "ExpressionReader",
@@ -389,6 +391,103 @@ class AggregateLanceReader(BaseExpressionReader):
             )
         return rows
 
+    # ------------------------------------------------------------------
+    # Fast path — direct flat read (Phase 2)
+    # ------------------------------------------------------------------
+
+    def read_expression_flat(
+        self, global_indices: Sequence[int]
+    ) -> ExpressionBatch:
+        """Read expression data directly as flat arrays (aggregate fast path).
+
+        Bypasses the per-dataset regrouping in
+        ``BaseExpressionReader.read_expression()`` and avoids per-row
+        ``ExpressionRow`` object construction.  Performs direct chunked
+        ``take()`` calls on the aggregate Lance file and returns
+        concatenated flat expression arrays with row offsets.
+
+        This is the aggregate-specific fast path.  The generic
+        ``read_expression()`` path (returning ``list[ExpressionRow]``)
+        remains available for backward compatibility.
+
+        Parameters
+        ----------
+        global_indices : sequence of int
+            Corpus-global cell indices into the aggregate Lance file.
+
+        Returns
+        -------
+        ExpressionBatch
+            Flat expression batch with concatenated arrays and row offsets.
+
+        Raises
+        ------
+        IndexError
+            If any index is out of range.
+        """
+        if not global_indices:
+            return ExpressionBatch(
+                batch_size=0,
+                global_row_index=np.array([], dtype=np.int64),
+                row_offsets=np.array([0], dtype=np.int64),
+                expressed_gene_indices=np.array([], dtype=np.int32),
+                expression_counts=np.array([], dtype=np.int32),
+            )
+
+        indices = [int(idx) for idx in global_indices]
+        n = len(indices)
+
+        # Validate all indices against Lance row count
+        total_rows = self._dataset.count_rows()
+        for idx in indices:
+            if idx < 0 or idx >= total_rows:
+                raise IndexError(
+                    f"global_index {idx} out of range [0, {total_rows})"
+                )
+
+        # Accumulate flat arrays and row offsets chunk by chunk
+        egi_parts: list[np.ndarray] = []
+        ec_parts: list[np.ndarray] = []
+        row_offsets = np.zeros(n + 1, dtype=np.int64)
+        cursor = 0  # tracks position in assembled rows
+
+        for chunk in _chunk_indices(indices):
+            table = self._dataset.take(chunk)
+            chunk_n = len(chunk)
+
+            egi_offsets, egi_flat = _extract_list_columns(
+                table, "expressed_gene_indices"
+            )
+            ec_offsets, ec_flat = _extract_list_columns(
+                table, "expression_counts"
+            )
+
+            for i in range(chunk_n):
+                s_egi = slice(egi_offsets[i], egi_offsets[i + 1])
+                s_ec = slice(ec_offsets[i], ec_offsets[i + 1])
+                egi_parts.append(np.asarray(egi_flat[s_egi]))
+                ec_parts.append(np.asarray(ec_flat[s_ec]))
+                cursor += 1
+                row_offsets[cursor] = (
+                    row_offsets[cursor - 1] + len(egi_parts[-1])
+                )
+
+        return ExpressionBatch(
+            batch_size=n,
+            global_row_index=np.array(indices, dtype=np.int64),
+            row_offsets=row_offsets,
+            expressed_gene_indices=(
+                np.concatenate(egi_parts)
+                if egi_parts
+                else np.array([], dtype=np.int32)
+            ),
+            expression_counts=(
+                np.concatenate(ec_parts)
+                if ec_parts
+                else np.array([], dtype=np.int32)
+            ),
+        )
+
 
 class FederatedLanceReader(BaseExpressionReader):
     """Expression reader for federated Lance topology.
@@ -462,6 +561,117 @@ class FederatedLanceReader(BaseExpressionReader):
                 )
             )
         return rows
+
+    # ------------------------------------------------------------------
+    # Fast path — direct flat read (Phase 3)
+    # ------------------------------------------------------------------
+
+    def read_expression_flat(
+        self, global_indices: Sequence[int]
+    ) -> ExpressionBatch:
+        """Read expression data directly as flat arrays (federated fast path).
+
+        Groups indices by dataset/file, performs chunked ``take()`` calls
+        per dataset, and returns concatenated flat expression arrays with
+        row offsets.  Avoids per-row ``ExpressionRow`` object construction.
+
+        This path retains per-dataset grouping (federated topology cannot
+        avoid it) but eliminates the de-batch/re-batch overhead of
+        ``ExpressionRow`` → flat-array reconstruction.
+
+        The generic ``read_expression()`` path (returning
+        ``list[ExpressionRow]``) remains available for backward
+        compatibility.
+
+        Parameters
+        ----------
+        global_indices : sequence of int
+            Corpus-global cell indices.
+
+        Returns
+        -------
+        ExpressionBatch
+            Flat expression batch with concatenated arrays and row offsets.
+
+        Raises
+        ------
+        IndexError
+            If any index is out of range or not registered in any dataset.
+        """
+        if not global_indices:
+            return ExpressionBatch(
+                batch_size=0,
+                global_row_index=np.array([], dtype=np.int64),
+                row_offsets=np.array([0], dtype=np.int64),
+                expressed_gene_indices=np.array([], dtype=np.int32),
+                expression_counts=np.array([], dtype=np.int32),
+            )
+
+        indices = [int(idx) for idx in global_indices]
+        n = len(indices)
+        self._validate_all(indices)
+
+        # Group by dataset, preserving the output position of each index.
+        # Within each dataset, selections are in the same relative order
+        # as they appear in the input.
+        # grouped[dataset_id] = list[(output_pos, local_index)]
+        grouped: dict[str, list[tuple[int, int]]] = {}
+        for output_pos, global_idx in enumerate(indices):
+            entry, local_idx = self._resolve_entry(global_idx)
+            grouped.setdefault(entry.dataset_id, []).append(
+                (output_pos, local_idx)
+            )
+
+        # Accumulate per-cell flat array parts indexed by output position
+        egi_by_pos: dict[int, np.ndarray] = {}
+        ec_by_pos: dict[int, np.ndarray] = {}
+
+        for ds_id, selections in grouped.items():
+            lance_entry = self._find_entry_by_id(ds_id)
+            assert isinstance(lance_entry, LanceDatasetEntry)
+            ds = self._open_dataset(lance_entry)
+
+            local_indices = [local for _, local in selections]
+            output_positions = [pos for pos, _ in selections]
+
+            idx_pos = 0
+            for chunk in _chunk_indices(local_indices):
+                table = ds.take(chunk)
+                chunk_n = len(chunk)
+
+                egi_offsets, egi_flat = _extract_list_columns(
+                    table, "expressed_gene_indices"
+                )
+                ec_offsets, ec_flat = _extract_list_columns(
+                    table, "expression_counts"
+                )
+
+                for i in range(chunk_n):
+                    s_egi = slice(egi_offsets[i], egi_offsets[i + 1])
+                    s_ec = slice(ec_offsets[i], ec_offsets[i + 1])
+                    pos = output_positions[idx_pos]
+                    egi_by_pos[pos] = np.asarray(egi_flat[s_egi])
+                    ec_by_pos[pos] = np.asarray(ec_flat[s_ec])
+                    idx_pos += 1
+
+        # Build row offsets and concatenate in output order
+        row_offsets = np.zeros(n + 1, dtype=np.int64)
+        egi_parts: list[np.ndarray] = []
+        ec_parts: list[np.ndarray] = []
+        for pos in range(n):
+            egi_parts.append(egi_by_pos[pos])
+            ec_parts.append(ec_by_pos[pos])
+            row_offsets[pos + 1] = (
+                row_offsets[pos] + len(egi_by_pos[pos])
+            )
+
+        return ExpressionBatch(
+            batch_size=n,
+            global_row_index=np.array(indices, dtype=np.int64),
+            row_offsets=row_offsets,
+            expressed_gene_indices=np.concatenate(egi_parts),
+            expression_counts=np.concatenate(ec_parts),
+        )
 
 
 # ===================================================================
