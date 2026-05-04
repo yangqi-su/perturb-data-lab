@@ -18,6 +18,7 @@ import yaml
 
 from .executor import BatchExecutor
 from .expression import (
+    CsrMemmapShardEntry,
     DatasetEntry,
     LanceDatasetEntry,
     build_expression_reader,
@@ -83,6 +84,7 @@ _BACKEND_NORMALIZE: dict[str, str] = {
     "lance": "lance",
     "zarr": "zarr",
     "webdataset": "webdataset",
+    "csr-memmap": "csr_memmap",
     # legacy / alternate names
     "arrow_hf": "parquet",
     "arrow_ipc": "arrow_ipc",
@@ -230,6 +232,17 @@ def load_corpus(
             expression_reader = build_expression_reader(
                 backend, topology, entries, lance_path=lance_path,
             )
+        elif backend == "csr_memmap":
+            # Read CSR manifest to build shard-level entries
+            manifest_path = root / "csr-corpus-manifest.yaml"
+            if not manifest_path.exists():
+                raise FileNotFoundError(
+                    f"CSR corpus manifest not found: {manifest_path}"
+                )
+            entries = _build_csr_entries(root, manifest_path)
+            expression_reader = build_expression_reader(
+                backend, topology, entries,
+            )
         else:
             raise ValueError(
                 f"Unsupported backend '{backend}' for aggregate topology. "
@@ -312,6 +325,78 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     """Read a YAML file and return the parsed dict."""
     with open(path, "r") as fh:
         return yaml.safe_load(fh) or {}
+
+
+def _build_csr_entries(
+    corpus_root: Path, manifest_path: Path
+) -> list[CsrMemmapShardEntry]:
+    """Build ``CsrMemmapShardEntry`` list from a ``csr-corpus-manifest.yaml``.
+
+    Parameters
+    ----------
+    corpus_root : Path
+        Root of the CSR corpus directory (for resolving relative shard paths).
+    manifest_path : Path
+        Path to ``csr-corpus-manifest.yaml``.
+
+    Returns
+    -------
+    list of CsrMemmapShardEntry
+        One entry per shard, sorted by ``global_start``.
+
+    Raises
+    ------
+    ValueError
+        If the manifest is missing required fields or the shards list is empty.
+    FileNotFoundError
+        If any required ``.npy`` file is missing.
+    """
+    doc = _read_yaml(manifest_path)
+    if doc.get("kind") != "csr-corpus-manifest":
+        raise ValueError(
+            f"Expected csr-corpus-manifest, got kind={doc.get('kind')!r}"
+        )
+    shards = doc.get("shards", [])
+    if not shards:
+        raise ValueError("CSR corpus manifest contains no shards")
+
+    entries: list[CsrMemmapShardEntry] = []
+    for s in shards:
+        shard_id = int(s["shard_id"])
+        shard_dir_name = s["path"]  # relative: "shard_000000"
+        shard_dir = corpus_root / shard_dir_name
+
+        ro_path = shard_dir / "row_offsets.npy"
+        gi_path = shard_dir / "gene_indices.npy"
+        cnt_path = shard_dir / "counts.npy"
+        if not ro_path.is_file():
+            raise FileNotFoundError(f"Missing: {ro_path}")
+        if not gi_path.is_file():
+            raise FileNotFoundError(f"Missing: {gi_path}")
+        if not cnt_path.is_file():
+            raise FileNotFoundError(f"Missing: {cnt_path}")
+
+        n_cells = int(s["n_cells"])
+        g_start = int(s["global_start"])
+        g_end = int(s["global_end"])
+
+        entries.append(
+            CsrMemmapShardEntry(
+                dataset_id=shard_dir_name,  # unique shard identifier
+                global_start=g_start,
+                global_end=g_end,
+                shard_id=shard_id,
+                shard_path=shard_dir,
+                row_offsets_path=ro_path,
+                gene_indices_path=gi_path,
+                counts_path=cnt_path,
+                n_cells=n_cells,
+            )
+        )
+
+    # Sort by global_start (defensive — manifest should already be sorted)
+    entries.sort(key=lambda e: e.global_start)
+    return entries
 
 
 def _build_metadata_index(

@@ -4,8 +4,10 @@ from .executor import BatchExecutor
 from .expression import (
     AggregateLanceReader,
     AggregateZarrReader,
+    AggregateCsrMemmapReader,
     ArrowIpcDatasetEntry,
     BaseExpressionReader,
+    CsrMemmapShardEntry,
     DatasetEntry,
     ExpressionReader,
     ExpressionRow,
@@ -62,6 +64,7 @@ __all__ = [
     "FederatedLanceReader",
     "AggregateZarrReader",
     "FederatedZarrReader",
+    "AggregateCsrMemmapReader",
     "FederatedArrowIpcReader",
     "FederatedParquetReader",
     "FederatedWebDatasetReader",
@@ -70,6 +73,7 @@ __all__ = [
     "ArrowIpcDatasetEntry",
     "ParquetDatasetEntry",
     "WebDatasetEntry",
+    "CsrMemmapShardEntry",
     "build_expression_reader",
     # Phase 3 — BatchExecutor
     "BatchExecutor",

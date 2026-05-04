@@ -22,6 +22,7 @@ from typing import Iterator, List, Protocol, Sequence
 
 import numpy as np
 
+from ..materializers.backends.csr_cache import ShardLRUCache
 from .loaders import ExpressionBatch
 
 __all__ = [
@@ -35,11 +36,13 @@ __all__ = [
     "FederatedArrowIpcReader",
     "FederatedParquetReader",
     "FederatedWebDatasetReader",
+    "AggregateCsrMemmapReader",
     "LanceDatasetEntry",
     "ZarrDatasetEntry",
     "ArrowIpcDatasetEntry",
     "ParquetDatasetEntry",
     "WebDatasetEntry",
+    "CsrMemmapShardEntry",
     "DatasetEntry",
     "build_expression_reader",
 ]
@@ -131,6 +134,37 @@ class WebDatasetEntry(DatasetEntry):
     """WebDataset (tar shard) dataset entry with a path to the ``.tar`` file."""
 
     tar_path: str | Path
+
+
+@dataclass(frozen=True)
+class CsrMemmapShardEntry(DatasetEntry):
+    """CSR memmap shard entry with paths to the CSR ``.npy`` files.
+
+    Each entry maps a contiguous range of global cell indices to a single
+    shard directory containing three ``.npy`` files in CSR format.
+
+    Attributes
+    ----------
+    shard_id : int
+        Zero-based shard index within the corpus.
+    shard_path : Path
+        Path to the shard directory (e.g. ``<root>/shard_000000/``).
+    row_offsets_path : Path
+        Path to ``row_offsets.npy`` (int64, shape ``(n_cells+1,)``).
+    gene_indices_path : Path
+        Path to ``gene_indices.npy`` (int32, flat).
+    counts_path : Path
+        Path to ``counts.npy`` (int32, flat).
+    n_cells : int
+        Number of cells stored in this shard.
+    """
+
+    shard_id: int
+    shard_path: Path
+    row_offsets_path: Path
+    gene_indices_path: Path
+    counts_path: Path
+    n_cells: int
 
 
 # ---------------------------------------------------------------------------
@@ -953,6 +987,262 @@ class FederatedWebDatasetReader(BaseExpressionReader):
 
 
 # ===================================================================
+# CSR memmap reader (Phase 3)
+# ===================================================================
+
+
+def _build_cache(cache_config: object | None) -> ShardLRUCache | None:
+    """Build a :class:`ShardLRUCache` from a cache configuration dict.
+
+    Returns ``None`` when *cache_config* is ``None`` or has
+    ``enabled=False``, meaning all reads go directly to source files.
+    """
+    if cache_config is None:
+        return None
+
+    if not isinstance(cache_config, dict):
+        raise TypeError(
+            f"cache_config must be a dict, got {type(cache_config).__name__}"
+        )
+
+    enabled = cache_config.get("enabled", False)
+    if not enabled:
+        return None
+
+    cache_root = cache_config.get("cache_root")
+    max_bytes = cache_config.get("max_bytes")
+
+    if cache_root is None:
+        raise ValueError("cache_config must include 'cache_root' when enabled")
+    if max_bytes is None:
+        raise ValueError("cache_config must include 'max_bytes' when enabled")
+
+    cache_root_path = Path(cache_root)
+    max_bytes_int = int(max_bytes)
+
+    per_worker = bool(cache_config.get("per_worker", False))
+
+    return ShardLRUCache(
+        cache_root=cache_root_path,
+        max_bytes=max_bytes_int,
+        per_worker=per_worker,
+    )
+
+
+class AggregateCsrMemmapReader(BaseExpressionReader):
+    """Expression reader for sharded CSR memmap corpora (aggregate topology).
+
+    Routes global cell indices to shards, opens shard ``.npy`` files via
+    ``np.load(..., mmap_mode="r")`` for OS-level paging, and returns flat
+    ``ExpressionBatch`` data via ``read_expression_flat()``.
+
+    Shards are opened lazily on first access and cached in
+    ``self._mmaps`` per reader instance.  When used with
+    ``torch.utils.data.DataLoader``, each worker process maintains its
+    own set of memmap handles (fork-safe, read-only).
+
+    Optional bounded shard LRU cache (Phase 4):
+    When *cache_config* is provided with ``"enabled": True``, shard
+    ``.npy`` files are first copied to a local scratch directory
+    (e.g. ``/tmp``) before being opened via memmap.  The cache enforces
+    a configurable byte limit with LRU eviction and is safe for
+    multi-worker use (per-worker namespace or per-shard file locking).
+
+    Parameters
+    ----------
+    entries : list of CsrMemmapShardEntry
+        One entry per shard, sorted by ``global_start``.  Shard ranges
+        must be contiguous and non-overlapping.
+    cache_config : dict or None
+        Optional shard cache configuration.  When ``None`` or
+        ``{"enabled": False}``, reads go directly to source ``.npy``
+        files via memmap.  When enabled, the config dict must contain:
+
+        - ``"enabled"`` (bool): ``True`` to activate the cache.
+        - ``"cache_root"`` (str or Path): local scratch directory.
+        - ``"max_bytes"`` (int): cache capacity in bytes (e.g.
+          ``20_000_000_000`` for 20 GB).
+        - ``"per_worker"`` (bool, optional): if ``True``, each worker
+          gets its own pid-based subdirectory.  Default ``False``.
+    """
+
+    def __init__(
+        self,
+        entries: list[CsrMemmapShardEntry],
+        *,
+        cache_config: object | None = None,
+    ):
+        super().__init__(list(entries))  # type: ignore[arg-type]
+        self._cache_config = cache_config
+        # Phase 4: build the optional ShardLRUCache
+        self._cache: ShardLRUCache | None = _build_cache(cache_config)
+        # Lazily opened memmap handles: shard_id → dict of arrays
+        self._mmaps: dict[int, dict[str, np.ndarray]] = {}
+
+    # ------------------------------------------------------------------
+    # Shard opening (lazy, fork-safe, cache-aware)
+    # ------------------------------------------------------------------
+
+    def _open_shard(self, entry: CsrMemmapShardEntry) -> dict[str, np.ndarray]:
+        """Return memmap-backed arrays for *entry*, opening them lazily.
+
+        When the optional shard LRU cache is active, ``.npy`` files are
+        first copied to the local cache root and opened from there.
+        Otherwise, files are opened directly from the source shard
+        directory via ``np.load(..., mmap_mode="r")``.
+        """
+        shard_id = entry.shard_id
+        if shard_id not in self._mmaps:
+            if self._cache is not None:
+                # Read from local cache (copied on first access)
+                local_dir = self._cache.get_shard_path(
+                    shard_id, entry.shard_path
+                )
+                row_offsets_path = local_dir / "row_offsets.npy"
+                gene_indices_path = local_dir / "gene_indices.npy"
+                counts_path = local_dir / "counts.npy"
+            else:
+                # Read directly from the source shard directory
+                row_offsets_path = entry.row_offsets_path
+                gene_indices_path = entry.gene_indices_path
+                counts_path = entry.counts_path
+
+            self._mmaps[shard_id] = {
+                "offsets": np.load(str(row_offsets_path), mmap_mode="r"),
+                "indices": np.load(str(gene_indices_path), mmap_mode="r"),
+                "counts": np.load(str(counts_path), mmap_mode="r"),
+            }
+        return self._mmaps[shard_id]
+
+    # ------------------------------------------------------------------
+    # Backend-specific hook (ExpressionRow path)
+    # ------------------------------------------------------------------
+
+    def _read_local_rows(
+        self, entry: DatasetEntry, local_indices: list[int]
+    ) -> list[ExpressionRow]:
+        """Read expression rows from a single shard.
+
+        Opens the shard's memmap arrays and slices per-row CSR data
+        using ``row_offsets``.
+        """
+        csr_entry = self._find_entry_by_id(entry.dataset_id)
+        assert isinstance(csr_entry, CsrMemmapShardEntry)
+        arrays = self._open_shard(csr_entry)
+        offsets = arrays["offsets"]
+        indices = arrays["indices"]
+        counts = arrays["counts"]
+        global_start = csr_entry.global_start
+
+        rows: list[ExpressionRow] = []
+        for li in local_indices:
+            s = slice(int(offsets[li]), int(offsets[li + 1]))
+            rows.append(
+                ExpressionRow(
+                    global_row_index=global_start + li,
+                    expressed_gene_indices=np.asarray(indices[s], dtype=np.int32),
+                    expression_counts=np.asarray(counts[s], dtype=np.int32),
+                )
+            )
+        return rows
+
+    # ------------------------------------------------------------------
+    # Fast path — direct flat read (Phase 3)
+    # ------------------------------------------------------------------
+
+    def read_expression_flat(
+        self, global_indices: Sequence[int]
+    ) -> ExpressionBatch:
+        """Read expression data directly as flat arrays.
+
+        Groups indices by shard via ``_resolve_entry()``, reads per-shard
+        flat arrays from the memmap, and reassembles in the original
+        input order.
+
+        This is the aggregate CSR fast path that avoids per-row
+        ``ExpressionRow`` object construction.  The generic
+        ``read_expression()`` path (returning ``list[ExpressionRow]``)
+        remains available for backward compatibility.
+
+        Parameters
+        ----------
+        global_indices : sequence of int
+            Corpus-global cell indices.
+
+        Returns
+        -------
+        ExpressionBatch
+            Flat expression batch with concatenated arrays and row offsets.
+
+        Raises
+        ------
+        IndexError
+            If any index is out of range.
+        """
+        if not global_indices:
+            return ExpressionBatch(
+                batch_size=0,
+                global_row_index=np.array([], dtype=np.int64),
+                row_offsets=np.array([0], dtype=np.int64),
+                expressed_gene_indices=np.array([], dtype=np.int32),
+                expression_counts=np.array([], dtype=np.int32),
+            )
+
+        indices = [int(idx) for idx in global_indices]
+        n = len(indices)
+        self._validate_all(indices)
+
+        # Group by shard, preserving the output position of each index.
+        # grouped[shard_dataset_id] = list[(output_pos, local_index)]
+        grouped: dict[str, list[tuple[int, int]]] = {}
+        for output_pos, global_idx in enumerate(indices):
+            entry, local_idx = self._resolve_entry(global_idx)
+            grouped.setdefault(entry.dataset_id, []).append(
+                (output_pos, local_idx)
+            )
+
+        # Accumulate per-cell flat array parts indexed by output position
+        egi_by_pos: dict[int, np.ndarray] = {}
+        ec_by_pos: dict[int, np.ndarray] = {}
+
+        for ds_id, selections in grouped.items():
+            csr_entry = self._find_entry_by_id(ds_id)
+            assert isinstance(csr_entry, CsrMemmapShardEntry)
+            arrays = self._open_shard(csr_entry)
+            offsets = arrays["offsets"]
+            indices_arr = arrays["indices"]
+            counts_arr = arrays["counts"]
+
+            for output_pos, local_idx in selections:
+                s = slice(int(offsets[local_idx]), int(offsets[local_idx + 1]))
+                egi_by_pos[output_pos] = np.asarray(
+                    indices_arr[s], dtype=np.int32
+                )
+                ec_by_pos[output_pos] = np.asarray(
+                    counts_arr[s], dtype=np.int32
+                )
+
+        # Build row offsets and concatenate in output order
+        row_offsets = np.zeros(n + 1, dtype=np.int64)
+        egi_parts: list[np.ndarray] = []
+        ec_parts: list[np.ndarray] = []
+        for pos in range(n):
+            egi_parts.append(egi_by_pos[pos])
+            ec_parts.append(ec_by_pos[pos])
+            row_offsets[pos + 1] = (
+                row_offsets[pos] + len(egi_by_pos[pos])
+            )
+
+        return ExpressionBatch(
+            batch_size=n,
+            global_row_index=np.array(indices, dtype=np.int64),
+            row_offsets=row_offsets,
+            expressed_gene_indices=np.concatenate(egi_parts),
+            expression_counts=np.concatenate(ec_parts),
+        )
+
+
+# ===================================================================
 # Factory
 # ===================================================================
 
@@ -969,7 +1259,7 @@ def build_expression_reader(
     ----------
     backend : str
         One of ``"lance"``, ``"zarr"``, ``"arrow_ipc"``, ``"parquet"``,
-        ``"webdataset"``.
+        ``"webdataset"``, ``"csr_memmap"``.
     topology : str
         Either ``"aggregate"`` or ``"federated"``.
     entries : list of DatasetEntry
@@ -1024,10 +1314,25 @@ def build_expression_reader(
             raise ValueError("WebDataset aggregate topology is not supported.")
         return FederatedWebDatasetReader(entries)  # type: ignore[arg-type]
 
+    elif backend == "csr_memmap":
+        if topology == "aggregate":
+            cache_config = kwargs.pop("cache_config", None)
+            if kwargs:
+                raise TypeError(
+                    f"Unexpected keyword arguments for csr_memmap backend: "
+                    f"{sorted(kwargs.keys())}"
+                )
+            return AggregateCsrMemmapReader(entries, cache_config=cache_config)  # type: ignore[arg-type]
+        else:
+            raise ValueError(
+                "csr_memmap only supports aggregate topology "
+                "(sharding is internal to the backend)."
+            )
+
     else:
         raise ValueError(
             f"Unknown backend '{backend}'. "
-            f"Supported: lance, zarr, arrow_ipc, parquet, webdataset."
+            f"Supported: lance, zarr, arrow_ipc, parquet, webdataset, csr_memmap."
         )
 
 
