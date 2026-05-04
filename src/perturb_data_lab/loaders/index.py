@@ -813,16 +813,21 @@ class MetadataIndex:
                     # numpy fancy indexing — zero-copy view when possible
                     result[col_name] = data[indices_arr]
             elif col_name in self.df.columns:
-                # Fallback: extract from Polars and cache for reuse
-                self.cache_hot_columns([col_name])
-                data = self._cache.get(col_name)
-                if data is None:
-                    # skip uncacheable columns
-                    continue
-                if isinstance(data, tuple):
-                    result[col_name] = tuple(data[i] for i in indices_arr)
-                else:
+                dtype = self.df[col_name].dtype
+                if dtype in self._NUMERIC_DTYPES:
+                    # Numeric columns are safe to cache eagerly.
+                    self.cache_hot_columns([col_name])
+                    data = self._cache.get(col_name)
+                    if data is None:
+                        # skip uncacheable columns
+                        continue
                     result[col_name] = data[indices_arr]
+                else:
+                    # String/object-like columns should only materialize the
+                    # requested rows to avoid full-column Python-object blowups.
+                    result[col_name] = tuple(
+                        self.df[indices_arr, col_name].to_list()
+                    )
 
         return result
 

@@ -259,7 +259,7 @@ def test_gather_columns_order():
 
 def test_gather_columns_uncached_fallback():
     """gather_columns falls back to Polars for uncached columns."""
-    meta = _meta()
+    meta = MetadataIndex.from_dummy_data()
     # Don't cache anything
     indices = [0, 1, 2]
     gathered = meta.gather_columns(indices, ["global_row_index", "cell_id"])
@@ -270,6 +270,8 @@ def test_gather_columns_uncached_fallback():
     )
     assert isinstance(gathered["cell_id"], tuple)
     assert len(gathered["cell_id"]) == 3
+    assert "global_row_index" in meta._cache
+    assert "cell_id" not in meta._cache
 
 
 def test_gather_columns_all_columns():
