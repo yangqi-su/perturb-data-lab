@@ -1,8 +1,14 @@
-"""Phase 3: BatchExecutor — composes MetadataIndex + ExpressionReader.
+"""BatchExecutor — composes ``MetadataIndex`` + ``ExpressionReader``.
 
 The ``BatchExecutor`` is the single entry point for reading cell data from a
 corpus.  It queries metadata from ``MetadataIndex`` and expression data from
 an ``ExpressionReader``, returning flat numpy array dicts via ``read_batch()``.
+
+For new training loops, prefer the corpus-level API built around
+``load_corpus()``, ``Corpus.set_sampler()``, and ``Corpus.loader()``. That path
+keeps Lance workers expression-only and attaches rich metadata only when
+requested. ``BatchExecutor`` remains useful for direct inspection, legacy
+integration, and low-level batch access.
 
 Key design rules:
 - Metadata comes from ``MetadataIndex``, **not** from expression readers.
@@ -99,6 +105,10 @@ def _coerce_optional_float32(
 
 class BatchExecutor:
     """Corpus-level batch reader composing metadata and expression I/O.
+
+    This is now primarily a low-level or legacy escape hatch. New loader code
+    should usually iterate through ``Corpus.loader(...)`` instead of manually
+    calling ``read_batch()`` and wiring pipelines itself.
 
     Parameters
     ----------

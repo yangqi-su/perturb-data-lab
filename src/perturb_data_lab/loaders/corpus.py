@@ -1,11 +1,14 @@
-"""Phase 3: Corpus loader utilities (stub).
+"""Legacy corpus-loader utilities and migration notes.
 
 The legacy ``CorpusLoader``, ``DatasetReaderEntry``, and ``build_corpus_loader``
 have been removed.  They are replaced by:
 
+- ``load_corpus`` / ``Corpus`` (``corpus_loader.py``) — preferred user-facing
+  corpus API for sampler setup, dataset access, and CPU/GPU loader iteration
 - ``MetadataIndex``  (``index.py``)  — metadata query / sampling
 - ``ExpressionReader`` (``expression.py``) — expression I/O
-- ``BatchExecutor`` (``executor.py``) — metadata + expression composition
+- ``BatchExecutor`` (``executor.py``) — direct / legacy metadata + expression
+  composition
 
 Utility functions ``read_raw_obs_parquet`` and ``read_raw_var_parquet`` are
 preserved for ad-hoc metadata inspection.

@@ -1,10 +1,20 @@
-"""Phase 2: ``load_corpus()`` factory — reconstruct a training-ready ``Corpus``
-from a corpus directory using canonical metadata as the source of truth.
+"""Corpus factory and preferred corpus-level loader API.
 
-The function reads ``corpus-index.yaml``, locates canonical obs/var parquets
-via ``resolve_corpus_paths()``, and wires up ``MetadataIndex``,
-``ExpressionReader``, ``BatchExecutor``, and ``FeatureRegistry`` so that
-training scripts need zero manual path arithmetic.
+``load_corpus()`` reconstructs a training-ready ``Corpus`` from a corpus
+directory using canonical metadata as the source of truth. The preferred
+runtime flow is::
+
+    corpus = load_corpus(path, seq_len=...)
+    corpus.set_sampler(batch_size=..., seed=...)
+    dataset = corpus.dataset()
+    for batch in corpus.loader(processing="gpu" or "cpu", ...):
+        ...
+
+Aggregate and federated Lance share this same public API. ``Corpus.loader()``
+keeps rich metadata in the main process by default, treats ``size_factor`` as
+optional metadata, and defaults Lance workers to ``spawn``. ``BatchExecutor``
+remains available for direct or legacy access, but new training code should
+usually prefer the corpus-level API.
 """
 
 from __future__ import annotations
@@ -73,10 +83,12 @@ _LOADER_METADATA_RESERVED_OVERRIDES: frozenset[str] = frozenset({"size_factor"})
 
 @dataclass
 class Corpus:
-    """Ready-to-train corpus object.
+    """Ready-to-train corpus object and preferred user-facing runtime handle.
 
-    Contains everything needed to instantiate a ``PerturbBatchDataset``
-    and a GPU/CPU pipeline — no manual path arithmetic required.
+    Use ``set_sampler()`` to choose batch sampling, ``dataset()`` to inspect
+    the expression-facing dataset contract, and ``loader()`` to iterate over
+    processed training batches. Aggregate and federated Lance topologies share
+    the same public API.
 
     Attributes
     ----------
@@ -121,7 +133,7 @@ class Corpus:
         return dict(self._sampler_params)
 
     def set_sampler(self, **params: Any) -> Any:
-        """Build and store a metadata-index-backed sampler for this corpus."""
+        """Build and store a metadata-index-backed sampler for ``loader()``."""
         normalized = _normalize_sampler_params(params)
         self._sampler = _build_sampler(self.metadata_index, normalized)
         self._sampler_params = normalized
@@ -132,7 +144,14 @@ class Corpus:
         *,
         metadata_columns: Sequence[str] | None = None,
     ) -> RawExpressionBatchDataset | LanceExpressionBatchDataset:
-        """Return the expression-only dataset for the corpus loader refactor."""
+        """Return the dataset consumed by ``Corpus.loader()``.
+
+        For Lance corpora with no requested metadata columns, this returns the
+        expression-only worker-safe dataset used by both aggregate and
+        federated loader routes. Requesting metadata columns falls back to the
+        executor-backed dataset intended for direct inspection or legacy-style
+        access.
+        """
         columns = _normalize_metadata_columns(
             self.metadata_index, metadata_columns,
         )
@@ -191,7 +210,17 @@ class Corpus:
         expressed_weight: float = 3.0,
         hvg_weight: float = 3.0,
     ) -> Iterator[dict[str, Any]]:
-        """Yield processed sparse training batches for the requested route."""
+        """Yield processed sparse training batches for the requested route.
+
+        ``processing="gpu"`` keeps DataLoader workers expression-only and runs
+        ``GPUSparsePipeline.process_batch(...)`` in the main process.
+        ``processing="cpu"`` runs the sparse pipeline inside CPU workers via
+        ``cpu_parallel_collate_fn``. Requested ``metadata_columns`` are
+        attached afterward as columnar ``meta_columns`` in the main process, so
+        rich metadata and optional ``size_factor`` do not need to live inside
+        Lance worker state. Lance-backed loaders default to
+        ``multiprocessing_context="spawn"`` unless explicitly overridden.
+        """
         validated = _validate_loader_params(
             processing=processing,
             device=device,
@@ -630,7 +659,11 @@ def load_corpus(
     """Load a training-ready ``Corpus`` from a corpus directory.
 
     Reads ``corpus-index.yaml``, locates canonical obs/var parquets via
-    ``resolve_corpus_paths()``, and constructs all loader components.
+    ``resolve_corpus_paths()``, and constructs all loader components. The
+    resulting ``Corpus`` exposes the preferred corpus-level API for both
+    aggregate and federated Lance:
+
+    ``load_corpus(...) -> corpus.set_sampler(...) -> corpus.dataset() -> corpus.loader(...)``.
 
     Parameters
     ----------
@@ -647,8 +680,10 @@ def load_corpus(
     Returns
     -------
     Corpus
-        Fully-constructed corpus object ready for ``PerturbBatchDataset``
-        and pipeline instantiation.
+        Fully-constructed corpus object ready for corpus-level sampling and
+        loading. ``BatchExecutor`` remains available via ``corpus.batch_executor``
+        for direct or legacy reads, but new training code should usually use
+        ``Corpus.loader(...)``.
 
     Raises
     ------
