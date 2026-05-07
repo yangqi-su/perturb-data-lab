@@ -358,7 +358,7 @@ class DatasetBatchSampler:
         all_indices = np.asarray(
             self._meta.df["global_row_index"].to_numpy(),
             dtype=np.int64,
-        )
+        ).copy()
         if self.shuffle:
             rng.shuffle(all_indices)
         for start in range(0, len(all_indices), self.batch_size):

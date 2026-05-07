@@ -63,6 +63,8 @@ _RAW_BATCH_RESERVED_KEYS: frozenset[str] = frozenset(
     }
 )
 
+_LOADER_METADATA_RESERVED_OVERRIDES: frozenset[str] = frozenset({"size_factor"})
+
 
 # ---------------------------------------------------------------------------
 # Corpus dataclass
@@ -200,17 +202,11 @@ class Corpus:
             prefetch_factor=prefetch_factor,
             metadata_columns=metadata_columns,
         )
-
-        if (
-            validated["num_workers"] > 0
-            and self.backend == "lance"
-            and validated["metadata_columns"]
-        ):
-            raise NotImplementedError(
-                "Phase 5 Lance worker loading is expression-only; "
-                "metadata_columns with num_workers > 0 are deferred to the "
-                "later metadata-attachment phases."
-            )
+        resolved_metadata_columns = _normalize_metadata_columns(
+            self.metadata_index,
+            validated["metadata_columns"],
+            allow_reserved=_LOADER_METADATA_RESERVED_OVERRIDES,
+        )
 
         resolved_sampler = _resolve_loader_sampler(
             self,
@@ -228,7 +224,7 @@ class Corpus:
         )
 
         dataset_obj = self.dataset(
-            metadata_columns=validated["metadata_columns"],
+            metadata_columns=None,
         )
         pipeline = GPUSparsePipeline(
             self.feature_registry,
@@ -257,8 +253,28 @@ class Corpus:
             collate_fn=collate_fn,
             **loader_kwargs,
         )
+
+        def _attach_requested_metadata(
+            batch: dict[str, Any],
+            global_row_index: torch.Tensor | np.ndarray | Sequence[int],
+        ) -> dict[str, Any]:
+            if not resolved_metadata_columns:
+                return batch
+            batch["meta_columns"] = self.metadata_index.take(
+                _normalize_batch_indices(global_row_index),
+                resolved_metadata_columns,
+            )
+            return batch
+
         if validated["processing"] == "cpu":
-            return iter(data_loader)
+            def _cpu_iterator() -> Iterator[dict[str, Any]]:
+                for processed_batch in data_loader:
+                    yield _attach_requested_metadata(
+                        processed_batch,
+                        processed_batch["global_row_index"],
+                    )
+
+            return _cpu_iterator()
 
         resolved_device = validated["device"]
 
@@ -275,9 +291,10 @@ class Corpus:
                     processed_batch["local_row_index"] = raw_batch[
                         "local_row_index"
                     ]
-                if "meta_columns" in raw_batch:
-                    processed_batch["meta_columns"] = raw_batch["meta_columns"]
-                yield processed_batch
+                yield _attach_requested_metadata(
+                    processed_batch,
+                    raw_batch["global_row_index"],
+                )
 
         return _gpu_iterator()
 
@@ -431,6 +448,8 @@ def _resolve_loader_sampler(
 def _normalize_metadata_columns(
     metadata_index: MetadataIndex,
     metadata_columns: Sequence[str] | None,
+    *,
+    allow_reserved: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
     """Validate requested optional metadata columns."""
     if metadata_columns is None:
@@ -445,7 +464,7 @@ def _normalize_metadata_columns(
         name = str(raw)
         if not name:
             raise ValueError("metadata_columns cannot contain empty names")
-        if name in _RAW_BATCH_RESERVED_KEYS:
+        if name in _RAW_BATCH_RESERVED_KEYS and name not in allow_reserved:
             raise ValueError(
                 f"metadata_columns cannot request reserved raw batch field {name!r}"
             )
@@ -458,6 +477,15 @@ def _normalize_metadata_columns(
             normalized.append(name)
             seen.add(name)
     return tuple(normalized)
+
+
+def _normalize_batch_indices(
+    indices: torch.Tensor | np.ndarray | Sequence[int],
+) -> np.ndarray:
+    """Convert batch row indices from torch/numpy/sequence form to int64."""
+    if isinstance(indices, torch.Tensor):
+        return indices.detach().cpu().numpy().astype(np.int64, copy=False)
+    return np.asarray(indices, dtype=np.int64)
 
 
 def _resolve_loader_seq_len(corpus: Corpus, *, seq_len: int | None) -> int:

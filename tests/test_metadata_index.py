@@ -307,6 +307,22 @@ def test_gather_columns_large_batch():
     )
 
 
+def test_take_alias_matches_gather_columns():
+    """take() reuses gather_columns semantics and preserves order."""
+    meta = _meta()
+    meta.cache_hot_columns(["global_row_index", "dataset_id"])
+
+    indices = [50001, 1, 99999, 0]
+    gathered = meta.gather_columns(indices, ["global_row_index", "dataset_id"])
+    taken = meta.take(indices, ["global_row_index", "dataset_id"])
+
+    np.testing.assert_array_equal(
+        taken["global_row_index"],
+        gathered["global_row_index"],
+    )
+    assert taken["dataset_id"] == gathered["dataset_id"]
+
+
 def test_get_column():
     """get_column returns cached or on-demand column data."""
     meta = _meta()

@@ -831,6 +831,21 @@ class MetadataIndex:
 
         return result
 
+    def take(
+        self,
+        indices: list[int] | np.ndarray,
+        columns: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, np.ndarray | tuple]:
+        """Return columnar metadata for the requested positional indices.
+
+        This is a small public alias around ``gather_columns()`` so loader
+        code can express main-process metadata attachment in dataframe-style
+        ``take(...)`` terms while reusing the existing cache-aware
+        implementation.
+        """
+        normalized_columns = None if columns is None else list(columns)
+        return self.gather_columns(indices, normalized_columns)
+
     # ------------------------------------------------------------------
     # Internal row conversion
     # ------------------------------------------------------------------

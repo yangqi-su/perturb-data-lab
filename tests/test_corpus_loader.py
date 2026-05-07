@@ -518,6 +518,25 @@ class TestCorpusApiPhase2:
         _assert_processed_loader_batch(batch, batch_size=4)
         assert batch["meta_columns"]["perturb_label"]
 
+    def test_loader_metadata_attachment_supports_size_factor(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+
+        batch = next(
+            corpus.loader(
+                processing="gpu",
+                batch_size=4,
+                metadata_columns=["size_factor", "perturb_label"],
+            )
+        )
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+        assert set(batch["meta_columns"]) == {"size_factor", "perturb_label"}
+        np.testing.assert_allclose(
+            batch["meta_columns"]["size_factor"],
+            batch["size_factor"].cpu().numpy(),
+        )
+
     def test_loader_uses_stored_sampler(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
@@ -542,6 +561,15 @@ class TestCorpusApiPhase2:
 
         with pytest.raises(ValueError, match="processing='cpu' only supports CPU devices"):
             next(corpus.loader(batch_size=4, seq_len=LOADER_SEQ_LEN, processing="cpu", device="cuda"))
+
+    def test_loader_omits_metadata_columns_by_default(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+
+        batch = next(corpus.loader(processing="gpu", batch_size=4))
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+        assert "meta_columns" not in batch
 
     def test_loader_allows_multiworker_federated_lance_spawn(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
@@ -609,20 +637,63 @@ class TestAggregateLancePhase4:
 
         _assert_processed_loader_batch(batch, batch_size=4)
 
-    def test_loader_rejects_multiworker_aggregate_metadata_columns(self, tmp_path: Path) -> None:
+    def test_loader_attaches_metadata_after_gpu_processing(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
-        with pytest.raises(NotImplementedError, match="metadata_columns"):
-            next(
-                corpus.loader(
-                    batch_size=4,
-                    seq_len=LOADER_SEQ_LEN,
-                    num_workers=1,
-                    multiprocessing_context="spawn",
-                    metadata_columns=["perturb_label"],
-                )
+        batch = next(
+            corpus.loader(
+                batch_size=4,
+                seq_len=LOADER_SEQ_LEN,
+                num_workers=1,
+                multiprocessing_context="spawn",
+                metadata_columns=["perturb_label", "cell_line_or_type"],
             )
+        )
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+        assert batch["meta_columns"]["perturb_label"]
+        assert batch["meta_columns"]["cell_line_or_type"] == (
+            "K562",
+            "K562",
+            "K562",
+            "K562",
+        )
+
+    def test_loader_dataset_sampler_drives_aggregate_batches(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus.set_sampler(
+            sampler="dataset",
+            dataset_index=1,
+            batch_size=4,
+            seed=7,
+        )
+
+        batch = next(corpus.loader(processing="gpu"))
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+        global_indices = batch["global_row_index"].cpu().numpy()
+        assert np.all(global_indices >= 10)
+        assert np.all(global_indices < 25)
+
+    def test_loader_dataset_context_sampler_preserves_context_group(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+
+        batch = next(
+            corpus.loader(
+                processing="gpu",
+                sampler="dataset_context",
+                dataset_index=1,
+                context_field="perturb_label",
+                batch_size=3,
+                metadata_columns=["perturb_label"],
+            )
+        )
+
+        _assert_processed_loader_batch(batch, batch_size=3)
+        assert len(set(batch["meta_columns"]["perturb_label"])) == 1
 
 
 class TestFederatedLancePhase5:
@@ -660,20 +731,41 @@ class TestFederatedLancePhase5:
         np.testing.assert_array_equal(batch["global_row_index"], [2, 12, 22])
         assert set(restored._reader._datasets) == {"mock_00", "mock_01"}
 
-    def test_loader_rejects_multiworker_federated_metadata_columns(self, tmp_path: Path) -> None:
+    def test_loader_attaches_metadata_after_cpu_processing(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
-        with pytest.raises(NotImplementedError, match="metadata_columns"):
-            next(
-                corpus.loader(
-                    batch_size=4,
-                    seq_len=LOADER_SEQ_LEN,
-                    num_workers=1,
-                    multiprocessing_context="spawn",
-                    metadata_columns=["perturb_label"],
-                )
+        batch = next(
+            corpus.loader(
+                processing="cpu",
+                batch_size=4,
+                seq_len=LOADER_SEQ_LEN,
+                num_workers=1,
+                multiprocessing_context="spawn",
+                metadata_columns=["perturb_label"],
             )
+        )
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+        assert batch["sampled_gene_ids"].device.type == "cpu"
+        assert batch["meta_columns"]["perturb_label"]
+
+    def test_loader_dataset_sampler_drives_federated_batches(self, tmp_path: Path) -> None:
+        _build_mock_federated_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus.set_sampler(
+            sampler="dataset",
+            dataset_index=0,
+            batch_size=4,
+            seed=11,
+        )
+
+        batch = next(corpus.loader(processing="cpu"))
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+        global_indices = batch["global_row_index"].cpu().numpy()
+        assert np.all(global_indices >= 0)
+        assert np.all(global_indices < 10)
 
 
 class TestCorpusLoaderPhase6:
