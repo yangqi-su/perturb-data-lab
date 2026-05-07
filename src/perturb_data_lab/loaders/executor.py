@@ -25,6 +25,7 @@ from .expression import ExpressionReader
 from .loaders import (
     BatchMetadata,
     ExpressionBatch,
+    RawExpressionBatch,
 )
 
 __all__ = [
@@ -438,6 +439,56 @@ class BatchExecutor:
             result["canonical_context"] = meta["canonical_context"]
         return result
 
+    def read_raw_batch(
+        self,
+        global_indices: Sequence[int],
+        *,
+        metadata_columns: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Read the stable raw expression batch contract.
+
+        This keeps the worker-facing batch minimal: expression arrays plus the
+        required ``dataset_index`` routing field, with ``local_row_index`` and
+        ``size_factor`` carried only as optional pass-through metadata.
+        Additional metadata columns are attached only when explicitly asked for.
+        """
+        indices = [int(i) for i in global_indices]
+        expr = self.read_expression_batch(indices)
+
+        requested_meta = list(dict.fromkeys(metadata_columns or ()))
+        gather_cols = ["dataset_index", "local_row_index", "size_factor"]
+        gather_cols.extend(
+            col for col in requested_meta if col not in gather_cols
+        )
+        gathered = self._meta.gather_columns(indices, gather_cols)
+
+        batch = RawExpressionBatch(
+            batch_size=expr.batch_size,
+            global_row_index=expr.global_row_index,
+            dataset_index=np.asarray(
+                gathered.get(
+                    "dataset_index",
+                    np.zeros(expr.batch_size, dtype=np.int32),
+                ),
+                dtype=np.int32,
+            ),
+            row_offsets=expr.row_offsets,
+            expressed_gene_indices=expr.expressed_gene_indices,
+            expression_counts=expr.expression_counts,
+            local_row_index=np.asarray(
+                gathered["local_row_index"], dtype=np.int64,
+            ) if "local_row_index" in gathered else None,
+            size_factor=np.asarray(
+                gathered["size_factor"], dtype=np.float32,
+            ) if "size_factor" in gathered else None,
+            meta_columns={
+                col: gathered[col]
+                for col in requested_meta
+                if col in gathered
+            },
+        )
+        return batch.to_dict()
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -612,5 +663,4 @@ class BatchExecutor:
     # for backward compatibility and are superseded by the columnar
     # builders above (``_build_canonical_from_columnar``,
     # ``_build_raw_from_columnar``) which avoid ``df.row(i, named=True)``.
-
 

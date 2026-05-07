@@ -28,9 +28,12 @@ from .loaders import (
     DatasetBatchSampler,
     DatasetContextBatchSampler,
     ExpressionBatch,
+    RawExpressionBatch,
     FastTrainingBatch,
     BatchMetadata,
+    RawExpressionBatchDataset,
     PerturbBatchDataset,
+    collate_raw_expression_batch,
     collate_batch_dict,
     cpu_parallel_collate_fn,
 )
@@ -79,6 +82,7 @@ __all__ = [
     "BatchExecutor",
     # Phase 3 — Core types
     "ExpressionBatch",
+    "RawExpressionBatch",
     # Phase 1 — Batch contracts (loader fast-path refactor)
     "FastTrainingBatch",
     "BatchMetadata",
@@ -87,7 +91,9 @@ __all__ = [
     "DatasetBatchSampler",
     "DatasetContextBatchSampler",
     # Phase 3 — Data loaders
+    "RawExpressionBatchDataset",
     "PerturbBatchDataset",
+    "collate_raw_expression_batch",
     "collate_batch_dict",
     "cpu_parallel_collate_fn",
     # Phase 2 — Feature Registry

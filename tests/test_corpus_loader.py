@@ -11,6 +11,7 @@ import numpy as np
 import polars as pl
 import pyarrow as pa
 import pytest
+import torch
 import yaml
 
 from perturb_data_lab.loaders.corpus_loader import Corpus, load_corpus
@@ -389,6 +390,120 @@ class TestLoadCorpusFederated:
             assert isinstance(entry, LanceDatasetEntry)
             assert Path(str(entry.lance_path)).exists()
             assert str(entry.lance_path).endswith(f"{entry.dataset_id}.lance")
+
+
+class TestCorpusApiPhase2:
+    """Phase 2 corpus-level API scaffolding tests."""
+
+    def test_set_sampler_stores_default_sampler(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        sampler = corpus.set_sampler(batch_size=4, seed=7)
+
+        assert sampler is corpus.sampler
+        assert corpus.sampler_params == {
+            "sampler": "corpus_random",
+            "batch_size": 4,
+            "drop_last": True,
+            "seed": 7,
+        }
+
+    def test_dataset_returns_raw_batch_contract_aggregate(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        dataset = corpus.dataset(metadata_columns=["perturb_label"])
+        batch = dataset.__getitems__([0, 10, 24])[0]
+
+        assert dataset.backend == "lance"
+        assert dataset.topology == "aggregate"
+        assert set(batch.keys()) == {
+            "batch_size",
+            "global_row_index",
+            "dataset_index",
+            "local_row_index",
+            "size_factor",
+            "row_offsets",
+            "expressed_gene_indices",
+            "expression_counts",
+            "meta_columns",
+        }
+        assert batch["batch_size"] == 3
+        np.testing.assert_array_equal(batch["global_row_index"], [0, 10, 24])
+        assert batch["dataset_index"].dtype == np.int32
+        assert batch["local_row_index"].dtype == np.int64
+        assert batch["size_factor"].dtype == np.float32
+        assert batch["meta_columns"]["perturb_label"]
+
+    def test_dataset_returns_raw_batch_contract_federated(self, tmp_path: Path) -> None:
+        _build_mock_federated_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        dataset = corpus.dataset(metadata_columns=["cell_line_or_type"])
+        batch = dataset.__getitems__([2, 11, 20])[0]
+
+        assert dataset.topology == "federated"
+        np.testing.assert_array_equal(batch["global_row_index"], [2, 11, 20])
+        assert batch["dataset_index"].tolist() == [0, 1, 1]
+        assert batch["meta_columns"]["cell_line_or_type"] == (
+            "K562",
+            "K562",
+            "K562",
+        )
+
+    def test_loader_requires_sampler_or_inline_batch_size(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        with pytest.raises(ValueError, match="No sampler is configured"):
+            next(corpus.loader())
+
+    def test_loader_accepts_inline_sampler_defaults(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        batch = next(
+            corpus.loader(
+                processing="gpu",
+                batch_size=4,
+                metadata_columns=["perturb_label"],
+            )
+        )
+
+        assert batch["batch_size"] == 4
+        assert isinstance(batch["global_row_index"], torch.Tensor)
+        assert isinstance(batch["dataset_index"], torch.Tensor)
+        assert isinstance(batch["row_offsets"], torch.Tensor)
+        assert isinstance(batch["expression_counts"], torch.Tensor)
+        assert batch["meta_columns"]["perturb_label"]
+
+    def test_loader_uses_stored_sampler(self, tmp_path: Path) -> None:
+        _build_mock_federated_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+        corpus.set_sampler(batch_size=5, seed=3)
+
+        batch = next(corpus.loader(processing="cpu"))
+
+        assert batch["batch_size"] == 5
+        assert isinstance(batch["global_row_index"], torch.Tensor)
+
+    def test_loader_validates_metadata_columns_and_worker_params(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        with pytest.raises(ValueError, match="reserved raw batch field"):
+            corpus.dataset(metadata_columns=["dataset_index"])
+
+        with pytest.raises(ValueError, match="persistent_workers requires num_workers > 0"):
+            next(corpus.loader(batch_size=4, persistent_workers=True))
+
+    def test_loader_rejects_multiworker_lance_until_later_phases(self, tmp_path: Path) -> None:
+        _build_mock_federated_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        with pytest.raises(NotImplementedError, match="multi-worker Lance"):
+            next(corpus.loader(batch_size=4, num_workers=1))
 
 
 class TestLoadCorpusErrors:

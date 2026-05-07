@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, Sequence
 
 import polars as pl
+import torch
 import yaml
+from torch.utils.data import DataLoader
 
 from .executor import BatchExecutor
 from .expression import (
@@ -25,6 +27,13 @@ from .expression import (
 )
 from .feature_registry import FeatureRegistry
 from .index import MetadataIndex
+from .loaders import (
+    CorpusRandomBatchSampler,
+    DatasetBatchSampler,
+    DatasetContextBatchSampler,
+    RawExpressionBatchDataset,
+    collate_raw_expression_batch,
+)
 
 # Import path resolver (Phase 1 output — canonical_meta under meta/)
 from ..materializers.paths import resolve_corpus_paths
@@ -33,6 +42,21 @@ __all__ = [
     "Corpus",
     "load_corpus",
 ]
+
+
+_RAW_BATCH_RESERVED_KEYS: frozenset[str] = frozenset(
+    {
+        "batch_size",
+        "global_row_index",
+        "dataset_index",
+        "local_row_index",
+        "size_factor",
+        "row_offsets",
+        "expressed_gene_indices",
+        "expression_counts",
+        "meta_columns",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +96,117 @@ class Corpus:
     topology: str = ""
     backend: str = ""
     corpus_root: Path = Path()
+    _sampler: Any | None = field(default=None, init=False, repr=False)
+    _sampler_params: dict[str, Any] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+
+    @property
+    def sampler(self) -> Any | None:
+        """Return the currently configured sampler, if any."""
+        return self._sampler
+
+    @property
+    def sampler_params(self) -> dict[str, Any]:
+        """Return the normalized sampler configuration."""
+        return dict(self._sampler_params)
+
+    def set_sampler(self, **params: Any) -> Any:
+        """Build and store a metadata-index-backed sampler for this corpus."""
+        normalized = _normalize_sampler_params(params)
+        self._sampler = _build_sampler(self.metadata_index, normalized)
+        self._sampler_params = normalized
+        return self._sampler
+
+    def dataset(
+        self,
+        *,
+        metadata_columns: Sequence[str] | None = None,
+    ) -> RawExpressionBatchDataset:
+        """Return the expression-only dataset for the corpus loader refactor."""
+        columns = _normalize_metadata_columns(
+            self.metadata_index, metadata_columns,
+        )
+        return RawExpressionBatchDataset(
+            self.batch_executor,
+            metadata_columns=columns,
+            topology=self.topology,
+            backend=self.backend,
+        )
+
+    def loader(
+        self,
+        *,
+        processing: str = "gpu",
+        device: torch.device | str | None = None,
+        num_workers: int = 0,
+        multiprocessing_context: str | None = None,
+        pin_memory: bool = False,
+        persistent_workers: bool = False,
+        prefetch_factor: int | None = None,
+        metadata_columns: Sequence[str] | None = None,
+        sampler: str | None = None,
+        batch_size: int | None = None,
+        drop_last: bool = True,
+        seed: int = 0,
+        shuffle: bool = True,
+        dataset_index: int | None = None,
+        context_field: str = "raw_cell_type",
+    ) -> Iterator[dict[str, Any]]:
+        """Yield raw expression batches after validating the corpus API surface.
+
+        Phase 2 intentionally stops at the shared raw-batch contract. Both
+        ``processing="gpu"`` and ``processing="cpu"`` currently return the
+        same collated raw batch shape; route-specific sparse processing lands in
+        later phases.
+        """
+        validated = _validate_loader_params(
+            processing=processing,
+            device=device,
+            num_workers=num_workers,
+            multiprocessing_context=multiprocessing_context,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            metadata_columns=metadata_columns,
+        )
+
+        if validated["num_workers"] > 0 and self.backend == "lance":
+            raise NotImplementedError(
+                "Phase 2 only defines the corpus API and raw batch contract; "
+                "multi-worker Lance loading is deferred to the later Lance "
+                "worker-safety phases. Use num_workers=0 for now."
+            )
+
+        resolved_sampler = _resolve_loader_sampler(
+            self,
+            sampler=sampler,
+            batch_size=batch_size,
+            drop_last=drop_last,
+            seed=seed,
+            shuffle=shuffle,
+            dataset_index=dataset_index,
+            context_field=context_field,
+        )
+
+        dataset_obj = self.dataset(
+            metadata_columns=validated["metadata_columns"],
+        )
+        loader_kwargs = _build_dataloader_kwargs(
+            num_workers=validated["num_workers"],
+            multiprocessing_context=validated["multiprocessing_context"],
+            pin_memory=validated["pin_memory"],
+            persistent_workers=validated["persistent_workers"],
+            prefetch_factor=validated["prefetch_factor"],
+            backend=self.backend,
+        )
+        data_loader = DataLoader(
+            dataset_obj,
+            batch_sampler=resolved_sampler,
+            collate_fn=collate_raw_expression_batch,
+            **loader_kwargs,
+        )
+        return iter(data_loader)
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +238,252 @@ def _normalize_backend(raw: str) -> str:
             f"Supported: {sorted(_BACKEND_NORMALIZE.keys())}"
         )
     return norm
+
+
+def _normalize_sampler_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize ``Corpus.set_sampler()`` parameters."""
+    kind = str(params.get("sampler", params.get("kind", "corpus_random")))
+    kind = kind.strip().lower().replace("-", "_")
+    if kind not in {"corpus_random", "dataset", "dataset_context"}:
+        raise ValueError(
+            "sampler must be one of 'corpus_random', 'dataset', or "
+            f"'dataset_context', got {kind!r}"
+        )
+
+    batch_size = params.get("batch_size")
+    if batch_size is None:
+        raise ValueError("batch_size is required to configure a sampler")
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    normalized: dict[str, Any] = {
+        "sampler": kind,
+        "batch_size": batch_size,
+        "drop_last": bool(params.get("drop_last", True)),
+        "seed": int(params.get("seed", 0)),
+    }
+
+    if kind == "corpus_random":
+        return normalized
+
+    if "dataset_index" not in params or params["dataset_index"] is None:
+        raise ValueError(
+            f"dataset_index is required for sampler={kind!r}"
+        )
+    normalized["dataset_index"] = int(params["dataset_index"])
+
+    if kind == "dataset":
+        normalized["shuffle"] = bool(params.get("shuffle", True))
+        return normalized
+
+    normalized["shuffle"] = bool(params.get("shuffle", True))
+    normalized["context_field"] = str(
+        params.get("context_field", "raw_cell_type")
+    )
+    return normalized
+
+
+def _build_sampler(
+    metadata_index: MetadataIndex,
+    params: dict[str, Any],
+) -> Any:
+    """Instantiate the normalized sampler config against a MetadataIndex."""
+    kind = params["sampler"]
+    if kind == "corpus_random":
+        return CorpusRandomBatchSampler(
+            metadata_index=metadata_index,
+            batch_size=params["batch_size"],
+            drop_last=params["drop_last"],
+            seed=params["seed"],
+        )
+    if kind == "dataset":
+        return DatasetBatchSampler(
+            metadata_index=metadata_index,
+            dataset_index=params["dataset_index"],
+            batch_size=params["batch_size"],
+            drop_last=params["drop_last"],
+            shuffle=params["shuffle"],
+            seed=params["seed"],
+        )
+    if kind == "dataset_context":
+        return DatasetContextBatchSampler(
+            metadata_index=metadata_index,
+            batch_size=params["batch_size"],
+            context_field=params["context_field"],
+            dataset_index=params["dataset_index"],
+            drop_last=params["drop_last"],
+            shuffle=params["shuffle"],
+            seed=params["seed"],
+        )
+    raise ValueError(f"Unsupported sampler kind: {kind!r}")
+
+
+def _resolve_loader_sampler(
+    corpus: Corpus,
+    *,
+    sampler: str | None,
+    batch_size: int | None,
+    drop_last: bool,
+    seed: int,
+    shuffle: bool,
+    dataset_index: int | None,
+    context_field: str,
+) -> Any:
+    """Resolve the sampler to use for one loader invocation."""
+    if sampler is None and batch_size is None:
+        if corpus.sampler is None:
+            raise ValueError(
+                "No sampler is configured. Call corpus.set_sampler(...) or "
+                "provide loader sampler defaults such as batch_size=."
+            )
+        return corpus.sampler
+
+    return _build_sampler(
+        corpus.metadata_index,
+        _normalize_sampler_params(
+            {
+                "sampler": sampler or "corpus_random",
+                "batch_size": batch_size,
+                "drop_last": drop_last,
+                "seed": seed,
+                "shuffle": shuffle,
+                "dataset_index": dataset_index,
+                "context_field": context_field,
+            }
+        ),
+    )
+
+
+def _normalize_metadata_columns(
+    metadata_index: MetadataIndex,
+    metadata_columns: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """Validate requested optional metadata columns."""
+    if metadata_columns is None:
+        return ()
+
+    if isinstance(metadata_columns, (str, bytes)):
+        raise TypeError("metadata_columns must be a sequence of column names")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in metadata_columns:
+        name = str(raw)
+        if not name:
+            raise ValueError("metadata_columns cannot contain empty names")
+        if name in _RAW_BATCH_RESERVED_KEYS:
+            raise ValueError(
+                f"metadata_columns cannot request reserved raw batch field {name!r}"
+            )
+        if name not in metadata_index.df.columns:
+            raise ValueError(
+                f"metadata column {name!r} not found. Available columns: "
+                f"{metadata_index.df.columns}"
+            )
+        if name not in seen:
+            normalized.append(name)
+            seen.add(name)
+    return tuple(normalized)
+
+
+def _validate_loader_params(
+    *,
+    processing: str,
+    device: torch.device | str | None,
+    num_workers: int,
+    multiprocessing_context: str | None,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int | None,
+    metadata_columns: Sequence[str] | None,
+) -> dict[str, Any]:
+    """Validate public ``Corpus.loader(...)`` parameters."""
+    normalized_processing = str(processing).strip().lower()
+    if normalized_processing not in {"gpu", "cpu"}:
+        raise ValueError(
+            f"processing must be 'gpu' or 'cpu', got {processing!r}"
+        )
+
+    if device is not None:
+        try:
+            torch.device(device)
+        except (TypeError, RuntimeError) as exc:
+            raise ValueError(f"Invalid device {device!r}") from exc
+
+    workers = int(num_workers)
+    if workers < 0:
+        raise ValueError("num_workers must be >= 0")
+
+    if not isinstance(pin_memory, bool):
+        raise TypeError("pin_memory must be a bool")
+    if not isinstance(persistent_workers, bool):
+        raise TypeError("persistent_workers must be a bool")
+
+    if workers == 0:
+        if multiprocessing_context is not None:
+            raise ValueError(
+                "multiprocessing_context requires num_workers > 0"
+            )
+        if persistent_workers:
+            raise ValueError("persistent_workers requires num_workers > 0")
+        if prefetch_factor is not None:
+            raise ValueError("prefetch_factor requires num_workers > 0")
+        normalized_context = None
+        normalized_prefetch = None
+    else:
+        if multiprocessing_context is None:
+            normalized_context = None
+        else:
+            normalized_context = str(multiprocessing_context).strip().lower()
+            if normalized_context not in {"fork", "spawn", "forkserver"}:
+                raise ValueError(
+                    "multiprocessing_context must be one of 'fork', 'spawn', "
+                    f"or 'forkserver', got {multiprocessing_context!r}"
+                )
+        if prefetch_factor is None:
+            normalized_prefetch = None
+        else:
+            normalized_prefetch = int(prefetch_factor)
+            if normalized_prefetch <= 0:
+                raise ValueError("prefetch_factor must be positive")
+
+    return {
+        "processing": normalized_processing,
+        "device": device,
+        "num_workers": workers,
+        "multiprocessing_context": normalized_context,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+        "prefetch_factor": normalized_prefetch,
+        "metadata_columns": metadata_columns,
+    }
+
+
+def _build_dataloader_kwargs(
+    *,
+    num_workers: int,
+    multiprocessing_context: str | None,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int | None,
+    backend: str,
+) -> dict[str, Any]:
+    """Build validated DataLoader kwargs from the public loader config."""
+    kwargs: dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers if num_workers > 0 else False,
+    }
+    if num_workers > 0:
+        kwargs["multiprocessing_context"] = (
+            multiprocessing_context
+            if multiprocessing_context is not None
+            else ("spawn" if backend == "lance" else None)
+        )
+        if prefetch_factor is not None:
+            kwargs["prefetch_factor"] = prefetch_factor
+    return kwargs
 
 
 # ---------------------------------------------------------------------------

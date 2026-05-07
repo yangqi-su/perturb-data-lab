@@ -12,20 +12,26 @@ This module implements:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 import polars as pl
 import torch
 
+if TYPE_CHECKING:
+    from .executor import BatchExecutor
+
 __all__ = [
     "ExpressionBatch",
+    "RawExpressionBatch",
     "FastTrainingBatch",
     "BatchMetadata",
     "CorpusRandomBatchSampler",
     "DatasetBatchSampler",
     "DatasetContextBatchSampler",
+    "RawExpressionBatchDataset",
     "PerturbBatchDataset",
+    "collate_raw_expression_batch",
     "collate_batch_dict",
     "cpu_parallel_collate_fn",
 ]
@@ -202,6 +208,46 @@ class ExpressionBatch:
     def row_counts(self, row_position: int) -> np.ndarray:
         """Return the expression counts array for a single row."""
         return self.expression_counts[self.row_slice(row_position)]
+
+
+@dataclass(frozen=True)
+class RawExpressionBatch:
+    """Stable raw expression batch contract for corpus-level loaders.
+
+    Required fields cover the minimal expression-only contract shared by
+    aggregate and federated Lance. ``local_row_index`` and ``size_factor``
+    remain optional pass-through metadata for transition compatibility.
+    Optional ``meta_columns`` carries explicitly requested rich metadata in
+    columnar form and stays CPU-side.
+    """
+
+    batch_size: int
+    global_row_index: np.ndarray
+    dataset_index: np.ndarray
+    row_offsets: np.ndarray
+    expressed_gene_indices: np.ndarray
+    expression_counts: np.ndarray
+    local_row_index: np.ndarray | None = None
+    size_factor: np.ndarray | None = None
+    meta_columns: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the batch as a plain dict for DataLoader compatibility."""
+        result: dict[str, Any] = {
+            "batch_size": self.batch_size,
+            "global_row_index": self.global_row_index,
+            "dataset_index": self.dataset_index,
+            "row_offsets": self.row_offsets,
+            "expressed_gene_indices": self.expressed_gene_indices,
+            "expression_counts": self.expression_counts,
+        }
+        if self.local_row_index is not None:
+            result["local_row_index"] = self.local_row_index
+        if self.size_factor is not None:
+            result["size_factor"] = self.size_factor
+        if self.meta_columns:
+            result["meta_columns"] = self.meta_columns
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +433,53 @@ class DatasetContextBatchSampler:
             yield sampled["global_row_index"].to_list()
 
 
+class RawExpressionBatchDataset:
+    """Map-style dataset returning the raw expression batch contract.
+
+    ``__getitems__`` accepts a batch of corpus-global indices and delegates to
+    ``BatchExecutor.read_raw_batch()`` so aggregate and federated corpora share
+    the same expression-only worker-facing shape.
+    """
+
+    def __init__(
+        self,
+        executor: "BatchExecutor",
+        *,
+        metadata_columns: Sequence[str] | None = None,
+        topology: str = "",
+        backend: str = "",
+    ):
+        self._exec = executor
+        self._metadata_columns = tuple(metadata_columns or ())
+        self._topology = topology
+        self._backend = backend
+
+    @property
+    def executor(self) -> "BatchExecutor":
+        return self._exec
+
+    @property
+    def metadata_columns(self) -> tuple[str, ...]:
+        return self._metadata_columns
+
+    @property
+    def topology(self) -> str:
+        return self._topology
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    def __len__(self) -> int:
+        return len(self._exec)
+
+    def __getitems__(self, indices: Sequence[int]) -> list[dict[str, Any]]:
+        batch = self._exec.read_raw_batch(
+            list(indices), metadata_columns=self._metadata_columns,
+        )
+        return [batch]
+
+
 # ---------------------------------------------------------------------------
 # PerturbBatchDataset — production-facing Dataset for DataLoader + GPU pipeline
 # ---------------------------------------------------------------------------
@@ -495,6 +588,43 @@ class PerturbBatchDataset:
         """
         batch = self._exec.read_batch(list(indices), columnar=self._columnar)
         return [batch]
+
+
+def collate_raw_expression_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate the raw expression batch contract for the GPU/main route."""
+    if not items:
+        raise ValueError("collate_raw_expression_batch received empty list")
+    batch = items[0]
+
+    result: dict[str, Any] = {
+        "batch_size": batch["batch_size"],
+        "global_row_index": torch.as_tensor(
+            batch["global_row_index"], dtype=torch.long
+        ),
+        "dataset_index": torch.as_tensor(
+            batch["dataset_index"], dtype=torch.long
+        ),
+        "row_offsets": torch.as_tensor(batch["row_offsets"], dtype=torch.long),
+        "expressed_gene_indices": torch.as_tensor(
+            batch["expressed_gene_indices"], dtype=torch.long
+        ),
+        "expression_counts": torch.as_tensor(
+            batch["expression_counts"], dtype=torch.float32
+        ),
+    }
+
+    if "local_row_index" in batch:
+        result["local_row_index"] = torch.as_tensor(
+            batch["local_row_index"], dtype=torch.long
+        )
+    if "size_factor" in batch:
+        result["size_factor"] = torch.as_tensor(
+            batch["size_factor"], dtype=torch.float32
+        )
+    if "meta_columns" in batch:
+        result["meta_columns"] = batch["meta_columns"]
+
+    return result
 
 
 def collate_batch_dict(items: list[dict[str, Any]]) -> dict[str, Any]:
