@@ -15,6 +15,7 @@ size_factor, etc.) belong in ``MetadataIndex``, not in ``ExpressionRow``.
 from __future__ import annotations
 
 import bisect
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -373,13 +374,38 @@ class AggregateLanceReader(BaseExpressionReader):
 
     def __init__(self, lance_path: str | Path, entries: list[DatasetEntry]):
         super().__init__(entries)
+        self._lance_path = str(Path(lance_path))
+        self._dataset = None
+        self._dataset_pid: int | None = None
+        self._total_rows: int | None = None
+
+    @property
+    def lance_path(self) -> str:
+        return self._lance_path
+
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        state["_dataset"] = None
+        state["_dataset_pid"] = None
+        return state
+
+    def _open_dataset(self):
         import lance
-        
-        self._dataset = lance.dataset(lance_path)
+
+        current_pid = os.getpid()
+        if self._dataset is None or self._dataset_pid != current_pid:
+            self._dataset = lance.dataset(self._lance_path)
+            self._dataset_pid = current_pid
+        return self._dataset
+
+    def _count_rows(self) -> int:
+        if self._total_rows is None:
+            self._total_rows = int(self._open_dataset().count_rows())
+        return self._total_rows
 
     def _validate_all(self, indices: list[int]) -> None:
         super()._validate_all(indices)
-        total_rows = self._dataset.count_rows()
+        total_rows = self._count_rows()
         for idx in indices:
             if idx >= total_rows:
                 raise IndexError(
@@ -389,12 +415,13 @@ class AggregateLanceReader(BaseExpressionReader):
     def _read_local_rows(
         self, entry: DatasetEntry, local_indices: list[int]
     ) -> list[ExpressionRow]:
+        dataset = self._open_dataset()
         # Convert local (per-dataset offset) back to global positions
         # for the aggregate Lance file, which stores rows at global positions.
         global_positions = [entry.global_start + li for li in local_indices]
         rows: list[ExpressionRow] = []
         for chunk in _chunk_indices(global_positions):
-            table = self._dataset.take(chunk)
+            table = dataset.take(chunk)
             rows.extend(self._table_to_rows(chunk, table))
         return rows
 
@@ -472,7 +499,8 @@ class AggregateLanceReader(BaseExpressionReader):
         n = len(indices)
 
         # Validate all indices against Lance row count
-        total_rows = self._dataset.count_rows()
+        dataset = self._open_dataset()
+        total_rows = self._count_rows()
         for idx in indices:
             if idx < 0 or idx >= total_rows:
                 raise IndexError(
@@ -486,7 +514,7 @@ class AggregateLanceReader(BaseExpressionReader):
         cursor = 0  # tracks position in assembled rows
 
         for chunk in _chunk_indices(indices):
-            table = self._dataset.take(chunk)
+            table = dataset.take(chunk)
             chunk_n = len(chunk)
 
             egi_offsets, egi_flat = _extract_list_columns(

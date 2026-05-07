@@ -37,6 +37,16 @@ __all__ = [
 ]
 
 
+def _coerce_optional_float32_array(values: np.ndarray | None) -> np.ndarray | None:
+    """Convert a full-column numeric array to float32 or omit if all-missing."""
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.size == 0 or np.isnan(arr).all():
+        return None
+    return arr
+
+
 # ===========================================================================
 # Phase 1 — Batch contract definitions
 # ===========================================================================
@@ -478,6 +488,72 @@ class RawExpressionBatchDataset:
             list(indices), metadata_columns=self._metadata_columns,
         )
         return [batch]
+
+
+class AggregateLanceExpressionBatchDataset:
+    """Aggregate Lance expression-only dataset with worker-local reader state."""
+
+    def __init__(
+        self,
+        expression_reader: Any,
+        *,
+        dataset_starts: np.ndarray,
+        dataset_stops: np.ndarray,
+        dataset_indices: np.ndarray,
+        size_factor: np.ndarray | None = None,
+        topology: str = "aggregate",
+        backend: str = "lance",
+    ):
+        self._reader = expression_reader
+        self._dataset_starts = np.asarray(dataset_starts, dtype=np.int64)
+        self._dataset_stops = np.asarray(dataset_stops, dtype=np.int64)
+        self._dataset_indices = np.asarray(dataset_indices, dtype=np.int32)
+        self._size_factor = _coerce_optional_float32_array(size_factor)
+        self._topology = topology
+        self._backend = backend
+
+    @property
+    def topology(self) -> str:
+        return self._topology
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    def __len__(self) -> int:
+        if self._dataset_stops.size == 0:
+            return 0
+        return int(self._dataset_stops[-1])
+
+    def _resolve_dataset_rows(
+        self, indices: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        entry_pos = np.searchsorted(self._dataset_stops, indices, side="right")
+        if np.any(entry_pos < 0) or np.any(entry_pos >= len(self._dataset_stops)):
+            raise IndexError("aggregate Lance batch contains out-of-range indices")
+        local_row_index = indices - self._dataset_starts[entry_pos]
+        return self._dataset_indices[entry_pos], local_row_index
+
+    def __getitems__(self, indices: Sequence[int]) -> list[dict[str, Any]]:
+        index_array = np.asarray(indices, dtype=np.int64)
+        expr = self._reader.read_expression_flat(index_array.tolist())
+        dataset_index, local_row_index = self._resolve_dataset_rows(index_array)
+
+        batch = RawExpressionBatch(
+            batch_size=expr.batch_size,
+            global_row_index=expr.global_row_index,
+            dataset_index=dataset_index,
+            row_offsets=expr.row_offsets,
+            expressed_gene_indices=expr.expressed_gene_indices,
+            expression_counts=expr.expression_counts,
+            local_row_index=local_row_index,
+            size_factor=(
+                self._size_factor[index_array]
+                if self._size_factor is not None
+                else None
+            ),
+        )
+        return [batch.to_dict()]
 
 
 # ---------------------------------------------------------------------------

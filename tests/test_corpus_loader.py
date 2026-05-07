@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import partial
+import pickle
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -523,12 +524,79 @@ class TestCorpusApiPhase2:
         with pytest.raises(ValueError, match="persistent_workers requires num_workers > 0"):
             next(corpus.loader(batch_size=4, persistent_workers=True))
 
-    def test_loader_rejects_multiworker_lance_until_later_phases(self, tmp_path: Path) -> None:
+    def test_loader_rejects_multiworker_federated_lance_until_later_phases(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
-        with pytest.raises(NotImplementedError, match="multi-worker Lance"):
+        with pytest.raises(NotImplementedError, match="federated Lance"):
             next(corpus.loader(batch_size=4, num_workers=1))
+
+
+class TestAggregateLancePhase4:
+    """Phase 4 aggregate Lance worker-safe dataset tests."""
+
+    def test_dataset_opens_lance_lazily(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        dataset = corpus.dataset()
+
+        assert dataset.topology == "aggregate"
+        assert dataset.backend == "lance"
+        assert dataset._reader._dataset is None
+
+        batch = dataset.__getitems__([0, 10, 24])[0]
+
+        assert dataset._reader._dataset is not None
+        np.testing.assert_array_equal(batch["global_row_index"], [0, 10, 24])
+        assert batch["dataset_index"].tolist() == [0, 1, 1]
+        assert batch["local_row_index"].tolist() == [0, 0, 14]
+
+    def test_dataset_pickle_state_drops_open_lance_handle(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        dataset = corpus.dataset()
+        dataset.__getitems__([1, 11, 21])
+        assert dataset._reader._dataset is not None
+
+        restored = pickle.loads(pickle.dumps(dataset))
+
+        assert restored._reader._dataset is None
+        batch = restored.__getitems__([2, 12, 22])[0]
+        np.testing.assert_array_equal(batch["global_row_index"], [2, 12, 22])
+
+    def test_loader_allows_multiworker_aggregate_lance_spawn(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        batch = next(
+            corpus.loader(
+                processing="gpu",
+                batch_size=4,
+                num_workers=1,
+                multiprocessing_context="spawn",
+            )
+        )
+
+        assert batch["batch_size"] == 4
+        assert isinstance(batch["global_row_index"], torch.Tensor)
+        assert isinstance(batch["dataset_index"], torch.Tensor)
+        assert isinstance(batch["expression_counts"], torch.Tensor)
+
+    def test_loader_rejects_multiworker_aggregate_metadata_columns(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        with pytest.raises(NotImplementedError, match="metadata_columns"):
+            next(
+                corpus.loader(
+                    batch_size=4,
+                    num_workers=1,
+                    multiprocessing_context="spawn",
+                    metadata_columns=["perturb_label"],
+                )
+            )
 
 
 class TestSparsePipelinePhase3:

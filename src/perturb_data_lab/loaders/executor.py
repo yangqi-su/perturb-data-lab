@@ -147,6 +147,11 @@ class BatchExecutor:
             _CANONICAL_CONTEXT_FIELDS
         )
 
+    @property
+    def expression_reader(self) -> ExpressionReader:
+        """Return the underlying expression reader."""
+        return self._reader
+
     # ------------------------------------------------------------------
     # Public API — flat-batch, zero per-cell Python objects
     # ------------------------------------------------------------------

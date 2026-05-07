@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+import numpy as np
 import polars as pl
 import torch
 import yaml
@@ -28,6 +29,7 @@ from .expression import (
 from .feature_registry import FeatureRegistry
 from .index import MetadataIndex
 from .loaders import (
+    AggregateLanceExpressionBatchDataset,
     CorpusRandomBatchSampler,
     DatasetBatchSampler,
     DatasetContextBatchSampler,
@@ -93,6 +95,7 @@ class Corpus:
     feature_registry: FeatureRegistry
     metadata_index: MetadataIndex
     dataset_entries: list[DatasetEntry] = field(default_factory=list)
+    dataset_index_by_id: dict[str, int] = field(default_factory=dict)
     topology: str = ""
     backend: str = ""
     corpus_root: Path = Path()
@@ -122,11 +125,36 @@ class Corpus:
         self,
         *,
         metadata_columns: Sequence[str] | None = None,
-    ) -> RawExpressionBatchDataset:
+    ) -> RawExpressionBatchDataset | AggregateLanceExpressionBatchDataset:
         """Return the expression-only dataset for the corpus loader refactor."""
         columns = _normalize_metadata_columns(
             self.metadata_index, metadata_columns,
         )
+        if self.backend == "lance" and self.topology == "aggregate" and not columns:
+            size_factor = None
+            if "size_factor" in self.metadata_index.df.columns:
+                size_factor = self.metadata_index.df["size_factor"].to_numpy()
+            ordered_entries = sorted(
+                self.dataset_entries, key=lambda entry: entry.global_start,
+            )
+            return AggregateLanceExpressionBatchDataset(
+                self.batch_executor.expression_reader,
+                dataset_starts=np.array(
+                    [entry.global_start for entry in ordered_entries],
+                    dtype=np.int64,
+                ),
+                dataset_stops=np.array(
+                    [entry.global_end for entry in ordered_entries],
+                    dtype=np.int64,
+                ),
+                dataset_indices=np.array(
+                    [self.dataset_index_by_id[entry.dataset_id] for entry in ordered_entries],
+                    dtype=np.int32,
+                ),
+                size_factor=size_factor,
+                topology=self.topology,
+                backend=self.backend,
+            )
         return RawExpressionBatchDataset(
             self.batch_executor,
             metadata_columns=columns,
@@ -171,11 +199,27 @@ class Corpus:
             metadata_columns=metadata_columns,
         )
 
-        if validated["num_workers"] > 0 and self.backend == "lance":
+        if (
+            validated["num_workers"] > 0
+            and self.backend == "lance"
+            and self.topology != "aggregate"
+        ):
             raise NotImplementedError(
-                "Phase 2 only defines the corpus API and raw batch contract; "
-                "multi-worker Lance loading is deferred to the later Lance "
-                "worker-safety phases. Use num_workers=0 for now."
+                "Phase 4 only enables multi-worker Lance for aggregate topology; "
+                "federated Lance worker routing is deferred to the later phases. "
+                "Use num_workers=0 for federated Lance for now."
+            )
+
+        if (
+            validated["num_workers"] > 0
+            and self.backend == "lance"
+            and self.topology == "aggregate"
+            and validated["metadata_columns"]
+        ):
+            raise NotImplementedError(
+                "Phase 4 aggregate Lance worker loading is expression-only; "
+                "metadata_columns with num_workers > 0 are deferred to the "
+                "later metadata-attachment phases."
             )
 
         resolved_sampler = _resolve_loader_sampler(
@@ -691,6 +735,7 @@ def load_corpus(
         feature_registry=feature_registry,
         metadata_index=metadata_index,
         dataset_entries=list(entries),
+        dataset_index_by_id={ds_id: ds_index for ds_id, ds_index, *_ in global_ranges},
         topology=topology,
         backend=backend,
         corpus_root=root,
