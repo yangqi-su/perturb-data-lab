@@ -374,7 +374,7 @@ class AggregateLanceReader(BaseExpressionReader):
     def __init__(self, lance_path: str | Path, entries: list[DatasetEntry]):
         super().__init__(entries)
         import lance
-
+        
         self._dataset = lance.dataset(lance_path)
 
     def _validate_all(self, indices: list[int]) -> None:
@@ -1076,20 +1076,20 @@ class AggregateCsrMemmapReader(BaseExpressionReader):
         self._cache_config = cache_config
         # Phase 4: build the optional ShardLRUCache
         self._cache: ShardLRUCache | None = _build_cache(cache_config)
-        # Lazily opened memmap handles: shard_id → dict of arrays
-        self._mmaps: dict[int, dict[str, np.ndarray]] = {}
+        # Lazily resolved shard paths: shard_id → dict of file paths
+        self._mmaps: dict[int, dict[str, Path]] = {}
 
     # ------------------------------------------------------------------
     # Shard opening (lazy, fork-safe, cache-aware)
     # ------------------------------------------------------------------
 
-    def _open_shard(self, entry: CsrMemmapShardEntry) -> dict[str, np.ndarray]:
-        """Return memmap-backed arrays for *entry*, opening them lazily.
+    def _open_shard(self, entry: CsrMemmapShardEntry) -> dict[str, Path]:
+        """Return resolved shard file paths for *entry*, opening them lazily.
 
         When the optional shard LRU cache is active, ``.npy`` files are
-        first copied to the local cache root and opened from there.
-        Otherwise, files are opened directly from the source shard
-        directory via ``np.load(..., mmap_mode="r")``.
+        first copied to the local cache root.
+        Otherwise, files are resolved directly from the source shard
+        directory.
         """
         shard_id = entry.shard_id
         if shard_id not in self._mmaps:
@@ -1108,11 +1108,22 @@ class AggregateCsrMemmapReader(BaseExpressionReader):
                 counts_path = entry.counts_path
 
             self._mmaps[shard_id] = {
-                "offsets": np.load(str(row_offsets_path), mmap_mode="r"),
-                "indices": np.load(str(gene_indices_path), mmap_mode="r"),
-                "counts": np.load(str(counts_path), mmap_mode="r"),
+                "offsets": row_offsets_path,
+                "indices": gene_indices_path,
+                "counts": counts_path,
             }
         return self._mmaps[shard_id]
+
+    def _load_shard_arrays(
+        self, entry: CsrMemmapShardEntry
+    ) -> dict[str, np.ndarray]:
+        """Open one shard's arrays as temporary read-only memmaps."""
+        paths = self._open_shard(entry)
+        return {
+            "offsets": np.load(str(paths["offsets"]), mmap_mode="r"),
+            "indices": np.load(str(paths["indices"]), mmap_mode="r"),
+            "counts": np.load(str(paths["counts"]), mmap_mode="r"),
+        }
 
     # ------------------------------------------------------------------
     # Backend-specific hook (ExpressionRow path)
@@ -1128,7 +1139,7 @@ class AggregateCsrMemmapReader(BaseExpressionReader):
         """
         csr_entry = self._find_entry_by_id(entry.dataset_id)
         assert isinstance(csr_entry, CsrMemmapShardEntry)
-        arrays = self._open_shard(csr_entry)
+        arrays = self._load_shard_arrays(csr_entry)
         offsets = arrays["offsets"]
         indices = arrays["indices"]
         counts = arrays["counts"]
@@ -1140,8 +1151,8 @@ class AggregateCsrMemmapReader(BaseExpressionReader):
             rows.append(
                 ExpressionRow(
                     global_row_index=global_start + li,
-                    expressed_gene_indices=np.asarray(indices[s], dtype=np.int32),
-                    expression_counts=np.asarray(counts[s], dtype=np.int32),
+                    expressed_gene_indices=np.array(indices[s], dtype=np.int32, copy=True),
+                    expression_counts=np.array(counts[s], dtype=np.int32, copy=True),
                 )
             )
         return rows
@@ -1208,18 +1219,18 @@ class AggregateCsrMemmapReader(BaseExpressionReader):
         for ds_id, selections in grouped.items():
             csr_entry = self._find_entry_by_id(ds_id)
             assert isinstance(csr_entry, CsrMemmapShardEntry)
-            arrays = self._open_shard(csr_entry)
+            arrays = self._load_shard_arrays(csr_entry)
             offsets = arrays["offsets"]
             indices_arr = arrays["indices"]
             counts_arr = arrays["counts"]
 
             for output_pos, local_idx in selections:
                 s = slice(int(offsets[local_idx]), int(offsets[local_idx + 1]))
-                egi_by_pos[output_pos] = np.asarray(
-                    indices_arr[s], dtype=np.int32
+                egi_by_pos[output_pos] = np.array(
+                    indices_arr[s], dtype=np.int32, copy=True
                 )
-                ec_by_pos[output_pos] = np.asarray(
-                    counts_arr[s], dtype=np.int32
+                ec_by_pos[output_pos] = np.array(
+                    counts_arr[s], dtype=np.int32, copy=True
                 )
 
         # Build row offsets and concatenate in output order
