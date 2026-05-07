@@ -29,10 +29,10 @@ from .expression import (
 from .feature_registry import FeatureRegistry
 from .index import MetadataIndex
 from .loaders import (
-    AggregateLanceExpressionBatchDataset,
     CorpusRandomBatchSampler,
     DatasetBatchSampler,
     DatasetContextBatchSampler,
+    LanceExpressionBatchDataset,
     RawExpressionBatchDataset,
     collate_raw_expression_batch,
 )
@@ -125,19 +125,19 @@ class Corpus:
         self,
         *,
         metadata_columns: Sequence[str] | None = None,
-    ) -> RawExpressionBatchDataset | AggregateLanceExpressionBatchDataset:
+    ) -> RawExpressionBatchDataset | LanceExpressionBatchDataset:
         """Return the expression-only dataset for the corpus loader refactor."""
         columns = _normalize_metadata_columns(
             self.metadata_index, metadata_columns,
         )
-        if self.backend == "lance" and self.topology == "aggregate" and not columns:
+        if self.backend == "lance" and not columns:
             size_factor = None
             if "size_factor" in self.metadata_index.df.columns:
                 size_factor = self.metadata_index.df["size_factor"].to_numpy()
             ordered_entries = sorted(
                 self.dataset_entries, key=lambda entry: entry.global_start,
             )
-            return AggregateLanceExpressionBatchDataset(
+            return LanceExpressionBatchDataset(
                 self.batch_executor.expression_reader,
                 dataset_starts=np.array(
                     [entry.global_start for entry in ordered_entries],
@@ -202,22 +202,10 @@ class Corpus:
         if (
             validated["num_workers"] > 0
             and self.backend == "lance"
-            and self.topology != "aggregate"
-        ):
-            raise NotImplementedError(
-                "Phase 4 only enables multi-worker Lance for aggregate topology; "
-                "federated Lance worker routing is deferred to the later phases. "
-                "Use num_workers=0 for federated Lance for now."
-            )
-
-        if (
-            validated["num_workers"] > 0
-            and self.backend == "lance"
-            and self.topology == "aggregate"
             and validated["metadata_columns"]
         ):
             raise NotImplementedError(
-                "Phase 4 aggregate Lance worker loading is expression-only; "
+                "Phase 5 Lance worker loading is expression-only; "
                 "metadata_columns with num_workers > 0 are deferred to the "
                 "later metadata-attachment phases."
             )

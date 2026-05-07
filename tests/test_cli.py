@@ -195,10 +195,13 @@ class TestParserConstruction:
 
 
 class TestEffectiveTopologyResolution:
-    """Ensure backend/topology routing resolves aggregate correctly."""
+    """Ensure backend/topology routing respects the requested topology."""
 
-    def test_lance_forces_aggregate_even_if_requested_federated(self):
-        assert _resolve_effective_topology("lance", "federated") == "aggregate"
+    def test_lance_respects_requested_federated(self):
+        assert _resolve_effective_topology("lance", "federated") == "federated"
+
+    def test_lance_respects_requested_aggregate(self):
+        assert _resolve_effective_topology("lance", "aggregate") == "aggregate"
 
     def test_non_lance_respects_requested_topology(self):
         assert _resolve_effective_topology("arrow-parquet", "federated") == "federated"
@@ -208,7 +211,7 @@ class TestEffectiveTopologyResolution:
 class TestMaterializeDatasetRouting:
     """Verify _materialize_dataset routes aggregate matrix_root correctly."""
 
-    def test_lance_uses_corpus_wide_matrix_root(self, tmp_path: Path, monkeypatch):
+    def test_lance_aggregate_uses_corpus_wide_matrix_root(self, tmp_path: Path, monkeypatch):
         import perturb_data_lab.materializers as materializers_mod
 
         captured: dict[str, object] = {}
@@ -236,7 +239,7 @@ class TestMaterializeDatasetRouting:
         )
         args = argparse.Namespace(
             backend="lance",
-            topology="federated",  # parser default
+            topology="aggregate",
             rerun_stage1=False,
             n_hvg=2000,
             corpus_id="test-corpus",
@@ -262,6 +265,63 @@ class TestMaterializeDatasetRouting:
         assert str(output_roots.matrix_root) == str(corpus_root / "matrix")
         assert str(output_roots.metadata_root) == str(corpus_root / "meta" / "dummy_00")
         assert captured["topology"] == "aggregate"
+        assert next_global == 17
+        assert next_writer_state == {"dummy": "state"}
+
+    def test_lance_federated_uses_dataset_matrix_root(self, tmp_path: Path, monkeypatch):
+        import perturb_data_lab.materializers as materializers_mod
+
+        captured: dict[str, object] = {}
+
+        class _DummyMaterializer:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.writer_state = {"dummy": "state"}
+
+            def materialize(self):
+                class _Manifest:
+                    cell_count = 7
+                    feature_count = 3
+                    route = "append_routed"
+                    corpus_registration = None
+
+                return _Manifest()
+
+        monkeypatch.setattr(materializers_mod, "Stage2Materializer", _DummyMaterializer)
+
+        ds = _DatasetInput(
+            source=str(tmp_path / "dummy.h5ad"),
+            dataset_id="dummy_00",
+            review_bundle=str(tmp_path / "dummy-summary.yaml"),
+        )
+        args = argparse.Namespace(
+            backend="lance",
+            topology="federated",
+            rerun_stage1=False,
+            n_hvg=2000,
+            corpus_id="test-corpus",
+        )
+        corpus_root = tmp_path / "corpus"
+
+        next_global, next_writer_state = _materialize_dataset(
+            ds,
+            args,
+            backend="lance",
+            corpus_root=corpus_root,
+            effective_topology=_resolve_effective_topology(args.backend, args.topology),
+            mode="append",
+            dataset_index=1,
+            global_row_start=10,
+            writer_state={"prev": "state"},
+            is_last_dataset=False,
+            total_datasets=2,
+            dry_run=False,
+        )
+
+        output_roots = captured["output_roots"]
+        assert str(output_roots.matrix_root) == str(corpus_root / "dummy_00" / "matrix")
+        assert str(output_roots.metadata_root) == str(corpus_root / "dummy_00" / "meta")
+        assert captured["topology"] == "federated"
         assert next_global == 17
         assert next_writer_state == {"dummy": "state"}
 
@@ -1282,6 +1342,53 @@ class TestDraftSchemaCmd:
 
 class TestMaterializeCmd:
     """Test _cmd_materialize backend/topology auto-detection behavior."""
+
+    def test_cmd_materialize_create_defaults_lance_to_federated(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        from perturb_data_lab.cli import _cmd_materialize
+
+        h5ad = tmp_path / "dummy_00.h5ad"
+        h5ad.write_text("fake")
+        review = tmp_path / "dummy_00-summary.yaml"
+        review.write_text("kind: dataset-summary")
+        corpus_root = tmp_path / "corpus"
+
+        args = argparse.Namespace(
+            mode="create",
+            source=str(h5ad),
+            input_list=None,
+            input_dir=None,
+            dataset_id="dummy_00",
+            review_bundle=str(review),
+            review_bundle_dir=None,
+            output_corpus=str(corpus_root),
+            backend="lance",
+            topology=None,
+            corpus_id="test-v0",
+            rerun_stage1=False,
+            n_hvg=2000,
+            dry_run=True,
+        )
+
+        captured: dict[str, object] = {}
+
+        def _fake_materialize_dataset(ds, parsed_args, **kwargs):
+            captured["backend"] = kwargs["backend"]
+            captured["effective_topology"] = kwargs["effective_topology"]
+            return (0, None)
+
+        monkeypatch.setattr(
+            "perturb_data_lab.cli._materialize_dataset",
+            _fake_materialize_dataset,
+        )
+
+        _cmd_materialize(args)
+
+        assert captured["backend"] == "lance"
+        assert captured["effective_topology"] == "federated"
 
     def test_cmd_materialize_append_autodetects_backend_and_topology(
         self,

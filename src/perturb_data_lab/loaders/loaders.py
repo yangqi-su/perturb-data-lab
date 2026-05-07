@@ -29,6 +29,7 @@ __all__ = [
     "CorpusRandomBatchSampler",
     "DatasetBatchSampler",
     "DatasetContextBatchSampler",
+    "LanceExpressionBatchDataset",
     "RawExpressionBatchDataset",
     "PerturbBatchDataset",
     "collate_raw_expression_batch",
@@ -490,8 +491,13 @@ class RawExpressionBatchDataset:
         return [batch]
 
 
-class AggregateLanceExpressionBatchDataset:
-    """Aggregate Lance expression-only dataset with worker-local reader state."""
+class LanceExpressionBatchDataset:
+    """Lance expression-only dataset with lightweight routing state.
+
+    Works for both aggregate and federated Lance topologies as long as the
+    expression reader exposes ``read_expression_flat()`` with order-preserving
+    output.
+    """
 
     def __init__(
         self,
@@ -530,7 +536,7 @@ class AggregateLanceExpressionBatchDataset:
     ) -> tuple[np.ndarray, np.ndarray]:
         entry_pos = np.searchsorted(self._dataset_stops, indices, side="right")
         if np.any(entry_pos < 0) or np.any(entry_pos >= len(self._dataset_stops)):
-            raise IndexError("aggregate Lance batch contains out-of-range indices")
+            raise IndexError("Lance batch contains out-of-range indices")
         local_row_index = indices - self._dataset_starts[entry_pos]
         return self._dataset_indices[entry_pos], local_row_index
 
@@ -554,6 +560,12 @@ class AggregateLanceExpressionBatchDataset:
             ),
         )
         return [batch.to_dict()]
+
+
+class AggregateLanceExpressionBatchDataset(LanceExpressionBatchDataset):
+    """Backward-compatible alias for the Phase 4 aggregate dataset name."""
+
+    pass
 
 
 # ---------------------------------------------------------------------------

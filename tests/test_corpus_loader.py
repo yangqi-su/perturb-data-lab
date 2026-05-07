@@ -524,12 +524,22 @@ class TestCorpusApiPhase2:
         with pytest.raises(ValueError, match="persistent_workers requires num_workers > 0"):
             next(corpus.loader(batch_size=4, persistent_workers=True))
 
-    def test_loader_rejects_multiworker_federated_lance_until_later_phases(self, tmp_path: Path) -> None:
+    def test_loader_allows_multiworker_federated_lance_spawn(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
-        with pytest.raises(NotImplementedError, match="federated Lance"):
-            next(corpus.loader(batch_size=4, num_workers=1))
+        batch = next(
+            corpus.loader(
+                batch_size=4,
+                num_workers=1,
+                multiprocessing_context="spawn",
+            )
+        )
+
+        assert batch["batch_size"] == 4
+        assert isinstance(batch["global_row_index"], torch.Tensor)
+        assert isinstance(batch["dataset_index"], torch.Tensor)
+        assert isinstance(batch["expression_counts"], torch.Tensor)
 
 
 class TestAggregateLancePhase4:
@@ -586,6 +596,56 @@ class TestAggregateLancePhase4:
 
     def test_loader_rejects_multiworker_aggregate_metadata_columns(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        with pytest.raises(NotImplementedError, match="metadata_columns"):
+            next(
+                corpus.loader(
+                    batch_size=4,
+                    num_workers=1,
+                    multiprocessing_context="spawn",
+                    metadata_columns=["perturb_label"],
+                )
+            )
+
+
+class TestFederatedLancePhase5:
+    """Phase 5 federated Lance worker-safe dataset tests."""
+
+    def test_dataset_opens_federated_lance_lazily(self, tmp_path: Path) -> None:
+        _build_mock_federated_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        dataset = corpus.dataset()
+
+        assert dataset.topology == "federated"
+        assert dataset.backend == "lance"
+        assert dataset._reader._datasets == {}
+
+        batch = dataset.__getitems__([24, 0, 10, 9])[0]
+
+        assert set(dataset._reader._datasets) == {"mock_00", "mock_01"}
+        np.testing.assert_array_equal(batch["global_row_index"], [24, 0, 10, 9])
+        assert batch["dataset_index"].tolist() == [1, 0, 1, 0]
+        assert batch["local_row_index"].tolist() == [14, 0, 0, 9]
+
+    def test_dataset_pickle_state_drops_open_federated_handles(self, tmp_path: Path) -> None:
+        _build_mock_federated_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        dataset = corpus.dataset()
+        dataset.__getitems__([1, 11, 21])
+        assert dataset._reader._datasets
+
+        restored = pickle.loads(pickle.dumps(dataset))
+
+        assert restored._reader._datasets == {}
+        batch = restored.__getitems__([2, 12, 22])[0]
+        np.testing.assert_array_equal(batch["global_row_index"], [2, 12, 22])
+        assert set(restored._reader._datasets) == {"mock_00", "mock_01"}
+
+    def test_loader_rejects_multiworker_federated_metadata_columns(self, tmp_path: Path) -> None:
+        _build_mock_federated_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
         with pytest.raises(NotImplementedError, match="metadata_columns"):

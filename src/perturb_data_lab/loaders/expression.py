@@ -567,12 +567,23 @@ class FederatedLanceReader(BaseExpressionReader):
     def __init__(self, entries: list[LanceDatasetEntry]):
         super().__init__(entries)  # type: ignore[arg-type]
         self._datasets: dict[str, "lance.Dataset"] = {}
+        self._datasets_pid: int | None = None
+
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        state["_datasets"] = {}
+        state["_datasets_pid"] = None
+        return state
 
     def _open_dataset(self, entry: LanceDatasetEntry):
         import lance
 
+        current_pid = os.getpid()
+        if self._datasets_pid != current_pid:
+            self._datasets = {}
+            self._datasets_pid = current_pid
         if entry.dataset_id not in self._datasets:
-            self._datasets[entry.dataset_id] = lance.dataset(entry.lance_path)
+            self._datasets[entry.dataset_id] = lance.dataset(str(entry.lance_path))
         return self._datasets[entry.dataset_id]
 
     def _read_local_rows(

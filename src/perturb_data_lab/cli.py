@@ -204,13 +204,13 @@ def _is_aggregate(backend: str, topology: str) -> bool:
 def _resolve_effective_topology(backend: str, topology: str) -> str:
     """Resolve the effective topology from backend + requested topology.
 
-    Lance is contractually aggregate-only in Stage 2 corpus materialization.
-    If the caller keeps the parser default (``topology='federated'``) while
-    selecting ``backend='lance'``, we route as aggregate to ensure all datasets
-    append into ``{corpus}/matrix/aggregated-cells.lance``.
+    Phase 5 removes the old Lance-specific aggregate forcing so federated Lance
+    can be selected explicitly and through the public CLI defaults.
     """
-    if backend == "lance":
-        return "aggregate"
+    if topology not in TOPOLOGY_CHOICES:
+        raise ValueError(
+            f"unsupported topology {topology!r}; expected one of {TOPOLOGY_CHOICES}"
+        )
     return topology
 
 
