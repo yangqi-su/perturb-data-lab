@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,12 @@ import pytest
 import torch
 import yaml
 
+from perturb_data_lab.loaders import (
+    CPUPipeline,
+    GPUSparsePipeline,
+    collate_raw_expression_batch,
+    cpu_parallel_collate_fn,
+)
 from perturb_data_lab.loaders.corpus_loader import Corpus, load_corpus
 
 
@@ -31,6 +38,7 @@ def _make_obs_df(
     global_start: int,
     *,
     canonical: bool = True,
+    include_size_factor: bool = True,
 ) -> pl.DataFrame:
     """Create a canonical-obs DataFrame for testing."""
     rows = []
@@ -41,7 +49,6 @@ def _make_obs_df(
             "dataset_index": str(dataset_index),
             "global_row_index": str(global_start + i),
             "local_row_index": str(i),
-            "size_factor": str(round(np.random.uniform(0.5, 2.0), 4)),
             "perturb_label": "CRISPR_control" if i % 3 == 0 else "CRISPR_geneX",
             "perturb_type": "CRISPR",
             "dose": "1.0",
@@ -59,6 +66,8 @@ def _make_obs_df(
             "sex": "NA",
             "disease_state": "healthy",
         }
+        if include_size_factor:
+            row["size_factor"] = str(round(np.random.uniform(0.5, 2.0), 4))
         rows.append(row)
 
     return pl.DataFrame(rows)
@@ -93,7 +102,9 @@ def _make_lance_rows(n_cells: int) -> list[dict[str, Any]]:
     return rows
 
 
-def _build_mock_aggregate_corpus(corpus_root: Path) -> None:
+def _build_mock_aggregate_corpus(
+    corpus_root: Path, *, include_size_factor: bool = True
+) -> None:
     """Build a minimal aggregate Lance corpus (2 datasets)."""
     corpus_root.mkdir(parents=True, exist_ok=True)
 
@@ -135,7 +146,13 @@ def _build_mock_aggregate_corpus(corpus_root: Path) -> None:
         meta_dir.mkdir(parents=True, exist_ok=True)
 
         # canonical-obs.parquet
-        obs_df = _make_obs_df(ds_id, ds["dataset_index"], ds["cell_count"], ds["global_start"])
+        obs_df = _make_obs_df(
+            ds_id,
+            ds["dataset_index"],
+            ds["cell_count"],
+            ds["global_start"],
+            include_size_factor=include_size_factor,
+        )
         obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
 
         # canonical-var.parquet
@@ -169,7 +186,9 @@ def _build_mock_aggregate_corpus(corpus_root: Path) -> None:
     lance.write_dataset(table, str(matrix_dir / "aggregated-cells.lance"), mode="overwrite")
 
 
-def _build_mock_federated_corpus(corpus_root: Path) -> None:
+def _build_mock_federated_corpus(
+    corpus_root: Path, *, include_size_factor: bool = True
+) -> None:
     """Build a minimal federated Lance corpus (2 datasets)."""
     corpus_root.mkdir(parents=True, exist_ok=True)
 
@@ -210,7 +229,13 @@ def _build_mock_federated_corpus(corpus_root: Path) -> None:
         meta_dir.mkdir(parents=True, exist_ok=True)
 
         # canonical-obs.parquet
-        obs_df = _make_obs_df(ds_id, ds["dataset_index"], ds["cell_count"], ds["global_start"])
+        obs_df = _make_obs_df(
+            ds_id,
+            ds["dataset_index"],
+            ds["cell_count"],
+            ds["global_start"],
+            include_size_factor=include_size_factor,
+        )
         obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
 
         # canonical-var.parquet
@@ -504,6 +529,126 @@ class TestCorpusApiPhase2:
 
         with pytest.raises(NotImplementedError, match="multi-worker Lance"):
             next(corpus.loader(batch_size=4, num_workers=1))
+
+
+class TestSparsePipelinePhase3:
+    """Phase 3 metadata-light sparse pipeline tests."""
+
+    def test_raw_loader_path_allows_missing_size_factor(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path, include_size_factor=False)
+        corpus = load_corpus(str(tmp_path))
+
+        raw_batch = corpus.dataset().__getitems__([0, 10, 24])[0]
+        assert "size_factor" not in raw_batch
+
+        loader_batch = next(corpus.loader(processing="gpu", batch_size=4))
+        assert "size_factor" not in loader_batch
+
+    def test_gpu_pipeline_output_is_size_factor_independent(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        batch_with_size_factor = corpus.dataset().__getitems__([0, 10, 24])[0]
+        batch_without_size_factor = {
+            key: value
+            for key, value in batch_with_size_factor.items()
+            if key != "size_factor"
+        }
+
+        collated_with = collate_raw_expression_batch([batch_with_size_factor])
+        collated_without = collate_raw_expression_batch([batch_without_size_factor])
+        pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=8)
+        sampled_gene_ids = torch.arange(8, dtype=torch.long).repeat(3, 1)
+
+        result_with = pipeline.process_batch(
+            collated_with, device="cpu", sampled_gene_ids=sampled_gene_ids
+        )
+        result_without = pipeline.process_batch(
+            collated_without, device="cpu", sampled_gene_ids=sampled_gene_ids
+        )
+
+        assert "size_factor" in result_with
+        assert "size_factor" not in result_without
+        assert result_with["batch_size"] == result_without["batch_size"] == 3
+        assert result_with["seq_len"] == result_without["seq_len"] == 8
+        for key in (
+            "sampled_gene_ids",
+            "sampled_counts",
+            "valid_mask",
+            "exact_match_mask",
+            "dataset_index",
+            "global_row_index",
+        ):
+            assert torch.equal(result_with[key], result_without[key])
+
+    def test_cpu_parallel_collate_allows_missing_size_factor(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        batch_with_size_factor = corpus.dataset().__getitems__([1, 11, 21])[0]
+        batch_without_size_factor = {
+            key: value
+            for key, value in batch_with_size_factor.items()
+            if key != "size_factor"
+        }
+
+        pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=8)
+        sampled_gene_ids = torch.arange(8, dtype=torch.long).repeat(3, 1)
+        collate = partial(
+            cpu_parallel_collate_fn,
+            pipeline=pipeline,
+            sampled_gene_ids=sampled_gene_ids,
+        )
+
+        result_with = collate([batch_with_size_factor])
+        result_without = collate([batch_without_size_factor])
+
+        assert "size_factor" in result_with
+        assert "size_factor" not in result_without
+        for key in (
+            "sampled_gene_ids",
+            "sampled_counts",
+            "valid_mask",
+            "exact_match_mask",
+            "dataset_index",
+            "global_row_index",
+        ):
+            assert torch.equal(result_with[key], result_without[key])
+
+    def test_cpu_pipeline_allows_missing_size_factor(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        batch_with_size_factor = corpus.dataset().__getitems__([2, 12, 22])[0]
+        batch_without_size_factor = {
+            key: value
+            for key, value in batch_with_size_factor.items()
+            if key != "size_factor"
+        }
+
+        pipeline = CPUPipeline(corpus.feature_registry, seq_len=8, seed=7)
+        sampled_gene_ids = np.arange(8, dtype=np.int32).reshape(1, 8).repeat(3, axis=0)
+
+        result_with = pipeline.process_batch(
+            batch_with_size_factor, sampled_gene_ids=sampled_gene_ids
+        )
+        result_without = pipeline.process_batch(
+            batch_without_size_factor, sampled_gene_ids=sampled_gene_ids
+        )
+
+        assert "size_factor" in result_with
+        assert "size_factor" not in result_without
+        assert result_with["batch_size"] == result_without["batch_size"] == 3
+        assert result_with["seq_len"] == result_without["seq_len"] == 8
+        for key in (
+            "sampled_gene_ids",
+            "sampled_counts",
+            "valid_mask",
+            "exact_match_mask",
+            "dataset_index",
+            "global_row_index",
+        ):
+            np.testing.assert_array_equal(result_with[key], result_without[key])
 
 
 class TestLoadCorpusErrors:

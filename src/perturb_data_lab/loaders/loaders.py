@@ -651,7 +651,8 @@ def collate_batch_dict(items: list[dict[str, Any]]) -> dict[str, Any]:
     dict
         Flat batch dict with numpy arrays replaced by CPU tensors.
         Compatible with ``GPUSparsePipeline.process_batch()`` and
-        ``CPUPipeline.process_batch()``.
+        ``CPUPipeline.process_batch()``. Optional ``size_factor`` is only
+        included when present in the input batch.
     """
     if not items:
         raise ValueError("collate_batch_dict received empty list")
@@ -674,9 +675,6 @@ def collate_batch_dict(items: list[dict[str, Any]]) -> dict[str, Any]:
         "dataset_index": torch.as_tensor(
             batch["dataset_index"], dtype=torch.long
         ),
-        "size_factor": torch.as_tensor(
-            batch["size_factor"], dtype=torch.float32
-        ),
         "local_row_index": torch.as_tensor(
             batch.get("local_row_index", batch["global_row_index"]),
             dtype=torch.long,
@@ -685,6 +683,11 @@ def collate_batch_dict(items: list[dict[str, Any]]) -> dict[str, Any]:
         "dataset_id": batch.get("dataset_id", ()),
         "cell_id": batch.get("cell_id", ()),
     }
+
+    if "size_factor" in batch and batch["size_factor"] is not None:
+        result["size_factor"] = torch.as_tensor(
+            batch["size_factor"], dtype=torch.float32
+        )
 
     # Columnar metadata (fast path): pass through, never moved to CUDA
     if "meta_columns" in batch:
@@ -751,7 +754,7 @@ def cpu_parallel_collate_fn(
         Fully processed batch dict with all tensors on CPU device.
         Keys: ``sampled_gene_ids``, ``sampled_counts``, ``valid_mask``,
         ``exact_match_mask``, ``dataset_index``, ``global_row_index``,
-        ``size_factor``, ``batch_size``, ``seq_len``.
+        ``batch_size``, ``seq_len``, and optional ``size_factor``.
     """
     global _cpu_collate_threads_initialized
 

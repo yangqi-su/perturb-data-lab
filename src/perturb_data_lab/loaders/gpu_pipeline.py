@@ -209,10 +209,12 @@ class GPUSparsePipeline:
         Parameters
         ----------
         batch : dict
-            Output of ``BatchExecutor.read_batch()``. Required keys:
+            Output of ``BatchExecutor.read_batch()`` or the raw corpus loader.
+            Required keys:
             ``expressed_gene_indices``, ``expression_counts``, ``row_offsets``,
-            ``dataset_index``, ``batch_size``, ``global_row_index``,
-            ``size_factor``.  All numpy arrays.
+            ``dataset_index``, ``batch_size``, and ``global_row_index``.
+            ``size_factor`` is optional pass-through metadata. All array-like
+            inputs may be numpy arrays or torch tensors.
         device : torch.device or str, optional
             Target device. Defaults to CUDA if available, else CPU.
         generator : torch.Generator, optional
@@ -237,12 +239,12 @@ class GPUSparsePipeline:
         dict
             Keys: ``sampled_gene_ids`` (int64), ``sampled_counts`` (float32),
             ``valid_mask`` (bool), ``exact_match_mask`` (bool),
-            ``dataset_index``, ``global_row_index``, ``size_factor``,
-            ``batch_size``, ``seq_len``.
+            ``dataset_index``, ``global_row_index``, ``batch_size``,
+            ``seq_len``, and optional ``size_factor``.
             All tensor shapes: ``sampled_gene_ids`` / ``sampled_counts`` /
             ``valid_mask`` are ``(batch_size, seq_len)``.
-            ``dataset_index`` / ``global_row_index`` / ``size_factor``
-            are ``(batch_size,)``.
+            ``dataset_index`` / ``global_row_index`` are ``(batch_size,)``.
+            ``size_factor`` is ``(batch_size,)`` when present.
         """
         # Resolve device
         if device is None:
@@ -272,14 +274,16 @@ class GPUSparsePipeline:
         global_row_index = torch.as_tensor(
             batch["global_row_index"], dtype=torch.long, device=device
         )
-        size_factor = torch.as_tensor(
-            batch["size_factor"], dtype=torch.float32, device=device
-        )
+        size_factor = None
+        if "size_factor" in batch and batch["size_factor"] is not None:
+            size_factor = torch.as_tensor(
+                batch["size_factor"], dtype=torch.float32, device=device
+            )
 
         bsz = int(batch["batch_size"])
         # Validate empty batch short-circuit
         if bsz == 0:
-            return {
+            result = {
                 "batch_size": 0,
                 "seq_len": self._seq_len,
                 "sampled_gene_ids": torch.empty(
@@ -296,8 +300,10 @@ class GPUSparsePipeline:
                 ),
                 "dataset_index": dataset_indices,
                 "global_row_index": global_row_index,
-                "size_factor": size_factor,
             }
+            if size_factor is not None:
+                result["size_factor"] = size_factor
+            return result
 
         # ---- Compute per-cell NNZ lengths ----
         row_lengths = row_offsets[1:] - row_offsets[:-1]  # (batch_size,)
@@ -377,7 +383,7 @@ class GPUSparsePipeline:
                 torch.full_like(sampled_counts, self._invalid_count_value),
             )
 
-            return {
+            result = {
                 "batch_size": bsz,
                 "seq_len": self._seq_len,
                 "sampled_gene_ids": final_gene_ids,
@@ -386,8 +392,10 @@ class GPUSparsePipeline:
                 "exact_match_mask": exact_match,
                 "dataset_index": dataset_indices,
                 "global_row_index": global_row_index,
-                "size_factor": size_factor,
             }
+            if size_factor is not None:
+                result["size_factor"] = size_factor
+            return result
 
         # ---- Local→Global resolution ----
         is_padding = padded_local_genes >= self._max_local_vocab
@@ -489,7 +497,7 @@ class GPUSparsePipeline:
             torch.full_like(sampled_counts, self._invalid_count_value),
         )
 
-        return {
+        result = {
             "batch_size": bsz,
             "seq_len": self._seq_len,
             "sampled_gene_ids": final_gene_ids,
@@ -498,8 +506,10 @@ class GPUSparsePipeline:
             "exact_match_mask": exact_match,
             "dataset_index": dataset_indices,
             "global_row_index": global_row_index,
-            "size_factor": size_factor,
         }
+        if size_factor is not None:
+            result["size_factor"] = size_factor
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +590,7 @@ class CPUPipeline:
         dict
             Keys: ``sampled_gene_ids``, ``sampled_counts``, ``valid_mask``,
             ``exact_match_mask``, ``dataset_index``, ``global_row_index``,
-            ``size_factor``, ``batch_size``, ``seq_len``.
+            ``batch_size``, ``seq_len``, and optional ``size_factor``.
             All arrays are numpy.
         """
         if seed is not None:
@@ -590,7 +600,7 @@ class CPUPipeline:
         bsz = int(batch["batch_size"])
 
         if bsz == 0:
-            return {
+            result = {
                 "batch_size": 0,
                 "seq_len": self._seq_len,
                 "sampled_gene_ids": np.empty((0, self._seq_len), dtype=np.int32),
@@ -599,15 +609,19 @@ class CPUPipeline:
                 "exact_match_mask": np.empty((0, self._seq_len), dtype=bool),
                 "dataset_index": np.array([], dtype=np.int32),
                 "global_row_index": np.array([], dtype=np.int64),
-                "size_factor": np.array([], dtype=np.float32),
             }
+            if "size_factor" in batch and batch["size_factor"] is not None:
+                result["size_factor"] = np.asarray([], dtype=np.float32)
+            return result
 
         expressed_gene_indices = np.asarray(batch["expressed_gene_indices"])
         expression_counts = np.asarray(batch["expression_counts"])
         row_offsets = np.asarray(batch["row_offsets"])
         dataset_indices = np.asarray(batch["dataset_index"])
         global_row_index = np.asarray(batch["global_row_index"])
-        size_factor = np.asarray(batch["size_factor"])
+        size_factor = None
+        if "size_factor" in batch and batch["size_factor"] is not None:
+            size_factor = np.asarray(batch["size_factor"], dtype=np.float32)
 
         # ---- Sample or accept pre-computed gene IDs ----
         if sampled_gene_ids is not None:
@@ -671,7 +685,7 @@ class CPUPipeline:
                         sampled_counts[i, j] = float(sorted_counts[pos])
                         exact_match_mask[i, j] = True
 
-        return {
+        result = {
             "batch_size": bsz,
             "seq_len": self._seq_len,
             "sampled_gene_ids": sids,
@@ -680,5 +694,7 @@ class CPUPipeline:
             "exact_match_mask": exact_match_mask,
             "dataset_index": dataset_indices,
             "global_row_index": global_row_index,
-            "size_factor": size_factor,
         }
+        if size_factor is not None:
+            result["size_factor"] = size_factor
+        return result

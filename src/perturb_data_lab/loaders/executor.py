@@ -62,6 +62,33 @@ _DEFAULT_CONTEXT_KEYS: tuple[str, ...] = (
 )
 
 
+def _coerce_optional_float32(
+    values: np.ndarray | tuple | None,
+) -> np.ndarray | None:
+    """Convert gathered size factors to float32 or omit when absent."""
+    if values is None:
+        return None
+    if isinstance(values, np.ndarray):
+        return np.asarray(values, dtype=np.float32)
+
+    arr = np.asarray(values, dtype=object)
+    if arr.size == 0:
+        return None
+
+    result = np.empty(arr.shape, dtype=np.float32)
+    saw_value = False
+    flat_values = arr.reshape(-1)
+    flat_result = result.reshape(-1)
+    for i, value in enumerate(flat_values):
+        if value is None or str(value) == "NA":
+            flat_result[i] = np.nan
+            continue
+        flat_result[i] = np.float32(value)
+        saw_value = True
+
+    return result if saw_value else None
+
+
 # ---------------------------------------------------------------------------
 # BatchExecutor
 # ---------------------------------------------------------------------------
@@ -456,7 +483,9 @@ class BatchExecutor:
         expr = self.read_expression_batch(indices)
 
         requested_meta = list(dict.fromkeys(metadata_columns or ()))
-        gather_cols = ["dataset_index", "local_row_index", "size_factor"]
+        gather_cols = ["dataset_index", "local_row_index"]
+        if "size_factor" in self._meta.df.columns:
+            gather_cols.append("size_factor")
         gather_cols.extend(
             col for col in requested_meta if col not in gather_cols
         )
@@ -478,9 +507,7 @@ class BatchExecutor:
             local_row_index=np.asarray(
                 gathered["local_row_index"], dtype=np.int64,
             ) if "local_row_index" in gathered else None,
-            size_factor=np.asarray(
-                gathered["size_factor"], dtype=np.float32,
-            ) if "size_factor" in gathered else None,
+            size_factor=_coerce_optional_float32(gathered.get("size_factor")),
             meta_columns={
                 col: gathered[col]
                 for col in requested_meta
@@ -663,4 +690,3 @@ class BatchExecutor:
     # for backward compatibility and are superseded by the columnar
     # builders above (``_build_canonical_from_columnar``,
     # ``_build_raw_from_columnar``) which avoid ``df.row(i, named=True)``.
-
