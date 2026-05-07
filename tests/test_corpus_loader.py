@@ -25,6 +25,23 @@ from perturb_data_lab.loaders import (
 from perturb_data_lab.loaders.corpus_loader import Corpus, load_corpus
 
 
+LOADER_SEQ_LEN = 8
+
+
+def _assert_processed_loader_batch(batch: dict[str, Any], *, batch_size: int) -> None:
+    assert batch["batch_size"] == batch_size
+    assert batch["seq_len"] == LOADER_SEQ_LEN
+    assert isinstance(batch["sampled_gene_ids"], torch.Tensor)
+    assert isinstance(batch["sampled_counts"], torch.Tensor)
+    assert isinstance(batch["valid_mask"], torch.Tensor)
+    assert isinstance(batch["exact_match_mask"], torch.Tensor)
+    assert isinstance(batch["dataset_index"], torch.Tensor)
+    assert isinstance(batch["global_row_index"], torch.Tensor)
+    assert "row_offsets" not in batch
+    assert "expressed_gene_indices" not in batch
+    assert "expression_counts" not in batch
+
+
 # ---------------------------------------------------------------------------
 # Helpers — build mock corpus on disk
 # ---------------------------------------------------------------------------
@@ -493,26 +510,22 @@ class TestCorpusApiPhase2:
             corpus.loader(
                 processing="gpu",
                 batch_size=4,
+                seq_len=LOADER_SEQ_LEN,
                 metadata_columns=["perturb_label"],
             )
         )
 
-        assert batch["batch_size"] == 4
-        assert isinstance(batch["global_row_index"], torch.Tensor)
-        assert isinstance(batch["dataset_index"], torch.Tensor)
-        assert isinstance(batch["row_offsets"], torch.Tensor)
-        assert isinstance(batch["expression_counts"], torch.Tensor)
+        _assert_processed_loader_batch(batch, batch_size=4)
         assert batch["meta_columns"]["perturb_label"]
 
     def test_loader_uses_stored_sampler(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
         corpus.set_sampler(batch_size=5, seed=3)
 
         batch = next(corpus.loader(processing="cpu"))
 
-        assert batch["batch_size"] == 5
-        assert isinstance(batch["global_row_index"], torch.Tensor)
+        _assert_processed_loader_batch(batch, batch_size=5)
 
     def test_loader_validates_metadata_columns_and_worker_params(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
@@ -524,6 +537,12 @@ class TestCorpusApiPhase2:
         with pytest.raises(ValueError, match="persistent_workers requires num_workers > 0"):
             next(corpus.loader(batch_size=4, persistent_workers=True))
 
+        with pytest.raises(ValueError, match="seq_len is required"):
+            next(corpus.loader(batch_size=4))
+
+        with pytest.raises(ValueError, match="processing='cpu' only supports CPU devices"):
+            next(corpus.loader(batch_size=4, seq_len=LOADER_SEQ_LEN, processing="cpu", device="cuda"))
+
     def test_loader_allows_multiworker_federated_lance_spawn(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
@@ -531,15 +550,13 @@ class TestCorpusApiPhase2:
         batch = next(
             corpus.loader(
                 batch_size=4,
+                seq_len=LOADER_SEQ_LEN,
                 num_workers=1,
                 multiprocessing_context="spawn",
             )
         )
 
-        assert batch["batch_size"] == 4
-        assert isinstance(batch["global_row_index"], torch.Tensor)
-        assert isinstance(batch["dataset_index"], torch.Tensor)
-        assert isinstance(batch["expression_counts"], torch.Tensor)
+        _assert_processed_loader_batch(batch, batch_size=4)
 
 
 class TestAggregateLancePhase4:
@@ -584,15 +601,13 @@ class TestAggregateLancePhase4:
             corpus.loader(
                 processing="gpu",
                 batch_size=4,
+                seq_len=LOADER_SEQ_LEN,
                 num_workers=1,
                 multiprocessing_context="spawn",
             )
         )
 
-        assert batch["batch_size"] == 4
-        assert isinstance(batch["global_row_index"], torch.Tensor)
-        assert isinstance(batch["dataset_index"], torch.Tensor)
-        assert isinstance(batch["expression_counts"], torch.Tensor)
+        _assert_processed_loader_batch(batch, batch_size=4)
 
     def test_loader_rejects_multiworker_aggregate_metadata_columns(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
@@ -602,6 +617,7 @@ class TestAggregateLancePhase4:
             next(
                 corpus.loader(
                     batch_size=4,
+                    seq_len=LOADER_SEQ_LEN,
                     num_workers=1,
                     multiprocessing_context="spawn",
                     metadata_columns=["perturb_label"],
@@ -652,6 +668,7 @@ class TestFederatedLancePhase5:
             next(
                 corpus.loader(
                     batch_size=4,
+                    seq_len=LOADER_SEQ_LEN,
                     num_workers=1,
                     multiprocessing_context="spawn",
                     metadata_columns=["perturb_label"],
@@ -659,12 +676,107 @@ class TestFederatedLancePhase5:
             )
 
 
+class TestCorpusLoaderPhase6:
+    """Phase 6 end-to-end CPU/GPU loader routing tests."""
+
+    def test_aggregate_gpu_loader_route(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+
+        batch = next(corpus.loader(processing="gpu", batch_size=4))
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+        assert batch["sampled_gene_ids"].shape == (4, LOADER_SEQ_LEN)
+        assert batch["local_row_index"].shape == (4,)
+
+    def test_aggregate_cpu_loader_route(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+
+        batch = next(corpus.loader(processing="cpu", batch_size=4))
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+        assert batch["sampled_gene_ids"].device.type == "cpu"
+        assert batch["local_row_index"].shape == (4,)
+
+    def test_federated_gpu_loader_route(self, tmp_path: Path) -> None:
+        _build_mock_federated_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+
+        batch = next(corpus.loader(processing="gpu", batch_size=4))
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+        assert batch["sampled_gene_ids"].shape == (4, LOADER_SEQ_LEN)
+        assert batch["local_row_index"].shape == (4,)
+
+    def test_federated_cpu_loader_route(self, tmp_path: Path) -> None:
+        _build_mock_federated_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+
+        batch = next(corpus.loader(processing="cpu", batch_size=4))
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+        assert batch["sampled_gene_ids"].device.type == "cpu"
+        assert batch["local_row_index"].shape == (4,)
+
+    def test_cpu_loader_supports_multiworker_spawn_aggregate(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+
+        batch = next(
+            corpus.loader(
+                processing="cpu",
+                batch_size=4,
+                num_workers=1,
+                multiprocessing_context="spawn",
+            )
+        )
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+
+    def test_cpu_loader_supports_multiworker_spawn_federated(self, tmp_path: Path) -> None:
+        _build_mock_federated_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+
+        batch = next(
+            corpus.loader(
+                processing="cpu",
+                batch_size=4,
+                num_workers=1,
+                multiprocessing_context="spawn",
+            )
+        )
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+
+    def test_lance_workers_default_to_spawn(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        captured: dict[str, Any] = {}
+
+        class FakeDataLoader:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+            def __iter__(self):
+                return iter(())
+
+        monkeypatch.setattr(
+            "perturb_data_lab.loaders.corpus_loader.DataLoader",
+            FakeDataLoader,
+        )
+
+        corpus.loader(processing="gpu", batch_size=4, num_workers=1)
+
+        assert captured["multiprocessing_context"] == "spawn"
+
+
 class TestSparsePipelinePhase3:
     """Phase 3 metadata-light sparse pipeline tests."""
 
     def test_raw_loader_path_allows_missing_size_factor(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path, include_size_factor=False)
-        corpus = load_corpus(str(tmp_path))
+        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
 
         raw_batch = corpus.dataset().__getitems__([0, 10, 24])[0]
         assert "size_factor" not in raw_batch

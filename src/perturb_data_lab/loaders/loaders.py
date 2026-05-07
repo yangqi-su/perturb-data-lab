@@ -856,7 +856,7 @@ def cpu_parallel_collate_fn(
         raise ValueError("cpu_parallel_collate_fn received empty list")
     batch = items[0]
 
-    return pipeline.process_batch(
+    result = pipeline.process_batch(
         batch,
         device="cpu",
         sampling_mode=sampling_mode,
@@ -865,3 +865,10 @@ def cpu_parallel_collate_fn(
         generator=generator,
         **kwargs,
     )
+    if "local_row_index" in batch:
+        result["local_row_index"] = torch.as_tensor(
+            batch["local_row_index"], dtype=torch.long
+        )
+    if "meta_columns" in batch:
+        result["meta_columns"] = batch["meta_columns"]
+    return result

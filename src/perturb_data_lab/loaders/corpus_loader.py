@@ -10,6 +10,7 @@ training scripts need zero manual path arithmetic.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -27,6 +28,7 @@ from .expression import (
     build_expression_reader,
 )
 from .feature_registry import FeatureRegistry
+from .gpu_pipeline import GPUSparsePipeline
 from .index import MetadataIndex
 from .loaders import (
     CorpusRandomBatchSampler,
@@ -35,6 +37,7 @@ from .loaders import (
     LanceExpressionBatchDataset,
     RawExpressionBatchDataset,
     collate_raw_expression_batch,
+    cpu_parallel_collate_fn,
 )
 
 # Import path resolver (Phase 1 output — canonical_meta under meta/)
@@ -99,6 +102,7 @@ class Corpus:
     topology: str = ""
     backend: str = ""
     corpus_root: Path = Path()
+    seq_len: int | None = None
     _sampler: Any | None = field(default=None, init=False, repr=False)
     _sampler_params: dict[str, Any] = field(
         default_factory=dict, init=False, repr=False,
@@ -173,6 +177,7 @@ class Corpus:
         persistent_workers: bool = False,
         prefetch_factor: int | None = None,
         metadata_columns: Sequence[str] | None = None,
+        seq_len: int | None = None,
         sampler: str | None = None,
         batch_size: int | None = None,
         drop_last: bool = True,
@@ -180,14 +185,11 @@ class Corpus:
         shuffle: bool = True,
         dataset_index: int | None = None,
         context_field: str = "raw_cell_type",
+        sampling_mode: str = "uniform",
+        expressed_weight: float = 3.0,
+        hvg_weight: float = 3.0,
     ) -> Iterator[dict[str, Any]]:
-        """Yield raw expression batches after validating the corpus API surface.
-
-        Phase 2 intentionally stops at the shared raw-batch contract. Both
-        ``processing="gpu"`` and ``processing="cpu"`` currently return the
-        same collated raw batch shape; route-specific sparse processing lands in
-        later phases.
-        """
+        """Yield processed sparse training batches for the requested route."""
         validated = _validate_loader_params(
             processing=processing,
             device=device,
@@ -220,9 +222,17 @@ class Corpus:
             dataset_index=dataset_index,
             context_field=context_field,
         )
+        resolved_seq_len = _resolve_loader_seq_len(self, seq_len=seq_len)
+        _validate_processing_device(
+            validated["processing"], validated["device"],
+        )
 
         dataset_obj = self.dataset(
             metadata_columns=validated["metadata_columns"],
+        )
+        pipeline = GPUSparsePipeline(
+            self.feature_registry,
+            seq_len=resolved_seq_len,
         )
         loader_kwargs = _build_dataloader_kwargs(
             num_workers=validated["num_workers"],
@@ -232,13 +242,44 @@ class Corpus:
             prefetch_factor=validated["prefetch_factor"],
             backend=self.backend,
         )
+        collate_fn = collate_raw_expression_batch
+        if validated["processing"] == "cpu":
+            collate_fn = partial(
+                cpu_parallel_collate_fn,
+                pipeline=pipeline,
+                sampling_mode=sampling_mode,
+                expressed_weight=expressed_weight,
+                hvg_weight=hvg_weight,
+            )
         data_loader = DataLoader(
             dataset_obj,
             batch_sampler=resolved_sampler,
-            collate_fn=collate_raw_expression_batch,
+            collate_fn=collate_fn,
             **loader_kwargs,
         )
-        return iter(data_loader)
+        if validated["processing"] == "cpu":
+            return iter(data_loader)
+
+        resolved_device = validated["device"]
+
+        def _gpu_iterator() -> Iterator[dict[str, Any]]:
+            for raw_batch in data_loader:
+                processed_batch = pipeline.process_batch(
+                    raw_batch,
+                    device=resolved_device,
+                    sampling_mode=sampling_mode,
+                    expressed_weight=expressed_weight,
+                    hvg_weight=hvg_weight,
+                )
+                if "local_row_index" in raw_batch:
+                    processed_batch["local_row_index"] = raw_batch[
+                        "local_row_index"
+                    ]
+                if "meta_columns" in raw_batch:
+                    processed_batch["meta_columns"] = raw_batch["meta_columns"]
+                yield processed_batch
+
+        return _gpu_iterator()
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +460,35 @@ def _normalize_metadata_columns(
     return tuple(normalized)
 
 
+def _resolve_loader_seq_len(corpus: Corpus, *, seq_len: int | None) -> int:
+    """Resolve the sequence length for ``Corpus.loader(...)``."""
+    resolved = corpus.seq_len if seq_len is None else seq_len
+    if resolved is None:
+        raise ValueError(
+            "seq_len is required for corpus.loader(...). Pass seq_len to "
+            "load_corpus(..., seq_len=...) or corpus.loader(seq_len=...)."
+        )
+    resolved = int(resolved)
+    if resolved <= 0:
+        raise ValueError("seq_len must be positive")
+    return resolved
+
+
+def _validate_processing_device(
+    processing: str,
+    device: torch.device | str | None,
+) -> None:
+    """Validate that the chosen device is compatible with the route."""
+    if processing != "cpu" or device is None:
+        return
+    normalized_device = torch.device(device)
+    if normalized_device.type != "cpu":
+        raise ValueError(
+            "processing='cpu' only supports CPU devices; pass device=None "
+            "or device='cpu'."
+        )
+
+
 def _validate_loader_params(
     *,
     processing: str,
@@ -539,8 +609,8 @@ def load_corpus(
     corpus_root : str or Path
         Path to a corpus directory containing ``corpus-index.yaml``.
     seq_len : int, optional
-        Target sequence length for downstream tokenisation (reserved for
-        future use; not consumed by this factory).
+        Default target sequence length for ``Corpus.loader(...)`` sparse
+        processing. May be overridden per loader call.
     use_canonical : bool
         Whether to use canonical obs/var parquets.  Default ``True``.
         When ``True``, reads ``canonical-obs.parquet`` and
@@ -727,6 +797,7 @@ def load_corpus(
         topology=topology,
         backend=backend,
         corpus_root=root,
+        seq_len=(int(seq_len) if seq_len is not None else None),
     )
 
 
