@@ -16,6 +16,24 @@ import polars as pl
 __all__ = ["MetadataIndex", "MetadataRow"]
 
 
+_CANONICAL_OBS_TYPED_DTYPES: dict[str, pl.DataType] = {
+    "global_row_index": pl.Int64,
+    "dataset_index": pl.Int32,
+    "local_row_index": pl.Int64,
+    "size_factor": pl.Float64,
+}
+
+_CANONICAL_SAFE_NULL_STRING_COLUMNS: frozenset[str] = frozenset(
+    {"dose", "dose_unit", "timepoint", "timepoint_unit"}
+)
+
+_CANONICAL_NULL_LITERALS: frozenset[str] = frozenset(
+    {"", "na", "n/a", "none", "null", "nan", ".", "-"}
+)
+
+_STRINGLIKE_DTYPES: set[pl.DataType] = {pl.Utf8, pl.Categorical, pl.Enum}
+
+
 # ---------------------------------------------------------------------------
 # Constants — known paths for the synthetic dummy corpus from Stage 2
 # ---------------------------------------------------------------------------
@@ -73,7 +91,7 @@ class MetadataRow:
     dataset_id: str
     dataset_index: int
     local_row_index: int
-    size_factor: float
+    size_factor: float | None
     raw_fields: dict[str, Any] = field(default_factory=dict)
 
 
@@ -385,22 +403,7 @@ class MetadataIndex:
 
             df = pl.read_parquet(obs_path)
             n_obs = len(df)
-
-            # The canonical obs columns may arrive as strings; cast numeric
-            # identity columns to proper types for downstream consumers.
-            _cast_map: dict[str, pl.DataType] = {
-                "global_row_index": pl.Int64,
-                "dataset_index": pl.Int32,
-                "local_row_index": pl.Int64,
-                "size_factor": pl.Float64,
-            }
-            for col_name, dtype in _cast_map.items():
-                if col_name in df.columns:
-                    try:
-                        df = df.with_columns(pl.col(col_name).cast(dtype))
-                    except Exception:
-                        # If casting fails (e.g. "NA" strings), keep as string
-                        pass
+            df = _normalize_canonical_obs_dtypes(df)
 
             # Ensure dataset_index is correct
             if "dataset_index" in df.columns:
@@ -441,9 +444,12 @@ class MetadataIndex:
         ]
         for col in _canonical_cols:
             if col not in combined.columns:
+                fill_dtype = _CANONICAL_OBS_TYPED_DTYPES.get(col, pl.Utf8)
                 combined = combined.with_columns(
-                    pl.lit(None, dtype=pl.Utf8).alias(col)
+                    pl.lit(None, dtype=fill_dtype).alias(col)
                 )
+
+        combined = _normalize_canonical_obs_dtypes(combined)
 
         # Sort by global_row_index
         combined = combined.sort("global_row_index")
@@ -874,6 +880,44 @@ class MetadataIndex:
             dataset_id=str(row["dataset_id"]),
             dataset_index=int(row["dataset_index"]),
             local_row_index=int(row["local_row_index"]),
-            size_factor=float(row["size_factor"]),
+            size_factor=(
+                None if row["size_factor"] is None else float(row["size_factor"])
+            ),
             raw_fields=raw_fields,
         )
+
+
+def _normalize_canonical_obs_dtypes(df: pl.DataFrame) -> pl.DataFrame:
+    """Normalize typed and null-aware canonical obs columns."""
+    expressions: list[pl.Expr] = []
+
+    for col_name, dtype in _CANONICAL_OBS_TYPED_DTYPES.items():
+        if col_name not in df.columns:
+            continue
+        expr = pl.col(col_name)
+        if df[col_name].dtype in _STRINGLIKE_DTYPES:
+            expr = _null_if_legacy_missing(expr)
+        expressions.append(expr.cast(dtype, strict=True).alias(col_name))
+
+    for col_name in _CANONICAL_SAFE_NULL_STRING_COLUMNS:
+        if col_name not in df.columns or df[col_name].dtype not in _STRINGLIKE_DTYPES:
+            continue
+        expressions.append(
+            _null_if_legacy_missing(pl.col(col_name)).cast(pl.Utf8).alias(col_name)
+        )
+
+    if not expressions:
+        return df
+    return df.with_columns(expressions)
+
+
+def _null_if_legacy_missing(expr: pl.Expr) -> pl.Expr:
+    """Convert legacy NA-like strings to true nulls."""
+    normalized = expr.cast(pl.Utf8).str.strip_chars().str.to_lowercase()
+    return (
+        pl.when(expr.is_null())
+        .then(None)
+        .when(normalized.is_in(_CANONICAL_NULL_LITERALS))
+        .then(None)
+        .otherwise(expr)
+    )

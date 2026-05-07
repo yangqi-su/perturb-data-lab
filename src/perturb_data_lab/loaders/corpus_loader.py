@@ -29,7 +29,7 @@ from .expression import (
 )
 from .feature_registry import FeatureRegistry
 from .gpu_pipeline import GPUSparsePipeline
-from .index import MetadataIndex
+from .index import MetadataIndex, _CANONICAL_OBS_TYPED_DTYPES, _normalize_canonical_obs_dtypes
 from .loaders import (
     CorpusRandomBatchSampler,
     DatasetBatchSampler,
@@ -944,43 +944,10 @@ def _build_metadata_index(
 
     processed: list[pl.DataFrame] = []
 
-    # Numeric columns that arrive as strings in canonical parquets
-    _num_cast: dict[str, pl.DataType] = {
-        "global_row_index": pl.Int64,
-        "dataset_index": pl.Int32,
-        "local_row_index": pl.Int64,
-        "size_factor": pl.Float64,
-    }
-
-    # Required structural columns for MetadataIndex
-    _required = {
-        "global_row_index", "cell_id", "dataset_id",
-        "dataset_index", "local_row_index", "size_factor",
-    }
-
     for ds_id, ds_index, g_start, g_end in datasets_info:
         obs_path = obs_paths[ds_id]
-        df = pl.read_parquet(str(obs_path))
+        df = _normalize_canonical_obs_dtypes(pl.read_parquet(str(obs_path)))
         n_obs = len(df)
-
-        # Cast string-typed numeric columns to proper types
-        for col_name, dtype in _num_cast.items():
-            if col_name in df.columns and df[col_name].dtype == pl.Utf8:
-                try:
-                    df = df.with_columns(
-                        pl.col(col_name).cast(dtype)
-                    )
-                except Exception:
-                    # If casting fails (e.g., "NA" strings for size_factor),
-                    # null-instead mode: replace "NA" with null then cast
-                    df = df.with_columns(
-                        pl.when(pl.col(col_name) == "NA")
-                        .then(None)
-                        .otherwise(pl.col(col_name))
-                        .cast(pl.Utf8)
-                        .cast(dtype)
-                        .alias(col_name)
-                    )
 
         # Override with corpus-global values
         df = df.with_columns(
@@ -1008,9 +975,12 @@ def _build_metadata_index(
     # Ensure all structural columns exist (fill missing with null)
     for col in structural:
         if col not in combined.columns:
+            fill_dtype = _CANONICAL_OBS_TYPED_DTYPES.get(col, pl.Utf8)
             combined = combined.with_columns(
-                pl.lit(None).alias(col)
+                pl.lit(None, dtype=fill_dtype).alias(col)
             )
+
+    combined = _normalize_canonical_obs_dtypes(combined)
 
     # Canonical content columns (may or may not all be present)
     _canonical_content = [

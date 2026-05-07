@@ -69,7 +69,10 @@ def _coerce_optional_float32(
     if values is None:
         return None
     if isinstance(values, np.ndarray):
-        return np.asarray(values, dtype=np.float32)
+        arr = np.asarray(values, dtype=np.float32)
+        if arr.size == 0 or np.isnan(arr).all():
+            return None
+        return arr
 
     arr = np.asarray(values, dtype=object)
     if arr.size == 0:

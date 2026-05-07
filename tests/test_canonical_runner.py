@@ -388,10 +388,15 @@ class TestCanonicalizationRunner:
         # Verify obs parquet
         obs = pq.read_table(str(result.obs_path))
         assert set(obs.column_names) >= set(CANONICAL_OBS_MUST_HAVE)
+        assert obs.schema.field("global_row_index").type == pa.int64()
+        assert obs.schema.field("dataset_index").type == pa.int32()
+        assert obs.schema.field("local_row_index").type == pa.int64()
+        assert obs.schema.field("size_factor").type == pa.float64()
 
         # Check specific values
         assert obs.column("cell_id")[0].as_py() == "cell_0"
         assert obs.column("dataset_id")[0].as_py() == "test"
+        assert obs.column("dataset_index")[0].as_py() == 0
         assert obs.column("perturb_label")[0].as_py() == "TP53"
         assert obs.column("perturb_type")[0].as_py() == "Drug_A"
         assert obs.column("cell_context")[0].as_py() == "B_cells"
@@ -399,17 +404,20 @@ class TestCanonicalizationRunner:
         assert obs.column("condition")[0].as_py() == "WT"
         assert obs.column("species")[0].as_py() == "human"
 
-        # NA-filled null strategy columns
-        assert obs.column("dose")[0].as_py() == "NA"
+        # Safe nullable fields now use real nulls
+        assert obs.column("dose")[0].as_py() is None
+        assert obs.column("dose_unit")[0].as_py() is None
+        assert obs.column("timepoint")[0].as_py() is None
+        assert obs.column("timepoint_unit")[0].as_py() is None
         assert obs.column("sex")[0].as_py() == "unknown"
 
         # Row index columns
-        assert obs.column("global_row_index")[0].as_py() == "0"
-        assert obs.column("local_row_index")[0].as_py() == "0"
-        assert obs.column("global_row_index")[1].as_py() == "1"
+        assert obs.column("global_row_index")[0].as_py() == 0
+        assert obs.column("local_row_index")[0].as_py() == 0
+        assert obs.column("global_row_index")[1].as_py() == 1
 
         # Size factors
-        assert obs.column("size_factor")[0].as_py() == "0.95"
+        assert obs.column("size_factor")[0].as_py() == pytest.approx(0.95)
 
         # No warnings
         assert result.warnings == ()

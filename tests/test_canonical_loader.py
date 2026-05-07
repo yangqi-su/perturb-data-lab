@@ -143,17 +143,25 @@ class TestMetadataIndexCanonical:
         dummy_01 = meta.filter(pl.col("dataset_id") == "dummy_01")
         assert dummy_01.df["dataset_index"].unique().to_list() == [1]
 
+    def test_structural_columns_are_typed(self):
+        meta = _meta_canon()
+        schema = meta.df.schema
+        assert schema["global_row_index"] == pl.Int64
+        assert schema["dataset_index"] == pl.Int32
+        assert schema["local_row_index"] == pl.Int64
+        assert schema["size_factor"] == pl.Float64
+
     def test_size_factors_populated(self):
         meta = _meta_canon()
         sf = meta.df["size_factor"].to_numpy()
         assert np.all(sf > 0.0)
         assert np.all(np.isfinite(sf))
 
-    def test_na_columns_exist(self):
-        """Columns with null strategy should contain NA strings."""
+    def test_safe_missing_columns_load_as_nulls(self):
+        """Safe nullable canonical columns are normalized to real nulls."""
         meta = _meta_canon()
         dose_vals = meta.df["dose"].to_list()[:10]
-        assert all(v == "NA" for v in dose_vals)
+        assert all(v is None for v in dose_vals)
 
     def test_canonical_vs_raw_same_count(self):
         """Canonical and raw indices have the same total row count."""

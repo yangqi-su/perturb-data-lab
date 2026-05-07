@@ -37,6 +37,17 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+_TYPED_OBS_ARROW_TYPES: dict[str, pa.DataType] = {
+    "global_row_index": pa.int64(),
+    "dataset_index": pa.int32(),
+    "local_row_index": pa.int64(),
+    "size_factor": pa.float64(),
+}
+
+_NULLABLE_STRING_OBS_FIELDS: frozenset[str] = frozenset(
+    {"dose", "dose_unit", "timepoint", "timepoint_unit"}
+)
+
 # ---------------------------------------------------------------------------
 # Transform dispatch registry
 # ---------------------------------------------------------------------------
@@ -345,47 +356,66 @@ class CanonicalizationRunner:
         size_factors: list[float],
         n_rows: int,
     ) -> pa.Array:
-        """Resolve a single obs column mapping to a PyArrow string array."""
+        """Resolve a single obs column mapping to a canonical PyArrow array."""
         strategy = mapping.strategy
 
         if strategy == "literal":
             value = mapping.literal_value if mapping.literal_value is not None else mapping.fallback
-            return pa.array([value] * n_rows, type=pa.string())
+            return _build_obs_array(
+                mapping.canonical_name,
+                [value] * n_rows,
+                fallback=mapping.fallback,
+            )
 
         if strategy == "passthrough":
             # Copy the column as-is; must exist in raw data
             if mapping.canonical_name in obs_raw:
                 raw_vals = obs_raw[mapping.canonical_name]
-                return pa.array(
+                return _build_obs_array(
+                    mapping.canonical_name,
                     [str(v) if v is not None else mapping.fallback for v in raw_vals],
-                    type=pa.string(),
+                    fallback=mapping.fallback,
                 )
             # Try the source_column if canonical_name not found
             src = mapping.source_column or mapping.canonical_name
             raw_vals = obs_raw.get(src, [])
             if raw_vals:
-                return pa.array(
+                return _build_obs_array(
+                    mapping.canonical_name,
                     [str(v) if v is not None else mapping.fallback for v in raw_vals],
-                    type=pa.string(),
+                    fallback=mapping.fallback,
                 )
             self._warnings.append(
                 f"passthrough column '{mapping.canonical_name}' not found; "
                 f"filling with {mapping.fallback}"
             )
-            return pa.array([mapping.fallback] * n_rows, type=pa.string())
+            return _build_obs_array(
+                mapping.canonical_name,
+                [mapping.fallback] * n_rows,
+                fallback=mapping.fallback,
+            )
 
         if strategy == "row-index":
-            return pa.array([str(i) for i in range(n_rows)], type=pa.string())
+            return _build_obs_array(
+                mapping.canonical_name,
+                list(range(n_rows)),
+                fallback=mapping.fallback,
+            )
 
         if strategy == "null":
-            return pa.array([mapping.fallback] * n_rows, type=pa.string())
+            return _build_obs_array(
+                mapping.canonical_name,
+                [mapping.fallback] * n_rows,
+                fallback=mapping.fallback,
+            )
 
         if strategy == "source-field":
             if mapping.canonical_name == "size_factor":
                 # Special case: size_factor is numeric, stored separately
-                return pa.array(
-                    [str(sf) for sf in size_factors],
-                    type=pa.string(),
+                return _build_obs_array(
+                    mapping.canonical_name,
+                    list(size_factors),
+                    fallback=mapping.fallback,
                 )
 
             src_col = mapping.source_column or mapping.canonical_name
@@ -395,7 +425,11 @@ class CanonicalizationRunner:
                     f"source-field '{mapping.canonical_name}' references missing "
                     f"column '{src_col}'; filling with {mapping.fallback}"
                 )
-                return pa.array([mapping.fallback] * n_rows, type=pa.string())
+                return _build_obs_array(
+                    mapping.canonical_name,
+                    [mapping.fallback] * n_rows,
+                    fallback=mapping.fallback,
+                )
 
             resolved: list[str] = []
             for v in raw_vals:
@@ -406,7 +440,11 @@ class CanonicalizationRunner:
                         fallback=mapping.fallback,
                     )
                 )
-            return pa.array(resolved, type=pa.string())
+            return _build_obs_array(
+                mapping.canonical_name,
+                resolved,
+                fallback=mapping.fallback,
+            )
 
         raise ValueError(f"Unhandled obs strategy: {strategy!r}")
 
@@ -784,3 +822,49 @@ def _is_null_like_str(value: str | None) -> bool:
     if not lowered:
         return True
     return lowered in _NA_LITERALS
+
+
+def _build_obs_array(
+    canonical_name: str,
+    values: list[Any],
+    *,
+    fallback: str,
+) -> pa.Array:
+    """Build a canonical obs array with minimal typing and null cleanup."""
+    arrow_type = _TYPED_OBS_ARROW_TYPES.get(canonical_name)
+    if arrow_type is not None:
+        return pa.array(
+            [_coerce_typed_obs_value(canonical_name, value) for value in values],
+            type=arrow_type,
+        )
+
+    if canonical_name in _NULLABLE_STRING_OBS_FIELDS:
+        return pa.array(
+            [
+                _coerce_nullable_string_obs_value(value, fallback=fallback)
+                for value in values
+            ],
+            type=pa.string(),
+        )
+
+    return pa.array(
+        [str(value) if value is not None else fallback for value in values],
+        type=pa.string(),
+    )
+
+
+def _coerce_typed_obs_value(canonical_name: str, value: Any) -> int | float | None:
+    """Convert safe structural/numeric obs fields to typed values."""
+    if value is None or _is_null_like_str(str(value)):
+        return None
+    if canonical_name == "size_factor":
+        return float(value)
+    return int(value)
+
+
+def _coerce_nullable_string_obs_value(value: Any, *, fallback: str) -> str | None:
+    """Return real nulls for safe nullable string fields."""
+    candidate = fallback if value is None else value
+    if _is_null_like_str(str(candidate)):
+        return None
+    return str(candidate)

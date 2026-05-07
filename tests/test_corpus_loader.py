@@ -57,6 +57,8 @@ def _make_obs_df(
     *,
     canonical: bool = True,
     include_size_factor: bool = True,
+    typed_structural: bool = False,
+    safe_nulls: bool = False,
 ) -> pl.DataFrame:
     """Create a canonical-obs DataFrame for testing."""
     rows = []
@@ -64,15 +66,15 @@ def _make_obs_df(
         row: dict[str, Any] = {
             "cell_id": f"{dataset_id}_cell_{i:04d}",
             "dataset_id": dataset_id,
-            "dataset_index": str(dataset_index),
-            "global_row_index": str(global_start + i),
-            "local_row_index": str(i),
+            "dataset_index": dataset_index if typed_structural else str(dataset_index),
+            "global_row_index": global_start + i if typed_structural else str(global_start + i),
+            "local_row_index": i if typed_structural else str(i),
             "perturb_label": "CRISPR_control" if i % 3 == 0 else "CRISPR_geneX",
             "perturb_type": "CRISPR",
-            "dose": "1.0",
-            "dose_unit": "MOI",
-            "timepoint": "7",
-            "timepoint_unit": "days",
+            "dose": None if safe_nulls else "1.0",
+            "dose_unit": None if safe_nulls else "MOI",
+            "timepoint": None if safe_nulls else "7",
+            "timepoint_unit": None if safe_nulls else "days",
             "cell_context": "",
             "cell_line_or_type": "K562",
             "species": "Homo sapiens",
@@ -85,7 +87,8 @@ def _make_obs_df(
             "disease_state": "healthy",
         }
         if include_size_factor:
-            row["size_factor"] = str(round(np.random.uniform(0.5, 2.0), 4))
+            size_factor = round(np.random.uniform(0.5, 2.0), 4)
+            row["size_factor"] = size_factor if typed_structural else str(size_factor)
         rows.append(row)
 
     return pl.DataFrame(rows)
@@ -121,7 +124,11 @@ def _make_lance_rows(n_cells: int) -> list[dict[str, Any]]:
 
 
 def _build_mock_aggregate_corpus(
-    corpus_root: Path, *, include_size_factor: bool = True
+    corpus_root: Path,
+    *,
+    include_size_factor: bool = True,
+    typed_structural: bool = False,
+    safe_nulls: bool = False,
 ) -> None:
     """Build a minimal aggregate Lance corpus (2 datasets)."""
     corpus_root.mkdir(parents=True, exist_ok=True)
@@ -170,6 +177,8 @@ def _build_mock_aggregate_corpus(
             ds["cell_count"],
             ds["global_start"],
             include_size_factor=include_size_factor,
+            typed_structural=typed_structural,
+            safe_nulls=safe_nulls,
         )
         obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
 
@@ -205,7 +214,11 @@ def _build_mock_aggregate_corpus(
 
 
 def _build_mock_federated_corpus(
-    corpus_root: Path, *, include_size_factor: bool = True
+    corpus_root: Path,
+    *,
+    include_size_factor: bool = True,
+    typed_structural: bool = False,
+    safe_nulls: bool = False,
 ) -> None:
     """Build a minimal federated Lance corpus (2 datasets)."""
     corpus_root.mkdir(parents=True, exist_ok=True)
@@ -253,6 +266,8 @@ def _build_mock_federated_corpus(
             ds["cell_count"],
             ds["global_start"],
             include_size_factor=include_size_factor,
+            typed_structural=typed_structural,
+            safe_nulls=safe_nulls,
         )
         obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
 
@@ -330,6 +345,42 @@ class TestLoadCorpusAggregate:
         assert "dataset_id" in mi.df.columns
         assert "size_factor" in mi.df.columns
         assert "perturb_label" in mi.df.columns
+
+    def test_load_corpus_casts_legacy_string_structural_fields(self, tmp_path: Path) -> None:
+        """Legacy all-string canonical obs fixtures still load with typed structure."""
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        schema = corpus.metadata_index.df.schema
+        assert schema["global_row_index"] == pl.Int64
+        assert schema["dataset_index"] == pl.Int32
+        assert schema["local_row_index"] == pl.Int64
+        assert schema["size_factor"] == pl.Float64
+
+    def test_load_corpus_preserves_typed_structural_fields_and_safe_nulls(
+        self, tmp_path: Path,
+    ) -> None:
+        """Typed canonical obs and safe nulls round-trip through load_corpus()."""
+        _build_mock_aggregate_corpus(
+            tmp_path,
+            typed_structural=True,
+            safe_nulls=True,
+        )
+        corpus = load_corpus(str(tmp_path))
+
+        mi = corpus.metadata_index
+        schema = mi.df.schema
+        assert schema["global_row_index"] == pl.Int64
+        assert schema["dataset_index"] == pl.Int32
+        assert schema["local_row_index"] == pl.Int64
+        assert schema["size_factor"] == pl.Float64
+        assert mi.df["dose"].null_count() == len(mi)
+        assert mi.df["timepoint"].null_count() == len(mi)
+
+        taken = mi.take([0, 10], ["dataset_index", "size_factor", "dose"])
+        assert np.issubdtype(taken["dataset_index"].dtype, np.integer)
+        assert np.issubdtype(taken["size_factor"].dtype, np.floating)
+        assert taken["dose"] == (None, None)
 
     def test_global_row_indices_contiguous(self, tmp_path: Path) -> None:
         """Global row indices are 0..N-1 contiguous."""
