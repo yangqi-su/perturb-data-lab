@@ -7,8 +7,6 @@ have been removed.  They are replaced by:
   corpus API for sampler setup, dataset access, and CPU/GPU loader iteration
 - ``MetadataIndex``  (``index.py``)  — metadata query / sampling
 - ``ExpressionReader`` (``expression.py``) — expression I/O
-- ``BatchExecutor`` (``executor.py``) — direct / legacy metadata + expression
-  composition
 
 Utility functions ``read_raw_obs_parquet`` and ``read_raw_var_parquet`` are
 preserved for ad-hoc metadata inspection.

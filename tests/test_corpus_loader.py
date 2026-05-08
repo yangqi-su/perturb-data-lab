@@ -6,7 +6,7 @@ from functools import partial
 import pickle
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import lance
 import numpy as np
@@ -14,19 +14,27 @@ import polars as pl
 import pyarrow as pa
 import pytest
 import torch
+from torch.utils.data import DataLoader
 import yaml
 
 from perturb_data_lab.loaders import (
-    AggregateLanceExpressionBatchDataset,
     CPUPipeline,
+    CorpusRandomBatchSampler,
+    DatasetEntry,
+    DatasetRoutingTable,
     ExpressionBatch,
     ExpressionBatchDataset,
     GPUSparsePipeline,
-    LanceExpressionBatchDataset,
-    collate_raw_expression_batch,
-    cpu_parallel_collate_fn,
+    MetadataIndex,
+    collate_expression_batch,
+    collate_expression_batch_cpu,
 )
-from perturb_data_lab.loaders.corpus_loader import Corpus, load_corpus
+from perturb_data_lab.loaders.corpus_loader import (
+    Corpus,
+    _build_dataset_routing_table,
+    _read_raw_batch,
+    load_corpus,
+)
 
 
 LOADER_SEQ_LEN = 8
@@ -64,17 +72,24 @@ def _assert_expression_batch_equal(actual: Any, expected: Any) -> None:
     np.testing.assert_array_equal(actual.expression_counts, expected.expression_counts)
 
 
-class _StubFlatReader:
-    def read_expression_flat(self, global_indices: list[int]) -> ExpressionBatch:
-        indices = np.asarray(global_indices, dtype=np.int64)
-        n = len(indices)
-        return ExpressionBatch(
-            batch_size=n,
-            global_row_index=indices,
-            row_offsets=np.arange(n + 1, dtype=np.int64),
-            expressed_gene_indices=np.arange(n, dtype=np.int32),
-            expression_counts=np.ones(n, dtype=np.int32),
+def _make_routing_metadata_index(
+    *,
+    dataset_id: Sequence[str],
+    dataset_index: Sequence[int],
+    local_row_index: Sequence[int],
+) -> MetadataIndex:
+    n_rows = len(dataset_id)
+    return MetadataIndex(
+        pl.DataFrame(
+            {
+                "global_row_index": np.arange(n_rows, dtype=np.int64),
+                "cell_id": [f"cell_{idx:03d}" for idx in range(n_rows)],
+                "dataset_id": list(dataset_id),
+                "dataset_index": np.asarray(dataset_index, dtype=np.int32),
+                "local_row_index": np.asarray(local_row_index, dtype=np.int64),
+            }
         )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +367,7 @@ class TestLoadCorpusAggregate:
         assert corpus.topology == "aggregate"
         assert corpus.backend == "lance"
         assert corpus.corpus_root == tmp_path.resolve()
-        assert corpus.batch_executor is not None
+        assert not hasattr(corpus, "batch_executor")
         assert corpus.feature_registry is not None
         assert corpus.metadata_index is not None
         assert len(corpus.dataset_entries) == 2
@@ -427,20 +442,19 @@ class TestLoadCorpusAggregate:
         assert gr[-1] == 24
         assert np.array_equal(gr, np.arange(25))
 
-    def test_batch_executor_reads_cells(self, tmp_path: Path) -> None:
-        """Batch executor can read expression + metadata."""
+    def test_inspect_batch_reads_cells(self, tmp_path: Path) -> None:
+        """Corpus inspection helper can read expression + metadata."""
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
-        batch = corpus.batch_executor.read_batch([0, 5, 12, 24])
+        batch = corpus.inspect_batch([0, 5, 12, 24], metadata_columns=["perturb_label"])
         assert batch["batch_size"] == 4
         assert len(batch["global_row_index"]) == 4
         assert batch["row_offsets"][0] == 0
         # Every cell should have at least one expressed gene
         assert len(batch["expressed_gene_indices"]) > 0
         assert len(batch["expression_counts"]) > 0
-        assert len(batch["dataset_id"]) == 4
-        assert len(batch["canonical_perturbation"]) == 4
+        assert set(batch["meta_columns"]) == {"perturb_label"}
 
     def test_dataset_entries_cover_full_range(self, tmp_path: Path) -> None:
         """Dataset entries have correct global_start/end ranges."""
@@ -468,7 +482,7 @@ class TestLoadCorpusFederated:
         assert corpus.topology == "federated"
         assert corpus.backend == "lance"
         assert corpus.corpus_root == tmp_path.resolve()
-        assert corpus.batch_executor is not None
+        assert not hasattr(corpus, "batch_executor")
         assert corpus.feature_registry is not None
         assert corpus.metadata_index is not None
         assert len(corpus.dataset_entries) == 2
@@ -498,15 +512,15 @@ class TestLoadCorpusFederated:
         mock01 = mi.df.filter(pl.col("dataset_id") == "mock_01")
         assert len(mock01) == 15
 
-    def test_batch_executor_reads_cells(self, tmp_path: Path) -> None:
-        """Batch executor can read expression + metadata."""
+    def test_inspect_batch_reads_cells(self, tmp_path: Path) -> None:
+        """Corpus inspection helper can read federated expression + metadata."""
         _build_mock_federated_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
-        batch = corpus.batch_executor.read_batch([2, 8, 11, 20])
+        batch = corpus.inspect_batch([2, 8, 11, 20], metadata_columns=["perturb_label"])
         assert batch["batch_size"] == 4
         assert len(batch["expressed_gene_indices"]) > 0
-        assert len(batch["canonical_perturbation"]) == 4
+        assert batch["meta_columns"]["perturb_label"]
 
     def test_dataset_entries_have_lance_paths(self, tmp_path: Path) -> None:
         """Federated entries are ``LanceDatasetEntry`` with per-file paths."""
@@ -524,13 +538,6 @@ class TestLoadCorpusFederated:
 class TestCorpusApiPhase2:
     """Phase 2 corpus-level API scaffolding tests."""
 
-    def test_lance_dataset_aliases_remain_importable(self) -> None:
-        assert issubclass(LanceExpressionBatchDataset, ExpressionBatchDataset)
-        assert issubclass(
-            AggregateLanceExpressionBatchDataset,
-            ExpressionBatchDataset,
-        )
-
     def test_set_sampler_stores_default_sampler(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
@@ -545,57 +552,108 @@ class TestCorpusApiPhase2:
             "seed": 7,
         }
 
-    def test_dataset_returns_raw_batch_contract_aggregate(self, tmp_path: Path) -> None:
+    def test_dataset_rejects_metadata_columns(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
-        with pytest.warns(DeprecationWarning, match="RawExpressionBatchDataset"):
-            dataset = corpus.dataset(metadata_columns=["perturb_label"])
-        batch = dataset.__getitems__([0, 10, 24])[0]
+        with pytest.raises(ValueError, match="no longer accepts metadata_columns"):
+            corpus.dataset(metadata_columns=["perturb_label"])
 
-        assert dataset.backend == "lance"
-        assert dataset.topology == "aggregate"
-        assert set(batch.keys()) == {
+    def test_expression_dataset_uses_explicit_routing_table(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        dataset = corpus.dataset()
+
+        assert type(dataset) is ExpressionBatchDataset
+        assert type(dataset.routing_table) is DatasetRoutingTable
+        np.testing.assert_array_equal(dataset.routing_table.dataset_starts, [0, 10])
+        np.testing.assert_array_equal(dataset.routing_table.dataset_stops, [10, 25])
+        np.testing.assert_array_equal(dataset.routing_table.dataset_indices, [0, 1])
+        assert dataset.routing_table.dataset_ids == ("mock_00", "mock_01")
+
+        batch = dataset.__getitems__([0, 10, 24])[0]
+        assert set(batch) == {
             "batch_size",
             "global_row_index",
             "dataset_index",
-            "local_row_index",
             "size_factor",
             "row_offsets",
             "expressed_gene_indices",
             "expression_counts",
-            "meta_columns",
         }
-        assert batch["batch_size"] == 3
-        np.testing.assert_array_equal(batch["global_row_index"], [0, 10, 24])
-        assert batch["dataset_index"].dtype == np.int32
-        assert batch["local_row_index"].dtype == np.int64
-        assert batch["size_factor"].dtype == np.float32
-        assert batch["meta_columns"]["perturb_label"]
+        assert "local_row_index" not in batch
 
-    def test_dataset_returns_raw_batch_contract_federated(self, tmp_path: Path) -> None:
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        with pytest.warns(DeprecationWarning, match="RawExpressionBatchDataset"):
-            dataset = corpus.dataset(metadata_columns=["cell_line_or_type"])
-        batch = dataset.__getitems__([2, 11, 20])[0]
-
-        assert dataset.topology == "federated"
-        np.testing.assert_array_equal(batch["global_row_index"], [2, 11, 20])
-        assert batch["dataset_index"].tolist() == [0, 1, 1]
-        assert batch["meta_columns"]["cell_line_or_type"] == (
-            "K562",
-            "K562",
-            "K562",
-        )
-
-    def test_loader_requires_sampler_or_inline_batch_size(self, tmp_path: Path) -> None:
+    def test_loader_can_attach_local_row_index_as_metadata_column(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
-        with pytest.raises(ValueError, match="No sampler is configured"):
-            next(corpus.loader())
+        batch = next(
+            corpus.loader(
+                processing="gpu",
+                batch_size=4,
+                seq_len=LOADER_SEQ_LEN,
+                metadata_columns=["local_row_index"],
+            )
+        )
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+        assert "local_row_index" not in batch
+        expected = corpus.take_metadata(
+            batch["global_row_index"].cpu().numpy(),
+            columns=["local_row_index"],
+        )
+        np.testing.assert_array_equal(
+            batch["meta_columns"]["local_row_index"],
+            expected["local_row_index"],
+        )
+
+    def test_build_dataset_routing_table_rejects_cross_dataset_entry(self) -> None:
+        metadata_index = _make_routing_metadata_index(
+            dataset_id=("ds0", "ds1"),
+            dataset_index=(0, 1),
+            local_row_index=(0, 0),
+        )
+
+        with pytest.raises(ValueError, match="stay within a single dataset"):
+            _build_dataset_routing_table(
+                metadata_index,
+                [DatasetEntry(dataset_id="entry_0", global_start=0, global_end=2)],
+            )
+
+    def test_build_dataset_routing_table_rejects_noncontiguous_local_rows(self) -> None:
+        metadata_index = _make_routing_metadata_index(
+            dataset_id=("ds0", "ds0"),
+            dataset_index=(0, 0),
+            local_row_index=(0, 2),
+        )
+
+        with pytest.raises(ValueError, match="contiguous local row indices"):
+            _build_dataset_routing_table(
+                metadata_index,
+                [DatasetEntry(dataset_id="entry_0", global_start=0, global_end=2)],
+            )
+
+    def test_loader_defaults_to_batch_size_128(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+        captured: dict[str, Any] = {}
+
+        class FakeDataLoader:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+            def __iter__(self):
+                return iter(())
+
+        monkeypatch.setattr(
+            "perturb_data_lab.loaders.corpus_loader.DataLoader",
+            FakeDataLoader,
+        )
+
+        corpus.loader(seq_len=LOADER_SEQ_LEN)
+
+        assert captured["batch_sampler"].batch_size == 128
 
     def test_loader_accepts_inline_sampler_defaults(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
@@ -615,12 +673,13 @@ class TestCorpusApiPhase2:
 
     def test_loader_metadata_attachment_supports_size_factor(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
 
         batch = next(
             corpus.loader(
                 processing="gpu",
                 batch_size=4,
+                seq_len=LOADER_SEQ_LEN,
                 metadata_columns=["size_factor", "perturb_label"],
             )
         )
@@ -634,19 +693,35 @@ class TestCorpusApiPhase2:
 
     def test_loader_uses_stored_sampler(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
         corpus.set_sampler(batch_size=5, seed=3)
 
-        batch = next(corpus.loader(processing="cpu"))
+        batch = next(corpus.loader(processing="cpu", seq_len=LOADER_SEQ_LEN))
 
         _assert_processed_loader_batch(batch, batch_size=5)
+
+    def test_loader_warns_when_local_sampler_overrides_stored_sampler(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+        corpus.set_sampler(batch_size=5, seed=3)
+
+        with pytest.warns(UserWarning, match="loader-local sampler"):
+            batch = next(
+                corpus.loader(
+                    processing="cpu",
+                    batch_size=4,
+                    seq_len=LOADER_SEQ_LEN,
+                )
+            )
+
+        _assert_processed_loader_batch(batch, batch_size=4)
 
     def test_loader_validates_metadata_columns_and_worker_params(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
         with pytest.raises(ValueError, match="reserved raw batch field"):
-            corpus.dataset(metadata_columns=["dataset_index"])
+            corpus.inspect_batch([0], metadata_columns=["dataset_index"])
 
         with pytest.raises(ValueError, match="persistent_workers requires num_workers > 0"):
             next(corpus.loader(batch_size=4, persistent_workers=True))
@@ -659,9 +734,9 @@ class TestCorpusApiPhase2:
 
     def test_loader_omits_metadata_columns_by_default(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
 
-        batch = next(corpus.loader(processing="gpu", batch_size=4))
+        batch = next(corpus.loader(processing="gpu", batch_size=4, seq_len=LOADER_SEQ_LEN))
 
         _assert_processed_loader_batch(batch, batch_size=4)
         assert "meta_columns" not in batch
@@ -701,7 +776,7 @@ class TestAggregateLancePhase4:
         assert dataset._reader._dataset is not None
         np.testing.assert_array_equal(batch["global_row_index"], [0, 10, 24])
         assert batch["dataset_index"].tolist() == [0, 1, 1]
-        assert batch["local_row_index"].tolist() == [0, 0, 14]
+        assert "local_row_index" not in batch
 
     def test_dataset_pickle_state_drops_open_lance_handle(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
@@ -758,7 +833,7 @@ class TestAggregateLancePhase4:
 
     def test_loader_dataset_sampler_drives_aggregate_batches(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
         corpus.set_sampler(
             sampler="dataset",
             dataset_index=1,
@@ -766,7 +841,7 @@ class TestAggregateLancePhase4:
             seed=7,
         )
 
-        batch = next(corpus.loader(processing="gpu"))
+        batch = next(corpus.loader(processing="gpu", seq_len=LOADER_SEQ_LEN))
 
         _assert_processed_loader_batch(batch, batch_size=4)
         global_indices = batch["global_row_index"].cpu().numpy()
@@ -775,7 +850,7 @@ class TestAggregateLancePhase4:
 
     def test_loader_dataset_context_sampler_preserves_context_group(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
 
         batch = next(
             corpus.loader(
@@ -784,6 +859,7 @@ class TestAggregateLancePhase4:
                 dataset_index=1,
                 context_field="perturb_label",
                 batch_size=3,
+                seq_len=LOADER_SEQ_LEN,
                 metadata_columns=["perturb_label"],
             )
         )
@@ -811,7 +887,7 @@ class TestFederatedLancePhase5:
         assert set(dataset._reader._datasets) == {"mock_00", "mock_01"}
         np.testing.assert_array_equal(batch["global_row_index"], [24, 0, 10, 9])
         assert batch["dataset_index"].tolist() == [1, 0, 1, 0]
-        assert batch["local_row_index"].tolist() == [14, 0, 0, 9]
+        assert "local_row_index" not in batch
 
     def test_dataset_pickle_state_drops_open_federated_handles(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
@@ -849,7 +925,7 @@ class TestFederatedLancePhase5:
 
     def test_loader_dataset_sampler_drives_federated_batches(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
         corpus.set_sampler(
             sampler="dataset",
             dataset_index=0,
@@ -857,7 +933,7 @@ class TestFederatedLancePhase5:
             seed=11,
         )
 
-        batch = next(corpus.loader(processing="cpu"))
+        batch = next(corpus.loader(processing="cpu", seq_len=LOADER_SEQ_LEN))
 
         _assert_processed_loader_batch(batch, batch_size=4)
         global_indices = batch["global_row_index"].cpu().numpy()
@@ -868,17 +944,17 @@ class TestFederatedLancePhase5:
 class TestCorpusInspectionHelpersPhase5:
     """Phase 5 corpus-level inspection helper tests."""
 
-    def test_read_expression_matches_batch_executor(self, tmp_path: Path) -> None:
+    def test_read_expression_matches_expression_reader(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
         indices = [24, 0, 10, 9]
 
         expr = corpus.read_expression(indices)
-        expected = corpus.batch_executor.read_expression_batch(indices)
+        expected = corpus.expression_reader.read_expression_flat(indices)
 
         _assert_expression_batch_equal(expr, expected)
 
-    def test_take_metadata_matches_executor_columnar_metadata(self, tmp_path: Path) -> None:
+    def test_take_metadata_matches_metadata_index_take(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(
             tmp_path,
             typed_structural=True,
@@ -891,7 +967,10 @@ class TestCorpusInspectionHelpersPhase5:
             indices,
             columns=["dataset_id", "cell_id", "dataset_index", "size_factor", "dose", "timepoint", "perturb_label"],
         )
-        expected = corpus.batch_executor.read_metadata_batch(indices, columnar=True)
+        expected = corpus.metadata_index.take(
+            indices,
+            ["dataset_id", "cell_id", "dataset_index", "size_factor", "dose", "timepoint", "perturb_label"],
+        )
 
         assert np.issubdtype(taken["dataset_index"].dtype, np.integer)
         assert np.issubdtype(taken["size_factor"].dtype, np.floating)
@@ -901,14 +980,11 @@ class TestCorpusInspectionHelpersPhase5:
         _assert_columnar_value_equal(taken["cell_id"], expected["cell_id"])
         _assert_columnar_value_equal(taken["dataset_index"], expected["dataset_index"])
         np.testing.assert_allclose(taken["size_factor"], expected["size_factor"])
-        _assert_columnar_value_equal(taken["dose"], expected["meta_columns"]["dose"])
-        _assert_columnar_value_equal(taken["timepoint"], expected["meta_columns"]["timepoint"])
-        _assert_columnar_value_equal(
-            taken["perturb_label"],
-            expected["meta_columns"]["perturb_label"],
-        )
+        _assert_columnar_value_equal(taken["dose"], expected["dose"])
+        _assert_columnar_value_equal(taken["timepoint"], expected["timepoint"])
+        _assert_columnar_value_equal(taken["perturb_label"], expected["perturb_label"])
 
-    def test_inspect_batch_matches_batch_executor_raw_contract(self, tmp_path: Path) -> None:
+    def test_inspect_batch_matches_direct_raw_batch_contract(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path, typed_structural=True, safe_nulls=True)
         corpus = load_corpus(str(tmp_path))
         indices = [0, 5, 12, 24]
@@ -917,7 +993,9 @@ class TestCorpusInspectionHelpersPhase5:
             indices,
             metadata_columns=["perturb_label", "dose", "size_factor"],
         )
-        expected = corpus.batch_executor.read_raw_batch(
+        expected = _read_raw_batch(
+            corpus.expression_reader,
+            corpus.metadata_index,
             indices,
             metadata_columns=["perturb_label", "dose", "size_factor"],
         )
@@ -938,38 +1016,26 @@ class TestCorpusInspectionHelpersPhase5:
             _assert_columnar_value_equal(batch["meta_columns"][key], value)
 
 
-class TestCorpusDeprecationsPhase6:
-    """Phase 6 deprecation coverage for compatibility-only loader surfaces."""
+class TestLegacySurfaceRemovalPhase6:
+    """Phase 6 import and API removal checks."""
 
     @pytest.mark.parametrize(
-        ("dataset_cls", "expected_name"),
+        "symbol",
         [
-            (LanceExpressionBatchDataset, "LanceExpressionBatchDataset"),
-            (
-                AggregateLanceExpressionBatchDataset,
-                "AggregateLanceExpressionBatchDataset",
-            ),
+            "BatchExecutor",
+            "RawExpressionBatch",
+            "RawExpressionBatchDataset",
+            "PerturbBatchDataset",
+            "collate_batch_dict",
+            "FastTrainingBatch",
+            "BatchMetadata",
+            "LanceExpressionBatchDataset",
+            "AggregateLanceExpressionBatchDataset",
         ],
     )
-    def test_legacy_lance_dataset_aliases_warn_but_still_work(
-        self,
-        dataset_cls: type[ExpressionBatchDataset],
-        expected_name: str,
-    ) -> None:
-        with pytest.warns(DeprecationWarning, match=expected_name):
-            dataset = dataset_cls(
-                _StubFlatReader(),
-                dataset_starts=np.array([0], dtype=np.int64),
-                dataset_stops=np.array([5], dtype=np.int64),
-                dataset_indices=np.array([7], dtype=np.int32),
-                topology="aggregate",
-                backend="lance",
-            )
-
-        batch = dataset.__getitems__([0, 3])[0]
-        np.testing.assert_array_equal(batch["global_row_index"], [0, 3])
-        np.testing.assert_array_equal(batch["dataset_index"], [7, 7])
-        np.testing.assert_array_equal(batch["local_row_index"], [0, 3])
+    def test_removed_public_symbols_are_not_importable(self, symbol: str) -> None:
+        with pytest.raises(ImportError):
+            exec(f"from perturb_data_lab.loaders import {symbol}", {}, {})
 
 
 class TestCorpusLoaderPhase6:
@@ -977,52 +1043,53 @@ class TestCorpusLoaderPhase6:
 
     def test_aggregate_gpu_loader_route(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
 
-        batch = next(corpus.loader(processing="gpu", batch_size=4))
+        batch = next(corpus.loader(processing="gpu", batch_size=4, seq_len=LOADER_SEQ_LEN))
 
         _assert_processed_loader_batch(batch, batch_size=4)
         assert batch["sampled_gene_ids"].shape == (4, LOADER_SEQ_LEN)
-        assert batch["local_row_index"].shape == (4,)
+        assert "local_row_index" not in batch
 
     def test_aggregate_cpu_loader_route(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
 
-        batch = next(corpus.loader(processing="cpu", batch_size=4))
+        batch = next(corpus.loader(processing="cpu", batch_size=4, seq_len=LOADER_SEQ_LEN))
 
         _assert_processed_loader_batch(batch, batch_size=4)
         assert batch["sampled_gene_ids"].device.type == "cpu"
-        assert batch["local_row_index"].shape == (4,)
+        assert "local_row_index" not in batch
 
     def test_federated_gpu_loader_route(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
 
-        batch = next(corpus.loader(processing="gpu", batch_size=4))
+        batch = next(corpus.loader(processing="gpu", batch_size=4, seq_len=LOADER_SEQ_LEN))
 
         _assert_processed_loader_batch(batch, batch_size=4)
         assert batch["sampled_gene_ids"].shape == (4, LOADER_SEQ_LEN)
-        assert batch["local_row_index"].shape == (4,)
+        assert "local_row_index" not in batch
 
     def test_federated_cpu_loader_route(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
 
-        batch = next(corpus.loader(processing="cpu", batch_size=4))
+        batch = next(corpus.loader(processing="cpu", batch_size=4, seq_len=LOADER_SEQ_LEN))
 
         _assert_processed_loader_batch(batch, batch_size=4)
         assert batch["sampled_gene_ids"].device.type == "cpu"
-        assert batch["local_row_index"].shape == (4,)
+        assert "local_row_index" not in batch
 
     def test_cpu_loader_supports_multiworker_spawn_aggregate(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
 
         batch = next(
             corpus.loader(
                 processing="cpu",
                 batch_size=4,
+                seq_len=LOADER_SEQ_LEN,
                 num_workers=1,
                 multiprocessing_context="spawn",
             )
@@ -1032,12 +1099,13 @@ class TestCorpusLoaderPhase6:
 
     def test_cpu_loader_supports_multiworker_spawn_federated(self, tmp_path: Path) -> None:
         _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
 
         batch = next(
             corpus.loader(
                 processing="cpu",
                 batch_size=4,
+                seq_len=LOADER_SEQ_LEN,
                 num_workers=1,
                 multiprocessing_context="spawn",
             )
@@ -1047,7 +1115,7 @@ class TestCorpusLoaderPhase6:
 
     def test_lance_workers_default_to_spawn(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
         captured: dict[str, Any] = {}
 
         class FakeDataLoader:
@@ -1062,9 +1130,99 @@ class TestCorpusLoaderPhase6:
             FakeDataLoader,
         )
 
-        corpus.loader(processing="gpu", batch_size=4, num_workers=1)
+        corpus.loader(processing="gpu", batch_size=4, seq_len=LOADER_SEQ_LEN, num_workers=1)
 
         assert captured["multiprocessing_context"] == "spawn"
+
+
+class TestModernCollatesPhase5:
+    """Phase 5 custom DataLoader and collate tests."""
+
+    def test_custom_dataloader_supports_collate_expression_batch(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+        dataset = corpus.dataset()
+        sampler = CorpusRandomBatchSampler(
+            metadata_index=corpus.metadata_index,
+            batch_size=3,
+            drop_last=False,
+            seed=5,
+        )
+
+        loader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            collate_fn=collate_expression_batch,
+            num_workers=0,
+        )
+
+        batch = next(iter(loader))
+
+        assert batch["batch_size"] == 3
+        assert isinstance(batch["global_row_index"], torch.Tensor)
+        assert isinstance(batch["dataset_index"], torch.Tensor)
+        assert isinstance(batch["row_offsets"], torch.Tensor)
+        assert isinstance(batch["expressed_gene_indices"], torch.Tensor)
+        assert isinstance(batch["expression_counts"], torch.Tensor)
+        assert batch["global_row_index"].dtype == torch.long
+        assert batch["size_factor"].dtype == torch.float32
+        assert "local_row_index" not in batch
+
+    def test_custom_dataloader_supports_collate_expression_batch_cpu(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+        dataset = corpus.dataset()
+        sampler = CorpusRandomBatchSampler(
+            metadata_index=corpus.metadata_index,
+            batch_size=3,
+            drop_last=False,
+            seed=7,
+        )
+        pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=LOADER_SEQ_LEN)
+
+        loader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            collate_fn=partial(
+                collate_expression_batch_cpu,
+                pipeline=pipeline,
+                sampled_gene_ids=torch.arange(
+                    LOADER_SEQ_LEN,
+                    dtype=torch.long,
+                ).repeat(3, 1),
+            ),
+            num_workers=0,
+        )
+
+        batch = next(iter(loader))
+
+        _assert_processed_loader_batch(batch, batch_size=3)
+        assert batch["sampled_gene_ids"].device.type == "cpu"
+
+    def test_collate_expression_batch_preserves_meta_columns(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        batch = corpus.inspect_batch([0, 10, 24], metadata_columns=["perturb_label"])
+        collated = collate_expression_batch([batch])
+
+        assert collated["meta_columns"] == batch["meta_columns"]
+        assert collated["size_factor"].dtype == torch.float32
+
+    def test_collate_expression_batch_cpu_preserves_meta_columns(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+        pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=LOADER_SEQ_LEN)
+        batch = corpus.inspect_batch([1, 11, 21], metadata_columns=["perturb_label"])
+
+        collated = collate_expression_batch_cpu(
+            [batch],
+            pipeline=pipeline,
+            sampled_gene_ids=torch.arange(LOADER_SEQ_LEN, dtype=torch.long).repeat(3, 1),
+        )
+
+        assert collated["meta_columns"] == batch["meta_columns"]
+        assert collated["size_factor"].dtype == torch.float32
 
 
 class TestSparsePipelinePhase3:
@@ -1072,12 +1230,12 @@ class TestSparsePipelinePhase3:
 
     def test_raw_loader_path_allows_missing_size_factor(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path, include_size_factor=False)
-        corpus = load_corpus(str(tmp_path), seq_len=LOADER_SEQ_LEN)
+        corpus = load_corpus(str(tmp_path))
 
         raw_batch = corpus.dataset().__getitems__([0, 10, 24])[0]
         assert "size_factor" not in raw_batch
 
-        loader_batch = next(corpus.loader(processing="gpu", batch_size=4))
+        loader_batch = next(corpus.loader(processing="gpu", batch_size=4, seq_len=LOADER_SEQ_LEN))
         assert "size_factor" not in loader_batch
 
     def test_gpu_pipeline_output_is_size_factor_independent(self, tmp_path: Path) -> None:
@@ -1091,8 +1249,8 @@ class TestSparsePipelinePhase3:
             if key != "size_factor"
         }
 
-        collated_with = collate_raw_expression_batch([batch_with_size_factor])
-        collated_without = collate_raw_expression_batch([batch_without_size_factor])
+        collated_with = collate_expression_batch([batch_with_size_factor])
+        collated_without = collate_expression_batch([batch_without_size_factor])
         pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=8)
         sampled_gene_ids = torch.arange(8, dtype=torch.long).repeat(3, 1)
 
@@ -1117,7 +1275,7 @@ class TestSparsePipelinePhase3:
         ):
             assert torch.equal(result_with[key], result_without[key])
 
-    def test_cpu_parallel_collate_allows_missing_size_factor(self, tmp_path: Path) -> None:
+    def test_collate_expression_batch_cpu_allows_missing_size_factor(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
@@ -1131,7 +1289,7 @@ class TestSparsePipelinePhase3:
         pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=8)
         sampled_gene_ids = torch.arange(8, dtype=torch.long).repeat(3, 1)
         collate = partial(
-            cpu_parallel_collate_fn,
+            collate_expression_batch_cpu,
             pipeline=pipeline,
             sampled_gene_ids=sampled_gene_ids,
         )

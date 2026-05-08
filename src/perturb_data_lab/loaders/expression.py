@@ -1,4 +1,4 @@
-"""Phase 2: Backend-agnostic expression readers.
+"""Backend-agnostic expression readers.
 
 Defines the ``ExpressionReader`` protocol, a ``BaseExpressionReader`` abstract
 class that handles global→local routing and order-preserving reassembly, and
@@ -7,22 +7,19 @@ backend-specific implementations for all supported backends.
 Supported backends: Lance, Zarr, Arrow IPC, Parquet, WebDataset.
 Supported topologies: aggregate, federated.
 
-The reader returns **only expression data** — no metadata fields.
-Identity/metadata fields (dataset_id, dataset_index, local_row_index,
-size_factor, etc.) belong in ``MetadataIndex``, not in ``ExpressionRow``.
-``read_expression_flat()`` is the preferred runtime contract; the older
-``ExpressionRow`` / ``read_expression()`` object path is retained as a
-compatibility surface for one deprecation cycle.
+Readers return **only expression data** via
+``read_expression_flat(global_indices) -> ExpressionBatch``. Identity and
+metadata fields (dataset_id, dataset_index, local_row_index, size_factor,
+etc.) belong in ``MetadataIndex``.
 """
 
 from __future__ import annotations
 
-import bisect
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Protocol, Sequence
+from typing import Protocol, Sequence
 
 import numpy as np
 
@@ -30,7 +27,6 @@ from ..materializers.backends.csr_cache import ShardLRUCache
 from .loaders import ExpressionBatch
 
 __all__ = [
-    "ExpressionRow",
     "ExpressionReader",
     "BaseExpressionReader",
     "AggregateLanceReader",
@@ -67,32 +63,6 @@ constant as the hard upper bound.
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ExpressionRow:
-    """A single row of expression data for one cell.
-
-    Compatibility-only row object retained for legacy inspection and reader
-    tests. New loader/runtime code should prefer flat ``ExpressionBatch``
-    reads instead of constructing or depending on ``ExpressionRow`` objects.
-
-    Contains only expression data — no metadata.  Identity and metadata
-    fields are handled separately by ``MetadataIndex``.
-
-    Fields
-    ------
-    global_row_index : int
-        Corpus-level global cell index.
-    expressed_gene_indices : np.ndarray
-        1-D int32 array of gene indices (dataset-local feature space).
-    expression_counts : np.ndarray
-        1-D int32 array of corresponding expression counts.
-    """
-
-    global_row_index: int
-    expressed_gene_indices: np.ndarray  # dtype int32
-    expression_counts: np.ndarray  # dtype int32
 
 
 @dataclass(frozen=True)
@@ -183,18 +153,10 @@ class CsrMemmapShardEntry(DatasetEntry):
 class ExpressionReader(Protocol):
     """Protocol for topology-aware expression readers.
 
-    Implementations must return expression data **only**.  Metadata
-    enrichment is handled by ``MetadataIndex`` + ``BatchExecutor``.
+    Implementations must return expression data **only**. Metadata
+    enrichment is handled separately by ``MetadataIndex`` and higher-level
+    loader code.
     """
-
-    def read_expression(self, global_indices: Sequence[int]) -> list[ExpressionRow]:
-        """Read expression data for the given global cell indices.
-
-        Compatibility path returning one ``ExpressionRow`` per input index, in
-        the same order. New runtime code should prefer
-        ``read_expression_flat()``.
-        """
-        ...
 
     def read_expression_flat(
         self, global_indices: Sequence[int]
@@ -234,32 +196,42 @@ def _list_column_as_py(table, col_name: str, row_idx: int):
     return table.column(col_name)[row_idx].as_py()
 
 
-def _rows_to_expression_batch(
-    global_indices: Sequence[int], rows: Sequence[ExpressionRow]
-) -> ExpressionBatch:
-    """Convert ordered ``ExpressionRow`` objects into an ``ExpressionBatch``."""
-    indices = np.array([int(idx) for idx in global_indices], dtype=np.int64)
-    if len(rows) == 0:
-        return ExpressionBatch(
-            batch_size=0,
-            global_row_index=indices,
-            row_offsets=np.array([0], dtype=np.int64),
-            expressed_gene_indices=np.array([], dtype=np.int32),
-            expression_counts=np.array([], dtype=np.int32),
-        )
+def _empty_expression_batch(global_indices: Sequence[int] | None = None) -> ExpressionBatch:
+    """Return an empty ``ExpressionBatch`` preserving index dtype conventions."""
+    if global_indices is None:
+        indices = np.array([], dtype=np.int64)
+    else:
+        indices = np.array([int(idx) for idx in global_indices], dtype=np.int64)
+    return ExpressionBatch(
+        batch_size=0,
+        global_row_index=indices,
+        row_offsets=np.array([0], dtype=np.int64),
+        expressed_gene_indices=np.array([], dtype=np.int32),
+        expression_counts=np.array([], dtype=np.int32),
+    )
 
-    row_offsets = np.zeros(len(rows) + 1, dtype=np.int64)
+
+def _cell_arrays_to_expression_batch(
+    global_indices: Sequence[int],
+    cells: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> ExpressionBatch:
+    """Convert ordered per-cell arrays into an ``ExpressionBatch``."""
+    indices = np.array([int(idx) for idx in global_indices], dtype=np.int64)
+    if len(cells) == 0:
+        return _empty_expression_batch(indices)
+
+    row_offsets = np.zeros(len(cells) + 1, dtype=np.int64)
     egi_parts: list[np.ndarray] = []
     ec_parts: list[np.ndarray] = []
-    for pos, row in enumerate(rows):
-        gene_indices = np.asarray(row.expressed_gene_indices, dtype=np.int32)
-        counts = np.asarray(row.expression_counts, dtype=np.int32)
+    for pos, (gene_indices, counts) in enumerate(cells):
+        gene_indices = np.asarray(gene_indices, dtype=np.int32)
+        counts = np.asarray(counts, dtype=np.int32)
         egi_parts.append(gene_indices)
         ec_parts.append(counts)
         row_offsets[pos + 1] = row_offsets[pos] + len(gene_indices)
 
     return ExpressionBatch(
-        batch_size=len(rows),
+        batch_size=len(cells),
         global_row_index=indices,
         row_offsets=row_offsets,
         expressed_gene_indices=np.concatenate(egi_parts),
@@ -298,53 +270,41 @@ class BaseExpressionReader(ABC):
     # Public API
     # ------------------------------------------------------------------
 
-    def read_expression(self, global_indices: Sequence[int]) -> list[ExpressionRow]:
-        """Read expression data for the given global cell indices.
+    def read_expression_flat(
+        self, global_indices: Sequence[int]
+    ) -> ExpressionBatch:
+        """Read expression data with shared routing and order reassembly.
 
-        Routes each index to its owning dataset, reads through the
-        backend-specific ``_read_local_rows``, and reassembles results
-        in the original input order. This compatibility path is kept for
-        legacy inspection; new runtime code should prefer
-        ``read_expression_flat()``.
+        Backends with a more efficient flat representation can override this
+        method. Other readers inherit this shared order-preserving
+        implementation backed by per-dataset local reads.
         """
         if not global_indices:
-            return []
+            return _empty_expression_batch()
 
         indices = [int(idx) for idx in global_indices]
         self._validate_all(indices)
 
-        # Group by dataset, preserving the output position of each index
-        # grouped[dataset_id] = list[(output_pos, local_index)]
         grouped: dict[str, list[tuple[int, int]]] = {}
         for output_pos, global_idx in enumerate(indices):
             entry, local_idx = self._resolve_entry(global_idx)
-            grouped.setdefault(entry.dataset_id, []).append(
-                (output_pos, local_idx)
-            )
+            grouped.setdefault(entry.dataset_id, []).append((output_pos, local_idx))
 
-        # Read per-dataset and map back to output positions
-        result_map: dict[int, ExpressionRow] = {}
+        cells_by_pos: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for ds_id, selections in grouped.items():
             entry = self._find_entry_by_id(ds_id)
             local_indices = [local for _, local in selections]
-            rows = self._read_local_rows(entry, local_indices)
-            for i, row in enumerate(rows):
-                result_map[selections[i][0]] = row
+            cells = self._read_local_cells(entry, local_indices)
+            if len(cells) != len(selections):
+                raise ValueError(
+                    f"Reader for dataset_id '{ds_id}' returned {len(cells)} cells "
+                    f"for {len(selections)} requested indices"
+                )
+            for (output_pos, _), cell in zip(selections, cells, strict=True):
+                cells_by_pos[output_pos] = cell
 
-        # Reassemble in original input order
-        return [result_map[pos] for pos in range(len(indices))]
-
-    def read_expression_flat(
-        self, global_indices: Sequence[int]
-    ) -> ExpressionBatch:
-        """Fallback flat reader built from ``read_expression()``.
-
-        Backends with a more efficient flat representation can override this
-        method, while other readers inherit a shared order-preserving fallback.
-        """
-        indices = [int(idx) for idx in global_indices]
-        rows = self.read_expression(indices)
-        return _rows_to_expression_batch(indices, rows)
+        ordered_cells = [cells_by_pos[pos] for pos in range(len(indices))]
+        return _cell_arrays_to_expression_batch(indices, ordered_cells)
 
     # ------------------------------------------------------------------
     # Routing helpers (shared across all backends)
@@ -397,18 +357,13 @@ class BaseExpressionReader(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def _read_local_rows(
+    def _read_local_cells(
         self, entry: DatasetEntry, local_indices: list[int]
-    ) -> list[ExpressionRow]:
-        """Read expression rows for *local_indices* within a single dataset.
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Read per-cell expression arrays within one dataset.
 
-        For aggregate topology, *local_indices* equal *global_indices*
-        (the single entry covers the full range).
-
-        For federated topology, *local_indices* are 0-based offsets
-        within the dataset file.
-
-        Subclasses implement backend-specific I/O here.
+        Returns one ``(expressed_gene_indices, expression_counts)`` tuple per
+        requested local index, in the same order as ``local_indices``.
         """
         ...
 
@@ -474,25 +429,21 @@ class AggregateLanceReader(BaseExpressionReader):
                     f"global_index {idx} out of range [0, {total_rows})"
                 )
 
-    def _read_local_rows(
+    def _read_local_cells(
         self, entry: DatasetEntry, local_indices: list[int]
-    ) -> list[ExpressionRow]:
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
         dataset = self._open_dataset()
-        # Convert local (per-dataset offset) back to global positions
-        # for the aggregate Lance file, which stores rows at global positions.
         global_positions = [entry.global_start + li for li in local_indices]
-        rows: list[ExpressionRow] = []
+        cells: list[tuple[np.ndarray, np.ndarray]] = []
         for chunk in _chunk_indices(global_positions):
             table = dataset.take(chunk)
-            rows.extend(self._table_to_rows(chunk, table))
-        return rows
+            cells.extend(self._table_to_cells(table))
+        return cells
 
     @staticmethod
-    def _table_to_rows(
-        requested_indices: list[int], table
-    ) -> list[ExpressionRow]:
-        """Convert a Lance table into ``ExpressionRow`` objects."""
-        n = len(requested_indices)
+    def _table_to_cells(table) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Convert a Lance table into per-cell expression arrays."""
+        n = table.num_rows
         egi_offsets, egi_flat = _extract_list_columns(
             table, "expressed_gene_indices"
         )
@@ -500,19 +451,12 @@ class AggregateLanceReader(BaseExpressionReader):
             table, "expression_counts"
         )
 
-        rows: list[ExpressionRow] = []
+        cells: list[tuple[np.ndarray, np.ndarray]] = []
         for i in range(n):
-            global_idx = requested_indices[i]
             s_egi = slice(egi_offsets[i], egi_offsets[i + 1])
             s_ec = slice(ec_offsets[i], ec_offsets[i + 1])
-            rows.append(
-                ExpressionRow(
-                    global_row_index=global_idx,
-                    expressed_gene_indices=egi_flat[s_egi].copy(),
-                    expression_counts=ec_flat[s_ec].copy(),
-                )
-            )
-        return rows
+            cells.append((egi_flat[s_egi].copy(), ec_flat[s_ec].copy()))
+        return cells
 
     # ------------------------------------------------------------------
     # Fast path — direct flat read (Phase 2)
@@ -523,15 +467,10 @@ class AggregateLanceReader(BaseExpressionReader):
     ) -> ExpressionBatch:
         """Read expression data directly as flat arrays (aggregate fast path).
 
-        Bypasses the per-dataset regrouping in
-        ``BaseExpressionReader.read_expression()`` and avoids per-row
-        ``ExpressionRow`` object construction.  Performs direct chunked
-        ``take()`` calls on the aggregate Lance file and returns
+        Bypasses the shared per-dataset regrouping in
+        ``BaseExpressionReader.read_expression_flat()``. Performs direct
+        chunked ``take()`` calls on the aggregate Lance file and returns
         concatenated flat expression arrays with row offsets.
-
-        This is the aggregate-specific fast path.  The generic
-        ``read_expression()`` path (returning ``list[ExpressionRow]``)
-        remains available for backward compatibility.
 
         Parameters
         ----------
@@ -549,13 +488,7 @@ class AggregateLanceReader(BaseExpressionReader):
             If any index is out of range.
         """
         if not global_indices:
-            return ExpressionBatch(
-                batch_size=0,
-                global_row_index=np.array([], dtype=np.int64),
-                row_offsets=np.array([0], dtype=np.int64),
-                expressed_gene_indices=np.array([], dtype=np.int32),
-                expression_counts=np.array([], dtype=np.int32),
-            )
+            return _empty_expression_batch()
 
         indices = [int(idx) for idx in global_indices]
         n = len(indices)
@@ -648,34 +581,23 @@ class FederatedLanceReader(BaseExpressionReader):
             self._datasets[entry.dataset_id] = lance.dataset(str(entry.lance_path))
         return self._datasets[entry.dataset_id]
 
-    def _read_local_rows(
+    def _read_local_cells(
         self, entry: DatasetEntry, local_indices: list[int]
-    ) -> list[ExpressionRow]:
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
         lance_entry = self._find_entry_by_id(entry.dataset_id)
         assert isinstance(lance_entry, LanceDatasetEntry)
         ds = self._open_dataset(lance_entry)
 
-        rows: list[ExpressionRow] = []
+        cells: list[tuple[np.ndarray, np.ndarray]] = []
         for chunk in _chunk_indices(local_indices):
             table = ds.take(chunk)
-            rows.extend(
-                self._table_to_rows(
-                    chunk, lance_entry.global_start, table
-                )
-            )
-        return rows
+            cells.extend(self._table_to_cells(table))
+        return cells
 
     @staticmethod
-    def _table_to_rows(
-        requested_local_indices: list[int],
-        global_start: int,
-        table,
-    ) -> list[ExpressionRow]:
-        """Convert a Lance table into ``ExpressionRow`` objects.
-
-        Rows are in the same order as ``requested_local_indices``.
-        """
-        n = len(requested_local_indices)
+    def _table_to_cells(table) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Convert a Lance table into per-cell expression arrays."""
+        n = table.num_rows
         egi_offsets, egi_flat = _extract_list_columns(
             table, "expressed_gene_indices"
         )
@@ -683,19 +605,12 @@ class FederatedLanceReader(BaseExpressionReader):
             table, "expression_counts"
         )
 
-        rows: list[ExpressionRow] = []
+        cells: list[tuple[np.ndarray, np.ndarray]] = []
         for i in range(n):
-            global_idx = global_start + requested_local_indices[i]
             s_egi = slice(egi_offsets[i], egi_offsets[i + 1])
             s_ec = slice(ec_offsets[i], ec_offsets[i + 1])
-            rows.append(
-                ExpressionRow(
-                    global_row_index=global_idx,
-                    expressed_gene_indices=egi_flat[s_egi].copy(),
-                    expression_counts=ec_flat[s_ec].copy(),
-                )
-            )
-        return rows
+            cells.append((egi_flat[s_egi].copy(), ec_flat[s_ec].copy()))
+        return cells
 
     # ------------------------------------------------------------------
     # Fast path — direct flat read (Phase 3)
@@ -708,15 +623,11 @@ class FederatedLanceReader(BaseExpressionReader):
 
         Groups indices by dataset/file, performs chunked ``take()`` calls
         per dataset, and returns concatenated flat expression arrays with
-        row offsets.  Avoids per-row ``ExpressionRow`` object construction.
+        row offsets.
 
         This path retains per-dataset grouping (federated topology cannot
-        avoid it) but eliminates the de-batch/re-batch overhead of
-        ``ExpressionRow`` → flat-array reconstruction.
-
-        The generic ``read_expression()`` path (returning
-        ``list[ExpressionRow]``) remains available for backward
-        compatibility.
+        avoid it) but bypasses the shared reassembly helper for a more direct
+        flat implementation.
 
         Parameters
         ----------
@@ -734,13 +645,7 @@ class FederatedLanceReader(BaseExpressionReader):
             If any index is out of range or not registered in any dataset.
         """
         if not global_indices:
-            return ExpressionBatch(
-                batch_size=0,
-                global_row_index=np.array([], dtype=np.int64),
-                row_offsets=np.array([0], dtype=np.int64),
-                expressed_gene_indices=np.array([], dtype=np.int32),
-                expression_counts=np.array([], dtype=np.int32),
-            )
+            return _empty_expression_batch()
 
         indices = [int(idx) for idx in global_indices]
         n = len(indices)
@@ -814,26 +719,18 @@ class FederatedLanceReader(BaseExpressionReader):
 # ===================================================================
 
 
-def _zarr_read_rows(
+def _zarr_read_cells(
     offsets: np.ndarray,
     indices_flat: np.ndarray,
     counts_flat: np.ndarray,
-    global_start: int,
     local_indices: list[int],
-) -> list[ExpressionRow]:
-    """Read expression rows from CSR-format Zarr arrays."""
-    rows: list[ExpressionRow] = []
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Read per-cell expression arrays from CSR-format Zarr arrays."""
+    cells: list[tuple[np.ndarray, np.ndarray]] = []
     for local_idx in local_indices:
-        global_idx = global_start + local_idx
         s = slice(offsets[local_idx], offsets[local_idx + 1])
-        rows.append(
-            ExpressionRow(
-                global_row_index=global_idx,
-                expressed_gene_indices=indices_flat[s].copy(),
-                expression_counts=counts_flat[s].copy(),
-            )
-        )
-    return rows
+        cells.append((indices_flat[s].copy(), counts_flat[s].copy()))
+    return cells
 
 
 class AggregateZarrReader(BaseExpressionReader):
@@ -865,14 +762,13 @@ class AggregateZarrReader(BaseExpressionReader):
         self._indices = zarr.open(str(indices_path), mode="r")["indices"]
         self._counts = zarr.open(str(counts_path), mode="r")["counts"]
 
-    def _read_local_rows(
+    def _read_local_cells(
         self, entry: DatasetEntry, local_indices: list[int]
-    ) -> list[ExpressionRow]:
-        return _zarr_read_rows(
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        return _zarr_read_cells(
             self._offsets,
             self._indices,
             self._counts,
-            entry.global_start,
             local_indices,
         )
 
@@ -912,14 +808,14 @@ class FederatedZarrReader(BaseExpressionReader):
             self._counts_cache[ds_id],
         )
 
-    def _read_local_rows(
+    def _read_local_cells(
         self, entry: DatasetEntry, local_indices: list[int]
-    ) -> list[ExpressionRow]:
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
         zarr_entry = self._find_entry_by_id(entry.dataset_id)
         assert isinstance(zarr_entry, ZarrDatasetEntry)
         offsets, indices_arr, counts_arr = self._open_arrays(zarr_entry)
-        return _zarr_read_rows(
-            offsets, indices_arr, counts_arr, entry.global_start, local_indices
+        return _zarr_read_cells(
+            offsets, indices_arr, counts_arr, local_indices
         )
 
 
@@ -952,26 +848,21 @@ class FederatedArrowIpcReader(BaseExpressionReader):
             ).read_all()
         return self._tables[ds_id]
 
-    def _read_local_rows(
+    def _read_local_cells(
         self, entry: DatasetEntry, local_indices: list[int]
-    ) -> list[ExpressionRow]:
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
         arrow_entry = self._find_entry_by_id(entry.dataset_id)
         assert isinstance(arrow_entry, ArrowIpcDatasetEntry)
         table = self._open_table(arrow_entry)
 
-        rows: list[ExpressionRow] = []
+        cells: list[tuple[np.ndarray, np.ndarray]] = []
         for local_idx in local_indices:
-            global_idx = entry.global_start + local_idx
             egi = _list_column_as_py(table, "expressed_gene_indices", local_idx)
             ec = _list_column_as_py(table, "expression_counts", local_idx)
-            rows.append(
-                ExpressionRow(
-                    global_row_index=global_idx,
-                    expressed_gene_indices=np.array(egi, dtype=np.int32),
-                    expression_counts=np.array(ec, dtype=np.int32),
-                )
+            cells.append(
+                (np.array(egi, dtype=np.int32), np.array(ec, dtype=np.int32))
             )
-        return rows
+        return cells
 
 
 # ===================================================================
@@ -1000,26 +891,21 @@ class FederatedParquetReader(BaseExpressionReader):
             self._tables[ds_id] = pq.read_table(str(entry.parquet_path))
         return self._tables[ds_id]
 
-    def _read_local_rows(
+    def _read_local_cells(
         self, entry: DatasetEntry, local_indices: list[int]
-    ) -> list[ExpressionRow]:
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
         pq_entry = self._find_entry_by_id(entry.dataset_id)
         assert isinstance(pq_entry, ParquetDatasetEntry)
         table = self._open_table(pq_entry)
 
-        rows: list[ExpressionRow] = []
+        cells: list[tuple[np.ndarray, np.ndarray]] = []
         for local_idx in local_indices:
-            global_idx = entry.global_start + local_idx
             egi = _list_column_as_py(table, "expressed_gene_indices", local_idx)
             ec = _list_column_as_py(table, "expression_counts", local_idx)
-            rows.append(
-                ExpressionRow(
-                    global_row_index=global_idx,
-                    expressed_gene_indices=np.array(egi, dtype=np.int32),
-                    expression_counts=np.array(ec, dtype=np.int32),
-                )
+            cells.append(
+                (np.array(egi, dtype=np.int32), np.array(ec, dtype=np.int32))
             )
-        return rows
+        return cells
 
 
 # ===================================================================
@@ -1053,16 +939,16 @@ class FederatedWebDatasetReader(BaseExpressionReader):
             self._tar_files[ds_id] = tarfile.open(str(entry.tar_path), "r")
         return self._tar_files[ds_id]
 
-    def _read_local_rows(
+    def _read_local_cells(
         self, entry: DatasetEntry, local_indices: list[int]
-    ) -> list[ExpressionRow]:
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
         import pickle
 
         wds_entry = self._find_entry_by_id(entry.dataset_id)
         assert isinstance(wds_entry, WebDatasetEntry)
         tar = self._open_tar(wds_entry)
 
-        rows: list[ExpressionRow] = []
+        cells: list[tuple[np.ndarray, np.ndarray]] = []
         for local_idx in local_indices:
             member_name = f"cell_{local_idx:08d}.pkl"
             member = tar.getmember(member_name)
@@ -1073,18 +959,13 @@ class FederatedWebDatasetReader(BaseExpressionReader):
                 )
             data = pickle.load(f)
             f.close()
-            rows.append(
-                ExpressionRow(
-                    global_row_index=entry.global_start + local_idx,
-                    expressed_gene_indices=np.asarray(
-                        data["expressed_gene_indices"], dtype=np.int32
-                    ),
-                    expression_counts=np.asarray(
-                        data["expression_counts"], dtype=np.int32
-                    ),
+            cells.append(
+                (
+                    np.asarray(data["expressed_gene_indices"], dtype=np.int32),
+                    np.asarray(data["expression_counts"], dtype=np.int32),
                 )
             )
-        return rows
+        return cells
 
 
 # ===================================================================
@@ -1227,36 +1108,29 @@ class AggregateCsrMemmapReader(BaseExpressionReader):
         }
 
     # ------------------------------------------------------------------
-    # Backend-specific hook (ExpressionRow path)
+    # Backend-specific hook
     # ------------------------------------------------------------------
 
-    def _read_local_rows(
+    def _read_local_cells(
         self, entry: DatasetEntry, local_indices: list[int]
-    ) -> list[ExpressionRow]:
-        """Read expression rows from a single shard.
-
-        Opens the shard's memmap arrays and slices per-row CSR data
-        using ``row_offsets``.
-        """
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Read per-cell expression arrays from a single shard."""
         csr_entry = self._find_entry_by_id(entry.dataset_id)
         assert isinstance(csr_entry, CsrMemmapShardEntry)
         arrays = self._load_shard_arrays(csr_entry)
         offsets = arrays["offsets"]
         indices = arrays["indices"]
         counts = arrays["counts"]
-        global_start = csr_entry.global_start
-
-        rows: list[ExpressionRow] = []
+        cells: list[tuple[np.ndarray, np.ndarray]] = []
         for li in local_indices:
             s = slice(int(offsets[li]), int(offsets[li + 1]))
-            rows.append(
-                ExpressionRow(
-                    global_row_index=global_start + li,
-                    expressed_gene_indices=np.array(indices[s], dtype=np.int32, copy=True),
-                    expression_counts=np.array(counts[s], dtype=np.int32, copy=True),
+            cells.append(
+                (
+                    np.array(indices[s], dtype=np.int32, copy=True),
+                    np.array(counts[s], dtype=np.int32, copy=True),
                 )
             )
-        return rows
+        return cells
 
     # ------------------------------------------------------------------
     # Fast path — direct flat read (Phase 3)
@@ -1271,10 +1145,8 @@ class AggregateCsrMemmapReader(BaseExpressionReader):
         flat arrays from the memmap, and reassembles in the original
         input order.
 
-        This is the aggregate CSR fast path that avoids per-row
-        ``ExpressionRow`` object construction.  The generic
-        ``read_expression()`` path (returning ``list[ExpressionRow]``)
-        remains available for backward compatibility.
+        This is the aggregate CSR fast path that bypasses the shared base
+        implementation for direct shard-oriented assembly.
 
         Parameters
         ----------
@@ -1292,13 +1164,7 @@ class AggregateCsrMemmapReader(BaseExpressionReader):
             If any index is out of range.
         """
         if not global_indices:
-            return ExpressionBatch(
-                batch_size=0,
-                global_row_index=np.array([], dtype=np.int64),
-                row_offsets=np.array([0], dtype=np.int64),
-                expressed_gene_indices=np.array([], dtype=np.int32),
-                expression_counts=np.array([], dtype=np.int32),
-            )
+            return _empty_expression_batch()
 
         indices = [int(idx) for idx in global_indices]
         n = len(indices)

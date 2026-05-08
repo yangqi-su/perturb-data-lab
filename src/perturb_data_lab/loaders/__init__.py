@@ -1,6 +1,5 @@
-"""Phase 3 refactored loaders package."""
+"""Public composable corpus-loader API exports."""
 
-from .executor import BatchExecutor
 from .expression import (
     AggregateLanceReader,
     AggregateZarrReader,
@@ -10,7 +9,6 @@ from .expression import (
     CsrMemmapShardEntry,
     DatasetEntry,
     ExpressionReader,
-    ExpressionRow,
     FederatedArrowIpcReader,
     FederatedLanceReader,
     FederatedParquetReader,
@@ -24,21 +22,14 @@ from .expression import (
 )
 from .index import MetadataIndex, MetadataRow
 from .loaders import (
-    AggregateLanceExpressionBatchDataset,
+    DatasetRoutingTable,
     ExpressionBatchDataset,
-    LanceExpressionBatchDataset,
     CorpusRandomBatchSampler,
     DatasetBatchSampler,
     DatasetContextBatchSampler,
     ExpressionBatch,
-    RawExpressionBatch,
-    FastTrainingBatch,
-    BatchMetadata,
-    RawExpressionBatchDataset,
-    PerturbBatchDataset,
-    collate_raw_expression_batch,
-    collate_batch_dict,
-    cpu_parallel_collate_fn,
+    collate_expression_batch,
+    collate_expression_batch_cpu,
 )
 from .corpus import (
     read_raw_obs_parquet,
@@ -62,7 +53,6 @@ __all__ = [
     "MetadataIndex",
     "MetadataRow",
     # Phase 2 — ExpressionReader (backend-agnostic)
-    "ExpressionRow",
     "ExpressionReader",
     "BaseExpressionReader",
     "DatasetEntry",
@@ -81,27 +71,17 @@ __all__ = [
     "WebDatasetEntry",
     "CsrMemmapShardEntry",
     "build_expression_reader",
-    # Phase 3 — BatchExecutor
-    "BatchExecutor",
     # Phase 3 — Core types
     "ExpressionBatch",
-    "RawExpressionBatch",
-    # Phase 1 — Batch contracts (loader fast-path refactor)
-    "FastTrainingBatch",
-    "BatchMetadata",
     # Phase 3 — Samplers (MetadataIndex-backed)
     "CorpusRandomBatchSampler",
     "DatasetBatchSampler",
     "DatasetContextBatchSampler",
     # Phase 3 — Data loaders
+    "DatasetRoutingTable",
     "ExpressionBatchDataset",
-    "LanceExpressionBatchDataset",
-    "AggregateLanceExpressionBatchDataset",
-    "RawExpressionBatchDataset",
-    "PerturbBatchDataset",
-    "collate_raw_expression_batch",
-    "collate_batch_dict",
-    "cpu_parallel_collate_fn",
+    "collate_expression_batch",
+    "collate_expression_batch_cpu",
     # Phase 2 — Feature Registry
     "FeatureRegistry",
     "GlobalGeneSampler",

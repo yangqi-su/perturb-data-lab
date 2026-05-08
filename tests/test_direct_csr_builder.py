@@ -13,7 +13,7 @@ import yaml
 
 from perturb_data_lab.loaders.corpus_loader import load_corpus
 from perturb_data_lab.loaders.expression import AggregateCsrMemmapReader, CsrMemmapShardEntry
-from perturb_data_lab.loaders.loaders import ExpressionBatchDataset, RawExpressionBatchDataset
+from perturb_data_lab.loaders.loaders import ExpressionBatchDataset
 from perturb_data_lab.materializers.direct_csr import (
     DirectH5adCsrReader,
     convert_h5ad_to_csr_dataset,
@@ -253,11 +253,11 @@ class TestCsrChunkWriter:
         ] == [(10, 12, 2), (12, 14, 2)]
 
         reader = AggregateCsrMemmapReader(_read_entries_from_manifest(out))
-        rows = reader.read_expression([13, 10, 12, 10])
-        assert [row.global_row_index for row in rows] == [13, 10, 12, 10]
-        np.testing.assert_array_equal(rows[0].expressed_gene_indices, [1])
-        np.testing.assert_array_equal(rows[1].expression_counts, [5, 6])
-        np.testing.assert_array_equal(rows[2].expressed_gene_indices, [2, 3, 4])
+        batch = reader.read_expression_flat([13, 10, 12, 10])
+        np.testing.assert_array_equal(batch.global_row_index, [13, 10, 12, 10])
+        np.testing.assert_array_equal(batch.row_gene_indices(0), [1])
+        np.testing.assert_array_equal(batch.row_counts(1), [5, 6])
+        np.testing.assert_array_equal(batch.row_gene_indices(2), [2, 3, 4])
 
     def test_append_csr_chunk_rejects_bad_dtypes(self, tmp_path: Path) -> None:
         writer = CsrMemmapWriter(tmp_path / "csr", shard_n_cells=2)
@@ -352,7 +352,7 @@ class TestCsrPackager:
 
         corpus = load_corpus(packaged_root)
         assert corpus.backend == "csr_memmap"
-        batch = corpus.batch_executor.read_batch([0, 2, 3, 5])
+        batch = corpus.inspect_batch([0, 2, 3, 5])
         np.testing.assert_array_equal(batch["global_row_index"], [0, 2, 3, 5])
         np.testing.assert_array_equal(batch["row_offsets"], [0, 2, 4, 5, 5])
         np.testing.assert_array_equal(batch["expressed_gene_indices"], [0, 1, 2, 4, 1])
@@ -364,7 +364,7 @@ class TestCsrPackager:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         packaged_root = _build_packaged_csr_corpus(tmp_path)
-        corpus = load_corpus(packaged_root, seq_len=3)
+        corpus = load_corpus(packaged_root)
 
         dataset = corpus.dataset()
         assert type(dataset) is ExpressionBatchDataset
@@ -374,18 +374,15 @@ class TestCsrPackager:
         batch = dataset.__getitems__([0, 2, 3, 5])[0]
         np.testing.assert_array_equal(batch["global_row_index"], [0, 2, 3, 5])
         np.testing.assert_array_equal(batch["dataset_index"], [0, 0, 1, 1])
-        np.testing.assert_array_equal(batch["local_row_index"], [0, 2, 0, 2])
+        assert "local_row_index" not in batch
 
-        with pytest.warns(DeprecationWarning, match="RawExpressionBatchDataset"):
-            legacy_dataset = corpus.dataset(metadata_columns=["perturb_label"])
-        assert type(legacy_dataset) is RawExpressionBatchDataset
-        legacy_batch = legacy_dataset.__getitems__([0, 3])[0]
-        assert legacy_batch["meta_columns"]["perturb_label"] == ("control", "control")
+        with pytest.raises(ValueError, match="no longer accepts metadata_columns"):
+            corpus.dataset(metadata_columns=["perturb_label"])
 
-        def _fail_read_raw_batch(*args: Any, **kwargs: Any) -> Any:
-            raise AssertionError("loader hot path should not call BatchExecutor.read_raw_batch")
+        def _fail_inspect_batch(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("loader hot path should not call Corpus.inspect_batch")
 
-        monkeypatch.setattr(corpus.batch_executor, "read_raw_batch", _fail_read_raw_batch)
+        monkeypatch.setattr(corpus, "inspect_batch", _fail_inspect_batch)
 
         processed = next(
             corpus.loader(

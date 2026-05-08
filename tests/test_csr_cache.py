@@ -648,8 +648,8 @@ class TestReaderCacheEnabled:
             # After eviction, only one shard should be cached
             # (not asserting 0 is gone since both might fit exactly)
 
-    def test_reader_legacy_read_path_with_cache(self, toy_corpus_10_cells_2_shards):
-        """Legacy read_expression() (ExpressionRow path) also uses cache."""
+    def test_reader_flat_read_with_cache(self, toy_corpus_10_cells_2_shards):
+        """Flat reader path also uses the shard cache."""
         _corpus_root, entries = toy_corpus_10_cells_2_shards
         with tempfile.TemporaryDirectory() as td:
             cache_root = Path(td) / "reader_cache"
@@ -661,8 +661,8 @@ class TestReaderCacheEnabled:
                     "max_bytes": 100_000_000,
                 },
             )
-            rows = reader.read_expression([0, 6])
-            assert len(rows) == 2
+            batch = reader.read_expression_flat([0, 6])
+            assert batch.batch_size == 2
             # At least one shard should be cached
             assert reader._cache.current_bytes > 0
 

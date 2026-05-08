@@ -1,6 +1,6 @@
 """Phase 3: GPU Pipeline with Cross-Dataset Gene Resolution.
 
-``GPUSparsePipeline`` receives flat expression arrays from ``read_batch()``,
+``GPUSparsePipeline`` receives flat raw batch dicts from corpus loaders,
 maps local→global using ``FeatureRegistry.local_to_global_map``, samples
 genes per cell from per-dataset probability pools on GPU, and gathers
 expression counts into dense ``(batch_size, seq_len)`` tensors.
@@ -37,7 +37,7 @@ DEFAULT_INVALID_COUNT_VALUE: float = -1.0
 class GPUSparsePipeline:
     """GPU sparse pipeline for cross-dataset gene resolution.
 
-    Receives flat expression arrays from ``BatchExecutor.read_batch()``,
+    Receives flat expression arrays from corpus raw batch dicts,
     resolves local gene indices to global gene IDs, samples from per-dataset
     probability pools on GPU, and gathers counts via searchsorted+gather.
 
@@ -209,7 +209,7 @@ class GPUSparsePipeline:
         Parameters
         ----------
         batch : dict
-            Output of ``BatchExecutor.read_batch()`` or the raw corpus loader.
+            Output of ``Corpus.inspect_batch()`` or the raw corpus loader.
             Required keys:
             ``expressed_gene_indices``, ``expression_counts``, ``row_offsets``,
             ``dataset_index``, ``batch_size``, and ``global_row_index``.
@@ -577,7 +577,7 @@ class CPUPipeline:
         Parameters
         ----------
         batch : dict
-            Output of ``BatchExecutor.read_batch()``.
+            Output of ``Corpus.inspect_batch()`` or ``ExpressionBatchDataset``.
         seed : int or None
             If given, re-seeds the internal sampler for reproducibility.
         sampled_gene_ids : np.ndarray or None
