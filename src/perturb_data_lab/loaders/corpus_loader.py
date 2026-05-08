@@ -6,15 +6,19 @@ runtime flow is::
 
     corpus = load_corpus(path, seq_len=...)
     corpus.set_sampler(batch_size=..., seed=...)
-    dataset = corpus.dataset()
+    dataset = corpus.dataset()  # optional: backend-neutral expression dataset
+    expr = corpus.read_expression([0, 1, 2])
+    meta = corpus.take_metadata([0, 1, 2], columns=["dataset_id"])
     for batch in corpus.loader(processing="gpu" or "cpu", ...):
         ...
 
-Aggregate and federated Lance share this same public API. ``Corpus.loader()``
-keeps rich metadata in the main process by default, treats ``size_factor`` as
-optional metadata, and defaults Lance workers to ``spawn``. ``BatchExecutor``
-remains available for direct or legacy access, but new training code should
-usually prefer the corpus-level API.
+Aggregate and federated corpora share this same public API. Compatible loader
+routes use the backend-neutral ``read_expression_flat(global_indices) ->
+ExpressionBatch`` contract internally while topology-specific routing stays
+inside ``Corpus``. ``Corpus.loader()`` keeps rich metadata in the main process
+by default, treats ``size_factor`` as optional metadata, and defaults Lance
+workers to ``spawn``. ``BatchExecutor`` remains available for direct or legacy
+access, but new training code should usually prefer the corpus-level API.
 """
 
 from __future__ import annotations
@@ -44,7 +48,8 @@ from .loaders import (
     CorpusRandomBatchSampler,
     DatasetBatchSampler,
     DatasetContextBatchSampler,
-    LanceExpressionBatchDataset,
+    ExpressionBatch,
+    ExpressionBatchDataset,
     RawExpressionBatchDataset,
     collate_raw_expression_batch,
     cpu_parallel_collate_fn,
@@ -86,9 +91,9 @@ class Corpus:
     """Ready-to-train corpus object and preferred user-facing runtime handle.
 
     Use ``set_sampler()`` to choose batch sampling, ``dataset()`` to inspect
-    the expression-facing dataset contract, and ``loader()`` to iterate over
-    processed training batches. Aggregate and federated Lance topologies share
-    the same public API.
+    the backend-neutral expression dataset contract, and ``loader()`` to
+    iterate over processed training batches. Aggregate and federated corpora
+    share the same public API.
 
     Attributes
     ----------
@@ -139,47 +144,121 @@ class Corpus:
         self._sampler_params = normalized
         return self._sampler
 
+    def read_expression(
+        self,
+        indices: torch.Tensor | np.ndarray | Sequence[int],
+    ) -> ExpressionBatch:
+        """Read flat expression arrays for ad-hoc corpus inspection."""
+        normalized_indices = _normalize_batch_indices(indices).tolist()
+        return self.batch_executor.read_expression_batch(normalized_indices)
+
+    def take_metadata(
+        self,
+        indices: torch.Tensor | np.ndarray | Sequence[int],
+        *,
+        columns: Sequence[str] | None = None,
+    ) -> dict[str, np.ndarray | tuple]:
+        """Return columnar metadata for selected corpus-global row indices."""
+        normalized_indices = _normalize_batch_indices(indices)
+        resolved_columns = _normalize_take_columns(self.metadata_index, columns)
+        return self.metadata_index.take(normalized_indices, resolved_columns)
+
+    def inspect_batch(
+        self,
+        indices: torch.Tensor | np.ndarray | Sequence[int],
+        *,
+        metadata_columns: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Read the stable raw inspection batch without touching the executor directly.
+
+        This returns the same expression-first raw batch contract used by the
+        corpus dataset/loader path: routing fields stay top-level, and any
+        requested rich metadata is attached as columnar ``meta_columns``.
+        """
+        normalized_indices = _normalize_batch_indices(indices).tolist()
+        resolved_columns = _normalize_metadata_columns(
+            self.metadata_index,
+            metadata_columns,
+            allow_reserved=_LOADER_METADATA_RESERVED_OVERRIDES,
+        )
+        return self.batch_executor.read_raw_batch(
+            normalized_indices,
+            metadata_columns=resolved_columns,
+        )
+
+    def _expression_dataset(self) -> ExpressionBatchDataset:
+        """Build the backend-neutral expression-only dataset route."""
+        ordered_entries = sorted(
+            self.dataset_entries, key=lambda entry: entry.global_start,
+        )
+        if not ordered_entries:
+            raise ValueError("Corpus has no dataset entries for expression loading")
+
+        dataset_starts = np.array(
+            [entry.global_start for entry in ordered_entries],
+            dtype=np.int64,
+        )
+        dataset_stops = np.array(
+            [entry.global_end for entry in ordered_entries],
+            dtype=np.int64,
+        )
+
+        probe_indices = dataset_starts.tolist() + (dataset_stops - 1).tolist()
+        probes = self.metadata_index.take(
+            probe_indices,
+            ("dataset_index", "local_row_index"),
+        )
+        dataset_index_probe = np.asarray(probes["dataset_index"], dtype=np.int32)
+        local_row_probe = np.asarray(probes["local_row_index"], dtype=np.int64)
+        n_entries = len(ordered_entries)
+        dataset_indices = dataset_index_probe[:n_entries]
+        end_dataset_indices = dataset_index_probe[n_entries:]
+        local_row_starts = local_row_probe[:n_entries]
+        local_row_ends = local_row_probe[n_entries:]
+
+        expected_local_row_ends = local_row_starts + (dataset_stops - dataset_starts - 1)
+        if not np.array_equal(dataset_indices, end_dataset_indices):
+            raise ValueError(
+                "ExpressionBatchDataset requires each routing entry to stay within a single dataset"
+            )
+        if not np.array_equal(local_row_ends, expected_local_row_ends):
+            raise ValueError(
+                "ExpressionBatchDataset requires contiguous local row indices within each routing entry"
+            )
+
+        size_factor = None
+        if "size_factor" in self.metadata_index.df.columns:
+            size_factor = self.metadata_index.df["size_factor"].to_numpy()
+
+        return ExpressionBatchDataset(
+            self.batch_executor.expression_reader,
+            dataset_starts=dataset_starts,
+            dataset_stops=dataset_stops,
+            dataset_indices=dataset_indices,
+            local_row_starts=local_row_starts,
+            size_factor=size_factor,
+            topology=self.topology,
+            backend=self.backend,
+        )
+
     def dataset(
         self,
         *,
         metadata_columns: Sequence[str] | None = None,
-    ) -> RawExpressionBatchDataset | LanceExpressionBatchDataset:
+    ) -> RawExpressionBatchDataset | ExpressionBatchDataset:
         """Return the dataset consumed by ``Corpus.loader()``.
 
-        For Lance corpora with no requested metadata columns, this returns the
-        expression-only worker-safe dataset used by both aggregate and
-        federated loader routes. Requesting metadata columns falls back to the
+        For supported corpora with no requested metadata columns, this returns
+        the backend-neutral expression-only worker-safe dataset used by the
+        normal loader hot path. Requesting metadata columns falls back to the
         executor-backed dataset intended for direct inspection or legacy-style
         access.
         """
         columns = _normalize_metadata_columns(
             self.metadata_index, metadata_columns,
         )
-        if self.backend == "lance" and not columns:
-            size_factor = None
-            if "size_factor" in self.metadata_index.df.columns:
-                size_factor = self.metadata_index.df["size_factor"].to_numpy()
-            ordered_entries = sorted(
-                self.dataset_entries, key=lambda entry: entry.global_start,
-            )
-            return LanceExpressionBatchDataset(
-                self.batch_executor.expression_reader,
-                dataset_starts=np.array(
-                    [entry.global_start for entry in ordered_entries],
-                    dtype=np.int64,
-                ),
-                dataset_stops=np.array(
-                    [entry.global_end for entry in ordered_entries],
-                    dtype=np.int64,
-                ),
-                dataset_indices=np.array(
-                    [self.dataset_index_by_id[entry.dataset_id] for entry in ordered_entries],
-                    dtype=np.int32,
-                ),
-                size_factor=size_factor,
-                topology=self.topology,
-                backend=self.backend,
-            )
+        if not columns:
+            return self._expression_dataset()
         return RawExpressionBatchDataset(
             self.batch_executor,
             metadata_columns=columns,
@@ -218,7 +297,7 @@ class Corpus:
         ``cpu_parallel_collate_fn``. Requested ``metadata_columns`` are
         attached afterward as columnar ``meta_columns`` in the main process, so
         rich metadata and optional ``size_factor`` do not need to live inside
-        Lance worker state. Lance-backed loaders default to
+        worker state. Lance-backed loaders default to
         ``multiprocessing_context="spawn"`` unless explicitly overridden.
         """
         validated = _validate_loader_params(
@@ -508,6 +587,20 @@ def _normalize_metadata_columns(
     return tuple(normalized)
 
 
+def _normalize_take_columns(
+    metadata_index: MetadataIndex,
+    columns: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """Validate columns for ``Corpus.take_metadata(...)``."""
+    if columns is None:
+        return tuple(metadata_index.df.columns)
+    return _normalize_metadata_columns(
+        metadata_index,
+        columns,
+        allow_reserved=_RAW_BATCH_RESERVED_KEYS,
+    )
+
+
 def _normalize_batch_indices(
     indices: torch.Tensor | np.ndarray | Sequence[int],
 ) -> np.ndarray:
@@ -661,7 +754,7 @@ def load_corpus(
     Reads ``corpus-index.yaml``, locates canonical obs/var parquets via
     ``resolve_corpus_paths()``, and constructs all loader components. The
     resulting ``Corpus`` exposes the preferred corpus-level API for both
-    aggregate and federated Lance:
+    aggregate and federated corpora:
 
     ``load_corpus(...) -> corpus.set_sampler(...) -> corpus.dataset() -> corpus.loader(...)``.
 
@@ -682,8 +775,13 @@ def load_corpus(
     Corpus
         Fully-constructed corpus object ready for corpus-level sampling and
         loading. ``BatchExecutor`` remains available via ``corpus.batch_executor``
-        for direct or legacy reads, but new training code should usually use
-        ``Corpus.loader(...)``.
+        for direct or legacy reads, but new code should usually prefer
+        ``Corpus.dataset(...)``, ``Corpus.loader(...)``,
+        ``Corpus.read_expression(...)``, ``Corpus.take_metadata(...)``, and
+        ``Corpus.inspect_batch(...)``. Executor-centric migration is usually:
+        ``read_batch(...) -> inspect_batch(...)``,
+        ``read_expression_batch(...) -> read_expression(...)``, and manual
+        DataLoader wiring -> ``set_sampler(...)`` + ``loader(...)``.
 
     Raises
     ------

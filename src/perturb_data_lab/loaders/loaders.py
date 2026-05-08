@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Sequence
+import warnings
 
 import numpy as np
 import polars as pl
@@ -29,13 +30,27 @@ __all__ = [
     "CorpusRandomBatchSampler",
     "DatasetBatchSampler",
     "DatasetContextBatchSampler",
+    "ExpressionBatchDataset",
     "LanceExpressionBatchDataset",
+    "AggregateLanceExpressionBatchDataset",
     "RawExpressionBatchDataset",
     "PerturbBatchDataset",
     "collate_raw_expression_batch",
     "collate_batch_dict",
     "cpu_parallel_collate_fn",
 ]
+
+
+def _warn_legacy_runtime_surface(surface: str, preferred: str) -> None:
+    """Emit a compatibility-cycle deprecation warning for a runtime surface."""
+    warnings.warn(
+        (
+            f"{surface} is deprecated and retained as a compatibility-only "
+            f"runtime surface for one release cycle; prefer {preferred}."
+        ),
+        DeprecationWarning,
+        stacklevel=1,
+    )
 
 
 def _coerce_optional_float32_array(values: np.ndarray | None) -> np.ndarray | None:
@@ -59,6 +74,10 @@ def _coerce_optional_float32_array(values: np.ndarray | None) -> np.ndarray | No
 @dataclass(frozen=True)
 class FastTrainingBatch:
     """Canonical minimal training batch — only numeric fields for the GPU path.
+
+    Compatibility-only container retained for one deprecation cycle. New code
+    should usually consume processed ``Corpus.loader(...)`` output instead of
+    constructing ``FastTrainingBatch`` directly.
 
     This is the stable fast-path batch contract.  It contains every
     numeric field consumed by ``GPUSparsePipeline.process_batch()`` and
@@ -126,6 +145,10 @@ class FastTrainingBatch:
 @dataclass(frozen=True)
 class BatchMetadata:
     """Columnar metadata for a batch — arrays, not per-cell dicts.
+
+    Compatibility-only container retained for one deprecation cycle. New code
+    should usually consume ``meta_columns`` from corpus-level loader or
+    inspection helpers instead of constructing ``BatchMetadata`` directly.
 
     This is the canonical extended metadata representation defined in
     Phase 1.  Instead of 128 individual dicts (one per cell), each
@@ -445,7 +468,7 @@ class DatasetContextBatchSampler:
 
 
 class RawExpressionBatchDataset:
-    """Map-style dataset returning the raw expression batch contract.
+    """Deprecated compatibility dataset returning the raw expression batch contract.
 
     ``__getitems__`` accepts a batch of corpus-global indices and delegates to
     ``BatchExecutor.read_raw_batch()`` so aggregate and federated corpora share
@@ -460,6 +483,10 @@ class RawExpressionBatchDataset:
         topology: str = "",
         backend: str = "",
     ):
+        _warn_legacy_runtime_surface(
+            "RawExpressionBatchDataset",
+            "Corpus.inspect_batch(...), Corpus.take_metadata(...), or Corpus.loader(...)",
+        )
         self._exec = executor
         self._metadata_columns = tuple(metadata_columns or ())
         self._topology = topology
@@ -491,12 +518,11 @@ class RawExpressionBatchDataset:
         return [batch]
 
 
-class LanceExpressionBatchDataset:
-    """Lance expression-only dataset with lightweight routing state.
+class ExpressionBatchDataset:
+    """Backend-neutral expression-only dataset with lightweight routing state.
 
-    Works for both aggregate and federated Lance topologies as long as the
-    expression reader exposes ``read_expression_flat()`` with order-preserving
-    output.
+    Works for any backend whose expression reader exposes
+    ``read_expression_flat()`` with order-preserving output.
     """
 
     def __init__(
@@ -506,6 +532,7 @@ class LanceExpressionBatchDataset:
         dataset_starts: np.ndarray,
         dataset_stops: np.ndarray,
         dataset_indices: np.ndarray,
+        local_row_starts: np.ndarray | None = None,
         size_factor: np.ndarray | None = None,
         topology: str = "aggregate",
         backend: str = "lance",
@@ -514,6 +541,20 @@ class LanceExpressionBatchDataset:
         self._dataset_starts = np.asarray(dataset_starts, dtype=np.int64)
         self._dataset_stops = np.asarray(dataset_stops, dtype=np.int64)
         self._dataset_indices = np.asarray(dataset_indices, dtype=np.int32)
+        self._local_row_starts = (
+            np.asarray(local_row_starts, dtype=np.int64)
+            if local_row_starts is not None
+            else None
+        )
+        n_entries = len(self._dataset_starts)
+        if len(self._dataset_stops) != n_entries or len(self._dataset_indices) != n_entries:
+            raise ValueError(
+                "dataset_starts, dataset_stops, and dataset_indices must have matching lengths"
+            )
+        if self._local_row_starts is not None and len(self._local_row_starts) != n_entries:
+            raise ValueError(
+                "local_row_starts must match dataset_starts length when provided"
+            )
         self._size_factor = _coerce_optional_float32_array(size_factor)
         self._topology = topology
         self._backend = backend
@@ -536,8 +577,10 @@ class LanceExpressionBatchDataset:
     ) -> tuple[np.ndarray, np.ndarray]:
         entry_pos = np.searchsorted(self._dataset_stops, indices, side="right")
         if np.any(entry_pos < 0) or np.any(entry_pos >= len(self._dataset_stops)):
-            raise IndexError("Lance batch contains out-of-range indices")
+            raise IndexError("Expression batch contains out-of-range indices")
         local_row_index = indices - self._dataset_starts[entry_pos]
+        if self._local_row_starts is not None:
+            local_row_index = local_row_index + self._local_row_starts[entry_pos]
         return self._dataset_indices[entry_pos], local_row_index
 
     def __getitems__(self, indices: Sequence[int]) -> list[dict[str, Any]]:
@@ -562,10 +605,26 @@ class LanceExpressionBatchDataset:
         return [batch.to_dict()]
 
 
-class AggregateLanceExpressionBatchDataset(LanceExpressionBatchDataset):
-    """Backward-compatible alias for the Phase 4 aggregate dataset name."""
+class LanceExpressionBatchDataset(ExpressionBatchDataset):
+    """Deprecated compatibility alias for the legacy Lance-specific dataset name."""
 
-    pass
+    def __init__(self, *args: Any, **kwargs: Any):
+        _warn_legacy_runtime_surface(
+            "LanceExpressionBatchDataset",
+            "ExpressionBatchDataset or Corpus.dataset()/Corpus.loader()",
+        )
+        super().__init__(*args, **kwargs)
+
+
+class AggregateLanceExpressionBatchDataset(LanceExpressionBatchDataset):
+    """Deprecated compatibility alias for the legacy aggregate Lance dataset name."""
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        _warn_legacy_runtime_surface(
+            "AggregateLanceExpressionBatchDataset",
+            "ExpressionBatchDataset or Corpus.dataset()/Corpus.loader()",
+        )
+        ExpressionBatchDataset.__init__(self, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +633,7 @@ class AggregateLanceExpressionBatchDataset(LanceExpressionBatchDataset):
 
 
 class PerturbBatchDataset:
-    """Map-style Dataset bridging ``BatchExecutor.read_batch()`` with the GPU pipeline.
+    """Deprecated compatibility Dataset bridging ``BatchExecutor.read_batch()`` with the GPU pipeline.
 
     Designed for use with ``torch.utils.data.DataLoader`` and a batch
     sampler that yields lists of corpus-global cell indices.  The
@@ -621,6 +680,10 @@ class PerturbBatchDataset:
         expressed_weight: float = 3.0,
         hvg_weight: float = 3.0,
     ):
+        _warn_legacy_runtime_surface(
+            "PerturbBatchDataset",
+            "load_corpus(...), Corpus.set_sampler(...), and Corpus.loader(...)",
+        )
         self._exec = executor
         self._seq_len = seq_len
         self._columnar = bool(columnar)
@@ -716,7 +779,7 @@ def collate_raw_expression_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def collate_batch_dict(items: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collate ``PerturbBatchDataset.__getitems__`` output into a batch dict.
+    """Deprecated compatibility collate for ``PerturbBatchDataset`` output.
 
     Converts numpy arrays to CPU tensors so that ``DataLoader(pin_memory=True)``
     can perform asynchronous host→device transfers.  Non-tensor fields
@@ -742,6 +805,10 @@ def collate_batch_dict(items: list[dict[str, Any]]) -> dict[str, Any]:
         ``CPUPipeline.process_batch()``. Optional ``size_factor`` is only
         included when present in the input batch.
     """
+    _warn_legacy_runtime_surface(
+        "collate_batch_dict",
+        "Corpus.loader(...) or collate_raw_expression_batch(...)",
+    )
     if not items:
         raise ValueError("collate_batch_dict received empty list")
     batch = items[0]

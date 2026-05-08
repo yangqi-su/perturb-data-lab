@@ -50,7 +50,7 @@ perturb-data-lab/
 - `examples/contracts/*.yaml`: human-editable review artifact examples
 - `tests/`: synthetic smoke coverage
 
-## Preferred corpus API
+## Preferred corpus-first API
 
 ```python
 from perturb_data_lab.loaders import load_corpus
@@ -58,7 +58,7 @@ from perturb_data_lab.loaders import load_corpus
 corpus = load_corpus("/path/to/corpus", seq_len=1024)
 corpus.set_sampler(batch_size=128, seed=0)
 
-dataset = corpus.dataset()
+dataset = corpus.dataset()  # optional: raw expression dataset contract
 
 for batch in corpus.loader(processing="gpu", num_workers=4):
     ...
@@ -72,18 +72,31 @@ for batch in corpus.loader(
     ...
 ```
 
-- The same public API works for aggregate Lance and federated Lance corpora.
-- `corpus.dataset()` is expression-only for the Lance fast path; rich metadata stays on the `Corpus` side by default.
+- Aggregate and federated corpora share the same public API; topology-specific routing stays internal.
+- `corpus.dataset()` exposes the backend-neutral expression dataset contract used by `corpus.loader(...)`.
+- Compatible backends read expression through `read_expression_flat(global_indices) -> ExpressionBatch`.
 - `corpus.loader(processing="gpu")` reads expression in the DataLoader and runs sparse processing in the main process.
 - `corpus.loader(processing="cpu")` runs sparse processing in CPU workers and returns processed batches to the main process.
 - Requested `metadata_columns` are attached after processing as columnar `batch["meta_columns"]`, so Lance workers do not need the full `MetadataIndex`.
 - `size_factor` is optional metadata/pass-through, not a required sparse-processing input.
 - Lance-backed loaders default to `multiprocessing_context="spawn"` for worker safety.
 
+For direct inspection, prefer corpus-level helpers over reaching into `corpus.batch_executor`:
+
+```python
+expr = corpus.read_expression([0, 10, 24])
+meta = corpus.take_metadata([0, 10, 24], columns=["dataset_id", "perturb_label"])
+raw_batch = corpus.inspect_batch([0, 10, 24], metadata_columns=["perturb_label"])
+```
+
 ## Migration note
 
-- Preferred usage is now corpus-centric: `load_corpus(...)`, `corpus.set_sampler(...)`, and `corpus.loader(...)`.
-- `BatchExecutor` remains available for direct or legacy batch reads, but new training loops should not need to manually wire `BatchExecutor`, `DataLoader`, and `GPUSparsePipeline` together.
+- Preferred usage is now corpus-centric: `load_corpus(...)`, `corpus.set_sampler(...)`, `corpus.dataset()`, `corpus.loader(...)`, `corpus.read_expression(...)`, `corpus.take_metadata(...)`, and `corpus.inspect_batch(...)`.
+- Migrate `corpus.batch_executor.read_batch(indices, ...)` to `corpus.inspect_batch(indices, metadata_columns=...)`.
+- Migrate `corpus.batch_executor.read_expression_batch(indices)` to `corpus.read_expression(indices)`.
+- Migrate `PerturbBatchDataset`, `collate_batch_dict`, and manual `DataLoader` + `GPUSparsePipeline` wiring to `corpus.set_sampler(...)` plus `corpus.loader(processing="gpu" | "cpu", ...)`.
+- `BatchExecutor` and the legacy runtime dataset/collate surfaces remain available for compatibility-only use during this deprecation cycle.
+- The per-row `ExpressionRow` / `read_expression(...)` reader path is also compatibility-only; runtime code should prefer flat `ExpressionBatch` reads via `Corpus.read_expression(...)` or backend `read_expression_flat(...)`.
 
 ## Running the inspector
 

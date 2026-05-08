@@ -429,8 +429,10 @@ class BatchExecutor:
         into a single dict with all numpy arrays needed for downstream
         collation and GPU transfer.
 
-        This is the primary hot-path entry point.  No ``CellState`` objects
-        are created.
+        This remains available for legacy or low-level integrations. New
+        training loops should usually prefer ``Corpus.loader(...)`` instead of
+        calling ``BatchExecutor.read_batch()`` directly. No ``CellState``
+        objects are created.
 
         Parameters
         ----------
@@ -496,6 +498,7 @@ class BatchExecutor:
         required ``dataset_index`` routing field, with ``local_row_index`` and
         ``size_factor`` carried only as optional pass-through metadata.
         Additional metadata columns are attached only when explicitly asked for.
+        New inspection code should usually prefer ``Corpus.inspect_batch(...)``.
         """
         indices = [int(i) for i in global_indices]
         expr = self.read_expression_batch(indices)

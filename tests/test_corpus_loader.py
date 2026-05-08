@@ -17,8 +17,12 @@ import torch
 import yaml
 
 from perturb_data_lab.loaders import (
+    AggregateLanceExpressionBatchDataset,
     CPUPipeline,
+    ExpressionBatch,
+    ExpressionBatchDataset,
     GPUSparsePipeline,
+    LanceExpressionBatchDataset,
     collate_raw_expression_batch,
     cpu_parallel_collate_fn,
 )
@@ -40,6 +44,37 @@ def _assert_processed_loader_batch(batch: dict[str, Any], *, batch_size: int) ->
     assert "row_offsets" not in batch
     assert "expressed_gene_indices" not in batch
     assert "expression_counts" not in batch
+
+
+def _assert_columnar_value_equal(actual: Any, expected: Any) -> None:
+    if isinstance(expected, np.ndarray):
+        np.testing.assert_array_equal(actual, expected)
+        return
+    assert actual == expected
+
+
+def _assert_expression_batch_equal(actual: Any, expected: Any) -> None:
+    assert actual.batch_size == expected.batch_size
+    np.testing.assert_array_equal(actual.global_row_index, expected.global_row_index)
+    np.testing.assert_array_equal(actual.row_offsets, expected.row_offsets)
+    np.testing.assert_array_equal(
+        actual.expressed_gene_indices,
+        expected.expressed_gene_indices,
+    )
+    np.testing.assert_array_equal(actual.expression_counts, expected.expression_counts)
+
+
+class _StubFlatReader:
+    def read_expression_flat(self, global_indices: list[int]) -> ExpressionBatch:
+        indices = np.asarray(global_indices, dtype=np.int64)
+        n = len(indices)
+        return ExpressionBatch(
+            batch_size=n,
+            global_row_index=indices,
+            row_offsets=np.arange(n + 1, dtype=np.int64),
+            expressed_gene_indices=np.arange(n, dtype=np.int32),
+            expression_counts=np.ones(n, dtype=np.int32),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +524,13 @@ class TestLoadCorpusFederated:
 class TestCorpusApiPhase2:
     """Phase 2 corpus-level API scaffolding tests."""
 
+    def test_lance_dataset_aliases_remain_importable(self) -> None:
+        assert issubclass(LanceExpressionBatchDataset, ExpressionBatchDataset)
+        assert issubclass(
+            AggregateLanceExpressionBatchDataset,
+            ExpressionBatchDataset,
+        )
+
     def test_set_sampler_stores_default_sampler(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
@@ -507,7 +549,8 @@ class TestCorpusApiPhase2:
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
-        dataset = corpus.dataset(metadata_columns=["perturb_label"])
+        with pytest.warns(DeprecationWarning, match="RawExpressionBatchDataset"):
+            dataset = corpus.dataset(metadata_columns=["perturb_label"])
         batch = dataset.__getitems__([0, 10, 24])[0]
 
         assert dataset.backend == "lance"
@@ -534,7 +577,8 @@ class TestCorpusApiPhase2:
         _build_mock_federated_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
-        dataset = corpus.dataset(metadata_columns=["cell_line_or_type"])
+        with pytest.warns(DeprecationWarning, match="RawExpressionBatchDataset"):
+            dataset = corpus.dataset(metadata_columns=["cell_line_or_type"])
         batch = dataset.__getitems__([2, 11, 20])[0]
 
         assert dataset.topology == "federated"
@@ -647,6 +691,7 @@ class TestAggregateLancePhase4:
 
         dataset = corpus.dataset()
 
+        assert type(dataset) is ExpressionBatchDataset
         assert dataset.topology == "aggregate"
         assert dataset.backend == "lance"
         assert dataset._reader._dataset is None
@@ -756,6 +801,7 @@ class TestFederatedLancePhase5:
 
         dataset = corpus.dataset()
 
+        assert type(dataset) is ExpressionBatchDataset
         assert dataset.topology == "federated"
         assert dataset.backend == "lance"
         assert dataset._reader._datasets == {}
@@ -817,6 +863,113 @@ class TestFederatedLancePhase5:
         global_indices = batch["global_row_index"].cpu().numpy()
         assert np.all(global_indices >= 0)
         assert np.all(global_indices < 10)
+
+
+class TestCorpusInspectionHelpersPhase5:
+    """Phase 5 corpus-level inspection helper tests."""
+
+    def test_read_expression_matches_batch_executor(self, tmp_path: Path) -> None:
+        _build_mock_federated_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+        indices = [24, 0, 10, 9]
+
+        expr = corpus.read_expression(indices)
+        expected = corpus.batch_executor.read_expression_batch(indices)
+
+        _assert_expression_batch_equal(expr, expected)
+
+    def test_take_metadata_matches_executor_columnar_metadata(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(
+            tmp_path,
+            typed_structural=True,
+            safe_nulls=True,
+        )
+        corpus = load_corpus(str(tmp_path))
+        indices = [0, 10]
+
+        taken = corpus.take_metadata(
+            indices,
+            columns=["dataset_id", "cell_id", "dataset_index", "size_factor", "dose", "timepoint", "perturb_label"],
+        )
+        expected = corpus.batch_executor.read_metadata_batch(indices, columnar=True)
+
+        assert np.issubdtype(taken["dataset_index"].dtype, np.integer)
+        assert np.issubdtype(taken["size_factor"].dtype, np.floating)
+        assert taken["dose"] == (None, None)
+        assert taken["timepoint"] == (None, None)
+        _assert_columnar_value_equal(taken["dataset_id"], expected["dataset_id"])
+        _assert_columnar_value_equal(taken["cell_id"], expected["cell_id"])
+        _assert_columnar_value_equal(taken["dataset_index"], expected["dataset_index"])
+        np.testing.assert_allclose(taken["size_factor"], expected["size_factor"])
+        _assert_columnar_value_equal(taken["dose"], expected["meta_columns"]["dose"])
+        _assert_columnar_value_equal(taken["timepoint"], expected["meta_columns"]["timepoint"])
+        _assert_columnar_value_equal(
+            taken["perturb_label"],
+            expected["meta_columns"]["perturb_label"],
+        )
+
+    def test_inspect_batch_matches_batch_executor_raw_contract(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path, typed_structural=True, safe_nulls=True)
+        corpus = load_corpus(str(tmp_path))
+        indices = [0, 5, 12, 24]
+
+        batch = corpus.inspect_batch(
+            indices,
+            metadata_columns=["perturb_label", "dose", "size_factor"],
+        )
+        expected = corpus.batch_executor.read_raw_batch(
+            indices,
+            metadata_columns=["perturb_label", "dose", "size_factor"],
+        )
+
+        assert set(batch.keys()) == set(expected.keys())
+        for key in (
+            "global_row_index",
+            "dataset_index",
+            "local_row_index",
+            "row_offsets",
+            "expressed_gene_indices",
+            "expression_counts",
+            "size_factor",
+        ):
+            np.testing.assert_array_equal(batch[key], expected[key])
+        assert set(batch["meta_columns"]) == set(expected["meta_columns"])
+        for key, value in expected["meta_columns"].items():
+            _assert_columnar_value_equal(batch["meta_columns"][key], value)
+
+
+class TestCorpusDeprecationsPhase6:
+    """Phase 6 deprecation coverage for compatibility-only loader surfaces."""
+
+    @pytest.mark.parametrize(
+        ("dataset_cls", "expected_name"),
+        [
+            (LanceExpressionBatchDataset, "LanceExpressionBatchDataset"),
+            (
+                AggregateLanceExpressionBatchDataset,
+                "AggregateLanceExpressionBatchDataset",
+            ),
+        ],
+    )
+    def test_legacy_lance_dataset_aliases_warn_but_still_work(
+        self,
+        dataset_cls: type[ExpressionBatchDataset],
+        expected_name: str,
+    ) -> None:
+        with pytest.warns(DeprecationWarning, match=expected_name):
+            dataset = dataset_cls(
+                _StubFlatReader(),
+                dataset_starts=np.array([0], dtype=np.int64),
+                dataset_stops=np.array([5], dtype=np.int64),
+                dataset_indices=np.array([7], dtype=np.int32),
+                topology="aggregate",
+                backend="lance",
+            )
+
+        batch = dataset.__getitems__([0, 3])[0]
+        np.testing.assert_array_equal(batch["global_row_index"], [0, 3])
+        np.testing.assert_array_equal(batch["dataset_index"], [7, 7])
+        np.testing.assert_array_equal(batch["local_row_index"], [0, 3])
 
 
 class TestCorpusLoaderPhase6:

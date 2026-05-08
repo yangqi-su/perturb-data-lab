@@ -10,6 +10,9 @@ Supported topologies: aggregate, federated.
 The reader returns **only expression data** — no metadata fields.
 Identity/metadata fields (dataset_id, dataset_index, local_row_index,
 size_factor, etc.) belong in ``MetadataIndex``, not in ``ExpressionRow``.
+``read_expression_flat()`` is the preferred runtime contract; the older
+``ExpressionRow`` / ``read_expression()`` object path is retained as a
+compatibility surface for one deprecation cycle.
 """
 
 from __future__ import annotations
@@ -69,6 +72,10 @@ constant as the hard upper bound.
 @dataclass(frozen=True)
 class ExpressionRow:
     """A single row of expression data for one cell.
+
+    Compatibility-only row object retained for legacy inspection and reader
+    tests. New loader/runtime code should prefer flat ``ExpressionBatch``
+    reads instead of constructing or depending on ``ExpressionRow`` objects.
 
     Contains only expression data — no metadata.  Identity and metadata
     fields are handled separately by ``MetadataIndex``.
@@ -183,8 +190,16 @@ class ExpressionReader(Protocol):
     def read_expression(self, global_indices: Sequence[int]) -> list[ExpressionRow]:
         """Read expression data for the given global cell indices.
 
-        Returns one ``ExpressionRow`` per input index, in the same order.
+        Compatibility path returning one ``ExpressionRow`` per input index, in
+        the same order. New runtime code should prefer
+        ``read_expression_flat()``.
         """
+        ...
+
+    def read_expression_flat(
+        self, global_indices: Sequence[int]
+    ) -> ExpressionBatch:
+        """Read expression data as an order-preserving ``ExpressionBatch``."""
         ...
 
 
@@ -217,6 +232,39 @@ def _extract_list_columns(table, col_name: str) -> tuple[np.ndarray, np.ndarray]
 def _list_column_as_py(table, col_name: str, row_idx: int):
     """Extract a single row's list-column value as a Python list."""
     return table.column(col_name)[row_idx].as_py()
+
+
+def _rows_to_expression_batch(
+    global_indices: Sequence[int], rows: Sequence[ExpressionRow]
+) -> ExpressionBatch:
+    """Convert ordered ``ExpressionRow`` objects into an ``ExpressionBatch``."""
+    indices = np.array([int(idx) for idx in global_indices], dtype=np.int64)
+    if len(rows) == 0:
+        return ExpressionBatch(
+            batch_size=0,
+            global_row_index=indices,
+            row_offsets=np.array([0], dtype=np.int64),
+            expressed_gene_indices=np.array([], dtype=np.int32),
+            expression_counts=np.array([], dtype=np.int32),
+        )
+
+    row_offsets = np.zeros(len(rows) + 1, dtype=np.int64)
+    egi_parts: list[np.ndarray] = []
+    ec_parts: list[np.ndarray] = []
+    for pos, row in enumerate(rows):
+        gene_indices = np.asarray(row.expressed_gene_indices, dtype=np.int32)
+        counts = np.asarray(row.expression_counts, dtype=np.int32)
+        egi_parts.append(gene_indices)
+        ec_parts.append(counts)
+        row_offsets[pos + 1] = row_offsets[pos] + len(gene_indices)
+
+    return ExpressionBatch(
+        batch_size=len(rows),
+        global_row_index=indices,
+        row_offsets=row_offsets,
+        expressed_gene_indices=np.concatenate(egi_parts),
+        expression_counts=np.concatenate(ec_parts),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +303,9 @@ class BaseExpressionReader(ABC):
 
         Routes each index to its owning dataset, reads through the
         backend-specific ``_read_local_rows``, and reassembles results
-        in the original input order.
+        in the original input order. This compatibility path is kept for
+        legacy inspection; new runtime code should prefer
+        ``read_expression_flat()``.
         """
         if not global_indices:
             return []
@@ -283,6 +333,18 @@ class BaseExpressionReader(ABC):
 
         # Reassemble in original input order
         return [result_map[pos] for pos in range(len(indices))]
+
+    def read_expression_flat(
+        self, global_indices: Sequence[int]
+    ) -> ExpressionBatch:
+        """Fallback flat reader built from ``read_expression()``.
+
+        Backends with a more efficient flat representation can override this
+        method, while other readers inherit a shared order-preserving fallback.
+        """
+        indices = [int(idx) for idx in global_indices]
+        rows = self.read_expression(indices)
+        return _rows_to_expression_batch(indices, rows)
 
     # ------------------------------------------------------------------
     # Routing helpers (shared across all backends)

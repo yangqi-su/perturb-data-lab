@@ -25,6 +25,7 @@ from .expression import (
 from .index import MetadataIndex, MetadataRow
 from .loaders import (
     AggregateLanceExpressionBatchDataset,
+    ExpressionBatchDataset,
     LanceExpressionBatchDataset,
     CorpusRandomBatchSampler,
     DatasetBatchSampler,
@@ -93,6 +94,7 @@ __all__ = [
     "DatasetBatchSampler",
     "DatasetContextBatchSampler",
     # Phase 3 — Data loaders
+    "ExpressionBatchDataset",
     "LanceExpressionBatchDataset",
     "AggregateLanceExpressionBatchDataset",
     "RawExpressionBatchDataset",

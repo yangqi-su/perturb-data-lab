@@ -25,7 +25,12 @@ from perturb_data_lab.loaders.expression import (
     ExpressionRow,
     FederatedArrowIpcReader,
     FederatedLanceReader,
+    FederatedParquetReader,
+    FederatedWebDatasetReader,
+    FederatedZarrReader,
     LanceDatasetEntry,
+    ParquetDatasetEntry,
+    WebDatasetEntry,
     ZarrDatasetEntry,
 )
 from perturb_data_lab.loaders.loaders import ExpressionBatch
@@ -44,8 +49,11 @@ AGGREGATE_LANCE = (
 )
 
 AGGREGATE_ZARR_BASE = _ARCHIVED_ROOT / "zarr-aggregate/matrix"
+FEDERATED_ZARR_BASE = _ARCHIVED_ROOT / "zarr-federated"
 FEDERATED_BASE = _ARCHIVED_ROOT / "lance-federated"
 ARROW_IPC_BASE = _ARCHIVED_ROOT / "arrow-ipc-federated"
+PARQUET_BASE = _ARCHIVED_ROOT / "arrow-parquet-federated"
+WEBDATASET_BASE = _ARCHIVED_ROOT / "webdataset-federated"
 
 # Dataset sizes from the archived corpus
 _DATASET_SIZES = {
@@ -147,6 +155,101 @@ def arrow_ipc_reader() -> FederatedArrowIpcReader:
         ),
     ]
     return FederatedArrowIpcReader(entries)
+
+
+@pytest.fixture(scope="module")
+def fed_zarr_reader() -> FederatedZarrReader:
+    """FederatedZarrReader for dummy_00 + dummy_01."""
+    entries = [
+        ZarrDatasetEntry(
+            "dummy_00",
+            0,
+            50_000,
+            FEDERATED_ZARR_BASE / "dummy_00/matrix/dummy_00-release-row-offsets.zarr",
+            FEDERATED_ZARR_BASE / "dummy_00/matrix/dummy_00-release-indices.zarr",
+            FEDERATED_ZARR_BASE / "dummy_00/matrix/dummy_00-release-counts.zarr",
+        ),
+        ZarrDatasetEntry(
+            "dummy_01",
+            50_000,
+            125_000,
+            FEDERATED_ZARR_BASE / "dummy_01/matrix/dummy_01-release-row-offsets.zarr",
+            FEDERATED_ZARR_BASE / "dummy_01/matrix/dummy_01-release-indices.zarr",
+            FEDERATED_ZARR_BASE / "dummy_01/matrix/dummy_01-release-counts.zarr",
+        ),
+    ]
+    return FederatedZarrReader(entries)
+
+
+@pytest.fixture(scope="module")
+def parquet_reader() -> FederatedParquetReader:
+    """FederatedParquetReader for dummy_00 + dummy_01."""
+    entries = [
+        ParquetDatasetEntry(
+            "dummy_00",
+            0,
+            50_000,
+            PARQUET_BASE / "dummy_00/matrix/dummy_00-release-cells.parquet",
+        ),
+        ParquetDatasetEntry(
+            "dummy_01",
+            50_000,
+            125_000,
+            PARQUET_BASE / "dummy_01/matrix/dummy_01-release-cells.parquet",
+        ),
+    ]
+    return FederatedParquetReader(entries)
+
+
+@pytest.fixture(scope="module")
+def webdataset_reader() -> FederatedWebDatasetReader:
+    """FederatedWebDatasetReader for dummy_00 + dummy_01."""
+    entries = [
+        WebDatasetEntry(
+            "dummy_00",
+            0,
+            50_000,
+            WEBDATASET_BASE / "dummy_00/matrix/dummy_00-release-cells.tar",
+        ),
+        WebDatasetEntry(
+            "dummy_01",
+            50_000,
+            125_000,
+            WEBDATASET_BASE / "dummy_01/matrix/dummy_01-release-cells.tar",
+        ),
+    ]
+    return FederatedWebDatasetReader(entries)
+
+
+def _assert_flat_batch_matches_legacy(reader, indices: list[int]) -> None:
+    """Assert ``read_expression_flat()`` matches ``read_expression()``."""
+    batch = reader.read_expression_flat(indices)
+    rows = reader.read_expression(indices)
+
+    assert isinstance(batch, ExpressionBatch)
+    assert batch.batch_size == len(indices)
+    np.testing.assert_array_equal(
+        batch.global_row_index, np.array(indices, dtype=np.int64)
+    )
+
+    if not indices:
+        expected_offsets = np.array([0], dtype=np.int64)
+        expected_egi = np.array([], dtype=np.int32)
+        expected_ec = np.array([], dtype=np.int32)
+    else:
+        expected_offsets = np.zeros(len(rows) + 1, dtype=np.int64)
+        for pos, row in enumerate(rows):
+            expected_offsets[pos + 1] = (
+                expected_offsets[pos] + len(row.expressed_gene_indices)
+            )
+        expected_egi = np.concatenate([row.expressed_gene_indices for row in rows])
+        expected_ec = np.concatenate([row.expression_counts for row in rows])
+
+    np.testing.assert_array_equal(batch.row_offsets, expected_offsets)
+    np.testing.assert_array_equal(batch.expressed_gene_indices, expected_egi)
+    np.testing.assert_array_equal(batch.expression_counts, expected_ec)
+    assert batch.row_offsets[-1] == len(batch.expressed_gene_indices)
+    assert len(batch.expressed_gene_indices) == len(batch.expression_counts)
 
 
 # ===================================================================
@@ -404,6 +507,59 @@ class TestAggregateZarrReader:
         assert not hasattr(r, "size_factor")
         assert r.expressed_gene_indices.dtype == np.int32
         assert r.expression_counts.dtype == np.int32
+
+
+class TestFallbackFlatReaderContract:
+    """Fallback ``read_expression_flat()`` coverage for non-optimized backends."""
+
+    @pytest.mark.parametrize(
+        ("fixture_name", "indices"),
+        [
+            ("agg_zarr_reader", [100, 5, 50_000, 99_999]),
+            ("fed_zarr_reader", [0, 50_000, 1, 50_001]),
+            ("arrow_ipc_reader", [0, 50_000, 1, 50_001]),
+            ("parquet_reader", [0, 50_000, 1, 50_001]),
+            ("webdataset_reader", [0, 50_000, 1, 50_001]),
+        ],
+    )
+    def test_flat_reader_matches_legacy_path(
+        self, request, fixture_name: str, indices: list[int]
+    ):
+        reader = request.getfixturevalue(fixture_name)
+        _assert_flat_batch_matches_legacy(reader, indices)
+
+    @pytest.mark.parametrize(
+        "fixture_name",
+        [
+            "agg_zarr_reader",
+            "fed_zarr_reader",
+            "arrow_ipc_reader",
+            "parquet_reader",
+            "webdataset_reader",
+        ],
+    )
+    def test_flat_reader_empty_batch(self, request, fixture_name: str):
+        reader = request.getfixturevalue(fixture_name)
+        _assert_flat_batch_matches_legacy(reader, [])
+
+    @pytest.mark.parametrize(
+        ("fixture_name", "indices"),
+        [
+            ("agg_zarr_reader", [42]),
+            ("fed_zarr_reader", [42]),
+            ("arrow_ipc_reader", [42]),
+            ("parquet_reader", [42]),
+            ("webdataset_reader", [42]),
+        ],
+    )
+    def test_flat_reader_returns_expression_only(
+        self, request, fixture_name: str, indices: list[int]
+    ):
+        reader = request.getfixturevalue(fixture_name)
+        batch = reader.read_expression_flat(indices)
+        assert not hasattr(batch, "size_factor")
+        assert not hasattr(batch, "canonical_perturbation")
+        assert not hasattr(batch, "canonical_context")
 
 
 # ===================================================================

@@ -13,6 +13,7 @@ import yaml
 
 from perturb_data_lab.loaders.corpus_loader import load_corpus
 from perturb_data_lab.loaders.expression import AggregateCsrMemmapReader, CsrMemmapShardEntry
+from perturb_data_lab.loaders.loaders import ExpressionBatchDataset, RawExpressionBatchDataset
 from perturb_data_lab.materializers.direct_csr import (
     DirectH5adCsrReader,
     convert_h5ad_to_csr_dataset,
@@ -184,6 +185,55 @@ def _write_template_corpus(root: Path) -> None:
             )
 
 
+def _build_packaged_csr_corpus(tmp_path: Path) -> Path:
+    template_root = tmp_path / "template"
+    _write_template_corpus(template_root)
+
+    ds0_source = tmp_path / "ds0.h5ad"
+    _write_mock_h5ad(
+        ds0_source,
+        shape=(3, 5),
+        indptr=[0, 2, 2, 4],
+        indices=[0, 1, 2, 4],
+        data=[1.0, 2.0, 3.0, 4.0],
+    )
+    ds1_source = tmp_path / "ds1.h5ad"
+    _write_mock_h5ad(
+        ds1_source,
+        shape=(3, 5),
+        indptr=[0, 1, 3, 3],
+        indices=[1, 0, 4],
+        data=[5.0, 6.0, 7.0],
+    )
+
+    ds0_manifest = convert_h5ad_to_csr_dataset(
+        dataset_id="ds0",
+        source_h5ad_path=ds0_source,
+        output_dir=tmp_path / "ds0-out",
+        global_row_start=0,
+        dataset_index=0,
+        shard_n_cells=2,
+        rows_per_chunk=2,
+    )
+    ds1_manifest = convert_h5ad_to_csr_dataset(
+        dataset_id="ds1",
+        source_h5ad_path=ds1_source,
+        output_dir=tmp_path / "ds1-out",
+        global_row_start=3,
+        dataset_index=1,
+        shard_n_cells=2,
+        rows_per_chunk=2,
+    )
+
+    packaged_root = tmp_path / "packaged"
+    package_csr_corpus(
+        dataset_manifest_paths=[ds0_manifest, ds1_manifest],
+        template_corpus_root=template_root,
+        output_root=packaged_root,
+    )
+    return packaged_root
+
+
 class TestCsrChunkWriter:
     def test_append_csr_chunk_across_shards_and_duplicate_reads(self, tmp_path: Path) -> None:
         out = tmp_path / "csr"
@@ -285,51 +335,7 @@ class TestDirectH5adReaderAndConverter:
 
 class TestCsrPackager:
     def test_package_csr_corpus_builds_loadable_overlay(self, tmp_path: Path) -> None:
-        template_root = tmp_path / "template"
-        _write_template_corpus(template_root)
-
-        ds0_source = tmp_path / "ds0.h5ad"
-        _write_mock_h5ad(
-            ds0_source,
-            shape=(3, 5),
-            indptr=[0, 2, 2, 4],
-            indices=[0, 1, 2, 4],
-            data=[1.0, 2.0, 3.0, 4.0],
-        )
-        ds1_source = tmp_path / "ds1.h5ad"
-        _write_mock_h5ad(
-            ds1_source,
-            shape=(3, 5),
-            indptr=[0, 1, 3, 3],
-            indices=[1, 0, 4],
-            data=[5.0, 6.0, 7.0],
-        )
-
-        ds0_manifest = convert_h5ad_to_csr_dataset(
-            dataset_id="ds0",
-            source_h5ad_path=ds0_source,
-            output_dir=tmp_path / "ds0-out",
-            global_row_start=0,
-            dataset_index=0,
-            shard_n_cells=2,
-            rows_per_chunk=2,
-        )
-        ds1_manifest = convert_h5ad_to_csr_dataset(
-            dataset_id="ds1",
-            source_h5ad_path=ds1_source,
-            output_dir=tmp_path / "ds1-out",
-            global_row_start=3,
-            dataset_index=1,
-            shard_n_cells=2,
-            rows_per_chunk=2,
-        )
-
-        packaged_root = tmp_path / "packaged"
-        package_csr_corpus(
-            dataset_manifest_paths=[ds0_manifest, ds1_manifest],
-            template_corpus_root=template_root,
-            output_root=packaged_root,
-        )
+        packaged_root = _build_packaged_csr_corpus(tmp_path)
 
         with open(packaged_root / "csr-corpus-manifest.yaml", "r") as fh:
             merged = yaml.safe_load(fh)
@@ -351,3 +357,51 @@ class TestCsrPackager:
         np.testing.assert_array_equal(batch["row_offsets"], [0, 2, 4, 5, 5])
         np.testing.assert_array_equal(batch["expressed_gene_indices"], [0, 1, 2, 4, 1])
         np.testing.assert_array_equal(batch["expression_counts"], [1, 2, 3, 4, 5])
+
+    def test_packaged_csr_corpus_uses_expression_dataset_hot_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        packaged_root = _build_packaged_csr_corpus(tmp_path)
+        corpus = load_corpus(packaged_root, seq_len=3)
+
+        dataset = corpus.dataset()
+        assert type(dataset) is ExpressionBatchDataset
+        assert dataset.backend == "csr_memmap"
+        assert dataset.topology == "aggregate"
+
+        batch = dataset.__getitems__([0, 2, 3, 5])[0]
+        np.testing.assert_array_equal(batch["global_row_index"], [0, 2, 3, 5])
+        np.testing.assert_array_equal(batch["dataset_index"], [0, 0, 1, 1])
+        np.testing.assert_array_equal(batch["local_row_index"], [0, 2, 0, 2])
+
+        with pytest.warns(DeprecationWarning, match="RawExpressionBatchDataset"):
+            legacy_dataset = corpus.dataset(metadata_columns=["perturb_label"])
+        assert type(legacy_dataset) is RawExpressionBatchDataset
+        legacy_batch = legacy_dataset.__getitems__([0, 3])[0]
+        assert legacy_batch["meta_columns"]["perturb_label"] == ("control", "control")
+
+        def _fail_read_raw_batch(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("loader hot path should not call BatchExecutor.read_raw_batch")
+
+        monkeypatch.setattr(corpus.batch_executor, "read_raw_batch", _fail_read_raw_batch)
+
+        processed = next(
+            corpus.loader(
+                processing="cpu",
+                batch_size=4,
+                seq_len=3,
+                shuffle=False,
+                metadata_columns=["perturb_label"],
+            )
+        )
+
+        assert processed["batch_size"] == 4
+        assert processed["sampled_gene_ids"].shape == (4, 3)
+        assert tuple(processed["meta_columns"]["perturb_label"]) == (
+            "control",
+            "control",
+            "control",
+            "control",
+        )

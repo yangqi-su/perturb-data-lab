@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import torch
 
@@ -106,6 +107,20 @@ def _executor_federated() -> BatchExecutor:
         reader = FederatedLanceReader(entries)
         _executor_federated._cache = BatchExecutor(reader, meta)
     return _executor_federated._cache
+
+
+def _legacy_perturb_batch_dataset(*args, **kwargs):
+    from perturb_data_lab.loaders import PerturbBatchDataset
+
+    with pytest.warns(DeprecationWarning, match="PerturbBatchDataset"):
+        return PerturbBatchDataset(*args, **kwargs)
+
+
+def _legacy_collate_batch_dict(items):
+    from perturb_data_lab.loaders import collate_batch_dict
+
+    with pytest.warns(DeprecationWarning, match="collate_batch_dict"):
+        return collate_batch_dict(items)
 
 
 # ===================================================================
@@ -705,9 +720,7 @@ class TestPhase5FastPathWiring:
 
     def test_dataset_columnar_false_default(self):
         """PerturbBatchDataset without columnar preserves legacy dict output."""
-        from perturb_data_lab.loaders import PerturbBatchDataset
-
-        ds = PerturbBatchDataset(_executor(), seq_len=128)
+        ds = _legacy_perturb_batch_dataset(_executor(), seq_len=128)
         assert ds.columnar is False
 
         batch = ds.__getitems__([0, 1, 50000])[0]
@@ -717,9 +730,9 @@ class TestPhase5FastPathWiring:
 
     def test_dataset_columnar_true_output(self):
         """PerturbBatchDataset with columnar=True returns meta_columns."""
-        from perturb_data_lab.loaders import PerturbBatchDataset
-
-        ds = PerturbBatchDataset(_executor(), seq_len=128, columnar=True)
+        ds = _legacy_perturb_batch_dataset(
+            _executor(), seq_len=128, columnar=True,
+        )
         assert ds.columnar is True
 
         batch = ds.__getitems__([0, 1, 50000])[0]
@@ -734,18 +747,14 @@ class TestPhase5FastPathWiring:
 
     def test_dataset_columnar_empty_batch(self):
         """PerturbBatchDataset columnar mode handles empty input."""
-        from perturb_data_lab.loaders import PerturbBatchDataset
-
-        ds = PerturbBatchDataset(_executor(), columnar=True)
+        ds = _legacy_perturb_batch_dataset(_executor(), columnar=True)
         batch = ds.__getitems__([])[0]
         assert batch["batch_size"] == 0
         assert batch["meta_columns"] == {}
 
     def test_dataset_columnar_meta_columns_content(self):
         """Columnar meta_columns from Dataset have correct shapes."""
-        from perturb_data_lab.loaders import PerturbBatchDataset
-
-        ds = PerturbBatchDataset(_executor(), columnar=True)
+        ds = _legacy_perturb_batch_dataset(_executor(), columnar=True)
         batch = ds.__getitems__([0, 1, 2, 50000, 50001])[0]
 
         mc = batch["meta_columns"]
@@ -763,11 +772,9 @@ class TestPhase5FastPathWiring:
 
     def test_collate_legacy_dict_metadata(self):
         """collate_batch_dict produces legacy dict fields in default mode."""
-        from perturb_data_lab.loaders import PerturbBatchDataset, collate_batch_dict
-
-        ds = PerturbBatchDataset(_executor(), columnar=False)
+        ds = _legacy_perturb_batch_dataset(_executor(), columnar=False)
         items = ds.__getitems__([0, 1, 2])
-        collated = collate_batch_dict(items)
+        collated = _legacy_collate_batch_dict(items)
 
         # Required numeric tensor fields
         assert isinstance(collated["global_row_index"], torch.Tensor)
@@ -784,11 +791,9 @@ class TestPhase5FastPathWiring:
 
     def test_collate_columnar_metadata(self):
         """collate_batch_dict passes meta_columns through unchanged."""
-        from perturb_data_lab.loaders import PerturbBatchDataset, collate_batch_dict
-
-        ds = PerturbBatchDataset(_executor(), columnar=True)
+        ds = _legacy_perturb_batch_dataset(_executor(), columnar=True)
         items = ds.__getitems__([0, 1, 50000])
-        collated = collate_batch_dict(items)
+        collated = _legacy_collate_batch_dict(items)
 
         # Required numeric tensor fields present
         assert isinstance(collated["global_row_index"], torch.Tensor)
@@ -810,11 +815,9 @@ class TestPhase5FastPathWiring:
 
     def test_collate_columnar_empty(self):
         """collate_batch_dict handles empty columnar batch."""
-        from perturb_data_lab.loaders import PerturbBatchDataset, collate_batch_dict
-
-        ds = PerturbBatchDataset(_executor(), columnar=True)
+        ds = _legacy_perturb_batch_dataset(_executor(), columnar=True)
         items = ds.__getitems__([])
-        collated = collate_batch_dict(items)
+        collated = _legacy_collate_batch_dict(items)
 
         assert collated["batch_size"] == 0
         assert collated["meta_columns"] == {}
@@ -822,11 +825,9 @@ class TestPhase5FastPathWiring:
 
     def test_collate_all_numeric_tensors_on_cpu(self):
         """collate_batch_dict produces CPU tensors (not CUDA)."""
-        from perturb_data_lab.loaders import PerturbBatchDataset, collate_batch_dict
-
-        ds = PerturbBatchDataset(_executor(), columnar=True)
+        ds = _legacy_perturb_batch_dataset(_executor(), columnar=True)
         items = ds.__getitems__([0, 1, 2])
-        collated = collate_batch_dict(items)
+        collated = _legacy_collate_batch_dict(items)
 
         tensor_keys = [
             "global_row_index", "row_offsets", "expressed_gene_indices",
