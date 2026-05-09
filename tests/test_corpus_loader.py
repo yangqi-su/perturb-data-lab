@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import partial
 import pickle
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Sequence
@@ -35,6 +36,8 @@ from perturb_data_lab.loaders.corpus_loader import (
     _read_raw_batch,
     load_corpus,
 )
+from perturb_data_lab.materializers.backends import build_backend_fn
+from perturb_data_lab.materializers.chunk_translation import ChunkBundle
 
 
 LOADER_SEQ_LEN = 8
@@ -70,6 +73,35 @@ def _assert_expression_batch_equal(actual: Any, expected: Any) -> None:
         expected.expressed_gene_indices,
     )
     np.testing.assert_array_equal(actual.expression_counts, expected.expression_counts)
+
+
+def _assert_raw_batch_equal(actual: dict[str, Any], expected: dict[str, Any]) -> None:
+    assert actual.keys() == expected.keys()
+    assert actual["batch_size"] == expected["batch_size"]
+    for key in (
+        "global_row_index",
+        "dataset_index",
+        "local_row_index",
+        "row_offsets",
+        "expressed_gene_indices",
+        "expression_counts",
+        "size_factor",
+    ):
+        if key in expected:
+            np.testing.assert_array_equal(actual[key], expected[key])
+    if "meta_columns" in expected:
+        assert set(actual["meta_columns"]) == set(expected["meta_columns"])
+        for key, value in expected["meta_columns"].items():
+            _assert_columnar_value_equal(actual["meta_columns"][key], value)
+
+
+def _assert_take_metadata_equal(
+    actual: dict[str, np.ndarray | tuple],
+    expected: dict[str, np.ndarray | tuple],
+) -> None:
+    assert set(actual) == set(expected)
+    for key, value in expected.items():
+        _assert_columnar_value_equal(actual[key], value)
 
 
 def _make_routing_metadata_index(
@@ -112,6 +144,7 @@ def _make_obs_df(
 ) -> pl.DataFrame:
     """Create a canonical-obs DataFrame for testing."""
     rows = []
+    rng = np.random.RandomState(dataset_index * 10_000 + global_start + n_cells)
     for i in range(n_cells):
         row: dict[str, Any] = {
             "cell_id": f"{dataset_id}_cell_{i:04d}",
@@ -137,7 +170,7 @@ def _make_obs_df(
             "disease_state": "healthy",
         }
         if include_size_factor:
-            size_factor = round(np.random.uniform(0.5, 2.0), 4)
+            size_factor = round(float(rng.uniform(0.5, 2.0)), 4)
             row["size_factor"] = size_factor if typed_structural else str(size_factor)
         rows.append(row)
 
@@ -171,6 +204,150 @@ def _make_lance_rows(n_cells: int) -> list[dict[str, Any]]:
             "expression_counts": list(counts),
         })
     return rows
+
+
+def _bundle_for_rows(global_start: int, rows: list[dict[str, Any]]) -> ChunkBundle:
+    indptr = [0]
+    gene_indices: list[int] = []
+    counts: list[int] = []
+    row_sums: list[float] = []
+    expressed_gene_indices = [row["expressed_gene_indices"] for row in rows]
+    expression_counts = [row["expression_counts"] for row in rows]
+
+    for genes, values in zip(expressed_gene_indices, expression_counts, strict=True):
+        gene_indices.extend(genes)
+        counts.extend(values)
+        indptr.append(indptr[-1] + len(genes))
+        row_sums.append(float(np.sum(values)))
+
+    return ChunkBundle(
+        table=pa.table(
+            {
+                "global_row_index": pa.array(
+                    np.arange(global_start, global_start + len(rows), dtype=np.int64),
+                    type=pa.int64(),
+                ),
+                "expressed_gene_indices": pa.array(expressed_gene_indices, type=pa.list_(pa.int32())),
+                "expression_counts": pa.array(expression_counts, type=pa.list_(pa.int32())),
+            }
+        ),
+        row_sums=np.asarray(row_sums, dtype=np.float64),
+        indptr=np.asarray(indptr, dtype=np.int64),
+        indices=np.asarray(gene_indices, dtype=np.int32),
+        counts=np.asarray(counts, dtype=np.int32),
+        row_count=len(rows),
+    )
+
+
+def _write_backend_rows(
+    *,
+    backend: str,
+    dataset_id: str,
+    matrix_root: Path,
+    global_start: int,
+    rows: list[dict[str, Any]],
+) -> None:
+    writer = build_backend_fn(backend, "federated")
+    writer(
+        bundle=_bundle_for_rows(global_start, rows),
+        dataset_id=dataset_id,
+        matrix_root=matrix_root,
+        _writer_state=None,
+        _is_last_chunk=True,
+    )
+
+
+def _build_mock_federated_backend_corpus(
+    corpus_root: Path,
+    *,
+    index_backend: str,
+    writer_backend: str,
+    include_size_factor: bool = True,
+    typed_structural: bool = False,
+    safe_nulls: bool = False,
+) -> None:
+    """Build a minimal federated corpus for a non-Lance matrix backend."""
+    corpus_root.mkdir(parents=True, exist_ok=True)
+
+    ds_configs = [
+        {"dataset_id": "mock_00", "cell_count": 10, "global_start": 0, "global_end": 10, "dataset_index": 0},
+        {"dataset_id": "mock_01", "cell_count": 15, "global_start": 10, "global_end": 25, "dataset_index": 1},
+    ]
+
+    index_doc = {
+        "kind": "corpus-index",
+        "contract_version": "0.3.0",
+        "global_metadata": {
+            "backend": index_backend,
+            "topology": "federated",
+        },
+        "datasets": [
+            {
+                "dataset_id": ds["dataset_id"],
+                "join_mode": "create_new" if i == 0 else "append_routed",
+                "dataset_index": ds["dataset_index"],
+                "cell_count": ds["cell_count"],
+                "global_start": ds["global_start"],
+                "global_end": ds["global_end"],
+            }
+            for i, ds in enumerate(ds_configs)
+        ],
+    }
+    with open(corpus_root / "corpus-index.yaml", "w") as f:
+        yaml.safe_dump(index_doc, f)
+
+    for ds in ds_configs:
+        ds_id = ds["dataset_id"]
+        ds_dir = corpus_root / ds_id
+        meta_dir = ds_dir / "meta" / "canonical_meta"
+        meta_dir.mkdir(parents=True, exist_ok=True)
+
+        obs_df = _make_obs_df(
+            ds_id,
+            ds["dataset_index"],
+            ds["cell_count"],
+            ds["global_start"],
+            include_size_factor=include_size_factor,
+            typed_structural=typed_structural,
+            safe_nulls=safe_nulls,
+        )
+        obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
+
+        var_df = _make_var_df(ds_id, N_GENES)
+        var_df.write_parquet(str(meta_dir / "canonical-var.parquet"))
+
+        matrix_dir = ds_dir / "matrix"
+        matrix_dir.mkdir(parents=True, exist_ok=True)
+        _write_backend_rows(
+            backend=writer_backend,
+            dataset_id=ds_id,
+            matrix_root=matrix_dir,
+            global_start=ds["global_start"],
+            rows=_make_lance_rows(ds["cell_count"]),
+        )
+
+
+def _assert_public_api_matches_federated_lance(
+    candidate: Corpus,
+    lance: Corpus,
+    indices: list[int],
+) -> None:
+    _assert_expression_batch_equal(
+        candidate.read_expression(indices),
+        lance.read_expression(indices),
+    )
+    _assert_raw_batch_equal(
+        candidate.dataset().__getitems__(indices)[0],
+        lance.dataset().__getitems__(indices)[0],
+    )
+    _assert_take_metadata_equal(
+        candidate.take_metadata(indices, columns=["dataset_id", "local_row_index", "perturb_label"]),
+        lance.take_metadata(indices, columns=["dataset_id", "local_row_index", "perturb_label"]),
+    )
+    _assert_raw_batch_equal(
+        candidate.inspect_batch(indices, metadata_columns=["perturb_label"]),
+        lance.inspect_batch(indices, metadata_columns=["perturb_label"]),
+    )
 
 
 def _build_mock_aggregate_corpus(
@@ -347,6 +524,90 @@ def _build_mock_federated_corpus(
             schema=schema,
         )
         lance.write_dataset(table, str(matrix_dir / f"{ds_id}.lance"), mode="overwrite")
+
+
+def _build_mock_federated_arrow_ipc_corpus(
+    corpus_root: Path,
+    *,
+    include_size_factor: bool = True,
+    typed_structural: bool = False,
+    safe_nulls: bool = False,
+) -> None:
+    """Build a minimal federated Arrow IPC corpus (2 datasets)."""
+    corpus_root.mkdir(parents=True, exist_ok=True)
+
+    ds_configs = [
+        {"dataset_id": "mock_00", "cell_count": 10, "global_start": 0, "global_end": 10, "dataset_index": 0},
+        {"dataset_id": "mock_01", "cell_count": 15, "global_start": 10, "global_end": 25, "dataset_index": 1},
+    ]
+
+    index_doc = {
+        "kind": "corpus-index",
+        "contract_version": "0.3.0",
+        "global_metadata": {
+            "backend": "arrow-ipc",
+            "topology": "federated",
+        },
+        "datasets": [
+            {
+                "dataset_id": ds["dataset_id"],
+                "join_mode": "create_new" if i == 0 else "append_routed",
+                "dataset_index": ds["dataset_index"],
+                "cell_count": ds["cell_count"],
+                "global_start": ds["global_start"],
+                "global_end": ds["global_end"],
+            }
+            for i, ds in enumerate(ds_configs)
+        ],
+    }
+    with open(corpus_root / "corpus-index.yaml", "w") as f:
+        yaml.safe_dump(index_doc, f)
+
+    schema = pa.schema([
+        ("expressed_gene_indices", pa.list_(pa.int32())),
+        ("expression_counts", pa.list_(pa.int32())),
+    ])
+    for ds in ds_configs:
+        ds_id = ds["dataset_id"]
+        ds_dir = corpus_root / ds_id
+        meta_dir = ds_dir / "meta" / "canonical_meta"
+        meta_dir.mkdir(parents=True, exist_ok=True)
+
+        obs_df = _make_obs_df(
+            ds_id,
+            ds["dataset_index"],
+            ds["cell_count"],
+            ds["global_start"],
+            include_size_factor=include_size_factor,
+            typed_structural=typed_structural,
+            safe_nulls=safe_nulls,
+        )
+        obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
+
+        var_df = _make_var_df(ds_id, N_GENES)
+        var_df.write_parquet(str(meta_dir / "canonical-var.parquet"))
+
+        matrix_dir = ds_dir / "matrix"
+        matrix_dir.mkdir(parents=True, exist_ok=True)
+        arrow_rows = _make_lance_rows(ds["cell_count"])
+        table = pa.table(
+            {
+                "expressed_gene_indices": pa.array(
+                    [row["expressed_gene_indices"] for row in arrow_rows],
+                    type=pa.list_(pa.int32()),
+                ),
+                "expression_counts": pa.array(
+                    [row["expression_counts"] for row in arrow_rows],
+                    type=pa.list_(pa.int32()),
+                ),
+            },
+            schema=schema,
+        )
+        with pa.ipc.new_file(
+            str(matrix_dir / f"{ds_id}-cells.arrow"),
+            table.schema,
+        ) as writer:
+            writer.write_table(table)
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +794,309 @@ class TestLoadCorpusFederated:
             assert isinstance(entry, LanceDatasetEntry)
             assert Path(str(entry.lance_path)).exists()
             assert str(entry.lance_path).endswith(f"{entry.dataset_id}.lance")
+
+
+class TestLoadCorpusFederatedArrowIpcPhase2:
+    """Phase 2 federated Arrow IPC public API tests."""
+
+    @staticmethod
+    def _load_backend_pair(tmp_path: Path) -> tuple[Corpus, Corpus]:
+        lance_root = tmp_path / "lance"
+        arrow_root = tmp_path / "arrow_ipc"
+        _build_mock_federated_corpus(lance_root)
+        _build_mock_federated_arrow_ipc_corpus(arrow_root)
+        return load_corpus(str(lance_root)), load_corpus(str(arrow_root))
+
+    def test_load_corpus_builds_arrow_ipc_dataset_entries(self, tmp_path: Path) -> None:
+        _build_mock_federated_arrow_ipc_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        from perturb_data_lab.loaders.expression import ArrowIpcDatasetEntry
+
+        assert corpus.topology == "federated"
+        assert corpus.backend == "arrow_ipc"
+        assert len(corpus.dataset_entries) == 2
+        for entry in corpus.dataset_entries:
+            assert isinstance(entry, ArrowIpcDatasetEntry)
+            assert Path(str(entry.arrow_path)).is_file()
+            assert str(entry.arrow_path).endswith(f"{entry.dataset_id}-cells.arrow")
+
+    @pytest.mark.parametrize(
+        "indices",
+        [
+            [0, 1, 2, 3],
+            [24, 10, 9, 0],
+            [8, 10, 24, 0],
+            [],
+        ],
+    )
+    def test_arrow_ipc_public_reads_match_federated_lance(
+        self,
+        tmp_path: Path,
+        indices: list[int],
+    ) -> None:
+        lance_corpus, arrow_corpus = self._load_backend_pair(tmp_path)
+
+        _assert_public_api_matches_federated_lance(arrow_corpus, lance_corpus, indices)
+
+    def test_arrow_ipc_cpu_loader_matches_sampler_and_metadata_contract(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        lance_corpus, arrow_corpus = self._load_backend_pair(tmp_path)
+        lance_corpus.set_sampler(batch_size=4, seed=11)
+        arrow_corpus.set_sampler(batch_size=4, seed=11)
+
+        lance_batch = next(
+            lance_corpus.loader(
+                processing="cpu",
+                seq_len=LOADER_SEQ_LEN,
+                metadata_columns=["perturb_label"],
+            )
+        )
+        arrow_batch = next(
+            arrow_corpus.loader(
+                processing="cpu",
+                seq_len=LOADER_SEQ_LEN,
+                metadata_columns=["perturb_label"],
+            )
+        )
+
+        _assert_processed_loader_batch(arrow_batch, batch_size=4)
+        np.testing.assert_array_equal(
+            arrow_batch["global_row_index"],
+            lance_batch["global_row_index"],
+        )
+        np.testing.assert_array_equal(
+            arrow_batch["dataset_index"],
+            lance_batch["dataset_index"],
+        )
+        assert arrow_batch["meta_columns"] == lance_batch["meta_columns"]
+
+    def test_missing_arrow_ipc_file_fails_with_clear_error(self, tmp_path: Path) -> None:
+        _build_mock_federated_arrow_ipc_corpus(tmp_path)
+        arrow_path = tmp_path / "mock_00" / "matrix" / "mock_00-cells.arrow"
+        arrow_path.unlink()
+
+        with pytest.raises(FileNotFoundError, match="Arrow IPC file not found"):
+            load_corpus(str(tmp_path))
+
+    def test_arrow_ipc_read_expression_rejects_out_of_range_index(self, tmp_path: Path) -> None:
+        _build_mock_federated_arrow_ipc_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        with pytest.raises(IndexError, match="out of range"):
+            corpus.read_expression([25])
+
+
+class TestLoadCorpusFederatedZarrPhase2:
+    """Phase 2 federated Zarr public API tests."""
+
+    @staticmethod
+    def _load_backend_pair(tmp_path: Path) -> tuple[Corpus, Corpus]:
+        lance_root = tmp_path / "lance"
+        zarr_root = tmp_path / "zarr"
+        _build_mock_federated_corpus(lance_root)
+        _build_mock_federated_backend_corpus(
+            zarr_root,
+            index_backend="zarr",
+            writer_backend="zarr",
+        )
+        return load_corpus(str(lance_root)), load_corpus(str(zarr_root))
+
+    def test_load_corpus_builds_zarr_dataset_entries(self, tmp_path: Path) -> None:
+        _build_mock_federated_backend_corpus(
+            tmp_path,
+            index_backend="zarr",
+            writer_backend="zarr",
+        )
+        corpus = load_corpus(str(tmp_path))
+
+        from perturb_data_lab.loaders.expression import ZarrDatasetEntry
+
+        assert corpus.topology == "federated"
+        assert corpus.backend == "zarr"
+        assert len(corpus.dataset_entries) == 2
+        for entry in corpus.dataset_entries:
+            assert isinstance(entry, ZarrDatasetEntry)
+            assert Path(str(entry.offsets_path)).is_dir()
+            assert Path(str(entry.indices_path)).is_dir()
+            assert Path(str(entry.counts_path)).is_dir()
+
+    @pytest.mark.parametrize(
+        "indices",
+        [
+            [0, 1, 2, 3],
+            [24, 10, 9, 0],
+            [8, 10, 24, 0],
+            [],
+        ],
+    )
+    def test_zarr_public_reads_match_federated_lance(
+        self,
+        tmp_path: Path,
+        indices: list[int],
+    ) -> None:
+        lance_corpus, zarr_corpus = self._load_backend_pair(tmp_path)
+
+        _assert_public_api_matches_federated_lance(zarr_corpus, lance_corpus, indices)
+
+    def test_zarr_cpu_loader_matches_sampler_and_metadata_contract(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        lance_corpus, zarr_corpus = self._load_backend_pair(tmp_path)
+        lance_corpus.set_sampler(batch_size=4, seed=11)
+        zarr_corpus.set_sampler(batch_size=4, seed=11)
+
+        lance_batch = next(
+            lance_corpus.loader(
+                processing="cpu",
+                seq_len=LOADER_SEQ_LEN,
+                metadata_columns=["perturb_label"],
+            )
+        )
+        zarr_batch = next(
+            zarr_corpus.loader(
+                processing="cpu",
+                seq_len=LOADER_SEQ_LEN,
+                metadata_columns=["perturb_label"],
+            )
+        )
+
+        _assert_processed_loader_batch(zarr_batch, batch_size=4)
+        np.testing.assert_array_equal(
+            zarr_batch["global_row_index"],
+            lance_batch["global_row_index"],
+        )
+        np.testing.assert_array_equal(
+            zarr_batch["dataset_index"],
+            lance_batch["dataset_index"],
+        )
+        assert zarr_batch["meta_columns"] == lance_batch["meta_columns"]
+
+    @pytest.mark.parametrize(
+        ("artifact_name", "message"),
+        [
+            ("mock_00-row-offsets.zarr", "Zarr row-offsets artifact not found"),
+            ("mock_00-indices.zarr", "Zarr indices artifact not found"),
+            ("mock_00-counts.zarr", "Zarr counts artifact not found"),
+        ],
+    )
+    def test_missing_zarr_artifact_fails_with_clear_error(
+        self,
+        tmp_path: Path,
+        artifact_name: str,
+        message: str,
+    ) -> None:
+        _build_mock_federated_backend_corpus(
+            tmp_path,
+            index_backend="zarr",
+            writer_backend="zarr",
+        )
+        artifact_path = tmp_path / "mock_00" / "matrix" / artifact_name
+        shutil.rmtree(artifact_path)
+
+        with pytest.raises(FileNotFoundError, match=message):
+            load_corpus(str(tmp_path))
+
+
+class TestLoadCorpusFederatedParquetPhase2:
+    """Phase 2 federated Parquet public API tests."""
+
+    @staticmethod
+    def _load_backend_pair(tmp_path: Path) -> tuple[Corpus, Corpus]:
+        lance_root = tmp_path / "lance"
+        parquet_root = tmp_path / "parquet"
+        _build_mock_federated_corpus(lance_root)
+        _build_mock_federated_backend_corpus(
+            parquet_root,
+            index_backend="arrow-parquet",
+            writer_backend="arrow-parquet",
+        )
+        return load_corpus(str(lance_root)), load_corpus(str(parquet_root))
+
+    def test_load_corpus_builds_parquet_dataset_entries(self, tmp_path: Path) -> None:
+        _build_mock_federated_backend_corpus(
+            tmp_path,
+            index_backend="arrow-parquet",
+            writer_backend="arrow-parquet",
+        )
+        corpus = load_corpus(str(tmp_path))
+
+        from perturb_data_lab.loaders.expression import ParquetDatasetEntry
+
+        assert corpus.topology == "federated"
+        assert corpus.backend == "parquet"
+        assert len(corpus.dataset_entries) == 2
+        for entry in corpus.dataset_entries:
+            assert isinstance(entry, ParquetDatasetEntry)
+            assert Path(str(entry.parquet_path)).is_file()
+            assert str(entry.parquet_path).endswith(f"{entry.dataset_id}-cells.parquet")
+
+    @pytest.mark.parametrize(
+        "indices",
+        [
+            [0, 1, 2, 3],
+            [24, 10, 9, 0],
+            [8, 10, 24, 0],
+            [],
+        ],
+    )
+    def test_parquet_public_reads_match_federated_lance(
+        self,
+        tmp_path: Path,
+        indices: list[int],
+    ) -> None:
+        lance_corpus, parquet_corpus = self._load_backend_pair(tmp_path)
+
+        _assert_public_api_matches_federated_lance(parquet_corpus, lance_corpus, indices)
+
+    def test_parquet_cpu_loader_matches_sampler_and_metadata_contract(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        lance_corpus, parquet_corpus = self._load_backend_pair(tmp_path)
+        lance_corpus.set_sampler(batch_size=4, seed=11)
+        parquet_corpus.set_sampler(batch_size=4, seed=11)
+
+        lance_batch = next(
+            lance_corpus.loader(
+                processing="cpu",
+                seq_len=LOADER_SEQ_LEN,
+                metadata_columns=["perturb_label"],
+            )
+        )
+        parquet_batch = next(
+            parquet_corpus.loader(
+                processing="cpu",
+                seq_len=LOADER_SEQ_LEN,
+                metadata_columns=["perturb_label"],
+            )
+        )
+
+        _assert_processed_loader_batch(parquet_batch, batch_size=4)
+        np.testing.assert_array_equal(
+            parquet_batch["global_row_index"],
+            lance_batch["global_row_index"],
+        )
+        np.testing.assert_array_equal(
+            parquet_batch["dataset_index"],
+            lance_batch["dataset_index"],
+        )
+        assert parquet_batch["meta_columns"] == lance_batch["meta_columns"]
+
+    def test_missing_parquet_file_fails_with_clear_error(self, tmp_path: Path) -> None:
+        _build_mock_federated_backend_corpus(
+            tmp_path,
+            index_backend="arrow-parquet",
+            writer_backend="arrow-parquet",
+        )
+        parquet_path = tmp_path / "mock_00" / "matrix" / "mock_00-cells.parquet"
+        parquet_path.unlink()
+
+        with pytest.raises(FileNotFoundError, match="Parquet file not found"):
+            load_corpus(str(tmp_path))
 
 
 class TestCorpusApiPhase2:

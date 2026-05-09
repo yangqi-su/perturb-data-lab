@@ -2,10 +2,10 @@
 
 ``load_corpus()`` reconstructs a training-ready ``Corpus`` from a corpus
 directory using canonical metadata as the source of truth. Supported
-artifact-backed routes are aggregate Lance, federated Lance, and aggregate CSR
-memmap. Dormant readers for Zarr, Arrow IPC, Parquet, and WebDataset remain in
-the package for future artifact work, but ``load_corpus(...)`` does not enable
-them yet.
+artifact-backed routes are aggregate Lance, federated Lance, federated Zarr,
+federated Arrow IPC, federated HuggingFace Datasets, federated Parquet, and
+aggregate CSR memmap. WebDataset remains dormant in the package for future
+artifact work, but ``load_corpus(...)`` does not enable it yet.
 
 The preferred runtime flow is::
 
@@ -58,10 +58,14 @@ import yaml
 from torch.utils.data import DataLoader
 
 from .expression import (
+    ArrowIpcDatasetEntry,
     CsrMemmapShardEntry,
     DatasetEntry,
     ExpressionReader,
+    HfDatasetsDatasetEntry,
     LanceDatasetEntry,
+    ParquetDatasetEntry,
+    ZarrDatasetEntry,
     build_expression_reader,
 )
 from .feature_registry import FeatureRegistry
@@ -398,14 +402,20 @@ class Corpus:
 
 _BACKEND_NORMALIZE: dict[str, str] = {
     "arrow-parquet": "parquet",
+    "arrow_parquet": "parquet",
     "arrow-ipc": "arrow_ipc",
+    "hf-datasets": "hf_datasets",
+    "huggingface-datasets": "hf_datasets",
+    "datasets": "hf_datasets",
     "lance": "lance",
+    "parquet": "parquet",
     "zarr": "zarr",
     "webdataset": "webdataset",
     "csr-memmap": "csr_memmap",
     # legacy / alternate names
     "arrow_hf": "parquet",
     "arrow_ipc": "arrow_ipc",
+    "hf_datasets": "hf_datasets",
     "lancedb": "lance",
 }
 
@@ -857,8 +867,8 @@ def load_corpus(
     Raises
     ------
     FileNotFoundError
-        If ``corpus-index.yaml``, any canonical parquet file, or required
-        matrix file is missing.
+        If ``corpus-index.yaml``, any canonical parquet file, or any required
+        backend matrix artifact is missing.
     ValueError
         If the corpus topology or backend is unsupported.
     """
@@ -964,33 +974,111 @@ def load_corpus(
                 f"Only 'lance' is currently supported for aggregate."
             )
     elif topology == "federated":
-        if backend == "lance":
-            entries = [
-                LanceDatasetEntry(
-                    dataset_id=ds_id,
-                    global_start=g_start,
-                    global_end=g_end,
-                    lance_path=str(
-                        root / ds_id / "matrix" / f"{ds_id}.lance"
-                    ),
-                )
-                for ds_id, _dsi, g_start, g_end in global_ranges
-            ]
-            # Verify all lance files exist
-            for entry in entries:
-                assert isinstance(entry, LanceDatasetEntry)
-                if not Path(str(entry.lance_path)).exists():
-                    raise FileNotFoundError(
-                        f"Lance file not found for dataset '{entry.dataset_id}': "
-                        f"{entry.lance_path}"
+        if backend in {"lance", "zarr", "arrow_ipc", "hf_datasets", "parquet"}:
+            entries = []
+            for ds_id, _dsi, g_start, g_end in global_ranges:
+                matrix_root = resolve_corpus_paths(topology, root, ds_id).matrix_root
+                if backend == "lance":
+                    lance_path = matrix_root / f"{ds_id}.lance"
+                    if not lance_path.exists():
+                        raise FileNotFoundError(
+                            f"Lance file not found for dataset '{ds_id}': "
+                            f"{lance_path}"
+                        )
+                    entries.append(
+                        LanceDatasetEntry(
+                            dataset_id=ds_id,
+                            global_start=g_start,
+                            global_end=g_end,
+                            lance_path=str(lance_path),
+                        )
                     )
-            expression_reader = build_expression_reader(
-                backend, topology, entries,
-            )
+                    continue
+
+                if backend == "zarr":
+                    row_offsets_path = matrix_root / f"{ds_id}-row-offsets.zarr"
+                    indices_path = matrix_root / f"{ds_id}-indices.zarr"
+                    counts_path = matrix_root / f"{ds_id}-counts.zarr"
+                    if not row_offsets_path.is_dir():
+                        raise FileNotFoundError(
+                            f"Zarr row-offsets artifact not found for dataset '{ds_id}': "
+                            f"{row_offsets_path}"
+                        )
+                    if not indices_path.is_dir():
+                        raise FileNotFoundError(
+                            f"Zarr indices artifact not found for dataset '{ds_id}': "
+                            f"{indices_path}"
+                        )
+                    if not counts_path.is_dir():
+                        raise FileNotFoundError(
+                            f"Zarr counts artifact not found for dataset '{ds_id}': "
+                            f"{counts_path}"
+                        )
+                    entries.append(
+                        ZarrDatasetEntry(
+                            dataset_id=ds_id,
+                            global_start=g_start,
+                            global_end=g_end,
+                            offsets_path=str(row_offsets_path),
+                            indices_path=str(indices_path),
+                            counts_path=str(counts_path),
+                        )
+                    )
+                    continue
+
+                if backend == "arrow_ipc":
+                    arrow_path = matrix_root / f"{ds_id}-cells.arrow"
+                    if not arrow_path.is_file():
+                        raise FileNotFoundError(
+                            f"Arrow IPC file not found for dataset '{ds_id}': "
+                            f"{arrow_path}"
+                        )
+                    entries.append(
+                        ArrowIpcDatasetEntry(
+                            dataset_id=ds_id,
+                            global_start=g_start,
+                            global_end=g_end,
+                            arrow_path=str(arrow_path),
+                        )
+                    )
+                    continue
+
+                if backend == "parquet":
+                    parquet_path = matrix_root / f"{ds_id}-cells.parquet"
+                    if not parquet_path.is_file():
+                        raise FileNotFoundError(
+                            f"Parquet file not found for dataset '{ds_id}': "
+                            f"{parquet_path}"
+                        )
+                    entries.append(
+                        ParquetDatasetEntry(
+                            dataset_id=ds_id,
+                            global_start=g_start,
+                            global_end=g_end,
+                            parquet_path=str(parquet_path),
+                        )
+                    )
+                    continue
+
+                hf_dataset_path = matrix_root / f"{ds_id}-hf-dataset"
+                if not hf_dataset_path.is_dir():
+                    raise FileNotFoundError(
+                        f"HF datasets directory not found for dataset '{ds_id}': "
+                        f"{hf_dataset_path}"
+                    )
+                entries.append(
+                    HfDatasetsDatasetEntry(
+                        dataset_id=ds_id,
+                        global_start=g_start,
+                        global_end=g_end,
+                        dataset_path=str(hf_dataset_path),
+                    )
+                )
+            expression_reader = build_expression_reader(backend, topology, entries)
         else:
             raise ValueError(
                 f"Unsupported backend '{backend}' for federated topology. "
-                f"Only 'lance' is currently supported for federated."
+                f"Only 'lance', 'zarr', 'arrow_ipc', 'hf_datasets', and 'parquet' are currently supported for federated."
             )
     else:
         raise ValueError(
