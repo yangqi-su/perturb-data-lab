@@ -2,10 +2,11 @@
 
 ``load_corpus()`` reconstructs a training-ready ``Corpus`` from a corpus
 directory using canonical metadata as the source of truth. Supported
-artifact-backed routes are aggregate Lance, federated Lance, federated Zarr,
-federated Arrow IPC, federated HuggingFace Datasets, federated Parquet, and
-aggregate CSR memmap. WebDataset remains dormant in the package for future
-artifact work, but ``load_corpus(...)`` does not enable it yet.
+artifact-backed routes are aggregate Lance, aggregate Zarr, federated Lance,
+federated Zarr, federated Arrow IPC, federated HuggingFace Datasets,
+federated Parquet, and aggregate CSR memmap. WebDataset remains dormant in the
+package for future artifact work, but ``load_corpus(...)`` does not enable it
+yet.
 
 The preferred runtime flow is::
 
@@ -957,6 +958,39 @@ def load_corpus(
             expression_reader = build_expression_reader(
                 backend, topology, entries, lance_path=lance_path,
             )
+        elif backend == "zarr":
+            row_offsets_path = root / "matrix" / "aggregated-row-offsets.zarr"
+            indices_path = root / "matrix" / "aggregated-indices.zarr"
+            counts_path = root / "matrix" / "aggregated-counts.zarr"
+            if not row_offsets_path.is_dir():
+                raise FileNotFoundError(
+                    "Aggregate Zarr row-offsets artifact not found: "
+                    f"{row_offsets_path}"
+                )
+            if not indices_path.is_dir():
+                raise FileNotFoundError(
+                    f"Aggregate Zarr indices artifact not found: {indices_path}"
+                )
+            if not counts_path.is_dir():
+                raise FileNotFoundError(
+                    f"Aggregate Zarr counts artifact not found: {counts_path}"
+                )
+            entries = [
+                DatasetEntry(
+                    dataset_id=ds_id,
+                    global_start=g_start,
+                    global_end=g_end,
+                )
+                for ds_id, _dsi, g_start, g_end in global_ranges
+            ]
+            expression_reader = build_expression_reader(
+                backend,
+                topology,
+                entries,
+                offsets_path=str(row_offsets_path),
+                indices_path=str(indices_path),
+                counts_path=str(counts_path),
+            )
         elif backend == "csr_memmap":
             # Read CSR manifest to build shard-level entries
             manifest_path = root / "csr-corpus-manifest.yaml"
@@ -971,7 +1005,8 @@ def load_corpus(
         else:
             raise ValueError(
                 f"Unsupported backend '{backend}' for aggregate topology. "
-                f"Only 'lance' is currently supported for aggregate."
+                "Only 'lance', 'zarr', and 'csr_memmap' are currently "
+                "supported for aggregate."
             )
     elif topology == "federated":
         if backend in {"lance", "zarr", "arrow_ipc", "hf_datasets", "parquet"}:

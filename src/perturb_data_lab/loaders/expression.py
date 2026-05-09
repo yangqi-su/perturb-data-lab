@@ -787,11 +787,12 @@ class AggregateZarrReader(BaseExpressionReader):
     def _read_local_cells(
         self, entry: DatasetEntry, local_indices: list[int]
     ) -> list[tuple[np.ndarray, np.ndarray]]:
+        global_positions = [entry.global_start + li for li in local_indices]
         return _zarr_read_cells(
             self._offsets,
             self._indices,
             self._counts,
-            local_indices,
+            global_positions,
         )
 
 
