@@ -11,6 +11,7 @@ New backend names (Phase 3):
 - ``webdataset``: WebDataset shard format
 - ``zarr``: Zarr 1D flat-buffer storage
 - ``lance``: Lance dataset storage
+- ``tiledb``: TileDB native sparse aggregate storage
 
 New topology names (Phase 3):
 - ``federated``: per-dataset output files
@@ -47,6 +48,7 @@ from .lance import write_lance_federated
 from .webdataset import write_webdataset_aggregate
 from .zarr import write_zarr_aggregate
 from .lance import write_lance_aggregate
+from .tiledb import write_tiledb_aggregate
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +217,9 @@ AVAILABLE_WRITERS: dict[str, dict[str, Any]] = {
         "federated": materialize_lance,
         "aggregate": write_lance_aggregate,
     },
+    "tiledb": {
+        "aggregate": write_tiledb_aggregate,
+    },
 }
 
 
@@ -225,7 +230,7 @@ def build_backend_fn(backend: str, topology: str = "federated"):
     ----------
     backend : str
         Backend name: ``arrow-parquet``, ``arrow-ipc``, ``hf-datasets``, ``webdataset``,
-        ``zarr``, or ``lance``.
+        ``zarr``, ``lance``, or ``tiledb``.
     topology : str, default "federated"
         Topology: ``federated`` (per-dataset files) or ``aggregate``
         (corpus-scoped).

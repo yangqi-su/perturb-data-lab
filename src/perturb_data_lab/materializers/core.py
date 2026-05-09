@@ -106,7 +106,7 @@ class Stage2Materializer:
     dataset_id : str
         Stable dataset identifier.
     backend : str
-        Storage backend: ``arrow-parquet`` (default), ``arrow-ipc``, ``webdataset``, ``zarr``, ``lance``.
+        Storage backend: ``arrow-parquet`` (default), ``arrow-ipc``, ``webdataset``, ``zarr``, ``lance``, ``tiledb``.
     topology : str
         Corpus topology: ``federated`` (default) or ``aggregate``.
     rerun_stage1 : bool, default False
@@ -803,6 +803,7 @@ class Stage2Materializer:
                 _writer_state=writer_state,
                 _is_last_chunk=is_last,
                 cell_ids=cell_ids_chunk,
+                local_vocabulary_size=n_vars,
             )
 
             all_paths.update(paths)
@@ -861,7 +862,7 @@ class Stage2Materializer:
         Returns ``(paths_dict, size_factors_array, hvg_sidecar_dir)`` — same
         format as ``_write_cells_federated``.
 
-        Note: Only ``lance``, ``zarr``, and ``webdataset`` backends support
+        Note: Only ``lance``, ``zarr``, ``webdataset``, and ``tiledb`` backends support
         aggregate topology. ``arrow-parquet`` and ``arrow-ipc`` do not support
         aggregate because they lack true incremental append capability.
         """
@@ -937,6 +938,7 @@ class Stage2Materializer:
                 _writer_state=writer_state,
                 _is_last_chunk=is_last_chunk,
                 cell_ids=cell_ids_chunk,
+                local_vocabulary_size=n_vars,
             )
 
             all_paths.update(paths)
@@ -1067,7 +1069,7 @@ def update_corpus_index(
         Relative path to ``corpus-emission-spec.yaml`` from the corpus root.
     backend : str | None
         Backend declaration for the corpus (e.g., "arrow-parquet", "arrow-ipc",
-        "webdataset", "zarr", "lance"). Required when creating a new corpus; written to
+        "webdataset", "zarr", "lance", "tiledb"). Required when creating a new corpus; written to
         ``global-metadata.yaml``.
     topology : str | None
         Corpus topology for the Parquet ledger entry (e.g., "federated",
@@ -1159,7 +1161,9 @@ def update_corpus_index(
     # This is safe because we always load the existing YAML index on append.
     ledger_path = corpus_index_path.parent / "corpus-ledger.parquet"
     # Resolve topology: use explicit parameter, infer from backend, or default to federated
-    effective_topology = topology or ("aggregate" if backend == "lance" else "federated")
+    effective_topology = topology or (
+        "aggregate" if backend in {"lance", "tiledb"} else "federated"
+    )
     _write_corpus_ledger_parquet(ledger_path, updated, backend, effective_topology)
 
     return updated

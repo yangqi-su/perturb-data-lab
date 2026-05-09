@@ -281,6 +281,7 @@ class MaterializationManifest(YamlDocument):
             "webdataset",
             "zarr",
             "lance",
+            "tiledb",
         }:
             raise ValueError(f"invalid backend: {self.backend}")
         if self.topology not in {"federated", "aggregate"}:
@@ -309,7 +310,9 @@ class MaterializationManifest(YamlDocument):
         # "lancedb-aggregated" implies topology="aggregate"; others are federated
         topo_raw = data.get("topology")
         if topo_raw is None:
-            topo_normalized = "aggregate" if backend_normalized == "lance" else "federated"
+            topo_normalized = (
+                "aggregate" if backend_normalized in {"lance", "tiledb"} else "federated"
+            )
         else:
             topo_normalized = str(topo_raw)
         document = cls(
@@ -674,7 +677,7 @@ class GlobalMetadataDocument(YamlDocument):
     feature_registry_id: str  # deprecated: replaced by tokenizer_path in contract 0.2.0
     missing_value_literal: str
     raw_field_policy: str
-    backend: str | None = None  # arrow-hf | arrow-parquet | arrow-ipc | hf-datasets | webdataset | zarr | lance
+    backend: str | None = None  # arrow-hf | arrow-parquet | arrow-ipc | hf-datasets | webdataset | zarr | lance | tiledb
     topology: str | None = None  # federated | aggregate (Stage 2 contract: separate from backend)
     tokenizer_path: str | None = None  # relative path from corpus root to tokenizer.json
     emission_spec_path: str | None = None  # relative path from corpus root to corpus-emission-spec.yaml
@@ -689,6 +692,7 @@ class GlobalMetadataDocument(YamlDocument):
             "webdataset",
             "zarr",
             "lance",
+            "tiledb",
         }:
             raise ValueError(f"invalid backend in global-metadata: {self.backend}")
         if self.topology is not None and self.topology not in {"federated", "aggregate"}:
@@ -740,7 +744,7 @@ class CorpusLedgerEntry:
     dataset_index: int
     join_mode: str  # create_new | append_routed
     manifest_path: str  # relative path from corpus root
-    backend: str  # arrow-hf | arrow-parquet | arrow-ipc | hf-datasets | webdataset | zarr | lance
+    backend: str  # arrow-hf | arrow-parquet | arrow-ipc | hf-datasets | webdataset | zarr | lance | tiledb
     topology: str  # federated | aggregate
     cell_count: int
     feature_count: int
@@ -754,7 +758,7 @@ class CorpusLedgerEntry:
         if self.backend not in {
             "arrow-hf", "arrow-parquet", "arrow-ipc",
             "hf-datasets",
-            "webdataset", "zarr", "lance",
+            "webdataset", "zarr", "lance", "tiledb",
         }:
             raise ValueError(f"invalid backend: {self.backend}")
         if self.topology not in {"federated", "aggregate"}:
