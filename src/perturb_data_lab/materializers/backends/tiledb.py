@@ -145,6 +145,36 @@ def _validate_local_gene_indices(
         )
 
 
+def _validate_duplicate_free_coordinates(
+    bundle: ChunkBundle,
+    *,
+    dataset_id: str,
+    global_rows: np.ndarray,
+) -> None:
+    if bundle.indices.size == 0:
+        return
+    row_lengths = np.diff(bundle.indptr).astype(np.int64, copy=False)
+    cursor = 0
+    for row_pos, row_length in enumerate(row_lengths):
+        row_stop = cursor + int(row_length)
+        if row_length > 1:
+            row_indices = np.asarray(bundle.indices[cursor:row_stop], dtype=np.int32)
+            unique_indices, counts = np.unique(row_indices, return_counts=True)
+            duplicate_indices = unique_indices[counts > 1]
+            if duplicate_indices.size > 0:
+                duplicate_preview = ", ".join(
+                    str(int(index)) for index in duplicate_indices[:5]
+                )
+                raise ValueError(
+                    "tiledb aggregate writer requires duplicate-free local gene "
+                    "indices per row; "
+                    f"dataset '{dataset_id}' global_row_index="
+                    f"{int(global_rows[row_pos])} repeats local_gene_index "
+                    f"values [{duplicate_preview}]"
+                )
+        cursor = row_stop
+
+
 def _global_rows(bundle: ChunkBundle) -> np.ndarray:
     column = bundle.table.column("global_row_index").combine_chunks()
     return np.asarray(column.to_numpy(zero_copy_only=False), dtype=np.int64)
@@ -172,6 +202,12 @@ def write_tiledb_aggregate(
         dataset_id=dataset_id,
         local_vocabulary_size=local_vocabulary_size,
     )
+    global_rows = _global_rows(bundle)
+    _validate_duplicate_free_coordinates(
+        bundle,
+        dataset_id=dataset_id,
+        global_rows=global_rows,
+    )
 
     if _writer_state is None:
         if array_path.exists():
@@ -186,7 +222,6 @@ def write_tiledb_aggregate(
                 "max_observed_local_vocabulary_size": 0,
             }
 
-    global_rows = _global_rows(bundle)
     if bundle.indices.size > 0:
         row_lengths = np.diff(bundle.indptr).astype(np.int64, copy=False)
         repeated_rows = np.repeat(global_rows, row_lengths)

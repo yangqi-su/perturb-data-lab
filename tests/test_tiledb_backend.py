@@ -197,6 +197,52 @@ def test_build_expression_reader_exposes_aggregate_tiledb_reader(
     assert isinstance(reader, AggregateTileDBReader)
 
 
+def test_tiledb_aggregate_single_dataset_roundtrip_across_chunks(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("tiledb")
+    writer = build_backend_fn("tiledb", "aggregate")
+    matrix_root = tmp_path / "matrix"
+
+    writer_state = None
+    paths = None
+    for global_start, rows, is_last_chunk in [
+        (0, [([1, 4], [6, 2]), ([], [])], False),
+        (2, [([0], [3]), ([2, 5], [4, 1])], True),
+    ]:
+        paths, writer_state = writer(
+            bundle=_bundle_for_rows(global_start, rows),
+            dataset_id="mock_00",
+            matrix_root=matrix_root,
+            _writer_state=writer_state,
+            _is_last_chunk=is_last_chunk,
+            local_vocabulary_size=6,
+        )
+
+    assert paths is not None
+    reader = build_expression_reader(
+        "tiledb",
+        "aggregate",
+        [DatasetEntry("mock_00", 0, 4)],
+        tiledb_path=str(paths["cells"]),
+        tiledb_meta_path=str(paths["meta"]),
+    )
+
+    batch = reader.read_expression_flat([3, 1, 0, 2])
+
+    assert batch.batch_size == 4
+    np.testing.assert_array_equal(batch.global_row_index, [3, 1, 0, 2])
+    np.testing.assert_array_equal(batch.row_offsets, [0, 2, 2, 4, 5])
+    np.testing.assert_array_equal(batch.row_gene_indices(0), [2, 5])
+    np.testing.assert_array_equal(batch.row_counts(0), [4, 1])
+    np.testing.assert_array_equal(batch.row_gene_indices(1), [])
+    np.testing.assert_array_equal(batch.row_counts(1), [])
+    np.testing.assert_array_equal(batch.row_gene_indices(2), [1, 4])
+    np.testing.assert_array_equal(batch.row_counts(2), [6, 2])
+    np.testing.assert_array_equal(batch.row_gene_indices(3), [0])
+    np.testing.assert_array_equal(batch.row_counts(3), [3])
+
+
 def test_aggregate_tiledb_reader_preserves_row_order_and_empty_rows(
     tmp_path: Path,
 ) -> None:
@@ -244,3 +290,23 @@ def test_aggregate_tiledb_reader_preserves_row_order_and_empty_rows(
     np.testing.assert_array_equal(batch.row_counts(2), [5, 7])
     np.testing.assert_array_equal(batch.row_gene_indices(3), [0, 4])
     np.testing.assert_array_equal(batch.row_counts(3), [1, 2])
+
+
+def test_tiledb_aggregate_writer_rejects_duplicate_local_gene_index_per_row(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("tiledb")
+    writer = build_backend_fn("tiledb", "aggregate")
+
+    with pytest.raises(
+        ValueError,
+        match=r"duplicate-free local gene indices per row.+mock_dup.+global_row_index=0.+\[1\]",
+    ):
+        writer(
+            bundle=_bundle_for_rows(0, [([1, 1, 3], [2, 3, 4])]),
+            dataset_id="mock_dup",
+            matrix_root=tmp_path / "matrix",
+            _writer_state=None,
+            _is_last_chunk=True,
+            local_vocabulary_size=5,
+        )

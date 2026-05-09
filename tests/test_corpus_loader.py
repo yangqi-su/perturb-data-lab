@@ -582,6 +582,120 @@ def _build_mock_aggregate_tiledb_corpus(
         )
 
 
+def _build_mock_aggregate_backend_corpus_from_configs(
+    corpus_root: Path,
+    *,
+    backend: str,
+    ds_configs: Sequence[dict[str, Any]],
+    include_size_factor: bool = True,
+    typed_structural: bool = False,
+    safe_nulls: bool = False,
+) -> None:
+    if backend == "tiledb":
+        pytest.importorskip("tiledb")
+    corpus_root.mkdir(parents=True, exist_ok=True)
+
+    normalized_configs: list[dict[str, Any]] = []
+    for ds in ds_configs:
+        rows = ds["rows"]
+        global_start = int(ds["global_start"])
+        cell_count = len(rows)
+        normalized_configs.append({
+            **ds,
+            "cell_count": cell_count,
+            "global_end": global_start + cell_count,
+        })
+
+    index_doc = {
+        "kind": "corpus-index",
+        "contract_version": "0.3.0",
+        "global_metadata": {
+            "backend": backend,
+            "topology": "aggregate",
+        },
+        "datasets": [
+            {
+                "dataset_id": ds["dataset_id"],
+                "join_mode": "create_new" if i == 0 else "append_routed",
+                "dataset_index": ds["dataset_index"],
+                "cell_count": ds["cell_count"],
+                "global_start": ds["global_start"],
+                "global_end": ds["global_end"],
+            }
+            for i, ds in enumerate(normalized_configs)
+        ],
+    }
+    with open(corpus_root / "corpus-index.yaml", "w") as f:
+        yaml.safe_dump(index_doc, f)
+
+    matrix_dir = corpus_root / "matrix"
+    matrix_dir.mkdir(parents=True, exist_ok=True)
+
+    lance_rows: list[dict[str, Any]] = []
+    writer_state: dict[str, Any] | None = None
+    writer = build_backend_fn("tiledb", "aggregate") if backend == "tiledb" else None
+
+    for i, ds in enumerate(normalized_configs):
+        ds_id = str(ds["dataset_id"])
+        global_start = int(ds["global_start"])
+        dataset_index = int(ds["dataset_index"])
+        rows = list(ds["rows"])
+        n_genes = int(ds["n_genes"])
+
+        meta_dir = corpus_root / "meta" / ds_id / "canonical_meta"
+        meta_dir.mkdir(parents=True, exist_ok=True)
+
+        obs_df = _make_obs_df(
+            ds_id,
+            dataset_index,
+            len(rows),
+            global_start,
+            include_size_factor=include_size_factor,
+            typed_structural=typed_structural,
+            safe_nulls=safe_nulls,
+        )
+        obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
+
+        var_df = _make_var_df(ds_id, n_genes)
+        var_df.write_parquet(str(meta_dir / "canonical-var.parquet"))
+
+        if backend == "lance":
+            lance_rows.extend(rows)
+            continue
+
+        assert writer is not None
+        _, writer_state = writer(
+            bundle=_bundle_for_rows(global_start, rows),
+            dataset_id=ds_id,
+            matrix_root=matrix_dir,
+            _writer_state=writer_state,
+            _is_last_chunk=i == len(normalized_configs) - 1,
+            local_vocabulary_size=n_genes,
+        )
+
+    if backend != "lance":
+        return
+
+    schema = pa.schema([
+        ("expressed_gene_indices", pa.list_(pa.int32())),
+        ("expression_counts", pa.list_(pa.int32())),
+    ])
+    table = pa.table(
+        {
+            "expressed_gene_indices": pa.array(
+                [row["expressed_gene_indices"] for row in lance_rows],
+                type=pa.list_(pa.int32()),
+            ),
+            "expression_counts": pa.array(
+                [row["expression_counts"] for row in lance_rows],
+                type=pa.list_(pa.int32()),
+            ),
+        },
+        schema=schema,
+    )
+    lance.write_dataset(table, str(matrix_dir / "aggregated-cells.lance"), mode="overwrite")
+
+
 def _build_mock_federated_corpus(
     corpus_root: Path,
     *,
@@ -1090,6 +1204,128 @@ class TestLoadCorpusAggregateTileDBPhase3:
 
         with pytest.raises(FileNotFoundError, match=message):
             load_corpus(str(tmp_path))
+
+
+class TestLoadCorpusAggregateTileDBPhase4:
+    """Phase 4 aggregate TileDB synthetic correctness tests."""
+
+    @staticmethod
+    def _mixed_local_vocab_configs() -> list[dict[str, Any]]:
+        return [
+            {
+                "dataset_id": "mock_00",
+                "dataset_index": 0,
+                "global_start": 0,
+                "n_genes": 5,
+                "rows": [
+                    {"expressed_gene_indices": [0, 2], "expression_counts": [5, 7]},
+                    {"expressed_gene_indices": [], "expression_counts": []},
+                    {"expressed_gene_indices": [1], "expression_counts": [3]},
+                ],
+            },
+            {
+                "dataset_id": "mock_01",
+                "dataset_index": 1,
+                "global_start": 3,
+                "n_genes": 9,
+                "rows": [
+                    {"expressed_gene_indices": [0, 4], "expression_counts": [1, 2]},
+                    {"expressed_gene_indices": [2, 5, 6], "expression_counts": [4, 5, 6]},
+                ],
+            },
+        ]
+
+    @classmethod
+    def _load_backend_pair(cls, tmp_path: Path) -> tuple[Corpus, Corpus]:
+        pytest.importorskip("tiledb")
+        configs = cls._mixed_local_vocab_configs()
+        lance_root = tmp_path / "lance"
+        tiledb_root = tmp_path / "tiledb"
+        _build_mock_aggregate_backend_corpus_from_configs(
+            lance_root,
+            backend="lance",
+            ds_configs=configs,
+        )
+        _build_mock_aggregate_backend_corpus_from_configs(
+            tiledb_root,
+            backend="tiledb",
+            ds_configs=configs,
+        )
+        return load_corpus(str(lance_root)), load_corpus(str(tiledb_root))
+
+    def test_load_corpus_handles_mixed_local_vocab_tiledb(self, tmp_path: Path) -> None:
+        pytest.importorskip("tiledb")
+        _build_mock_aggregate_backend_corpus_from_configs(
+            tmp_path,
+            backend="tiledb",
+            ds_configs=self._mixed_local_vocab_configs(),
+        )
+
+        corpus = load_corpus(str(tmp_path))
+
+        assert corpus.backend == "tiledb"
+        assert corpus.topology == "aggregate"
+        assert corpus.feature_registry.max_local_vocab == 9
+        assert corpus.feature_registry.global_vocab_size == 9
+
+    @pytest.mark.parametrize(
+        "indices",
+        [
+            [4, 1, 0, 3],
+            [2, 4],
+            [],
+        ],
+    )
+    def test_aggregate_tiledb_mixed_local_vocab_public_reads_match_lance(
+        self,
+        tmp_path: Path,
+        indices: list[int],
+    ) -> None:
+        lance_corpus, tiledb_corpus = self._load_backend_pair(tmp_path)
+
+        _assert_public_api_matches_federated_lance(
+            tiledb_corpus,
+            lance_corpus,
+            indices,
+        )
+
+    def test_aggregate_tiledb_cpu_loader_smoke_with_mixed_local_vocab_spawn(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        lance_corpus, tiledb_corpus = self._load_backend_pair(tmp_path)
+        lance_corpus.set_sampler(batch_size=4, seed=13)
+        tiledb_corpus.set_sampler(batch_size=4, seed=13)
+
+        lance_batch = next(
+            lance_corpus.loader(
+                processing="cpu",
+                seq_len=LOADER_SEQ_LEN,
+                num_workers=1,
+                multiprocessing_context="spawn",
+                metadata_columns=["perturb_label"],
+            )
+        )
+        tiledb_batch = next(
+            tiledb_corpus.loader(
+                processing="cpu",
+                seq_len=LOADER_SEQ_LEN,
+                num_workers=1,
+                multiprocessing_context="spawn",
+                metadata_columns=["perturb_label"],
+            )
+        )
+
+        _assert_processed_loader_batch(tiledb_batch, batch_size=4)
+        np.testing.assert_array_equal(
+            tiledb_batch["global_row_index"],
+            lance_batch["global_row_index"],
+        )
+        np.testing.assert_array_equal(
+            tiledb_batch["dataset_index"],
+            lance_batch["dataset_index"],
+        )
+        assert tiledb_batch["meta_columns"] == lance_batch["meta_columns"]
 
 
 class TestLoadCorpusFederated:
