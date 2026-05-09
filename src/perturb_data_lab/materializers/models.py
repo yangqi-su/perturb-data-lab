@@ -277,6 +277,7 @@ class MaterializationManifest(YamlDocument):
             "arrow-hf",
             "arrow-parquet",
             "arrow-ipc",
+            "hf-datasets",
             "webdataset",
             "zarr",
             "lance",
@@ -673,7 +674,7 @@ class GlobalMetadataDocument(YamlDocument):
     feature_registry_id: str  # deprecated: replaced by tokenizer_path in contract 0.2.0
     missing_value_literal: str
     raw_field_policy: str
-    backend: str | None = None  # arrow-hf | webdataset | zarr | lance (legacy names normalized on read)
+    backend: str | None = None  # arrow-hf | arrow-parquet | arrow-ipc | hf-datasets | webdataset | zarr | lance
     topology: str | None = None  # federated | aggregate (Stage 2 contract: separate from backend)
     tokenizer_path: str | None = None  # relative path from corpus root to tokenizer.json
     emission_spec_path: str | None = None  # relative path from corpus root to corpus-emission-spec.yaml
@@ -684,6 +685,7 @@ class GlobalMetadataDocument(YamlDocument):
             "arrow-hf",
             "arrow-parquet",
             "arrow-ipc",
+            "hf-datasets",
             "webdataset",
             "zarr",
             "lance",
@@ -738,7 +740,7 @@ class CorpusLedgerEntry:
     dataset_index: int
     join_mode: str  # create_new | append_routed
     manifest_path: str  # relative path from corpus root
-    backend: str  # arrow-hf | webdataset | zarr | lance
+    backend: str  # arrow-hf | arrow-parquet | arrow-ipc | hf-datasets | webdataset | zarr | lance
     topology: str  # federated | aggregate
     cell_count: int
     feature_count: int
@@ -751,6 +753,7 @@ class CorpusLedgerEntry:
             raise ValueError(f"invalid join_mode: {self.join_mode}")
         if self.backend not in {
             "arrow-hf", "arrow-parquet", "arrow-ipc",
+            "hf-datasets",
             "webdataset", "zarr", "lance",
         }:
             raise ValueError(f"invalid backend: {self.backend}")

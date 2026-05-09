@@ -4,7 +4,8 @@ Defines the ``ExpressionReader`` protocol, a ``BaseExpressionReader`` abstract
 class that handles global→local routing and order-preserving reassembly, and
 backend-specific implementations for all supported backends.
 
-Supported backends: Lance, Zarr, Arrow IPC, Parquet, WebDataset.
+Supported backends: Lance, Zarr, Arrow IPC, HuggingFace Datasets, Parquet,
+WebDataset.
 Supported topologies: aggregate, federated.
 
 Readers return **only expression data** via
@@ -34,12 +35,14 @@ __all__ = [
     "AggregateZarrReader",
     "FederatedZarrReader",
     "FederatedArrowIpcReader",
+    "FederatedHfDatasetsReader",
     "FederatedParquetReader",
     "FederatedWebDatasetReader",
     "AggregateCsrMemmapReader",
     "LanceDatasetEntry",
     "ZarrDatasetEntry",
     "ArrowIpcDatasetEntry",
+    "HfDatasetsDatasetEntry",
     "ParquetDatasetEntry",
     "WebDatasetEntry",
     "CsrMemmapShardEntry",
@@ -98,6 +101,13 @@ class ArrowIpcDatasetEntry(DatasetEntry):
     """Arrow IPC (feather) dataset entry with a path to the ``.arrow`` file."""
 
     arrow_path: str | Path
+
+
+@dataclass(frozen=True)
+class HfDatasetsDatasetEntry(DatasetEntry):
+    """HuggingFace datasets entry with a path to the saved dataset directory."""
+
+    dataset_path: str | Path
 
 
 @dataclass(frozen=True)
@@ -194,6 +204,18 @@ def _extract_list_columns(table, col_name: str) -> tuple[np.ndarray, np.ndarray]
 def _list_column_as_py(table, col_name: str, row_idx: int):
     """Extract a single row's list-column value as a Python list."""
     return table.column(col_name)[row_idx].as_py()
+
+
+def _import_hf_datasets():
+    """Import optional HuggingFace datasets helpers with an actionable error."""
+    try:
+        from datasets import load_from_disk
+    except ImportError as exc:
+        raise ImportError(
+            "hf_datasets backend requires the optional 'datasets' package; "
+            "install perturb-data-lab[hf-datasets] or pip install datasets"
+        ) from exc
+    return load_from_disk
 
 
 def _empty_expression_batch(global_indices: Sequence[int] | None = None) -> ExpressionBatch:
@@ -866,6 +888,57 @@ class FederatedArrowIpcReader(BaseExpressionReader):
 
 
 # ===================================================================
+# HuggingFace datasets federated reader
+# ===================================================================
+
+
+class FederatedHfDatasetsReader(BaseExpressionReader):
+    """Expression reader for federated HuggingFace datasets topology."""
+
+    def __init__(self, entries: list[HfDatasetsDatasetEntry]):
+        super().__init__(entries)  # type: ignore[arg-type]
+        _import_hf_datasets()
+        self._datasets: dict[str, object] = {}
+        self._dataset_pids: dict[str, int] = {}
+
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        state["_datasets"] = {}
+        state["_dataset_pids"] = {}
+        return state
+
+    def _open_dataset(self, entry: HfDatasetsDatasetEntry):
+        load_from_disk = _import_hf_datasets()
+        current_pid = os.getpid()
+        ds_id = entry.dataset_id
+        if ds_id not in self._datasets or self._dataset_pids.get(ds_id) != current_pid:
+            self._datasets[ds_id] = load_from_disk(
+                str(entry.dataset_path),
+                keep_in_memory=False,
+            )
+            self._dataset_pids[ds_id] = current_pid
+        return self._datasets[ds_id]
+
+    def _read_local_cells(
+        self, entry: DatasetEntry, local_indices: list[int]
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        hf_entry = self._find_entry_by_id(entry.dataset_id)
+        assert isinstance(hf_entry, HfDatasetsDatasetEntry)
+        dataset = self._open_dataset(hf_entry)
+
+        cells: list[tuple[np.ndarray, np.ndarray]] = []
+        for local_idx in local_indices:
+            row = dataset[int(local_idx)]
+            cells.append(
+                (
+                    np.asarray(row["expressed_gene_indices"], dtype=np.int32),
+                    np.asarray(row["expression_counts"], dtype=np.int32),
+                )
+            )
+        return cells
+
+
+# ===================================================================
 # Parquet federated reader
 # ===================================================================
 
@@ -1236,7 +1309,7 @@ def build_expression_reader(
     Parameters
     ----------
     backend : str
-        One of ``"lance"``, ``"zarr"``, ``"arrow_ipc"``, ``"parquet"``,
+        One of ``"lance"``, ``"zarr"``, ``"arrow_ipc"``, ``"hf_datasets"``, ``"parquet"``,
         ``"webdataset"``, ``"csr_memmap"``.
     topology : str
         Either ``"aggregate"`` or ``"federated"``.
@@ -1282,6 +1355,11 @@ def build_expression_reader(
             raise ValueError("Arrow IPC aggregate topology is not supported.")
         return FederatedArrowIpcReader(entries)  # type: ignore[arg-type]
 
+    elif backend == "hf_datasets":
+        if topology == "aggregate":
+            raise ValueError("HF datasets aggregate topology is not supported.")
+        return FederatedHfDatasetsReader(entries)  # type: ignore[arg-type]
+
     elif backend == "parquet":
         if topology == "aggregate":
             raise ValueError("Parquet aggregate topology is not supported.")
@@ -1310,7 +1388,7 @@ def build_expression_reader(
     else:
         raise ValueError(
             f"Unknown backend '{backend}'. "
-            f"Supported: lance, zarr, arrow_ipc, parquet, webdataset, csr_memmap."
+            f"Supported: lance, zarr, arrow_ipc, hf_datasets, parquet, webdataset, csr_memmap."
         )
 
 

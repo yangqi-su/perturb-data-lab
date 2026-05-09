@@ -35,7 +35,7 @@ from .materializers.paths import resolve_corpus_paths
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-BACKEND_CHOICES = ["arrow-parquet", "arrow-ipc", "webdataset", "zarr", "lance"]
+BACKEND_CHOICES = ["arrow-parquet", "arrow-ipc", "hf-datasets", "webdataset", "zarr", "lance"]
 TOPOLOGY_CHOICES = ["federated", "aggregate"]
 
 

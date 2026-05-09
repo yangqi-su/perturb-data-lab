@@ -639,7 +639,7 @@ def _resolve_loader_sampler(
                 "dataset_index": dataset_index,
                 "context_field": context_field,
             }
-        ),
+        )
     )
 
 

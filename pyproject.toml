@@ -17,5 +17,10 @@ dependencies = [
     "scipy>=1.14",
 ]
 
+[project.optional-dependencies]
+hf-datasets = [
+    "datasets>=4.2",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]

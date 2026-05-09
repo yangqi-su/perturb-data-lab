@@ -7,6 +7,7 @@ registry and all fused-name aliases have been removed.
 New backend names (Phase 3):
 - ``arrow-parquet``: Arrow IPC over Parquet storage
 - ``arrow-ipc``: Arrow IPC file storage
+- ``hf-datasets``: HuggingFace datasets directory storage
 - ``webdataset``: WebDataset shard format
 - ``zarr``: Zarr 1D flat-buffer storage
 - ``lance``: Lance dataset storage
@@ -37,6 +38,7 @@ import numpy as np
 # ---- Phase 3 federated writers ----
 from .arrow_parquet import write_arrow_parquet_federated
 from .arrow_ipc import write_arrow_ipc_federated
+from .hf_datasets import write_hf_datasets_federated
 from .webdataset import write_webdataset_federated
 from .zarr import write_zarr_federated
 from .lance import write_lance_federated
@@ -122,6 +124,25 @@ def materialize_webdataset(
     )
 
 
+def materialize_hf_datasets(
+    bundle: Any,
+    dataset_id: str,
+    matrix_root: Path,
+    *,
+    _writer_state: dict[str, Any] | None = None,
+    _is_last_chunk: bool = False,
+    **kwargs: Any,
+) -> tuple[dict[str, Path], dict | None]:
+    """Write using hf-datasets × federated backend."""
+    return write_hf_datasets_federated(
+        bundle=bundle,
+        dataset_id=dataset_id,
+        matrix_root=matrix_root,
+        _writer_state=_writer_state,
+        _is_last_chunk=_is_last_chunk,
+    )
+
+
 def materialize_zarr(
     bundle: Any,
     dataset_id: str,
@@ -179,6 +200,9 @@ AVAILABLE_WRITERS: dict[str, dict[str, Any]] = {
     "arrow-ipc": {
         "federated": materialize_arrow_ipc,
     },
+    "hf-datasets": {
+        "federated": materialize_hf_datasets,
+    },
     "webdataset": {
         "federated": materialize_webdataset,
         "aggregate": write_webdataset_aggregate,
@@ -200,7 +224,7 @@ def build_backend_fn(backend: str, topology: str = "federated"):
     Parameters
     ----------
     backend : str
-        Backend name: ``arrow-parquet``, ``arrow-ipc``, ``webdataset``,
+        Backend name: ``arrow-parquet``, ``arrow-ipc``, ``hf-datasets``, ``webdataset``,
         ``zarr``, or ``lance``.
     topology : str, default "federated"
         Topology: ``federated`` (per-dataset files) or ``aggregate``
