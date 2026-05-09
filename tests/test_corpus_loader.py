@@ -510,6 +510,78 @@ def _build_mock_aggregate_zarr_corpus(
         )
 
 
+def _build_mock_aggregate_tiledb_corpus(
+    corpus_root: Path,
+    *,
+    include_size_factor: bool = True,
+    typed_structural: bool = False,
+    safe_nulls: bool = False,
+) -> None:
+    """Build a minimal aggregate TileDB corpus (2 datasets)."""
+    pytest.importorskip("tiledb")
+    corpus_root.mkdir(parents=True, exist_ok=True)
+
+    ds_configs = [
+        {"dataset_id": "mock_00", "cell_count": 10, "global_start": 0, "global_end": 10, "dataset_index": 0},
+        {"dataset_id": "mock_01", "cell_count": 15, "global_start": 10, "global_end": 25, "dataset_index": 1},
+    ]
+
+    index_doc = {
+        "kind": "corpus-index",
+        "contract_version": "0.3.0",
+        "global_metadata": {
+            "backend": "tiledb",
+            "topology": "aggregate",
+        },
+        "datasets": [
+            {
+                "dataset_id": ds["dataset_id"],
+                "join_mode": "create_new" if i == 0 else "append_routed",
+                "dataset_index": ds["dataset_index"],
+                "cell_count": ds["cell_count"],
+                "global_start": ds["global_start"],
+                "global_end": ds["global_end"],
+            }
+            for i, ds in enumerate(ds_configs)
+        ],
+    }
+    with open(corpus_root / "corpus-index.yaml", "w") as f:
+        yaml.safe_dump(index_doc, f)
+
+    writer = build_backend_fn("tiledb", "aggregate")
+    writer_state: dict[str, Any] | None = None
+    matrix_dir = corpus_root / "matrix"
+    matrix_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, ds in enumerate(ds_configs):
+        ds_id = ds["dataset_id"]
+        meta_dir = corpus_root / "meta" / ds_id / "canonical_meta"
+        meta_dir.mkdir(parents=True, exist_ok=True)
+
+        obs_df = _make_obs_df(
+            ds_id,
+            ds["dataset_index"],
+            ds["cell_count"],
+            ds["global_start"],
+            include_size_factor=include_size_factor,
+            typed_structural=typed_structural,
+            safe_nulls=safe_nulls,
+        )
+        obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
+
+        var_df = _make_var_df(ds_id, N_GENES)
+        var_df.write_parquet(str(meta_dir / "canonical-var.parquet"))
+
+        _, writer_state = writer(
+            bundle=_bundle_for_rows(ds["global_start"], _make_lance_rows(ds["cell_count"])),
+            dataset_id=ds_id,
+            matrix_root=matrix_dir,
+            _writer_state=writer_state,
+            _is_last_chunk=i == len(ds_configs) - 1,
+            local_vocabulary_size=N_GENES,
+        )
+
+
 def _build_mock_federated_corpus(
     corpus_root: Path,
     *,
@@ -906,6 +978,115 @@ class TestLoadCorpusAggregateZarrPhase2:
     ) -> None:
         _build_mock_aggregate_zarr_corpus(tmp_path)
         shutil.rmtree(tmp_path / "matrix" / artifact_name)
+
+        with pytest.raises(FileNotFoundError, match=message):
+            load_corpus(str(tmp_path))
+
+
+class TestLoadCorpusAggregateTileDBPhase3:
+    """Phase 3 aggregate TileDB public API tests."""
+
+    @staticmethod
+    def _load_backend_pair(tmp_path: Path) -> tuple[Corpus, Corpus]:
+        pytest.importorskip("tiledb")
+        lance_root = tmp_path / "lance"
+        tiledb_root = tmp_path / "tiledb"
+        _build_mock_aggregate_corpus(lance_root)
+        _build_mock_aggregate_tiledb_corpus(tiledb_root)
+        return load_corpus(str(lance_root)), load_corpus(str(tiledb_root))
+
+    def test_load_corpus_builds_aggregate_tiledb_entries(self, tmp_path: Path) -> None:
+        pytest.importorskip("tiledb")
+        _build_mock_aggregate_tiledb_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        assert corpus.topology == "aggregate"
+        assert corpus.backend == "tiledb"
+        assert len(corpus.dataset_entries) == 2
+        assert [
+            (entry.dataset_id, entry.global_start, entry.global_end)
+            for entry in corpus.dataset_entries
+        ] == [
+            ("mock_00", 0, 10),
+            ("mock_01", 10, 25),
+        ]
+
+    @pytest.mark.parametrize(
+        "indices",
+        [
+            [0, 1, 2, 3],
+            [24, 10, 9, 0],
+            [8, 10, 24, 0],
+            [],
+        ],
+    )
+    def test_aggregate_tiledb_public_reads_match_aggregate_lance(
+        self,
+        tmp_path: Path,
+        indices: list[int],
+    ) -> None:
+        lance_corpus, tiledb_corpus = self._load_backend_pair(tmp_path)
+
+        _assert_public_api_matches_federated_lance(
+            tiledb_corpus,
+            lance_corpus,
+            indices,
+        )
+
+    def test_aggregate_tiledb_cpu_loader_matches_sampler_and_metadata_contract(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        lance_corpus, tiledb_corpus = self._load_backend_pair(tmp_path)
+        lance_corpus.set_sampler(batch_size=4, seed=11)
+        tiledb_corpus.set_sampler(batch_size=4, seed=11)
+
+        lance_batch = next(
+            lance_corpus.loader(
+                processing="cpu",
+                seq_len=LOADER_SEQ_LEN,
+                metadata_columns=["perturb_label"],
+            )
+        )
+        tiledb_batch = next(
+            tiledb_corpus.loader(
+                processing="cpu",
+                seq_len=LOADER_SEQ_LEN,
+                metadata_columns=["perturb_label"],
+            )
+        )
+
+        _assert_processed_loader_batch(tiledb_batch, batch_size=4)
+        np.testing.assert_array_equal(
+            tiledb_batch["global_row_index"],
+            lance_batch["global_row_index"],
+        )
+        np.testing.assert_array_equal(
+            tiledb_batch["dataset_index"],
+            lance_batch["dataset_index"],
+        )
+        assert tiledb_batch["meta_columns"] == lance_batch["meta_columns"]
+
+    @pytest.mark.parametrize(
+        ("artifact_path", "message"),
+        [
+            ("matrix/aggregated-cells.tiledb", "Aggregate TileDB array not found"),
+            ("matrix/aggregated-meta.json", "Aggregate TileDB metadata not found"),
+        ],
+    )
+    def test_missing_aggregate_tiledb_artifact_fails_with_clear_error(
+        self,
+        tmp_path: Path,
+        artifact_path: str,
+        message: str,
+    ) -> None:
+        pytest.importorskip("tiledb")
+        _build_mock_aggregate_tiledb_corpus(tmp_path)
+        path = tmp_path / artifact_path
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
 
         with pytest.raises(FileNotFoundError, match=message):
             load_corpus(str(tmp_path))

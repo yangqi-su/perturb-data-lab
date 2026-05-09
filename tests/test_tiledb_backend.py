@@ -9,6 +9,11 @@ import pytest
 import yaml
 
 from perturb_data_lab.cli import _infer_backend_topology_from_corpus
+from perturb_data_lab.loaders.expression import (
+    AggregateTileDBReader,
+    DatasetEntry,
+    build_expression_reader,
+)
 from perturb_data_lab.materializers.backends import build_backend_fn
 from perturb_data_lab.materializers.chunk_translation import ChunkBundle
 
@@ -161,3 +166,81 @@ def test_tiledb_aggregate_writer_rejects_out_of_bounds_local_gene_index(
             _is_last_chunk=True,
             local_vocabulary_size=4,
         )
+
+
+def test_build_expression_reader_exposes_aggregate_tiledb_reader(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("tiledb")
+    writer = build_backend_fn("tiledb", "aggregate")
+    matrix_root = tmp_path / "matrix"
+    paths, writer_state = writer(
+        bundle=_bundle_for_rows(0, [([1, 3], [4, 6])]),
+        dataset_id="mock_00",
+        matrix_root=matrix_root,
+        _writer_state=None,
+        _is_last_chunk=True,
+        local_vocabulary_size=5,
+    )
+
+    assert writer_state is None
+    assert paths is not None
+
+    reader = build_expression_reader(
+        "tiledb",
+        "aggregate",
+        [DatasetEntry("mock_00", 0, 1)],
+        tiledb_path=str(paths["cells"]),
+        tiledb_meta_path=str(paths["meta"]),
+    )
+
+    assert isinstance(reader, AggregateTileDBReader)
+
+
+def test_aggregate_tiledb_reader_preserves_row_order_and_empty_rows(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("tiledb")
+    writer = build_backend_fn("tiledb", "aggregate")
+    matrix_root = tmp_path / "matrix"
+
+    writer_state = None
+    paths = None
+    for dataset_id, local_vocabulary_size, global_start, rows, is_last_chunk in [
+        ("mock_00", 3, 0, [([0, 2], [5, 7]), ([], []), ([1], [3])], False),
+        ("mock_01", 7, 3, [([0, 4], [1, 2]), ([2, 5, 6], [4, 5, 6])], True),
+    ]:
+        paths, writer_state = writer(
+            bundle=_bundle_for_rows(global_start, rows),
+            dataset_id=dataset_id,
+            matrix_root=matrix_root,
+            _writer_state=writer_state,
+            _is_last_chunk=is_last_chunk,
+            local_vocabulary_size=local_vocabulary_size,
+        )
+
+    assert paths is not None
+    reader = build_expression_reader(
+        "tiledb",
+        "aggregate",
+        [
+            DatasetEntry("mock_00", 0, 3),
+            DatasetEntry("mock_01", 3, 5),
+        ],
+        tiledb_path=str(paths["cells"]),
+        tiledb_meta_path=str(paths["meta"]),
+    )
+
+    batch = reader.read_expression_flat([4, 1, 0, 3])
+
+    assert batch.batch_size == 4
+    np.testing.assert_array_equal(batch.global_row_index, [4, 1, 0, 3])
+    np.testing.assert_array_equal(batch.row_offsets, [0, 3, 3, 5, 7])
+    np.testing.assert_array_equal(batch.row_gene_indices(0), [2, 5, 6])
+    np.testing.assert_array_equal(batch.row_counts(0), [4, 5, 6])
+    np.testing.assert_array_equal(batch.row_gene_indices(1), [])
+    np.testing.assert_array_equal(batch.row_counts(1), [])
+    np.testing.assert_array_equal(batch.row_gene_indices(2), [0, 2])
+    np.testing.assert_array_equal(batch.row_counts(2), [5, 7])
+    np.testing.assert_array_equal(batch.row_gene_indices(3), [0, 4])
+    np.testing.assert_array_equal(batch.row_counts(3), [1, 2])

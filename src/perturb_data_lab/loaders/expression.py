@@ -4,8 +4,8 @@ Defines the ``ExpressionReader`` protocol, a ``BaseExpressionReader`` abstract
 class that handles global→local routing and order-preserving reassembly, and
 backend-specific implementations for all supported backends.
 
-Supported backends: Lance, Zarr, Arrow IPC, HuggingFace Datasets, Parquet,
-WebDataset.
+Supported backends: Lance, TileDB, Zarr, Arrow IPC, HuggingFace Datasets,
+Parquet, WebDataset.
 Supported topologies: aggregate, federated.
 
 Readers return **only expression data** via
@@ -16,6 +16,7 @@ etc.) belong in ``MetadataIndex``.
 
 from __future__ import annotations
 
+import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ __all__ = [
     "FederatedLanceReader",
     "AggregateZarrReader",
     "FederatedZarrReader",
+    "AggregateTileDBReader",
     "FederatedArrowIpcReader",
     "FederatedHfDatasetsReader",
     "FederatedParquetReader",
@@ -216,6 +218,18 @@ def _import_hf_datasets():
             "install perturb-data-lab[hf-datasets] or pip install datasets"
         ) from exc
     return load_from_disk
+
+
+def _import_tiledb():
+    """Import optional TileDB with an actionable error."""
+    try:
+        import tiledb
+    except ImportError as exc:
+        raise ImportError(
+            "tiledb backend requires the TileDB Python package; "
+            "install tiledb in the selected runtime"
+        ) from exc
+    return tiledb
 
 
 def _empty_expression_batch(global_indices: Sequence[int] | None = None) -> ExpressionBatch:
@@ -843,6 +857,97 @@ class FederatedZarrReader(BaseExpressionReader):
 
 
 # ===================================================================
+# TileDB reader
+# ===================================================================
+
+
+class AggregateTileDBReader(BaseExpressionReader):
+    """Expression reader for aggregate TileDB topology.
+
+    Opens a single sparse TileDB array lazily per process/worker and
+    reconstructs per-row expression arrays from ``(global_row_index,
+    local_gene_index) -> count`` coordinates.
+    """
+
+    def __init__(
+        self,
+        tiledb_path: str | Path,
+        entries: list[DatasetEntry],
+        *,
+        tiledb_meta_path: str | Path | None = None,
+        max_local_gene_index_exclusive: int | None = None,
+    ):
+        super().__init__(entries)
+        self._tiledb_path = str(Path(tiledb_path))
+        self._tiledb_meta_path = (
+            str(Path(tiledb_meta_path))
+            if tiledb_meta_path is not None
+            else None
+        )
+        self._array = None
+        self._array_pid: int | None = None
+        self._max_local_gene_index_exclusive = self._resolve_gene_bound(
+            max_local_gene_index_exclusive
+        )
+
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        state["_array"] = None
+        state["_array_pid"] = None
+        return state
+
+    def _resolve_gene_bound(self, explicit: int | None) -> int:
+        if explicit is not None:
+            bound = int(explicit)
+        elif self._tiledb_meta_path is not None:
+            meta = json.loads(Path(self._tiledb_meta_path).read_text())
+            bound = int(meta.get("max_observed_local_vocabulary_size", 0))
+        else:
+            raise ValueError(
+                "AggregateTileDBReader requires either tiledb_meta_path or "
+                "max_local_gene_index_exclusive"
+            )
+        if bound <= 0:
+            raise ValueError(
+                "AggregateTileDBReader requires a positive local gene bound; "
+                f"got {bound}"
+            )
+        return bound
+
+    def _open_array(self):
+        tiledb = _import_tiledb()
+        current_pid = os.getpid()
+        if self._array is None or self._array_pid != current_pid:
+            self._array = tiledb.open(self._tiledb_path, mode="r")
+            self._array_pid = current_pid
+        return self._array
+
+    @staticmethod
+    def _query_result_to_cell(result) -> tuple[np.ndarray, np.ndarray]:
+        genes = np.asarray(result["local_gene_index"], dtype=np.int32)
+        counts = np.asarray(result["count"], dtype=np.int32)
+        if genes.size == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+        order = np.argsort(genes, kind="stable")
+        return genes[order].copy(), counts[order].copy()
+
+    def _read_local_cells(
+        self, entry: DatasetEntry, local_indices: list[int]
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        array = self._open_array()
+        cells: list[tuple[np.ndarray, np.ndarray]] = []
+        gene_stop = self._max_local_gene_index_exclusive
+        for local_idx in local_indices:
+            global_idx = entry.global_start + local_idx
+            result = array.query(attrs=["count"], coords=True)[
+                global_idx : global_idx + 1,
+                0:gene_stop,
+            ]
+            cells.append(self._query_result_to_cell(result))
+        return cells
+
+
+# ===================================================================
 # Arrow IPC federated reader
 # ===================================================================
 
@@ -1310,8 +1415,8 @@ def build_expression_reader(
     Parameters
     ----------
     backend : str
-        One of ``"lance"``, ``"zarr"``, ``"arrow_ipc"``, ``"hf_datasets"``, ``"parquet"``,
-        ``"webdataset"``, ``"csr_memmap"``.
+        One of ``"lance"``, ``"tiledb"``, ``"zarr"``, ``"arrow_ipc"``, ``"hf_datasets"``,
+        ``"parquet"``, ``"webdataset"``, ``"csr_memmap"``.
     topology : str
         Either ``"aggregate"`` or ``"federated"``.
     entries : list of DatasetEntry
@@ -1341,6 +1446,21 @@ def build_expression_reader(
             return AggregateLanceReader(lance_path, entries)
         else:
             return FederatedLanceReader(entries)  # type: ignore[arg-type]
+
+    elif backend == "tiledb":
+        if topology == "aggregate":
+            tiledb_path = kwargs.pop("tiledb_path")
+            tiledb_meta_path = kwargs.pop("tiledb_meta_path", None)
+            max_local_gene_index_exclusive = kwargs.pop(
+                "max_local_gene_index_exclusive", None
+            )
+            return AggregateTileDBReader(
+                tiledb_path,
+                entries,
+                tiledb_meta_path=tiledb_meta_path,
+                max_local_gene_index_exclusive=max_local_gene_index_exclusive,
+            )
+        raise ValueError("TileDB only supports aggregate topology.")
 
     elif backend == "zarr":
         if topology == "aggregate":
@@ -1389,7 +1509,7 @@ def build_expression_reader(
     else:
         raise ValueError(
             f"Unknown backend '{backend}'. "
-            f"Supported: lance, zarr, arrow_ipc, hf_datasets, parquet, webdataset, csr_memmap."
+            f"Supported: lance, tiledb, zarr, arrow_ipc, hf_datasets, parquet, webdataset, csr_memmap."
         )
 
 

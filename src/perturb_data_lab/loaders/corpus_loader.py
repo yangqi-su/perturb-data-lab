@@ -2,11 +2,11 @@
 
 ``load_corpus()`` reconstructs a training-ready ``Corpus`` from a corpus
 directory using canonical metadata as the source of truth. Supported
-artifact-backed routes are aggregate Lance, aggregate Zarr, federated Lance,
-federated Zarr, federated Arrow IPC, federated HuggingFace Datasets,
-federated Parquet, and aggregate CSR memmap. WebDataset remains dormant in the
-package for future artifact work, but ``load_corpus(...)`` does not enable it
-yet.
+artifact-backed routes are aggregate Lance, aggregate TileDB, aggregate Zarr,
+federated Lance, federated Zarr, federated Arrow IPC, federated HuggingFace
+Datasets, federated Parquet, and aggregate CSR memmap. WebDataset remains
+dormant in the package for future artifact work, but ``load_corpus(...)`` does
+not enable it yet.
 
 The preferred runtime flow is::
 
@@ -410,6 +410,7 @@ _BACKEND_NORMALIZE: dict[str, str] = {
     "datasets": "hf_datasets",
     "lance": "lance",
     "parquet": "parquet",
+    "tiledb": "tiledb",
     "zarr": "zarr",
     "webdataset": "webdataset",
     "csr-memmap": "csr_memmap",
@@ -958,6 +959,32 @@ def load_corpus(
             expression_reader = build_expression_reader(
                 backend, topology, entries, lance_path=lance_path,
             )
+        elif backend == "tiledb":
+            tiledb_path = root / "matrix" / "aggregated-cells.tiledb"
+            tiledb_meta_path = root / "matrix" / "aggregated-meta.json"
+            if not tiledb_path.is_dir():
+                raise FileNotFoundError(
+                    f"Aggregate TileDB array not found: {tiledb_path}"
+                )
+            if not tiledb_meta_path.is_file():
+                raise FileNotFoundError(
+                    f"Aggregate TileDB metadata not found: {tiledb_meta_path}"
+                )
+            entries = [
+                DatasetEntry(
+                    dataset_id=ds_id,
+                    global_start=g_start,
+                    global_end=g_end,
+                )
+                for ds_id, _dsi, g_start, g_end in global_ranges
+            ]
+            expression_reader = build_expression_reader(
+                backend,
+                topology,
+                entries,
+                tiledb_path=str(tiledb_path),
+                tiledb_meta_path=str(tiledb_meta_path),
+            )
         elif backend == "zarr":
             row_offsets_path = root / "matrix" / "aggregated-row-offsets.zarr"
             indices_path = root / "matrix" / "aggregated-indices.zarr"
@@ -1005,7 +1032,7 @@ def load_corpus(
         else:
             raise ValueError(
                 f"Unsupported backend '{backend}' for aggregate topology. "
-                "Only 'lance', 'zarr', and 'csr_memmap' are currently "
+                "Only 'lance', 'tiledb', 'zarr', and 'csr_memmap' are currently "
                 "supported for aggregate."
             )
     elif topology == "federated":

@@ -2,6 +2,7 @@
 
 from .expression import (
     AggregateLanceReader,
+    AggregateTileDBReader,
     AggregateZarrReader,
     AggregateCsrMemmapReader,
     ArrowIpcDatasetEntry,
@@ -59,6 +60,7 @@ __all__ = [
     "BaseExpressionReader",
     "DatasetEntry",
     "AggregateLanceReader",
+    "AggregateTileDBReader",
     "FederatedLanceReader",
     "AggregateZarrReader",
     "FederatedZarrReader",
