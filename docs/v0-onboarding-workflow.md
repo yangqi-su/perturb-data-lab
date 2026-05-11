@@ -1,69 +1,44 @@
 # V0 Onboarding Workflow
 
-**Date**: 2026-04-20
-**Plan ID**: `copilot-plans-20260420-perturb-data-lab-schema-realignment`
-**Scope**: How to onboard a new h5ad dataset into the perturb-data-lab v0 stack, from raw h5ad inspection through to a training-ready loader.
+**Date**: 2026-05-11  
+**Plan ID**: `plans-20260511-lance-create-append-canonicalization`  
+**Scope**: Current public onboarding workflow for turning raw `.h5ad` inputs into a canonicalized corpus that can be loaded through `load_corpus()`.
 
 ---
 
-## Prerequisites
+## Current public workflow
 
-- A raw `.h5ad` file accessible via a read-only path
-- `perturb-data-lab` installed or available on a machine with Slurm access (`torch_flashv3` environment for large files)
-- At least one existing pilot dataset already materialized to understand the feature registry baseline
-- No data is ever written to protected symlink roots (`data/`, `pertTF/`, `perturb/`); all outputs go to repo-local real directories
-
----
-
-## Route Model
-
-The materialization layer exposes two public routes:
-
-| Route | When to use |
-|---|---|
-| `create_new` | First dataset of a new corpus, or a standalone dataset not joined to any corpus |
-| `append_routed` | Adding a new dataset to an existing corpus that may continue growing |
-
-`append_monolithic` is removed — its behaviour was identical to `append_routed` and its presence created a redundant public branch.
-
----
-
-## Step 1 — Batch Inspection Config (Slurm CPU for large files)
-
-**Tool**: `perturb_data_lab.inspect` CLI via `InspectionBatchConfig`
-
-**Goal**: Produce a `dataset-summary.yaml` and `schema.yaml` draft without loading the full matrix into memory.
-
-**Inspection config** (`inspection-config.yaml`):
-```yaml
-output_root: /path/to/plan/phase-02-inspector-outputs/
-datasets:
-  - dataset_id: your_dataset_v0
-    source_path: /path/to/your/data.h5ad
-    source_release: "2026-01"
+```text
+inspect
+→ materialize
+→ draft-schema
+→ finalize final-schema.yaml
+→ canonicalize
+→ load_corpus
 ```
 
-**What to run**:
-```bash
-cd /path/to/perturb-data-lab
-PYTHONPATH=src python -m perturb_data_lab.inspect \
-  --config /path/to/plan/phase-02-inspection-config.yaml
-```
+This order is intentional:
 
-**What it does**:
-- Opens each h5ad with `backed='r'` (no full load)
-- Extracts `.obs` column names, dtypes, nunique, sample values
-- Extracts `.var` gene metadata and genome annotation
-- Checks `.raw` and named `.layers` for count-source candidates
-- Audits integer-likeness of selected count source (sample-based, not full scan)
-- Runs heuristic field mapping for canonical cell perturbation, context, and feature fields
-- Writes `dataset-summary.yaml` and `schema.yaml` (draft) per dataset
+- **Materialization is count-first and schema-independent.** It needs an inspection review bundle, not a finalized canonical schema.
+- **Canonical metadata is required before runtime loading.** `load_corpus()` expects `canonical-obs.parquet` and `canonical-var.parquet`.
+- **Append is a first-class public route.** Create the corpus with the first dataset, then append later datasets into the existing corpus.
 
-**Slurm resource request** (for large h5ad files, >1M cells):
+---
+
+## Prerequisites and safety rules
+
+- Source `.h5ad` files must be treated as read-only inputs.
+- Large h5ad inspection/materialization should run on Slurm CPU in the `torch_flashv3` environment.
+- Do not write into protected symlink roots: `data/`, `pertTF/`, or `perturb/`.
+- Write all review bundles, corpus outputs, schemas, and validation artifacts to repo-local real directories.
+- Use stable dataset identifiers because they become corpus paths under `meta/<dataset_id>/`.
+
+Baseline Slurm request for large inspection/materialization work:
+
 ```bash
 #SBATCH --partition=ihc
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=24
+#SBATCH --nodelist=ihc-grid-1-1-1
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=128G
 #SBATCH --time=3:00:00
 #SBATCH --account=ihc
@@ -71,215 +46,265 @@ PYTHONPATH=src python -m perturb_data_lab.inspect \
 
 ---
 
-## Step 2 — Human Schema Review
+## Step 1 — Inspect the raw h5ad
 
-**Actors**: Dataset owner or curator
+**Goal**: Produce a review bundle that records metadata inventory, matrix-source candidates, and materialization readiness without loading the whole matrix eagerly.
 
-**Goal**: Review the generated `schema.yaml`, fill in any unresolved fields, confirm the count-source and feature tokenization choices, and set `status: ready`.
+Preferred single-dataset CLI:
 
-**Input artifacts**:
-- `dataset-summary.yaml` — dataset statistics and field inventory
-- `schema.yaml` (draft) — proposed raw-to-canonical field mappings for all cell and feature fields
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli inspect \
+  --source /path/to/dataset.h5ad \
+  --dataset-id my_dataset \
+  --output-dir /path/to/review/my_dataset
+```
 
-**What to review**:
+Batch mode is also available:
 
-1. **Count source**: Which matrix was selected (`.X`, `.raw.X`, or a named layer). Is the auto-detected choice correct?
-2. **Perturbation fields**: `perturbation_label`, `perturbation_type`, `target_id`, `target_label`, `control_flag`, `dose`, `dose_unit`, `timepoint`, `timepoint_unit`, `combination_key`
-3. **Context fields**: `cell_context`, `cell_line_or_type`, `species`, `tissue`, `assay`, `condition`, `batch_id`, `donor_id`, `sex`, `disease_state`
-4. **Feature fields**: `feature_id` (required), `feature_label` (optional), `feature_namespace` (optional)
-5. **Unresolved fields**: Fields with `strategy: null` will materialize to `NA`. If a field is genuinely not applicable, leave it null.
-6. **Control identification**: Are control/vehicle cells labelled correctly via the `control_flag` derived field?
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli inspect \
+  --config /path/to/inspection-batch.yaml \
+  --workers 1
+```
 
-**Required action before materialization**: Set `status: ready` at the top of `schema.yaml`. Materialization will refuse to run on schemas that are not `ready`.
+Primary output:
 
-**Output**: Reviewed and edited `schema.yaml` with `status: ready`.
+- `dataset-summary.yaml`
+
+What inspection decides:
+
+- Which expression source is selected (`.X`, `.raw.X`, or a named layer)
+- Whether sampled values are directly integer-like
+- Whether recovery is required
+- Whether the dataset is `pass`, `needs-review`, or blocked for materialization
+
+### Interpreting count-source outcomes
+
+| Inspection outcome | Meaning | Action |
+|---|---|---|
+| direct | Selected values already behave like counts | Materialize with the reviewed bundle |
+| recovered | Selected values need an approved recovery policy before integer verification | Materialize only through the reviewed/approved path |
+| needs-review | Recovery is plausible but should not pass silently | Resolve explicitly before materialization |
+| fail | No acceptable count source | Stop and diagnose before continuing |
+
+Recovery-specific note:
+
+- Float storage alone is not a blocker.
+- A float matrix can still pass directly if sampled nonzero values are exactly integer-valued.
+- A log-like or binned source may be usable only through recovery, and Stage 2 must still verify integer counts before writing the corpus.
 
 ---
 
-## Step 3 — Materialization
+## Step 2 — Materialize counts into a corpus
 
-**Tool**: Python API via `perturb_data_lab.materializers`
+**Goal**: Write backend artifacts, raw metadata sidecars, manifests, and corpus registration entries.
 
-**Route selection**:
-```
-Is this the first dataset in a new corpus?
-├── YES → create_new
-└── NO  → append_routed (default scale path for growing corpora)
-```
+### 2A. Create a new corpus from the first dataset
 
-**Python API for create_new**:
-```python
-from perturb_data_lab.materializers import (
-    build_materialization_route,
-    update_corpus_index,
-    OutputRoots,
-)
-from perturb_data_lab.materializers.models import DatasetJoinRecord, CountSourceSpec
-from perturb_data_lab.inspectors.models import SchemaDocument
-
-schema = SchemaDocument.from_yaml_file("/path/to/reviewed-schema.yaml")
-count_source = CountSourceSpec(
-    selected=schema.count_source.selected,
-    integer_only=schema.count_source.integer_only,
-)
-
-roots = OutputRoots(
-    metadata_root="/path/to/outputs/metadata",
-    matrix_root="/path/to/outputs/matrix",
-)
-route = build_materialization_route(
-    route="create_new",
-    output_roots=roots,
-    release_id="your-dataset-v0",
-    dataset_id="your_dataset_v0",
-    count_source=count_source,
-)
-manifest = route.materialize(
-    source_path="/path/to/your/data.h5ad",
-    schema_path="/path/to/reviewed-schema.yaml",
-)
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli materialize \
+  --mode create \
+  --source /path/to/first_dataset.h5ad \
+  --dataset-id first_dataset \
+  --review-bundle /path/to/review/first_dataset/dataset-summary.yaml \
+  --output-corpus /path/to/corpus \
+  --backend lance \
+  --topology aggregate \
+  --corpus-id my_corpus
 ```
 
-**Python API for append_routed** (on top of an existing corpus):
-```python
-# Same as above, but use route="append_routed"
-route = build_materialization_route(
-    route="append_routed",
-    output_roots=roots,
-    release_id="your-dataset-v0",
-    dataset_id="your_dataset_v0",
-    count_source=count_source,
-)
-manifest = route.materialize(
-    source_path="/path/to/your/data.h5ad",
-    schema_path="/path/to/reviewed-schema.yaml",
-)
+### 2B. Append a later dataset into that existing corpus
 
-# Update the corpus index to record the new dataset
-corpus_record = DatasetJoinRecord(
-    dataset_id="your_dataset_v0",
-    release_id="your-dataset-v0",
-    join_mode="append_routed",
-    manifest_path=str(Path(roots.metadata_root) / "materialization-manifest.yaml"),
-)
-from perturb_data_lab.materializers import update_corpus_index
-update_corpus_index(Path("/path/to/outputs/metadata/corpus-index.yaml"), corpus_record)
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli materialize \
+  --mode append \
+  --source /path/to/later_dataset.h5ad \
+  --dataset-id later_dataset \
+  --review-bundle /path/to/review/later_dataset/dataset-summary.yaml \
+  --output-corpus /path/to/corpus
 ```
 
-**What gets written**:
-- `{release_id}-cells/` — Arrow/HF sparse per-cell expression directory (int32 indices + int32 counts)
-- `{release_id}-cell-meta.sqlite` — SQLite-backed per-cell canonical metadata (canonical_perturbation, canonical_context, raw_obs as JSON columns)
-- `{release_id}-features-origin.parquet` — canonical feature metadata in original dataset feature order
-- `{release_id}-features-token.parquet` — tokenized companion mapping original indices to token IDs
-- `tokenizer.json` — corpus-level append-safe JSON tokenizer (replaces the old feature-registry.yaml approach)
-- `corpus-emission-spec.yaml` — corpus-level emission spec controlling which perturbation/context fields loaders emit
-- `hvg_sidecar/` — `hvg.npy` and `nonhvg.npy` in dataset-original feature indices (for `HVGRandomSampler`)
-- `size-factor-manifest.yaml` — per-cell size factors
-- `qa-manifest.yaml` — QA checks including integer verification
-- `materialization-manifest.yaml` — full provenance and configuration snapshot
-- `corpus-index.yaml` (for `append_routed`) — updated corpus membership
-- `global-metadata.yaml` (for `create_new`) — corpus defaults and pointers to tokenizer and emission spec
+Append notes:
 
-**Validation checks**:
+- `--backend` and `--topology` can usually be omitted for append; the existing corpus metadata is authoritative.
+- Aggregate append must preserve contiguous global row ranges across datasets.
+- Materialization copies the reviewed `dataset-summary.yaml` into `meta/<dataset_id>/` for downstream schema drafting.
+
+Key outputs written during materialization:
+
+- `corpus-index.yaml`
+- `corpus-ledger.parquet`
+- `global-metadata.yaml`
+- backend matrix artifacts (for example `matrix/aggregated-cells.lance`)
+- `meta/<dataset_id>/raw-obs.parquet`
+- `meta/<dataset_id>/raw-var.parquet`
+- `meta/<dataset_id>/metadata-summary.yaml`
+- `meta/<dataset_id>/materialization-manifest.yaml`
+- `meta/<dataset_id>/qa-manifest.yaml`
+- `meta/<dataset_id>/size-factor.parquet`
+
+Materialization checks to review before moving on:
+
 - `integer_verified: true` in `materialization-manifest.yaml`
 - `all_passed: true` in `qa-manifest.yaml`
-- Feature registry token IDs are preserved across append operations (no ID reuse collisions)
+- expected `global_start` / `global_end` registration in `corpus-index.yaml`
 
 ---
 
-## Step 4 — Training Loader Integration
+## Step 3 — Draft the canonical schema after materialization
 
-**Import**: `from perturb_data_lab.loaders import ArrowHFCellReader, PerturbIterableDataset, PerturbDataLoader`
+**Goal**: Generate a starting `draft-schema.yaml` from the corpus-local raw metadata artifacts.
 
-**Minimal example** (standalone dataset):
-```python
-from perturb_data_lab.loaders import ArrowHFCellReader, PerturbIterableDataset
-from perturb_data_lab.loaders.samplers import RandomContextSampler
-
-reader = ArrowHFCellReader(
-    cells_parquet="/path/to/outputs/matrix/{release_id}-cells/",
-    cell_meta_sqlite="/path/to/outputs/metadata/{release_id}-cell-meta.sqlite",
-    feature_meta_paths={  # optional: preload feature objects for token translation
-        "your_dataset_v0": "/path/to/outputs/metadata/{release_id}-features-token.parquet",
-    },
-)
-sampler = RandomContextSampler(reader, context_size=128)
-dataset = PerturbIterableDataset(reader, sampler, batch_size=64)
-
-for batch in dataset:
-    # batch["gene_indices"]: (batch, context_size) int32
-    # batch["expression_counts"]: (batch, context_size) int32
-    # batch["size_factor"]: (batch,) float32
-    # batch["cell_id"]: (batch,) str
-    pass
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli draft-schema \
+  --corpus /path/to/corpus
 ```
 
-**Token-space translation** (optional):
-```python
-# Add translate_indices=True to get token-space gene indices instead of
-# original dataset-order indices
-dataset = PerturbIterableDataset(reader, sampler, batch_size=64, translate_indices=True)
-for batch in dataset:
-    # batch["token_gene_indices"]: (batch, context_size) int32
-    pass
-```
+What it reads:
 
-**Multi-dataset corpus loading**: Use `CorpusLoader` to load a corpus by its index file:
+- `corpus-index.yaml`
+- `meta/<dataset_id>/dataset-summary.yaml`
+- corpus-local raw metadata sidecars already written by materialization
 
-```python
-from perturb_data_lab.loaders.corpus import build_corpus_loader
+What it writes:
 
-loader = build_corpus_loader(Path("/path/to/corpus/corpus-index.yaml"))
+- `meta/<dataset_id>/draft-schema.yaml`
 
-# Iterate all cells across all datasets
-for cell in loader.iter_cells():
-    print(cell.cell_id, cell.dataset_id)
+Important: schema drafting happens **after** materialization in the current public API. Older documentation that implies pre-materialization schema approval is obsolete.
 
-# Direct index access (global corpus index)
-cell = loader.read_cell(42)
+Known caveat:
 
-# Per-dataset access with HVG token IDs
-entry = loader.dataset_reader("replogle_k562")
-state = SamplerState(
-    mode="hvg_random",
-    total_cells=len(entry.reader),
-    n_genes=entry.n_vars,
-    hvg_set=entry.token_hvg_set,  # token-ID space for HVGRandomSampler
-)
-sampler = HVGRandomSampler(state, np.random.default_rng(42))
-```
-
-**Sampler options** (all backend-agnostic):
-- `RandomContextSampler` — uniform random context from expressed genes
-- `ExpressedZerosSampler` — half expressed genes, half zero genes
-- `HVGRandomSampler` — HVGs + equal random non-HVG genes
+- If the public `draft-schema` path fails because raw fields collide onto the same canonical name, inspect the raw metadata sidecars directly and write the reviewed schema manually as a temporary workaround.
 
 ---
 
-## End-to-End Flow Summary
+## Step 4 — Finalize `final-schema.yaml`
 
+**Goal**: Turn the draft into the reviewed schema used for canonicalization.
+
+Review these inputs together:
+
+- `meta/<dataset_id>/draft-schema.yaml`
+- `meta/<dataset_id>/dataset-summary.yaml`
+- `meta/<dataset_id>/metadata-summary.yaml`
+- sampled values from `raw-obs.parquet` and `raw-var.parquet`
+
+What to decide explicitly:
+
+- dataset-level literals such as `dataset_id`, assay, species, or cell context when they are constant
+- canonical cell metadata mappings (`perturb_label`, `cell_line_or_type`, `timepoint`, etc.)
+- canonical feature identity fields (`feature_id`, `feature_label`, namespace)
+- whether high-cardinality raw fields should stay raw-only rather than become vocabulary-driving canonical fields
+
+Output:
+
+- `meta/<dataset_id>/final-schema.yaml`
+
+Practical rule: prefer the smallest faithful mapping that matches the dataset's actual raw fields; do not invent ontology that the source metadata does not support.
+
+---
+
+## Step 5 — Canonicalize the corpus
+
+**Goal**: Build canonical obs/var parquets from finalized schemas and rebuild corpus-level vocabulary.
+
+All finalized datasets:
+
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli canonicalize \
+  --corpus /path/to/corpus
 ```
+
+Single dataset only:
+
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli canonicalize \
+  --corpus /path/to/corpus \
+  --dataset-id my_dataset
+```
+
+Dry-run:
+
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli canonicalize \
+  --corpus /path/to/corpus \
+  --dry-run
+```
+
+Primary outputs:
+
+- `meta/<dataset_id>/canonical_meta/canonical-obs.parquet`
+- `meta/<dataset_id>/canonical_meta/canonical-var.parquet`
+- `corpus-vocab.yaml`
+
+---
+
+## Step 6 — Validate with `load_corpus()`
+
+**Goal**: Confirm the canonicalized corpus is actually loadable through the public runtime API.
+
+```python
+from perturb_data_lab.loaders import load_corpus
+
+corpus = load_corpus("/path/to/corpus")
+
+expr = corpus.read_expression([0, 1, 2])
+meta = corpus.take_metadata([0, 1, 2], columns=["dataset_id", "local_row_index"])
+raw = corpus.inspect_batch([0, 1, 2], metadata_columns=["dataset_id", "perturb_label"])
+
+corpus.set_sampler(batch_size=128, seed=0)
+batch = next(iter(corpus.loader(seq_len=1024, processing="gpu", num_workers=0)))
+```
+
+Recommended validation sequence:
+
+1. `load_corpus()` succeeds
+2. `read_expression(...)` succeeds on representative rows
+3. `take_metadata(...)` returns expected canonical columns
+4. `inspect_batch(...)` succeeds on spot-check rows
+5. `corpus.loader(...)` returns at least one valid batch
+
+For multi-dataset corpora, include boundary checks across the dataset transition.
+
+---
+
+## Backend policy summary
+
+- **Default production backend:** aggregate Lance
+- **Optional node-local staging backend:** Zarr
+- **Experimental but still wired:** TileDB, CSR memmap, federated Lance/Zarr/Arrow IPC/HF datasets/Parquet
+- **Not part of the current default runtime path:** WebDataset
+
+Use aggregate Lance unless there is a clear operational reason to stage a chunked array representation locally.
+
+---
+
+## End-to-end summary
+
+```text
 h5ad file
    │
    ▼
-[Step 1] Batch inspection (backed h5ad, no full load)
-   dataset-summary.yaml + schema.yaml (draft)
+[1] inspect
+   dataset-summary.yaml
    │
    ▼
-[Step 2] Human schema review
-   schema.yaml (status: ready)
+[2] materialize
+   raw metadata + matrix artifacts + manifests
    │
    ▼
-[Step 3] Materialization (create_new or append_routed)
-   SQLite + Arrow/HF + feature parquets + manifests
+[3] draft-schema
+   draft-schema.yaml
    │
    ▼
-[Step 4] Training loader (ArrowHFCellReader + sampler)
-   PyTorch batch ready for transformer forward pass
+[4] finalize-schema
+   final-schema.yaml
+   │
+   ▼
+[5] canonicalize
+   canonical-obs.parquet + canonical-var.parquet + corpus-vocab.yaml
+   │
+   ▼
+[6] load_corpus
+   runtime smoke / loader validation
 ```
-
-**Onboarding a second dataset into an existing corpus**:
-- Start from Step 1 for the new h5ad
-- In Step 3, use `append_routed` (not `create_new`)
-- Call `update_corpus_index()` to record the new dataset in the corpus index
-- Step 4 uses the same reader + sampler API; corpus-level iteration is handled by enumerating datasets via corpus index

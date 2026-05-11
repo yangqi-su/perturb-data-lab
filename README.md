@@ -4,13 +4,12 @@ Corpus-first preprocessing and runtime-loading system for large-scale perturb-se
 
 ## Current scope
 
-- define repo boundaries for the data-lab codebase
-- lock the v0 contract catalog and additive metadata rules
-- provide typed YAML review artifacts for dataset summaries and schema review
-- inspect real h5ad metadata and count-source candidates on Slurm without eager matrix materialization
-- materialize per-dataset Arrow/HF outputs with a corpus-level JSON tokenizer
-- expose corpus-level perturbation/context emission specs for runtime sample generation
-- provide a corpus-level `load_corpus()` / `Corpus` runtime API for unified corpus access
+- inspect real h5ad metadata and count-source candidates without eager matrix materialization
+- materialize new corpora and later append datasets through the public CLI
+- keep materialization count-first and schema-independent
+- draft and finalize canonical schemas after materialization, then canonicalize corpus metadata
+- expose a corpus-level `load_corpus()` / `Corpus` runtime API for unified access
+- keep aggregate Lance as the production-default backend while leaving other backends wired for controlled experiments
 
 ## Repo layout
 
@@ -39,28 +38,47 @@ perturb-data-lab/
 
 ## Current outputs
 
-- `src/perturb_data_lab/contracts.py`: typed phase-1 blueprint objects
-- `src/perturb_data_lab/inspectors/`: typed inspection models, transform catalog, workflow, and CLI
-- `src/perturb_data_lab/materializers/tokenizer.py`: append-safe JSON corpus tokenizer (compatible with pertTF `SimpleVocab`)
-- `src/perturb_data_lab/materializers/emission_spec.py`: corpus-level emission spec for runtime field emission
-- `src/perturb_data_lab/loaders/corpus_loader.py`: `load_corpus()` and `Corpus` for unified corpus runtime access
-- `docs/phase-01-contract-blueprint.md`: repo boundaries, contract catalog, and canonical field sets
-- `docs/phase-02-inspector-workflow.md`: inspector design, count audit rules, and YAML workflow
-- `docs/git-workflow.md`: local git bootstrap and commit cadence
-- `examples/contracts/*.yaml`: human-editable review artifact examples
-- `tests/`: synthetic smoke coverage
+- `src/perturb_data_lab/cli.py`: public `inspect`, `materialize`, `draft-schema`, `canonicalize`, `corpus-validate`, and `corpus-gc` entrypoints
+- `src/perturb_data_lab/inspectors/`: inspection models, count-source audits, recovery classification, and review-bundle generation
+- `src/perturb_data_lab/materializers/`: create/append corpus writers, aggregate/federated backends, manifests, and emission-spec helpers
+- `src/perturb_data_lab/canonical/`: draft/final schema application and canonical obs/var generation
+- `src/perturb_data_lab/loaders/corpus_loader.py`: `load_corpus()` and `Corpus` for unified runtime access
+- `docs/v0-onboarding-workflow.md`: current inspect → materialize → draft-schema → finalize-schema → canonicalize → load workflow
+- `docs/v0-default-backend-decision.md`: current backend policy and default/experimental guidance
+- `tests/`: focused regression and runtime smoke coverage
+
+## Preferred onboarding workflow
+
+The public workflow is now:
+
+```text
+inspect
+→ materialize
+→ draft-schema
+→ finalize final-schema.yaml
+→ canonicalize
+→ load_corpus
+```
+
+Important constraints:
+
+- Materialization is count-first and does **not** require finalized canonical schema inputs.
+- Canonical metadata is required before `load_corpus()` succeeds.
+- For large h5ad inputs, run inspection/materialization on Slurm CPU in `torch_flashv3`.
+- Treat `data/`, `pertTF/`, and `perturb/` as read-only sources; write outputs only to repo-local real directories.
+
+See `docs/v0-onboarding-workflow.md` for concrete create/append CLI examples and schema-review guidance.
 
 ## Preferred corpus-first API
 
-`load_corpus(path)` currently supports these artifact-backed corpus routes:
+Recommended policy:
 
-- aggregate Lance
-- federated Lance
-- aggregate CSR memmap
+- **Default production path:** aggregate Lance
+- **Optional node-local staging path:** Zarr when chunked array artifacts are operationally preferable
+- **Experimental but wired:** aggregate TileDB, aggregate CSR memmap, federated Lance, federated Zarr, federated Arrow IPC, federated HuggingFace datasets, federated Parquet
+- **Not currently enabled by `load_corpus(...)`:** WebDataset
 
-Dormant readers for aggregate/federated Zarr plus federated Arrow IPC, Parquet,
-and WebDataset remain in the package for future artifact plans, but
-`load_corpus(...)` does not wire those routes yet.
+`load_corpus(path)` reconstructs a corpus from canonical metadata plus backend artifacts and exposes one backend-neutral runtime API across those supported routes.
 
 ```python
 from perturb_data_lab.loaders import load_corpus
@@ -206,10 +224,19 @@ cpu_batch = next(iter(cpu_loader))
 
 ## Running the inspector
 
-Use a YAML config and run the CLI as a module:
+Batch mode remains available:
 
 ```bash
 PYTHONPATH=src python -m perturb_data_lab.inspectors.cli --config /path/to/inspection-config.yaml --workers 3
+```
+
+The preferred public entrypoint for a single dataset is:
+
+```bash
+PYTHONPATH=src python -m perturb_data_lab.cli inspect \
+  --source /path/to/dataset.h5ad \
+  --dataset-id my_dataset \
+  --output-dir /path/to/review/my_dataset
 ```
 
 Real large h5ad inspection should run on Slurm CPU in the `torch_flashv3` environment.
