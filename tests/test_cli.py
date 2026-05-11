@@ -1201,15 +1201,12 @@ class TestCanonicalizeCmd:
         assert "dry-run" in captured.out.lower()
         assert "dummy_00" in captured.out
 
-    def test_cmd_incremental_canonicalize_rebuilds_vocab_from_existing_outputs(
+    def test_cmd_incremental_canonicalize_does_not_write_corpus_vocab(
         self,
         tmp_path: Path,
         monkeypatch,
+        capsys,
     ):
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
-        from perturb_data_lab.canonical import CanonicalVocab
         from perturb_data_lab.canonical.runner import CanonicalizationResult
         from perturb_data_lab.cli import _cmd_canonicalize
 
@@ -1217,28 +1214,8 @@ class TestCanonicalizeCmd:
         corpus_root.mkdir()
         meta_root_0 = corpus_root / "meta" / "dummy_00"
         meta_root_1 = corpus_root / "meta" / "dummy_01"
-        canonical_root_0 = meta_root_0 / "canonical_meta"
         canonical_root_1 = meta_root_1 / "canonical_meta"
-        canonical_root_0.mkdir(parents=True)
         canonical_root_1.mkdir(parents=True)
-
-        pq.write_table(
-            pa.table({
-                "global_row_index": pa.array([0], type=pa.int64()),
-                "local_row_index": pa.array([0], type=pa.int64()),
-                "size_factor": pa.array([1.0], type=pa.float64()),
-                "perturb_label": pa.array(["CTRL"], type=pa.string()),
-            }),
-            canonical_root_0 / "canonical-obs.parquet",
-        )
-        pq.write_table(
-            pa.table({
-                "origin_index": pa.array([0], type=pa.int32()),
-                "gene_id": pa.array(["gene_a"], type=pa.string()),
-                "canonical_gene_id": pa.array(["gene_a"], type=pa.string()),
-            }),
-            canonical_root_0 / "canonical-var.parquet",
-        )
 
         for meta_root, dataset_id in [(meta_root_0, "dummy_00"), (meta_root_1, "dummy_01")]:
             meta_root.mkdir(parents=True, exist_ok=True)
@@ -1286,18 +1263,12 @@ class TestCanonicalizeCmd:
             return ("/fake/raw-obs.parquet", "/fake/raw-var.parquet", None)
 
         def _fake_run_canonicalization(**kwargs):
-            vocab = CanonicalVocab()
-            vocab.obs_categories["perturb_label"] = ["TP53"]
-            vocab.var_categories["canonical_gene_id"] = ["gene_b"]
-            vocab.gene_id_mappings["gene_b"] = "gene_b"
-            vocab.global_vocab_size = 1
             return CanonicalizationResult(
                 dataset_id="dummy_01",
                 obs_path=canonical_root_1 / "canonical-obs.parquet",
                 var_path=canonical_root_1 / "canonical-var.parquet",
                 obs_rows=1,
                 var_rows=1,
-                vocab=vocab,
             )
 
         monkeypatch.setattr(
@@ -1315,12 +1286,10 @@ class TestCanonicalizeCmd:
             dry_run=False,
         )
         _cmd_canonicalize(args)
+        captured = capsys.readouterr()
 
-        vocab_text = (corpus_root / "corpus-vocab.yaml").read_text(encoding="utf-8")
-        assert "CTRL" in vocab_text
-        assert "TP53" in vocab_text
-        assert "gene_a" in vocab_text
-        assert "gene_b" in vocab_text
+        assert not (corpus_root / "corpus-vocab.yaml").exists()
+        assert "merged vocab" not in captured.out.lower()
 
 
 class TestInspectCmd:

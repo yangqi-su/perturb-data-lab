@@ -138,6 +138,11 @@ _NULL_FALLBACKS: dict[str, str] = {
 }
 """Fallback values when strategy is ``null`` and no literal default applies."""
 
+_SOURCE_PREFERRED_LITERAL_FIELDS: frozenset[str] = frozenset(
+    set(_LITERAL_DEFAULTS) - {"dataset_index"}
+)
+"""Literal-default fields that should use a real raw column when available."""
+
 # ---------------------------------------------------------------------------
 # Gene ID pattern detection
 # ---------------------------------------------------------------------------
@@ -472,9 +477,14 @@ def draft_canonicalization_schema(
         )
 
     # --- Extensible columns ---
+    obs_required_names = {mapping.canonical_name for mapping in obs_mappings}
     obs_extensible: list[ExtensibleColumn] = []
+    skipped_obs_extensible: list[str] = []
     for col in obs_columns:
         if col not in mapped_obs_raw and col.lower() not in {"cell_id"}:
+            if col in obs_required_names:
+                skipped_obs_extensible.append(col)
+                continue
             obs_extensible.append(ExtensibleColumn(raw_source_column=col))
     if obs_extensible:
         ext_names = [e.raw_source_column for e in obs_extensible]
@@ -483,16 +493,31 @@ def draft_canonicalization_schema(
             f"{', '.join(ext_names)}. Review and remove noise columns before "
             f"materializing."
         )
+    if skipped_obs_extensible:
+        notes.append(
+            f"[info] skipped {len(skipped_obs_extensible)} obs extensible columns "
+            f"due to canonical-name conflicts: {', '.join(skipped_obs_extensible)}."
+        )
 
+    var_required_names = {mapping.canonical_name for mapping in var_mappings}
     var_extensible: list[ExtensibleColumn] = []
+    skipped_var_extensible: list[str] = []
     for col in var_columns:
         if col not in mapped_var_raw and col.lower() not in {"origin_index"}:
+            if col in var_required_names:
+                skipped_var_extensible.append(col)
+                continue
             var_extensible.append(ExtensibleColumn(raw_source_column=col))
     if var_extensible:
         ext_names = [e.raw_source_column for e in var_extensible]
         notes.append(
             f"[info] {len(var_extensible)} var extensible columns auto-detected: "
             f"{', '.join(ext_names)}."
+        )
+    if skipped_var_extensible:
+        notes.append(
+            f"[info] skipped {len(skipped_var_extensible)} var extensible columns "
+            f"due to canonical-name conflicts: {', '.join(skipped_var_extensible)}."
         )
 
     # --- Check which required fields are still null/filled ---
@@ -553,8 +578,8 @@ def _draft_obs_mapping(
             strategy="row-index",
         )
 
-    # Literal defaults (with hint overrides)
-    if canonical_name in _LITERAL_DEFAULTS:
+    # Structural literal defaults stay literal even if a raw column exists.
+    if canonical_name == "dataset_index":
         literal_value = hints.get(canonical_name, _LITERAL_DEFAULTS[canonical_name])
         return ObsColumnMapping(
             canonical_name=canonical_name,
@@ -609,6 +634,46 @@ def _draft_obs_mapping(
             canonical_name=canonical_name,
             strategy="null",
             fallback=_NULL_FALLBACKS.get(canonical_name, MISSING_VALUE_LITERAL),
+        )
+
+    # Prefer real raw columns for non-structural literal-default fields.
+    if canonical_name in _SOURCE_PREFERRED_LITERAL_FIELDS:
+        match = find_obs_column(canonical_name, obs_columns)
+        if match is not None:
+            confidence = "exact" if match.lower() == canonical_name.lower() else "heuristic"
+            if confidence == "heuristic":
+                notes.append(
+                    f"[heuristic] '{canonical_name}' → '{match}' "
+                    f"(not an exact match; verify this mapping)."
+                )
+
+            sampled_values = None
+            if hints and "sampled_obs_values" in hints:
+                sv = hints["sampled_obs_values"]
+                if isinstance(sv, dict):
+                    sampled_values = sv.get(match)
+
+            transforms = _suggest_transforms(canonical_name, match, sampled_values)
+            if transforms:
+                t_names = [t.name for t in transforms]
+                notes.append(
+                    f"[suggested] '{canonical_name}' → transforms: {t_names} "
+                    f"(auto-detected from value patterns; verify before applying)."
+                )
+
+            return ObsColumnMapping(
+                canonical_name=canonical_name,
+                strategy="source-field",
+                source_column=match,
+                transforms=transforms,
+                fallback=_NULL_FALLBACKS.get(canonical_name, MISSING_VALUE_LITERAL),
+            )
+
+        literal_value = hints.get(canonical_name, _LITERAL_DEFAULTS[canonical_name])
+        return ObsColumnMapping(
+            canonical_name=canonical_name,
+            strategy="literal",
+            literal_value=str(literal_value),
         )
 
     # General heuristics for remaining fields

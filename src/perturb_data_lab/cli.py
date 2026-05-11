@@ -1088,75 +1088,10 @@ def _resolve_sidecars_from_corpus(
     )
 
 
-def _build_vocab_from_canonical_parquets(obs_path: Path, var_path: Path):
-    """Rebuild a per-dataset vocab from existing canonical parquet outputs."""
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    from .canonical.contract import CanonicalVocab
-    from .contracts import MISSING_VALUE_LITERAL
-
-    obs_table = pq.read_table(str(obs_path))
-    var_table = pq.read_table(str(var_path))
-    vocab = CanonicalVocab()
-
-    skip_obs = {"global_row_index", "local_row_index", "size_factor"}
-    for col_name in obs_table.column_names:
-        if col_name in skip_obs:
-            continue
-        col = obs_table.column(col_name)
-        if col.type == pa.string():
-            uniq = sorted(
-                {
-                    value
-                    for value in col.to_pylist()
-                    if value and value != MISSING_VALUE_LITERAL
-                }
-            )
-            if uniq:
-                vocab.obs_categories[col_name] = uniq
-
-    skip_var = {"origin_index", "global_id"}
-    for col_name in var_table.column_names:
-        if col_name in skip_var:
-            continue
-        col = var_table.column(col_name)
-        if col.type == pa.string():
-            uniq = sorted(
-                {
-                    value
-                    for value in col.to_pylist()
-                    if value and value != MISSING_VALUE_LITERAL
-                }
-            )
-            if uniq:
-                vocab.var_categories[col_name] = uniq
-
-    if "gene_id" in var_table.column_names and "canonical_gene_id" in var_table.column_names:
-        for gene_id, canonical_gene_id in zip(
-            var_table.column("gene_id").to_pylist(),
-            var_table.column("canonical_gene_id").to_pylist(),
-        ):
-            if gene_id and gene_id != MISSING_VALUE_LITERAL:
-                vocab.gene_id_mappings[gene_id] = canonical_gene_id
-
-    if "canonical_gene_id" in var_table.column_names:
-        vocab.global_vocab_size = len(
-            {
-                value
-                for value in var_table.column("canonical_gene_id").to_pylist()
-                if value and value != MISSING_VALUE_LITERAL
-            }
-        )
-
-    return vocab
-
-
 def _cmd_canonicalize(args: argparse.Namespace) -> None:
     """Execute the canonicalize command (bulk or incremental)."""
     from .canonical import (
         CanonicalizationResult,
-        build_canonical_vocab,
         run_canonicalization,
     )
 
@@ -1249,42 +1184,6 @@ def _cmd_canonicalize(args: argparse.Namespace) -> None:
             failures.append((dataset_id, str(exc)))
             # Continue with remaining datasets on failure (bulk mode resilience)
             continue
-
-    # --- Merge and write corpus-level vocab ---
-    if not args.dry_run and results:
-        result_vocab_by_dataset = {result.dataset_id: result.vocab for result in results}
-        per_dataset_vocabs = []
-        vocab_dataset_ids: list[str] = []
-
-        for dataset_id in all_dataset_ids:
-            if dataset_id in result_vocab_by_dataset:
-                per_dataset_vocabs.append(result_vocab_by_dataset[dataset_id])
-                vocab_dataset_ids.append(dataset_id)
-                continue
-
-            _, canonical_meta_root = _dataset_paths_for_topology(
-                corpus_root=corpus_root,
-                topology=topology,
-                dataset_id=dataset_id,
-            )
-            canonical_obs = canonical_meta_root / "canonical-obs.parquet"
-            canonical_var = canonical_meta_root / "canonical-var.parquet"
-            if canonical_obs.exists() and canonical_var.exists():
-                per_dataset_vocabs.append(
-                    _build_vocab_from_canonical_parquets(canonical_obs, canonical_var)
-                )
-                vocab_dataset_ids.append(dataset_id)
-
-        corpus_vocab_path = corpus_root / "corpus-vocab.yaml"
-        merged = build_canonical_vocab(
-            per_dataset_vocabs,
-            output_path=corpus_vocab_path,
-        )
-        print(
-            f"\n[canonicalize] merged vocab: {corpus_vocab_path}  "
-            f"global_vocab_size={merged.global_vocab_size}  "
-            f"datasets={', '.join(vocab_dataset_ids)}"
-        )
 
     # --- Summary ---
     succeeded = len(results)

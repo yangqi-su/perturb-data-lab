@@ -501,6 +501,52 @@ class TestExtensibleColumns:
         # Let's just verify no errors
         assert isinstance(schema.obs_extensible, tuple)
 
+    def test_raw_sex_column_is_preferred_over_literal_default(self):
+        obs_cols = [
+            "cell_id", "guide_1", "treatment", "cell_type", "cellline",
+            "genotype", "batch", "donor_id", "dataset_id", "sex",
+        ]
+        var_cols = ["origin_index", "feature_id"]
+
+        schema = draft_canonicalization_schema("test_sex_source", obs_cols, var_cols)
+
+        mappings = {m.canonical_name: m for m in schema.obs_column_mappings}
+        assert mappings["sex"].strategy == "source-field"
+        assert mappings["sex"].source_column == "sex"
+        ext_names = {e.raw_source_column for e in schema.obs_extensible}
+        assert "sex" not in ext_names
+
+    def test_sex_falls_back_to_literal_only_when_raw_column_missing(self):
+        obs_cols = [
+            "cell_id", "guide_1", "treatment", "cell_type", "cellline",
+            "genotype", "batch", "donor_id", "dataset_id",
+        ]
+        var_cols = ["origin_index", "feature_id"]
+
+        schema = draft_canonicalization_schema("test_sex_literal", obs_cols, var_cols)
+
+        mappings = {m.canonical_name: m for m in schema.obs_column_mappings}
+        assert mappings["sex"].strategy == "literal"
+        assert mappings["sex"].literal_value == "unknown"
+
+    def test_conflicting_extensible_columns_are_skipped(self):
+        obs_cols = [
+            "cell_id", "guide_1", "treatment", "cell_type", "cellline",
+            "genotype", "batch", "donor_id", "dataset_id", "dataset_index",
+            "passage",
+        ]
+        var_cols = ["origin_index", "feature_id"]
+
+        schema = draft_canonicalization_schema("test_ext_conflict", obs_cols, var_cols)
+
+        ext_names = {e.raw_source_column for e in schema.obs_extensible}
+        assert "dataset_index" not in ext_names
+        assert "passage" in ext_names
+        assert any(
+            "canonical-name conflicts" in note and "dataset_index" in note
+            for note in schema.notes
+        )
+
 
 # ---------------------------------------------------------------------------
 # Hint overrides
