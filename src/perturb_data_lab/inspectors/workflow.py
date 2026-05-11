@@ -252,7 +252,7 @@ def _attempt_reverse_normalization(
     """
     import numpy as np
 
-    # Only recover when candidate is not already integer
+    # Only recover when candidate is not already integer.
     if candidate.status == "pass":
         return None
 
@@ -352,9 +352,9 @@ def _choose_count_source(
     2. Among equally-sized passing sources, direct integer beats recovered.
     3. If still tied, preserve existing source enumeration order.
 
-    Every candidate receives both a direct check (from _audit_matrix_candidate) and,
+    Every candidate receives a direct check (from _audit_matrix_candidate) and,
     if needed, a reverse-normalized check via _attempt_reverse_normalization.
-    Bin-named sources are included in both checks.
+    Recovery eligibility is decided from the recovered values, not the source name.
     """
     if not candidates:
         return CountSourceDecision(

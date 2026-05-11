@@ -84,6 +84,28 @@ from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
 from ..inspectors.models import DatasetSummaryDocument
 
 
+def _slice_matrix_chunk_as_csr(
+    count_matrix: Any,
+    chunk_start: int,
+    chunk_end: int,
+) -> csr_matrix:
+    """Slice a row chunk and normalize it to SciPy CSR.
+
+    Aggregate/federated write paths operate on sparse chunk translation. Some
+    datasets expose direct count matrices as dense numpy arrays after backed
+    slicing, so convert those chunks to CSR before translation instead of
+    assuming ``.tocsr()`` exists on the slice object.
+    """
+    if hasattr(count_matrix, "local_slice"):
+        matrix_chunk = count_matrix.local_slice(chunk_start, chunk_end)
+    else:
+        matrix_chunk = count_matrix[chunk_start:chunk_end]
+
+    if issparse(matrix_chunk):
+        return matrix_chunk.tocsr(copy=False)
+    return csr_matrix(matrix_chunk)
+
+
 # ---------------------------------------------------------------------------
 # Stage 2 Materializer — schema-independent, Stage-1-gated, count-first
 # ---------------------------------------------------------------------------
@@ -764,11 +786,12 @@ class Stage2Materializer:
             chunk_end = min(chunk_start + self.chunk_rows, n_obs)
             is_last = (chunk_end == n_obs)
 
-            # Slice the CSR matrix chunk.
-            if hasattr(count_matrix, "local_slice"):
-                matrix_chunk = count_matrix.local_slice(chunk_start, chunk_end)
-            else:
-                matrix_chunk = count_matrix[chunk_start:chunk_end].tocsr()
+            # Slice the matrix chunk and normalize dense/sparse inputs to CSR.
+            matrix_chunk = _slice_matrix_chunk_as_csr(
+                count_matrix,
+                chunk_start,
+                chunk_end,
+            )
 
             # Translate the chunk via the shared translation layer.
             bundle = _translate_chunk(
@@ -903,11 +926,12 @@ class Stage2Materializer:
             # final dataset — triggers aggregate backend finalization.
             is_last_chunk = (chunk_end == n_obs) and self._is_last_dataset
 
-            # Slice the CSR matrix chunk.
-            if hasattr(count_matrix, "local_slice"):
-                matrix_chunk = count_matrix.local_slice(chunk_start, chunk_end)
-            else:
-                matrix_chunk = count_matrix[chunk_start:chunk_end].tocsr()
+            # Slice the matrix chunk and normalize dense/sparse inputs to CSR.
+            matrix_chunk = _slice_matrix_chunk_as_csr(
+                count_matrix,
+                chunk_start,
+                chunk_end,
+            )
 
             # Translate the chunk via the shared translation layer.
             bundle = _translate_chunk(

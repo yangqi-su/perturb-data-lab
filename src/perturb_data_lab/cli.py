@@ -431,6 +431,7 @@ def _materialize_dataset(
     is_last_dataset: bool,
     total_datasets: int,
     dry_run: bool,
+    display_index: int = 0,
 ) -> tuple[int, dict | None]:
     """Materialize a single dataset and return (next_global_row_start, next_writer_state).
 
@@ -441,7 +442,7 @@ def _materialize_dataset(
 
     if dry_run:
         print(
-            f"  [{dataset_index + 1}/{total_datasets}] DRY-RUN: "
+            f"  [{display_index + 1}/{total_datasets}] DRY-RUN: "
             f"{ds.dataset_id} source={ds.source}"
         )
         # Simulate a cell count of 0 for dry-run planning
@@ -461,7 +462,7 @@ def _materialize_dataset(
     corpus_index_path = str(corpus_root / "corpus-index.yaml")
 
     print(
-        f"\n  [{dataset_index + 1}/{total_datasets}] materializing "
+        f"\n  [{display_index + 1}/{total_datasets}] materializing "
         f"{ds.dataset_id}"
     )
     print(f"    source: {ds.source}")
@@ -553,6 +554,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
     corpus_index_path = corpus_root / "corpus-index.yaml"
     effective_backend: str
     effective_topology: str
+    existing_corpus = None
 
     # --- Determine actual mode based on corpus existence ---
     effective_mode: str
@@ -586,6 +588,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
         effective_mode = "append"
+        existing_corpus = _load_corpus_index(corpus_root)
         detected_backend, detected_topology = _infer_backend_topology_from_corpus(
             corpus_root
         )
@@ -613,10 +616,8 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
 
     # --- Check for duplicate dataset_ids against existing corpus (append mode) ---
     if effective_mode == "append":
-        from .materializers.models import CorpusIndexDocument
-
-        existing = CorpusIndexDocument.from_yaml_file(corpus_index_path)
-        existing_ids = {d.dataset_id for d in existing.datasets}
+        assert existing_corpus is not None
+        existing_ids = {d.dataset_id for d in existing_corpus.datasets}
         for ds in sources:
             if ds.dataset_id in existing_ids:
                 print(
@@ -642,6 +643,11 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
         print(f"  Corpus ID: {args.corpus_id}")
         # Walk through and validate
         next_global = 0
+        next_dataset_index = 0
+        if effective_mode == "append":
+            assert existing_corpus is not None
+            next_global = sum(ds.cell_count for ds in existing_corpus.datasets)
+            next_dataset_index = len(existing_corpus.datasets)
         writer_state: dict | None = None
         for i, ds in enumerate(sources):
             mode_name = "create" if i == 0 and effective_mode == "create" else "append"
@@ -652,12 +658,13 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
                 corpus_root=corpus_root,
                 effective_topology=effective_topology,
                 mode=mode_name,
-                dataset_index=i,
+                dataset_index=next_dataset_index + i,
                 global_row_start=next_global,
                 writer_state=writer_state,
                 is_last_dataset=is_last,
                 total_datasets=total,
                 dry_run=True,
+                display_index=i,
             )
         print(f"  Estimated total cells: {next_global}")
         return
@@ -665,6 +672,11 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
     # --- Execute materialization ---
     corpus_root.mkdir(parents=True, exist_ok=True)
     next_global = 0
+    next_dataset_index = 0
+    if effective_mode == "append":
+        assert existing_corpus is not None
+        next_global = sum(ds.cell_count for ds in existing_corpus.datasets)
+        next_dataset_index = len(existing_corpus.datasets)
     writer_state: dict | None = None
     success_count = 0
 
@@ -678,12 +690,13 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
                 corpus_root=corpus_root,
                 effective_topology=effective_topology,
                 mode=mode_name,
-                dataset_index=i,
+                dataset_index=next_dataset_index + i,
                 global_row_start=next_global,
                 writer_state=writer_state,
                 is_last_dataset=is_last,
                 total_datasets=total,
                 dry_run=False,
+                display_index=i,
             )
             success_count += 1
         except Exception as e:
@@ -1075,6 +1088,70 @@ def _resolve_sidecars_from_corpus(
     )
 
 
+def _build_vocab_from_canonical_parquets(obs_path: Path, var_path: Path):
+    """Rebuild a per-dataset vocab from existing canonical parquet outputs."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from .canonical.contract import CanonicalVocab
+    from .contracts import MISSING_VALUE_LITERAL
+
+    obs_table = pq.read_table(str(obs_path))
+    var_table = pq.read_table(str(var_path))
+    vocab = CanonicalVocab()
+
+    skip_obs = {"global_row_index", "local_row_index", "size_factor"}
+    for col_name in obs_table.column_names:
+        if col_name in skip_obs:
+            continue
+        col = obs_table.column(col_name)
+        if col.type == pa.string():
+            uniq = sorted(
+                {
+                    value
+                    for value in col.to_pylist()
+                    if value and value != MISSING_VALUE_LITERAL
+                }
+            )
+            if uniq:
+                vocab.obs_categories[col_name] = uniq
+
+    skip_var = {"origin_index", "global_id"}
+    for col_name in var_table.column_names:
+        if col_name in skip_var:
+            continue
+        col = var_table.column(col_name)
+        if col.type == pa.string():
+            uniq = sorted(
+                {
+                    value
+                    for value in col.to_pylist()
+                    if value and value != MISSING_VALUE_LITERAL
+                }
+            )
+            if uniq:
+                vocab.var_categories[col_name] = uniq
+
+    if "gene_id" in var_table.column_names and "canonical_gene_id" in var_table.column_names:
+        for gene_id, canonical_gene_id in zip(
+            var_table.column("gene_id").to_pylist(),
+            var_table.column("canonical_gene_id").to_pylist(),
+        ):
+            if gene_id and gene_id != MISSING_VALUE_LITERAL:
+                vocab.gene_id_mappings[gene_id] = canonical_gene_id
+
+    if "canonical_gene_id" in var_table.column_names:
+        vocab.global_vocab_size = len(
+            {
+                value
+                for value in var_table.column("canonical_gene_id").to_pylist()
+                if value and value != MISSING_VALUE_LITERAL
+            }
+        )
+
+    return vocab
+
+
 def _cmd_canonicalize(args: argparse.Namespace) -> None:
     """Execute the canonicalize command (bulk or incremental)."""
     from .canonical import (
@@ -1175,7 +1252,29 @@ def _cmd_canonicalize(args: argparse.Namespace) -> None:
 
     # --- Merge and write corpus-level vocab ---
     if not args.dry_run and results:
-        per_dataset_vocabs = [r.vocab for r in results]
+        result_vocab_by_dataset = {result.dataset_id: result.vocab for result in results}
+        per_dataset_vocabs = []
+        vocab_dataset_ids: list[str] = []
+
+        for dataset_id in all_dataset_ids:
+            if dataset_id in result_vocab_by_dataset:
+                per_dataset_vocabs.append(result_vocab_by_dataset[dataset_id])
+                vocab_dataset_ids.append(dataset_id)
+                continue
+
+            _, canonical_meta_root = _dataset_paths_for_topology(
+                corpus_root=corpus_root,
+                topology=topology,
+                dataset_id=dataset_id,
+            )
+            canonical_obs = canonical_meta_root / "canonical-obs.parquet"
+            canonical_var = canonical_meta_root / "canonical-var.parquet"
+            if canonical_obs.exists() and canonical_var.exists():
+                per_dataset_vocabs.append(
+                    _build_vocab_from_canonical_parquets(canonical_obs, canonical_var)
+                )
+                vocab_dataset_ids.append(dataset_id)
+
         corpus_vocab_path = corpus_root / "corpus-vocab.yaml"
         merged = build_canonical_vocab(
             per_dataset_vocabs,
@@ -1183,7 +1282,8 @@ def _cmd_canonicalize(args: argparse.Namespace) -> None:
         )
         print(
             f"\n[canonicalize] merged vocab: {corpus_vocab_path}  "
-            f"global_vocab_size={merged.global_vocab_size}"
+            f"global_vocab_size={merged.global_vocab_size}  "
+            f"datasets={', '.join(vocab_dataset_ids)}"
         )
 
     # --- Summary ---

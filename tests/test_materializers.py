@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 from scipy.sparse import csr_matrix
 
 from perturb_data_lab.materializers import (
@@ -552,3 +553,87 @@ class TestStage2MaterializerConstructorApi:
         )
         assert mat.dataset_index == 3
         assert mat.global_row_start == 1500
+
+
+class TestStage2MaterializerReviewGate:
+    """Test Stage 2 respects non-pass review bundles."""
+
+    def test_materialize_rejects_needs_review_bundle_before_loading_h5ad(
+        self,
+        tmp_path: Path,
+    ):
+        try:
+            from perturb_data_lab.materializers import Stage2Materializer
+        except ImportError:
+            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+
+        review_bundle = tmp_path / "dataset-summary.yaml"
+        review_bundle.write_text(
+            yaml.safe_dump(
+                {
+                    "kind": "dataset-summary",
+                    "contract_version": "0.3.0",
+                    "dataset": {
+                        "dataset_id": "fp32_ds",
+                        "source_release": "fp32_ds",
+                        "source_path": "/missing/source.h5ad",
+                        "obs_rows": 10,
+                        "var_rows": 5,
+                        "obs_index_name": "index",
+                        "var_index_name": "index",
+                    },
+                    "structure": {
+                        "has_raw": False,
+                        "raw_var_rows": 0,
+                        "layers": ["X_binned"],
+                    },
+                    "obs_fields": [],
+                    "var_fields": [],
+                    "count_source_candidates": [
+                        {
+                            "candidate": ".layers[X_binned]",
+                            "rank": 1,
+                            "status": "fail",
+                            "storage": "sparse",
+                            "dtype": "float32",
+                            "shape": [10, 5],
+                            "sampled_rows": 3,
+                            "sampled_nonzero_values": 6,
+                            "sampled_density": 0.1,
+                            "fraction_noninteger_nonzero": 1.0,
+                            "max_abs_integer_deviation": 0.49,
+                            "nonnegative": True,
+                            "inferred_transform": "binned",
+                            "recovery_policy": "disallowed",
+                            "notes": ["candidate name suggests binned data"],
+                        }
+                    ],
+                    "count_source_decision": {
+                        "selected_candidate": ".layers[X_binned]",
+                        "status": "needs-review",
+                        "confidence": "medium",
+                        "recovery_policy": "disallowed",
+                        "rationale": "explicit approval required",
+                        "uses_recovery": False,
+                        "pass_mode": None,
+                    },
+                    "materialization_readiness": "needs-review",
+                    "inspector_notes": [],
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        materializer = Stage2Materializer(
+            source_path="/missing/source.h5ad",
+            review_bundle_path=str(review_bundle),
+            output_roots=OutputRoots(
+                metadata_root=str(tmp_path / "meta"),
+                matrix_root=str(tmp_path / "matrix"),
+            ),
+            dataset_id="fp32_ds",
+        )
+
+        with pytest.raises(ValueError, match="materialization_readiness is 'needs-review'"):
+            materializer.materialize()

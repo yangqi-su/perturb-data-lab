@@ -3,13 +3,13 @@
 Tests cover:
 - Reverse-normalization recovery via expm1/size_factor path
 - CountSourceDecision.uses_recovery flag
-- Bin-named sources are included in both direct and recovery checks
+- Bin-named sources are still inspected and may recover based on values alone
 - Largest-passing-source selection with direct-vs-recovered tie-breaking
 - Source-order tie-breaking when size and pass mode are equal
 
 New contract (Phase 2):
 - Every source receives both direct integer check and reverse-normalized check
-- Bin-named sources are NOT excluded from recovery attempts
+- Recovery is judged from recovered values, not layer/source names
 - Among passing sources, largest feature dimension wins
 - Direct integer beats recovered when otherwise tied
 - Existing source order resolves remaining ties
@@ -93,20 +93,37 @@ def test_reverse_normalization_not_attempted_on_direct_integer():
 
 
 def test_binned_source_included_in_recovery_attempts():
-    """Bin-named sources are included in both direct and recovery checks.
+    """Bin-named sources are still eligible for recovery when values support it."""
+    obs = pd.DataFrame(index=["cell-1", "cell-2", "cell-3"])
+    var = pd.DataFrame(index=["gene-a", "gene-b", "gene-c"])
+    raw_counts = np.array([[1, 0, 3], [0, 2, 0], [4, 0, 1]], dtype=np.int32)
+    binned_like = np.log1p(raw_counts).astype(np.float32)
+    adata = ad.AnnData(X=np.zeros((3, 3), dtype=np.float32), obs=obs, var=var)
+    adata.layers["X_binned"] = binned_like
 
-    Under the new contract, bin-named sources are NOT excluded from recovery.
-    Recovery is attempted on all non-pass candidates including bin-named ones.
-    The values [0.7, 0.35] per row in a 2-column sparse matrix fail recovery
-    because expm1 ratios produce max_abs_integer_deviation ~0.42 > 0.01.
-    The single-nonzero-per-row pattern used previously accidentally passes
-    recovery (each single nonzero becomes 1.0 by definition); the multi-nonzero
-    pattern is genuinely non-recoverable.
-    """
+    candidate = _audit_matrix_candidate(
+        ".layers[X_binned]",
+        adata.layers["X_binned"],
+        row_count=3,
+        column_count=3,
+        sample_rows=3,
+    )
+
+    assert candidate.status == "fail"
+    assert candidate.inferred_transform == "binned"
+
+    recovered = _attempt_reverse_normalization(candidate, adata)
+
+    assert recovered is not None
+    assert recovered.recovery_policy == "expm1_over_size_factor"
+    assert recovered.inferred_transform == "recovered-count"
+    assert recovered.max_abs_integer_deviation < 0.01
+
+
+def test_binned_source_still_fails_when_recovered_values_are_not_integer_like():
+    """Non-recoverable floats stay rejected even for bin-named sources."""
     obs = pd.DataFrame(index=["cell-1", "cell-2"])
     var = pd.DataFrame(index=["gene-a", "gene-b"])
-    # Row 0: [0.7, 0.35], Row 1: [0.3, 0.85] — both rows have two nonzeros
-    # with expm1 ratios that fail the integer threshold
     binned = csr_matrix(np.array([[0.7, 0.35], [0.3, 0.85]], dtype=np.float32))
     adata = ad.AnnData(X=np.array([[1, 0], [0, 1]], dtype=np.int32), obs=obs, var=var)
     adata.layers["binned"] = binned
@@ -120,14 +137,39 @@ def test_binned_source_included_in_recovery_attempts():
         sample_rows=2,
     )
 
-    # Direct check: binned fails (non-integer)
     assert candidate.status == "fail"
     assert candidate.inferred_transform == "binned"
-    assert candidate.recovery_policy == "disallowed"
 
-    # Recovery is attempted but fails for non-log-norm data
     recovered = _attempt_reverse_normalization(candidate, adata)
     assert recovered is None
+
+
+def test_choose_count_source_binned_only_source_recovers_when_values_recover():
+    """A binned-only source may still be selected via recovered values."""
+    obs = pd.DataFrame(index=["cell-1", "cell-2", "cell-3"])
+    var = pd.DataFrame(index=["gene-a", "gene-b", "gene-c"])
+    raw_counts = np.array([[1, 0, 3], [0, 2, 0], [4, 0, 1]], dtype=np.int32)
+    binned_like = np.log1p(raw_counts).astype(np.float32)
+    adata = ad.AnnData(X=np.zeros((3, 3), dtype=np.float32), obs=obs, var=var)
+    adata.layers["X_binned"] = binned_like
+
+    candidate = _audit_matrix_candidate(
+        ".layers[X_binned]",
+        adata.layers["X_binned"],
+        row_count=3,
+        column_count=3,
+        sample_rows=3,
+    )
+
+    ranked = _rank_candidates([
+        _audit_matrix_candidate(".layers[X_binned]", adata.layers["X_binned"], 3, 3, 3)
+    ])
+
+    decision = _choose_count_source(ranked, adata)
+
+    assert decision.selected_candidate == ".layers[X_binned]"
+    assert decision.status == "pass"
+    assert decision.uses_recovery is True
 
 
 def test_choose_count_source_prefers_largest_passing_source():
@@ -311,16 +353,12 @@ def test_count_source_decision_from_dict_without_uses_recovery():
 
 
 # ---------------------------------------------------------------------------
-# Binned matrix recovery disallowed test
+# Direct-audit vs recovery-path separation
 # ---------------------------------------------------------------------------
 
 
-def test_binned_candidate_recovery_policy_is_disallowed():
-    """Binned candidate has recovery_policy='disallowed' under the new contract.
-
-    Bin-named sources are included in recovery attempts but the binned transform
-    family means recovery is not applicable (not log-normalized data).
-    """
+def test_binned_candidate_recovery_policy_is_disallowed_before_recovery_check():
+    """Direct audit remains separate from the later recovery attempt."""
     obs = pd.DataFrame(index=["cell-1"])
     var = pd.DataFrame(index=["gene-a"])
     binned = csr_matrix(np.array([[0.1]], dtype=np.float32))
@@ -396,4 +434,37 @@ def test_inspect_target_recovery_flag_when_raw_counts_available(tmp_path: Path):
 
     # .X is integer — no recovery needed, uses_recovery is False
     assert summary.count_source_decision.uses_recovery is False
+    assert summary.count_source_decision.status == "pass"
+
+
+def test_inspect_target_binned_only_source_can_still_recover(tmp_path: Path):
+    """inspect_target records recovered selection even for a bin-named layer."""
+    obs = pd.DataFrame({"guide": ["ctrl", "gene-a", "gene-b"]}, index=["c1", "c2", "c3"])
+    var = pd.DataFrame(index=["gene-x", "gene-y", "gene-z"])
+    raw_counts = np.array([[1, 0, 3], [0, 2, 0], [4, 0, 1]], dtype=np.int32)
+    adata = ad.AnnData(X=np.zeros((3, 3), dtype=np.float32), obs=obs, var=var)
+    adata.layers["X_binned"] = np.log1p(raw_counts).astype(np.float32)
+
+    source_path = tmp_path / "binned_only_recovery_test.h5ad"
+    adata.write_h5ad(source_path)
+
+    inspect_target(
+        InspectionTarget(
+            dataset_id="binned_only_recovery_check",
+            source_path=str(source_path),
+            source_release="synthetic-v1",
+        ),
+        output_root=tmp_path / "outputs",
+    )
+
+    from perturb_data_lab.inspectors.models import DatasetSummaryDocument
+
+    summary_path = (
+        tmp_path / "outputs" / "binned_only_recovery_check" / "dataset-summary.yaml"
+    )
+    summary = DatasetSummaryDocument.from_yaml_file(summary_path)
+
+    assert summary.count_source_decision.selected_candidate == ".layers[X_binned]"
+    assert summary.count_source_decision.uses_recovery is True
+    assert summary.count_source_decision.recovery_policy == "expm1_over_size_factor"
     assert summary.count_source_decision.status == "pass"

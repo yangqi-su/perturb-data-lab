@@ -266,3 +266,40 @@ class TestAggregateWriters:
         assert state is None
         ds = lance.dataset(str(paths["cells"]))
         assert ds.count_rows() == total_rows
+
+    def test_lance_aggregate_writer_reopens_for_separate_append_invocations(
+        self,
+        bundles,
+        tmp_path: Path,
+    ):
+        lance = pytest.importorskip("lance")
+        from perturb_data_lab.materializers.backends.lance import write_lance_aggregate
+
+        b0, b1, total_rows = bundles
+        matrix_root = tmp_path / "lance-agg-reopen"
+
+        paths, state = write_lance_aggregate(
+            bundle=b0,
+            dataset_id="dummy_00",
+            matrix_root=matrix_root,
+            _writer_state=None,
+            _is_last_chunk=True,
+        )
+        assert state is None
+
+        paths, state = write_lance_aggregate(
+            bundle=b1,
+            dataset_id="dummy_01",
+            matrix_root=matrix_root,
+            _writer_state=None,
+            _is_last_chunk=True,
+        )
+        assert state is None
+
+        ds = lance.dataset(str(paths["cells"]))
+        table = ds.to_table()
+        assert ds.count_rows() == total_rows
+        np.testing.assert_array_equal(
+            table.column("global_row_index").to_numpy(),
+            np.arange(total_rows, dtype=np.int64),
+        )

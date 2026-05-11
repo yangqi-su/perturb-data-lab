@@ -1201,6 +1201,127 @@ class TestCanonicalizeCmd:
         assert "dry-run" in captured.out.lower()
         assert "dummy_00" in captured.out
 
+    def test_cmd_incremental_canonicalize_rebuilds_vocab_from_existing_outputs(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from perturb_data_lab.canonical import CanonicalVocab
+        from perturb_data_lab.canonical.runner import CanonicalizationResult
+        from perturb_data_lab.cli import _cmd_canonicalize
+
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+        meta_root_0 = corpus_root / "meta" / "dummy_00"
+        meta_root_1 = corpus_root / "meta" / "dummy_01"
+        canonical_root_0 = meta_root_0 / "canonical_meta"
+        canonical_root_1 = meta_root_1 / "canonical_meta"
+        canonical_root_0.mkdir(parents=True)
+        canonical_root_1.mkdir(parents=True)
+
+        pq.write_table(
+            pa.table({
+                "global_row_index": pa.array([0], type=pa.int64()),
+                "local_row_index": pa.array([0], type=pa.int64()),
+                "size_factor": pa.array([1.0], type=pa.float64()),
+                "perturb_label": pa.array(["CTRL"], type=pa.string()),
+            }),
+            canonical_root_0 / "canonical-obs.parquet",
+        )
+        pq.write_table(
+            pa.table({
+                "origin_index": pa.array([0], type=pa.int32()),
+                "gene_id": pa.array(["gene_a"], type=pa.string()),
+                "canonical_gene_id": pa.array(["gene_a"], type=pa.string()),
+            }),
+            canonical_root_0 / "canonical-var.parquet",
+        )
+
+        for meta_root, dataset_id in [(meta_root_0, "dummy_00"), (meta_root_1, "dummy_01")]:
+            meta_root.mkdir(parents=True, exist_ok=True)
+            (meta_root / "final-schema.yaml").write_text(
+                yaml.safe_dump({
+                    "kind": "canonicalization-schema",
+                    "contract_version": "0.3.0",
+                    "dataset_id": dataset_id,
+                    "status": "ready",
+                    "description": "",
+                    "gene_mapping": {"enabled": False, "engine": "identity"},
+                }),
+                encoding="utf-8",
+            )
+
+        (corpus_root / "corpus-index.yaml").write_text(yaml.safe_dump({
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {"backend": "lance", "topology": "aggregate"},
+            "datasets": [
+                {
+                    "dataset_id": "dummy_00",
+                    "join_mode": "create_new",
+                    "manifest_path": "meta/dummy_00/materialization-manifest.yaml",
+                    "dataset_index": 0,
+                    "cell_count": 1,
+                    "global_start": 0,
+                    "global_end": 1,
+                },
+                {
+                    "dataset_id": "dummy_01",
+                    "join_mode": "append_routed",
+                    "manifest_path": "meta/dummy_01/materialization-manifest.yaml",
+                    "dataset_index": 1,
+                    "cell_count": 1,
+                    "global_start": 1,
+                    "global_end": 2,
+                },
+            ],
+        }))
+
+        def _fake_sidecars(dataset_id: str, corpus_root_arg: Path):
+            assert dataset_id == "dummy_01"
+            return ("/fake/raw-obs.parquet", "/fake/raw-var.parquet", None)
+
+        def _fake_run_canonicalization(**kwargs):
+            vocab = CanonicalVocab()
+            vocab.obs_categories["perturb_label"] = ["TP53"]
+            vocab.var_categories["canonical_gene_id"] = ["gene_b"]
+            vocab.gene_id_mappings["gene_b"] = "gene_b"
+            vocab.global_vocab_size = 1
+            return CanonicalizationResult(
+                dataset_id="dummy_01",
+                obs_path=canonical_root_1 / "canonical-obs.parquet",
+                var_path=canonical_root_1 / "canonical-var.parquet",
+                obs_rows=1,
+                var_rows=1,
+                vocab=vocab,
+            )
+
+        monkeypatch.setattr(
+            "perturb_data_lab.cli._resolve_sidecars_from_corpus",
+            _fake_sidecars,
+        )
+        monkeypatch.setattr(
+            "perturb_data_lab.canonical.run_canonicalization",
+            _fake_run_canonicalization,
+        )
+
+        args = argparse.Namespace(
+            dataset_id="dummy_01",
+            corpus=str(corpus_root),
+            dry_run=False,
+        )
+        _cmd_canonicalize(args)
+
+        vocab_text = (corpus_root / "corpus-vocab.yaml").read_text(encoding="utf-8")
+        assert "CTRL" in vocab_text
+        assert "TP53" in vocab_text
+        assert "gene_a" in vocab_text
+        assert "gene_b" in vocab_text
+
 
 class TestInspectCmd:
     """Test _cmd_inspect behavior for batch and direct modes."""
@@ -1445,3 +1566,142 @@ class TestMaterializeCmd:
 
         assert captured["backend"] == "lance"
         assert captured["effective_topology"] == "aggregate"
+
+    def test_cmd_materialize_append_seeds_existing_offsets(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        from perturb_data_lab.cli import _cmd_materialize
+
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+        (corpus_root / "corpus-index.yaml").write_text(yaml.safe_dump({
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {"backend": "lance", "topology": "aggregate"},
+            "datasets": [{
+                "dataset_id": "dummy_00",
+                "join_mode": "create_new",
+                "manifest_path": "meta/dummy_00/materialization-manifest.yaml",
+                "dataset_index": 0,
+                "cell_count": 10,
+                "global_start": 0,
+                "global_end": 10,
+            }],
+        }))
+
+        h5ad = tmp_path / "dummy_01.h5ad"
+        h5ad.write_text("fake")
+        review = tmp_path / "dummy_01-summary.yaml"
+        review.write_text("kind: dataset-summary")
+
+        args = argparse.Namespace(
+            mode="append",
+            source=str(h5ad),
+            input_list=None,
+            input_dir=None,
+            dataset_id="dummy_01",
+            review_bundle=str(review),
+            review_bundle_dir=None,
+            output_corpus=str(corpus_root),
+            backend=None,
+            topology=None,
+            corpus_id="test-v0",
+            rerun_stage1=False,
+            n_hvg=2000,
+            dry_run=True,
+        )
+
+        captured: dict[str, object] = {}
+
+        def _fake_materialize_dataset(ds, parsed_args, **kwargs):
+            captured["dataset_index"] = kwargs["dataset_index"]
+            captured["global_row_start"] = kwargs["global_row_start"]
+            return (kwargs["global_row_start"], None)
+
+        monkeypatch.setattr(
+            "perturb_data_lab.cli._materialize_dataset",
+            _fake_materialize_dataset,
+        )
+
+        _cmd_materialize(args)
+
+        assert captured["dataset_index"] == 1
+        assert captured["global_row_start"] == 10
+
+    def test_cmd_materialize_append_bulk_continues_existing_offsets(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        from perturb_data_lab.cli import _cmd_materialize
+
+        corpus_root = tmp_path / "corpus"
+        corpus_root.mkdir()
+        (corpus_root / "corpus-index.yaml").write_text(yaml.safe_dump({
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {"backend": "lance", "topology": "aggregate"},
+            "datasets": [{
+                "dataset_id": "dummy_00",
+                "join_mode": "create_new",
+                "manifest_path": "meta/dummy_00/materialization-manifest.yaml",
+                "dataset_index": 0,
+                "cell_count": 10,
+                "global_start": 0,
+                "global_end": 10,
+            }],
+        }))
+
+        input_list = tmp_path / "inputs.csv"
+        input_list.write_text(
+            "source,dataset_id,review_bundle\n"
+            f"{tmp_path / 'dummy_01.h5ad'},dummy_01,{tmp_path / 'dummy_01-summary.yaml'}\n"
+            f"{tmp_path / 'dummy_02.h5ad'},dummy_02,{tmp_path / 'dummy_02-summary.yaml'}\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "dummy_01.h5ad").write_text("fake")
+        (tmp_path / "dummy_02.h5ad").write_text("fake")
+        (tmp_path / "dummy_01-summary.yaml").write_text("kind: dataset-summary")
+        (tmp_path / "dummy_02-summary.yaml").write_text("kind: dataset-summary")
+
+        args = argparse.Namespace(
+            mode="append",
+            source=None,
+            input_list=str(input_list),
+            input_dir=None,
+            dataset_id=None,
+            review_bundle=None,
+            review_bundle_dir=None,
+            output_corpus=str(corpus_root),
+            backend=None,
+            topology=None,
+            corpus_id="test-v0",
+            rerun_stage1=False,
+            n_hvg=2000,
+            dry_run=False,
+        )
+
+        calls: list[tuple[str, int, int]] = []
+        fake_cell_counts = {"dummy_01": 7, "dummy_02": 5}
+
+        def _fake_materialize_dataset(ds, parsed_args, **kwargs):
+            calls.append(
+                (ds.dataset_id, kwargs["dataset_index"], kwargs["global_row_start"])
+            )
+            return (kwargs["global_row_start"] + fake_cell_counts[ds.dataset_id], None)
+
+        monkeypatch.setattr(
+            "perturb_data_lab.cli._materialize_dataset",
+            _fake_materialize_dataset,
+        )
+
+        _cmd_materialize(args)
+
+        assert calls == [
+            ("dummy_01", 1, 10),
+            ("dummy_02", 2, 17),
+        ]
