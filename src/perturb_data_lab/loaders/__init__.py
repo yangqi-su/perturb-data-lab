@@ -57,6 +57,7 @@ from .gpu_pipeline import (
 from .adapters import (
     CategoricalLabelMap,
     PertTFAdapterConfig,
+    PertTFPairedBatchBuilder,
     PerturbationPairBatch,
     PerturbationPairSampler,
     PertTFCorpusAdapter,
@@ -112,6 +113,7 @@ __all__ = [
     # Phase 4 — pertTF-local adapters
     "CategoricalLabelMap",
     "PertTFAdapterConfig",
+    "PertTFPairedBatchBuilder",
     "PerturbationPairBatch",
     "PerturbationPairSampler",
     "PertTFCorpusAdapter",

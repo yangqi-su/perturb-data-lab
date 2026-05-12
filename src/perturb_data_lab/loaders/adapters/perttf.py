@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 import numpy as np
+import torch
 
 from ..feature_registry import FeatureRegistry
+from ..gpu_pipeline import GPUSparsePipeline
 from ..index import MetadataIndex
 
 if TYPE_CHECKING:
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CategoricalLabelMap",
     "PertTFAdapterConfig",
+    "PertTFPairedBatchBuilder",
     "PerturbationPairBatch",
     "PerturbationPairSampler",
     "PertTFCorpusAdapter",
@@ -69,6 +72,9 @@ class PertTFAdapterConfig:
     mask_value: int = -1
     cls_value: int = -3
     unknown_label: str | None = None
+    append_cls: bool = True
+    mask_ratio: float = 0.15
+    ps_width: int = 1
 
     def __post_init__(self) -> None:
         if len(set(self.special_tokens)) != len(self.special_tokens):
@@ -83,6 +89,10 @@ class PertTFAdapterConfig:
                 raise ValueError(
                     f"{token_name}={token_value!r} must appear in special_tokens"
                 )
+        if not 0.0 <= float(self.mask_ratio) <= 1.0:
+            raise ValueError("mask_ratio must be between 0 and 1")
+        if int(self.ps_width) <= 0:
+            raise ValueError("ps_width must be positive")
 
 
 class CategoricalLabelMap:
@@ -626,6 +636,281 @@ class PerturbationPairSampler:
             source_batch_labels=source_batch_labels,
             target_batch_labels=target_batch_labels,
         )
+
+
+class PertTFPairedBatchBuilder:
+    """Build pertTF-compatible paired source/target batches from corpus rows."""
+
+    def __init__(
+        self,
+        corpus: Corpus,
+        *,
+        seq_len: int,
+        config: PertTFAdapterConfig | None = None,
+        adapter: "PertTFCorpusAdapter" | None = None,
+        device: torch.device | str | None = "cpu",
+    ) -> None:
+        if seq_len <= 0:
+            raise ValueError("seq_len must be positive")
+        resolved_adapter = adapter or PertTFCorpusAdapter.from_corpus(corpus, config)
+        self.corpus = corpus
+        self.adapter = resolved_adapter
+        self.config = resolved_adapter.config
+        self.seq_len = int(seq_len)
+        self.device = torch.device("cpu" if device is None else device)
+        self._pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=self.seq_len)
+        stoi = self.adapter.vocab.to_simple_vocab_stoi()
+        self._pad_token_id = int(stoi[self.config.pad_token])
+        self._cls_token_id = int(stoi[self.config.cls_token])
+        self._special_token_offset = self.adapter.vocab.special_token_offset
+
+    def build_paired_batch(
+        self,
+        pair_batch: PerturbationPairBatch,
+        *,
+        seed: int | None = None,
+        sampled_gene_ids: torch.Tensor | None = None,
+        sampling_mode: str = "hvg",
+        expressed_weight: float = 3.0,
+        hvg_weight: float = 3.0,
+        hvg_top_k: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        self._validate_pair_batch(pair_batch)
+
+        source_raw = self.corpus.inspect_batch(pair_batch.source_indices)
+        target_raw = self.corpus.inspect_batch(pair_batch.target_indices)
+
+        source_processed = self._pipeline.process_batch(
+            source_raw,
+            device=self.device,
+            generator=self._torch_generator(seed),
+            sampled_gene_ids=sampled_gene_ids,
+            sampling_mode=sampling_mode,
+            expressed_weight=expressed_weight,
+            hvg_weight=hvg_weight,
+            hvg_top_k=hvg_top_k,
+        )
+        target_processed = self._pipeline.process_batch(
+            target_raw,
+            device=self.device,
+            sampled_gene_ids=source_processed["sampled_gene_ids"],
+            sampling_mode=sampling_mode,
+            expressed_weight=expressed_weight,
+            hvg_weight=hvg_weight,
+            hvg_top_k=hvg_top_k,
+        )
+
+        source_sampled_gene_ids = source_processed["sampled_gene_ids"]
+        target_sampled_gene_ids = target_processed["sampled_gene_ids"]
+        source_valid_mask = source_processed["valid_mask"]
+        target_valid_mask = target_processed["valid_mask"]
+        if not torch.equal(source_sampled_gene_ids, target_sampled_gene_ids):
+            raise RuntimeError("target reconstruction changed the source-sampled gene IDs")
+        if not torch.equal(source_valid_mask, target_valid_mask):
+            raise RuntimeError(
+                "source and target valid masks diverged despite same-dataset pairing"
+            )
+
+        gene_ids = self._to_token_ids(source_sampled_gene_ids, source_valid_mask)
+        source_values = self._to_value_tensor(
+            source_processed["sampled_counts"],
+            source_valid_mask,
+        )
+        target_values_next = self._to_value_tensor(
+            target_processed["sampled_counts"],
+            target_valid_mask,
+        )
+
+        batch_size = int(source_processed["batch_size"])
+        masked_values = self._mask_values(
+            source_values,
+            generator=self._torch_generator(None if seed is None else int(seed) + 1),
+        )
+
+        batch = {
+            "gene_ids": gene_ids,
+            "next_gene_ids": gene_ids.clone(),
+            "values": masked_values,
+            "target_values": source_values,
+            "target_values_next": target_values_next,
+            "batch_labels": torch.as_tensor(
+                pair_batch.source_batch_ids,
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "celltype_labels": torch.as_tensor(
+                pair_batch.source_cell_context_ids,
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "perturbation_labels": torch.as_tensor(
+                pair_batch.source_perturbation_ids,
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "celltype_labels_next": torch.as_tensor(
+                pair_batch.target_cell_context_ids,
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "perturbation_labels_next": torch.as_tensor(
+                pair_batch.target_perturbation_ids,
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "sf": self._size_factor_tensor(source_processed, batch_size),
+            "sf_next": self._size_factor_tensor(target_processed, batch_size),
+            "index": torch.as_tensor(
+                pair_batch.source_indices,
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "next_index": torch.as_tensor(
+                pair_batch.target_indices,
+                dtype=torch.long,
+                device=self.device,
+            ),
+            "ps": torch.zeros(
+                (batch_size, int(self.config.ps_width)),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            "ps_next": torch.zeros(
+                (batch_size, int(self.config.ps_width)),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+        }
+        return batch
+
+    __call__ = build_paired_batch
+
+    def _validate_pair_batch(self, pair_batch: PerturbationPairBatch) -> None:
+        if pair_batch.source_indices.shape != pair_batch.target_indices.shape:
+            raise ValueError("pair_batch source and target indices must have matching shapes")
+        if not np.array_equal(
+            pair_batch.source_dataset_indices,
+            pair_batch.target_dataset_indices,
+        ):
+            raise ValueError("pair_batch must preserve same-dataset pairing")
+        if not np.array_equal(
+            pair_batch.source_cell_context_ids,
+            pair_batch.target_cell_context_ids,
+        ):
+            raise ValueError("pair_batch must preserve same-context pairing")
+
+    def _torch_generator(self, seed: int | None) -> torch.Generator | None:
+        if seed is None:
+            return None
+        if self.device.type == "cuda":
+            generator = torch.Generator(device=self.device)
+        else:
+            generator = torch.Generator()
+        generator.manual_seed(int(seed))
+        return generator
+
+    def _to_token_ids(
+        self,
+        sampled_gene_ids: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        token_ids = torch.where(
+            valid_mask,
+            sampled_gene_ids.to(dtype=torch.long) + self._special_token_offset,
+            torch.full_like(sampled_gene_ids, self._pad_token_id, dtype=torch.long),
+        )
+        return self._prepend_cls_gene_ids(token_ids)
+
+    def _to_value_tensor(
+        self,
+        sampled_counts: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        values = torch.where(
+            valid_mask,
+            sampled_counts.to(dtype=torch.float32),
+            torch.full_like(
+                sampled_counts,
+                float(self.config.pad_value),
+                dtype=torch.float32,
+            ),
+        )
+        return self._prepend_cls_values(values)
+
+    def _prepend_cls_gene_ids(self, gene_ids: torch.Tensor) -> torch.Tensor:
+        if not self.config.append_cls:
+            return gene_ids
+        cls_column = torch.full(
+            (gene_ids.shape[0], 1),
+            self._cls_token_id,
+            dtype=torch.long,
+            device=gene_ids.device,
+        )
+        return torch.cat([cls_column, gene_ids], dim=1)
+
+    def _prepend_cls_values(self, values: torch.Tensor) -> torch.Tensor:
+        if not self.config.append_cls:
+            return values
+        cls_column = torch.full(
+            (values.shape[0], 1),
+            float(self.config.cls_value),
+            dtype=torch.float32,
+            device=values.device,
+        )
+        return torch.cat([cls_column, values], dim=1)
+
+    def _mask_values(
+        self,
+        values: torch.Tensor,
+        *,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        if self.config.mask_ratio <= 0.0:
+            return values.clone()
+        masked = values.clone()
+        pad_value = float(self.config.pad_value)
+        cls_value = float(self.config.cls_value)
+        mask_value = float(self.config.mask_value)
+        for row_idx in range(masked.shape[0]):
+            eligible = torch.nonzero(
+                (masked[row_idx] != pad_value) & (masked[row_idx] != cls_value),
+                as_tuple=False,
+            ).flatten()
+            if eligible.numel() == 0:
+                continue
+            n_mask = int(eligible.numel() * float(self.config.mask_ratio))
+            if n_mask <= 0:
+                continue
+            chosen = eligible[
+                torch.randperm(
+                    eligible.numel(),
+                    generator=generator,
+                    device=eligible.device,
+                )[:n_mask]
+            ]
+            masked[row_idx, chosen] = mask_value
+        return masked
+
+    def _size_factor_tensor(
+        self,
+        processed_batch: dict[str, Any],
+        batch_size: int,
+    ) -> torch.Tensor:
+        raw_size_factor = processed_batch.get("size_factor")
+        if raw_size_factor is None:
+            return torch.ones(
+                (batch_size, 1),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        size_factor = torch.as_tensor(
+            raw_size_factor,
+            dtype=torch.float32,
+            device=self.device,
+        ).reshape(-1, 1)
+        if size_factor.shape[0] != batch_size:
+            raise RuntimeError("size_factor length does not match batch size")
+        return size_factor
 
 
 @dataclass(frozen=True)
