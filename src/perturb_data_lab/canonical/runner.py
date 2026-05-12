@@ -12,7 +12,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -47,24 +47,6 @@ _TYPED_OBS_ARROW_TYPES: dict[str, pa.DataType] = {
 _NULLABLE_STRING_OBS_FIELDS: frozenset[str] = frozenset(
     {"dose", "dose_unit", "timepoint", "timepoint_unit"}
 )
-
-# ---------------------------------------------------------------------------
-# Transform dispatch registry
-# ---------------------------------------------------------------------------
-
-_transform_registry: dict[str, Callable[..., str]] = {
-    "strip_prefix": _xforms.strip_prefix,
-    "strip_suffix": _xforms.strip_suffix,
-    "regex_sub": _xforms.regex_sub,
-    "normalize_case": _xforms.normalize_case,
-    "dose_parse": _xforms.dose_parse,
-    "dose_unit": _xforms.dose_unit,
-    "timepoint_parse": _xforms.timepoint_parse,
-    "timepoint_unit": _xforms.timepoint_unit,
-    "map_values": _xforms.map_values,
-    "split_on_delimiter": _xforms.split_on_delimiter,
-}
-
 
 # ---------------------------------------------------------------------------
 # Gene mapping engines
@@ -610,10 +592,11 @@ class CanonicalizationRunner:
     ) -> str:
         """Apply an ordered list of ``TransformRule`` objects to a string value.
 
-        Returns *fallback* if any intermediate value is null-like.
+        Unknown transform names are warned and skipped. Transform exceptions and
+        null-like end states fall back to *fallback*.
         """
         for rule in transforms:
-            fn = _transform_registry.get(rule.name)
+            fn = _xforms.get_transform(rule.name)
             if fn is None:
                 logger.warning(
                     "Unknown transform '%s'; skipping (value=%r)", rule.name, value

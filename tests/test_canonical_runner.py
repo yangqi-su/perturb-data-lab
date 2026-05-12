@@ -28,6 +28,7 @@ from perturb_data_lab.canonical.runner import (
     build_canonical_vocab,
     run_canonicalization,
 )
+from perturb_data_lab.inspectors.transforms import TRANSFORM_CATALOG, get_transform
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -168,6 +169,31 @@ def _make_minimal_schema(path: Path, dataset_id: str = "test") -> Canonicalizati
 class TestTransformApplication:
     """Test that individual transforms work as expected through the runner."""
 
+    def test_transform_catalog_and_dispatch_include_phase4_scalars(self):
+        required = {
+            "map_control_labels",
+            "strip_whitespace",
+            "replace_empty_with_null",
+            "normalize_case",
+            "map_values",
+            "regex_sub",
+            "strip_prefix",
+            "strip_suffix",
+            "strip_guide_suffix",
+            "split_on_delimiter",
+            "dose_parse",
+            "dose_unit",
+            "timepoint_parse",
+            "timepoint_unit",
+            "normalize_time_unit",
+            "normalize_dose_unit",
+            "strip_ensembl_version",
+            "normalize_boolean",
+        }
+        catalog_names = {entry.name for entry in TRANSFORM_CATALOG}
+        assert required.issubset(catalog_names)
+        assert all(get_transform(name) is not None for name in required)
+
     def test_strip_suffix_transform(self):
         """strip_suffix removes a known suffix."""
         result = CanonicalizationRunner._apply_transforms(
@@ -208,6 +234,53 @@ class TestTransformApplication:
         )
         assert result == "TP53"
 
+    def test_strip_whitespace_transform(self):
+        """strip_whitespace trims leading and trailing spaces."""
+        result = CanonicalizationRunner._apply_transforms(
+            "  TP53  ",
+            transforms=(TransformRule(name="strip_whitespace", args={}),),
+        )
+        assert result == "TP53"
+
+    def test_replace_empty_with_null_uses_fallback(self):
+        """replace_empty_with_null converts empty strings into fallback values."""
+        result = CanonicalizationRunner._apply_transforms(
+            "   ",
+            transforms=(TransformRule(name="replace_empty_with_null", args={}),),
+            fallback="FALLBACK",
+        )
+        assert result == "FALLBACK"
+
+    def test_map_control_labels_case_insensitive_and_whitespace_aware(self):
+        """map_control_labels matches normalized candidate labels and emits ctrl."""
+        result = CanonicalizationRunner._apply_transforms(
+            "  Non-Targeting  ",
+            transforms=(TransformRule(
+                name="map_control_labels",
+                args={"candidates": ["ctrl", "ntc", "non-targeting"]},
+            ),),
+        )
+        assert result == "ctrl"
+
+    def test_map_control_labels_preserves_unmatched_values(self):
+        """map_control_labels leaves non-control labels unchanged."""
+        result = CanonicalizationRunner._apply_transforms(
+            "TP53",
+            transforms=(TransformRule(
+                name="map_control_labels",
+                args={"candidates": ["ctrl", "ntc", "non-targeting"]},
+            ),),
+        )
+        assert result == "TP53"
+
+    def test_strip_guide_suffix_transform(self):
+        """strip_guide_suffix removes common perturbation guide suffixes."""
+        result = CanonicalizationRunner._apply_transforms(
+            "NTC_sg1",
+            transforms=(TransformRule(name="strip_guide_suffix", args={}),),
+        )
+        assert result == "NTC"
+
     def test_dose_parse_extracts_numeric(self):
         """dose_parse extracts the numeric part of dose strings."""
         result = CanonicalizationRunner._apply_transforms(
@@ -224,6 +297,14 @@ class TestTransformApplication:
         )
         assert result == "nm"
 
+    def test_normalize_dose_unit_normalizes_standalone_unit(self):
+        """normalize_dose_unit normalizes unit-only metadata values."""
+        result = CanonicalizationRunner._apply_transforms(
+            "μM",
+            transforms=(TransformRule(name="normalize_dose_unit", args={}),),
+        )
+        assert result == "um"
+
     def test_timepoint_parse_extracts_numeric(self):
         """timepoint_parse extracts the numeric part."""
         result = CanonicalizationRunner._apply_transforms(
@@ -231,6 +312,14 @@ class TestTransformApplication:
             transforms=(TransformRule(name="timepoint_parse", args={}),),
         )
         assert result == "24"
+
+    def test_timepoint_unit_extracts_unit(self):
+        """timepoint_unit extracts and normalizes the time unit."""
+        result = CanonicalizationRunner._apply_transforms(
+            "48 hr",
+            transforms=(TransformRule(name="timepoint_unit", args={}),),
+        )
+        assert result == "h"
 
     def test_map_values(self):
         """map_values remaps via a lookup table."""
@@ -270,6 +359,46 @@ class TestTransformApplication:
         )
         assert result == "MDM2"
 
+    def test_normalize_time_unit_normalizes_standalone_unit(self):
+        """normalize_time_unit normalizes unit-only metadata values."""
+        result = CanonicalizationRunner._apply_transforms(
+            "Hours",
+            transforms=(TransformRule(name="normalize_time_unit", args={}),),
+        )
+        assert result == "h"
+
+    def test_strip_ensembl_version(self):
+        """strip_ensembl_version removes trailing Ensembl version numbers."""
+        result = CanonicalizationRunner._apply_transforms(
+            "ENSG00000141510.18",
+            transforms=(TransformRule(name="strip_ensembl_version", args={}),),
+        )
+        assert result == "ENSG00000141510"
+
+    @pytest.mark.parametrize(
+        ("raw_value", "expected"),
+        [
+            ("Yes", "true"),
+            (" 0 ", "false"),
+            ("FALSE", "false"),
+        ],
+    )
+    def test_normalize_boolean(self, raw_value: str, expected: str):
+        """normalize_boolean handles common truthy and falsy spellings."""
+        result = CanonicalizationRunner._apply_transforms(
+            raw_value,
+            transforms=(TransformRule(name="normalize_boolean", args={}),),
+        )
+        assert result == expected
+
+    def test_normalize_boolean_preserves_unmatched_values(self):
+        """normalize_boolean leaves unknown values unchanged."""
+        result = CanonicalizationRunner._apply_transforms(
+            "maybe",
+            transforms=(TransformRule(name="normalize_boolean", args={}),),
+        )
+        assert result == "maybe"
+
     def test_chained_transforms(self):
         """Multiple transforms are applied in order."""
         result = CanonicalizationRunner._apply_transforms(
@@ -277,6 +406,17 @@ class TestTransformApplication:
             transforms=(
                 TransformRule(name="strip_suffix", args={"suffix": "_sg1"}),
                 TransformRule(name="normalize_case", args={"mode": "lower"}),
+            ),
+        )
+        assert result == "ctrl"
+
+    def test_chained_control_normalization(self):
+        """Guide suffix stripping can feed into control-label normalization."""
+        result = CanonicalizationRunner._apply_transforms(
+            "NTC_sg1",
+            transforms=(
+                TransformRule(name="strip_guide_suffix", args={}),
+                TransformRule(name="map_control_labels", args={"candidates": ["ntc"]}),
             ),
         )
         assert result == "ctrl"
@@ -297,6 +437,15 @@ class TestTransformApplication:
             transforms=(TransformRule(name="nonexistent_transform", args={}),),
         )
         assert result == "hello"
+
+    def test_failing_transform_uses_fallback(self):
+        """Transform failures warn and fall back instead of propagating."""
+        result = CanonicalizationRunner._apply_transforms(
+            "TP53",
+            transforms=(TransformRule(name="normalize_case", args={"mode": "snake"}),),
+            fallback="FALLBACK",
+        )
+        assert result == "FALLBACK"
 
 
 # ---------------------------------------------------------------------------
