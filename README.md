@@ -44,6 +44,7 @@ perturb-data-lab/
 - `src/perturb_data_lab/canonical/`: draft/final schema application and canonical obs/var generation
 - `src/perturb_data_lab/loaders/corpus_loader.py`: `load_corpus()` and `Corpus` for unified runtime access
 - `docs/v0-onboarding-workflow.md`: current inspect → materialize → draft-schema → finalize-schema → canonicalize → load workflow
+- `docs/canonicalization_handbook.md`: canonical schema review rules, transform behavior, tokenizer notes, and common failure modes
 - `docs/v0-default-backend-decision.md`: current backend policy and default/experimental guidance
 - `tests/`: focused regression and runtime smoke coverage
 
@@ -67,7 +68,7 @@ Important constraints:
 - For large h5ad inputs, run inspection/materialization on Slurm CPU in `torch_flashv3`.
 - Treat `data/`, `pertTF/`, and `perturb/` as read-only sources; write outputs only to repo-local real directories.
 
-See `docs/v0-onboarding-workflow.md` for concrete create/append CLI examples and schema-review guidance.
+See `docs/v0-onboarding-workflow.md` for concrete create/append CLI examples and `docs/canonicalization_handbook.md` for draft-to-final schema review guidance.
 
 ## Preferred corpus-first API
 

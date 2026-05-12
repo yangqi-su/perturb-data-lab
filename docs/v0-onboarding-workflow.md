@@ -182,6 +182,8 @@ Known caveat:
 
 **Goal**: Turn the draft into the reviewed schema used for canonicalization.
 
+Use `docs/canonicalization_handbook.md` as the current reference for mapping strategies, transform order, control-label review, gene-tokenizer behavior, and common schema failure modes.
+
 Review these inputs together:
 
 - `meta/<dataset_id>/draft-schema.yaml`
@@ -206,7 +208,7 @@ Practical rule: prefer the smallest faithful mapping that matches the dataset's 
 
 ## Step 5 — Canonicalize the corpus
 
-**Goal**: Build canonical obs/var parquets from finalized schemas and rebuild corpus-level vocabulary.
+**Goal**: Build canonical obs/var parquets from finalized schemas.
 
 All finalized datasets:
 
@@ -235,7 +237,11 @@ Primary outputs:
 
 - `meta/<dataset_id>/canonical_meta/canonical-obs.parquet`
 - `meta/<dataset_id>/canonical_meta/canonical-var.parquet`
-- `corpus-vocab.yaml`
+
+Important:
+
+- `canonicalize` no longer writes `corpus-vocab.yaml`.
+- `load_corpus()` uses `canonical_gene_id` as the runtime identity surface and can rebuild a deterministic corpus-global tokenizer when `gene-tokenizer.json` is absent.
 
 ---
 
