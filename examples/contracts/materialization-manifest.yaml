@@ -16,5 +16,6 @@ tokenizer_path: tokenizer.json
 feature_meta_paths:
   features_origin: examples/contracts/features-origin.parquet
   features_token: examples/contracts/features-token.parquet
-hvg_sidecar_path: hvg_sidecar
+hvg_ranking_path: hvg.parquet
+default_n_hvg: 2000
 integer_verified: true

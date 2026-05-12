@@ -9,4 +9,4 @@ emission_spec_path: corpus-emission-spec.yaml
 notes:
   - tokenizer.json provides the authoritative append-safe token mapping
   - corpus-emission-spec.yaml controls which fields loaders emit at runtime
-  - hvg_sidecar/ directory contains hvg.npy and nonhvg.npy per dataset
+  - each dataset metadata directory now includes a canonical hvg.parquet ranking artifact

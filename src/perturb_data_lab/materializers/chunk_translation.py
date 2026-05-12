@@ -27,7 +27,8 @@ Design principles from the archived benchmark (materialize_split_brain_backends.
     inside ``_translate_chunk()`` using a temporary expm1 CSR matrix — no full-matrix
     densification. The caller passes ``needs_recovery`` based on Stage 1's decision.
   - HVG statistics are accumulated by the caller during the chunk loop (via np.add.at)
-    and finalized by ``_finalize_hvg()`` after all chunks are written — no separate pass.
+    and finalized into a deterministic ``hvg.parquet`` ranking artifact after all
+    chunks are written — no separate pass.
 
 Schema summary
 --------------
@@ -126,6 +127,19 @@ DATASET_OFFSET_SCHEMA = pa.schema(
         pa.field("global_row_start", pa.int64()),
         pa.field("global_row_stop", pa.int64()),
         pa.field("nnz_total", pa.int64()),
+    ]
+)
+
+HVG_RANKING_SCHEMA = pa.schema(
+    [
+        pa.field("origin_index", pa.int32()),
+        pa.field("feature_id", pa.string()),
+        pa.field("mean_log1p_expr", pa.float64()),
+        pa.field("variance_log1p_expr", pa.float64()),
+        pa.field("dispersion_log", pa.float64()),
+        pa.field("dispersion_norm", pa.float64()),
+        pa.field("hvg_rank", pa.int32()),
+        pa.field("selected_at_default_n_hvg", pa.bool_()),
     ]
 )
 
@@ -467,14 +481,14 @@ def _translate_chunk(
 # Seurat-style HVG selection
 # ---------------------------------------------------------------------------
 
-def _finalize_hvg(
+def _compute_hvg_ranking_arrays(
     sum_log1p: np.ndarray,
     sum_log1p_sq: np.ndarray,
     n_cells_total: int,
     n_vars: int,
     n_hvg: int = 2000,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute Seurat-style highly variable gene selection from streaming accumulators.
+) -> dict[str, np.ndarray]:
+    """Compute deterministic HVG ranking arrays from streaming accumulators.
 
     Parameters
     ----------
@@ -487,25 +501,50 @@ def _finalize_hvg(
     n_vars : int
         Number of genes (features) in the dataset.
     n_hvg : int, default 2000
-        Number of top-dispersion genes to mark as highly variable.
+        Number of top-dispersion genes to mark as selected by default.
 
     Returns
     -------
-    tuple[np.ndarray, np.ndarray]
-        ``(hvg_indices, nonhvg_indices)`` — dataset-local gene indices (int32) for
-        highly variable and non-highly variable genes respectively.
+    dict[str, np.ndarray]
+        Arrays for the canonical HVG ranking artifact. ``hvg_rank`` is 1-indexed,
+        with ties broken by ``origin_index`` ascending after
+        ``dispersion_norm`` descending.
     """
     import pandas as pd
 
-    mean = sum_log1p / n_cells_total
-    var = (sum_log1p_sq - sum_log1p**2 / n_cells_total) / max(n_cells_total - 1, 1)
-    mean[mean == 0] = 1e-12
-    dispersion = var / mean
-    dispersion[dispersion == 0] = np.nan
-    dispersion = np.log(dispersion)
-    mean = np.log1p(mean)
+    if n_cells_total <= 0:
+        raise ValueError("n_cells_total must be positive")
+    if n_hvg < 0:
+        raise ValueError("n_hvg must be non-negative")
+    if len(sum_log1p) != n_vars or len(sum_log1p_sq) != n_vars:
+        raise ValueError("streaming HVG accumulators must match n_vars")
 
-    df = pd.DataFrame({"means": mean, "dispersions": dispersion})
+    origin_index = np.arange(n_vars, dtype=np.int32)
+    mean_log1p_expr = sum_log1p / n_cells_total
+    variance_log1p_expr = (sum_log1p_sq - sum_log1p**2 / n_cells_total) / max(
+        n_cells_total - 1, 1
+    )
+
+    mean_for_dispersion = mean_log1p_expr.copy()
+    mean_for_dispersion[mean_for_dispersion == 0] = 1e-12
+    dispersion = variance_log1p_expr / mean_for_dispersion
+    dispersion[dispersion == 0] = np.nan
+    dispersion_log = np.log(dispersion)
+
+    # Preserve the legacy selection semantics exactly: Seurat-style mean binning
+    # is performed on log1p(mean(log1p(counts))). The artifact stores the
+    # pre-binning mean/variance columns explicitly, while ``dispersion_norm``
+    # still follows the historical binning path for backward-compatible top-N.
+    mean_for_binning = np.log1p(mean_log1p_expr)
+
+    df = pd.DataFrame(
+        {
+            "origin_index": origin_index,
+            "means": mean_for_binning,
+            "dispersions": dispersion_log,
+        },
+        index=origin_index,
+    )
     # pd.cut(bins=20) can produce empty bins when gene count < 20.
     # Lines below handle the single-gene-bin edge case: when a bin contains
     # exactly one gene, dev=std is NaN; it is replaced with dev=avg so the
@@ -521,16 +560,93 @@ def _finalize_hvg(
         df["dispersions"] - disp_stats.loc[df["mean_bin"], "avg"].values
     ) / disp_stats.loc[df["mean_bin"], "dev"].values
 
-    df = df.sort_values("dispersions_norm", ascending=False)
-    df["highly_variable"] = False
-    df.iloc[:n_hvg, df.columns.get_loc("highly_variable")] = True
-    df = df.sort_index()
+    dispersion_norm = df["dispersions_norm"].to_numpy(dtype=np.float64, copy=False)
+    ranked_dispersion = np.nan_to_num(dispersion_norm, nan=-np.inf)
+    rank_order = np.lexsort((origin_index, -ranked_dispersion))
+    hvg_rank = np.empty(n_vars, dtype=np.int32)
+    hvg_rank[rank_order] = np.arange(1, n_vars + 1, dtype=np.int32)
+    selected_at_default_n_hvg = hvg_rank <= min(n_hvg, n_vars)
 
-    hvg_indices = df.index[df["highly_variable"]].to_numpy().astype(np.int32)
-    hvg_indices.sort()
-    nonhvg_indices = np.array(
-        [j for j in range(n_vars) if j not in set(hvg_indices)], dtype=np.int32
+    return {
+        "origin_index": origin_index,
+        "mean_log1p_expr": mean_log1p_expr.astype(np.float64, copy=False),
+        "variance_log1p_expr": variance_log1p_expr.astype(np.float64, copy=False),
+        "dispersion_log": dispersion_log.astype(np.float64, copy=False),
+        "dispersion_norm": dispersion_norm.astype(np.float64, copy=False),
+        "hvg_rank": hvg_rank,
+        "selected_at_default_n_hvg": selected_at_default_n_hvg.astype(bool, copy=False),
+    }
+
+
+def _build_hvg_ranking_table(
+    sum_log1p: np.ndarray,
+    sum_log1p_sq: np.ndarray,
+    n_cells_total: int,
+    feature_ids: Any,
+    *,
+    n_hvg: int = 2000,
+) -> pa.Table:
+    """Build the canonical per-dataset ``hvg.parquet`` ranking table.
+
+    ``mean_log1p_expr`` and ``variance_log1p_expr`` are computed directly from the
+    streaming log1p(count) accumulators. ``dispersion_log`` is the log of
+    ``variance_log1p_expr / mean_log1p_expr`` after the historical zero guard.
+    ``dispersion_norm`` preserves the existing Seurat-style mean-bin normalization,
+    including the legacy ``log1p(mean_log1p_expr)`` binning step used by the
+    previous fixed-top-N helper.
+    """
+
+    feature_id_list = [str(feature_id) for feature_id in feature_ids]
+    arrays = _compute_hvg_ranking_arrays(
+        sum_log1p=sum_log1p,
+        sum_log1p_sq=sum_log1p_sq,
+        n_cells_total=n_cells_total,
+        n_vars=len(feature_id_list),
+        n_hvg=n_hvg,
     )
+    return pa.table(
+        {
+            "origin_index": pa.array(arrays["origin_index"], type=pa.int32()),
+            "feature_id": pa.array(feature_id_list, type=pa.string()),
+            "mean_log1p_expr": pa.array(arrays["mean_log1p_expr"], type=pa.float64()),
+            "variance_log1p_expr": pa.array(
+                arrays["variance_log1p_expr"], type=pa.float64()
+            ),
+            "dispersion_log": pa.array(arrays["dispersion_log"], type=pa.float64()),
+            "dispersion_norm": pa.array(arrays["dispersion_norm"], type=pa.float64()),
+            "hvg_rank": pa.array(arrays["hvg_rank"], type=pa.int32()),
+            "selected_at_default_n_hvg": pa.array(
+                arrays["selected_at_default_n_hvg"], type=pa.bool_()
+            ),
+        },
+        schema=HVG_RANKING_SCHEMA,
+    )
+
+
+def _finalize_hvg(
+    sum_log1p: np.ndarray,
+    sum_log1p_sq: np.ndarray,
+    n_cells_total: int,
+    n_vars: int,
+    n_hvg: int = 2000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Legacy helper returning selected/non-selected origin indices.
+
+    New materializations should write ``hvg.parquet`` via
+    ``_build_hvg_ranking_table()``. This compatibility helper remains for callers
+    that still need the old selected/complement index arrays.
+    """
+
+    arrays = _compute_hvg_ranking_arrays(
+        sum_log1p=sum_log1p,
+        sum_log1p_sq=sum_log1p_sq,
+        n_cells_total=n_cells_total,
+        n_vars=n_vars,
+        n_hvg=n_hvg,
+    )
+    selected_mask = arrays["selected_at_default_n_hvg"]
+    hvg_indices = arrays["origin_index"][selected_mask].astype(np.int32, copy=False)
+    nonhvg_indices = arrays["origin_index"][~selected_mask].astype(np.int32, copy=False)
     return hvg_indices, nonhvg_indices
 
 

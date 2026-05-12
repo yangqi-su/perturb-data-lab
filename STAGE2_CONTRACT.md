@@ -165,16 +165,27 @@ All heavy-row storage uses **sparse representation** (CSR/CSC or equivalent). De
 
 The **dataset-local feature order is the authoritative feature order** for this release. No canonical feature mapping is applied at this stage. The `origin_index` field in the raw `var` sidecar and provenance parquet files establishes the feature order.
 
-### 5.2 HVG Arrays
+### 5.2 HVG Ranking Table
 
-- **Format**: NumPy `.npy` files
-- **Path**: `{metadata_root}/hvg_sidecar/{release_id}-hvg.npy` and `{release_id}-nonhvg.npy`
-- **Content**:
-  - `hvg.npy`: `int32` array of dataset-local feature indices selected as HVGs
-  - `nonhvg.npy`: `int32` array of the complement (all other feature indices)
-- **Selection method**: Top-N dispersion (`variance / mean` of log1p(counts), computed via exact all-cells streaming accumulation using `np.add.at` during the chunk loop — no sampling)
-- **N default**: 2000 (configurable via `n_hvg` parameter)
-- **HVG indices are in dataset-local feature space** — they are NOT token IDs or global feature indices
+- **Format**: Parquet
+- **Path**: `{metadata_root}/hvg.parquet`
+- **Schema**:
+  - `origin_index`: `int32`
+  - `feature_id`: `string`
+  - `mean_log1p_expr`: `float64`
+  - `variance_log1p_expr`: `float64`
+  - `dispersion_log`: `float64`
+  - `dispersion_norm`: `float64`
+  - `hvg_rank`: `int32` — 1 is most highly variable
+  - `selected_at_default_n_hvg`: `bool`
+- **Selection method**: Top-N normalized dispersion derived from exact all-cells streaming accumulation of `log1p(counts)` using `np.add.at` during the chunk loop — no sampling
+- **Ranking semantics**:
+  - sort by `dispersion_norm` descending
+  - tie-break by `origin_index` ascending
+  - `selected_at_default_n_hvg` must equal `hvg_rank <= default_n_hvg`
+- **N default**: 2000 (configurable via `n_hvg`, recorded in the manifest as `default_n_hvg`)
+- **Feature space**: `origin_index` and ranks are in dataset-local feature space — they are NOT token IDs or global feature indices
+- **Legacy note**: Older corpora may still retain `hvg.npy` / `nonhvg.npy` sidecars for backward-compatible read support, but they are no longer the canonical artifact for new materializations
 
 ---
 
@@ -209,7 +220,8 @@ provenance:
 raw_cell_meta_path: str      # path to raw-obs.parquet
 raw_feature_meta_path: str   # path to raw-var.parquet
 provenance_spec_path: str     # path to feature-provenance.parquet
-hvg_sidecar_path: str        # path to hvg_sidecar directory
+hvg_ranking_path: str         # path to per-dataset hvg.parquet
+default_n_hvg: int            # default top-N used to set selected_at_default_n_hvg
 size_factor_parquet_path: str # path to size-factor.parquet (separate, not inline)
 qa_manifest_path: str
 integer_verified: bool

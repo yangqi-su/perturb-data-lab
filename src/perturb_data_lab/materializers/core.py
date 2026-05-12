@@ -336,16 +336,17 @@ class Stage2Materializer:
             # --- Write backend-specific sparse cell data ---
             # HVG statistics are accumulated during the chunk loop via np.add.at.
             # Global size factors are computed after the loop from all row_sums.
-            # Both HVG arrays and size factors are written to sidecars after the loop.
+            # Size factors and the canonical HVG ranking parquet are written after the loop.
             backend_result: tuple[dict[str, Path], np.ndarray, Path] | dict[str, Path]
             backend_result = self._write_cells(
                 count_matrix=count_matrix,
                 adata=adata,
                 matrix_root=matrix_root,
+                feature_ids=tuple(str(v) for v in var_index),
                 needs_recovery=count_source.uses_recovery,
             )
             if isinstance(backend_result, tuple):
-                backend_paths, size_factors, hvg_sidecar_path = backend_result
+                backend_paths, size_factors, hvg_ranking_path = backend_result
                 size_factor_parquet_path = self._write_size_factor_parquet(
                     size_factors=size_factors,
                     cell_ids=adata.obs.index,
@@ -354,7 +355,7 @@ class Stage2Materializer:
             else:
                 backend_paths = backend_result
                 size_factor_parquet_path = None
-                hvg_sidecar_path = None
+                hvg_ranking_path = None
 
             # --- Run QA checks ---
             qa_metrics, all_passed = self._run_qa_checks(backend_paths, count_matrix)
@@ -389,7 +390,8 @@ class Stage2Materializer:
                     str(size_factor_parquet_path) if size_factor_parquet_path else None
                 ),
                 qa_manifest_path=str(qa_path),
-                hvg_sidecar_path=str(hvg_sidecar_path),
+                hvg_ranking_path=(str(hvg_ranking_path) if hvg_ranking_path else None),
+                default_n_hvg=self.n_hvg,
                 integer_verified=all_passed,
                 cell_count=n_obs,
                 feature_count=n_vars,
@@ -449,6 +451,8 @@ class Stage2Materializer:
                     size_factor_parquet_path=manifest.size_factor_parquet_path,
                     qa_manifest_path=manifest.qa_manifest_path,
                     hvg_sidecar_path=manifest.hvg_sidecar_path,
+                    hvg_ranking_path=manifest.hvg_ranking_path,
+                    default_n_hvg=manifest.default_n_hvg,
                     integer_verified=manifest.integer_verified,
                     cell_count=manifest.cell_count,
                     feature_count=manifest.feature_count,
@@ -709,6 +713,7 @@ class Stage2Materializer:
         adata: ad.AnnData,
         matrix_root: Path,
         *,
+        feature_ids: Sequence[str],
         needs_recovery: bool = False,
     ) -> tuple[dict[str, Path], np.ndarray, Path] | dict[str, Path]:
         """Write sparse cell data using the configured backend and topology.
@@ -717,7 +722,7 @@ class Stage2Materializer:
         or ``_write_cells_aggregate`` (multi-dataset corpus) based on ``self.topology``.
 
         HVG accumulation and global size factor computation are done during the
-        chunk loop; both are finalized and written to sidecars after the loop.
+        chunk loop; the canonical ``hvg.parquet`` artifact is finalized after the loop.
 
         For aggregate topology, writer state is passed through ``self.writer_state``
         and ``self._is_last_dataset``, set by the corpus-level orchestrator before
@@ -725,12 +730,43 @@ class Stage2Materializer:
         """
         if self.topology == "aggregate":
             return self._write_cells_aggregate(
-                count_matrix, adata, matrix_root,
+                count_matrix,
+                adata,
+                matrix_root,
+                feature_ids=feature_ids,
                 needs_recovery=needs_recovery,
             )
         return self._write_cells_federated(
-            count_matrix, adata, matrix_root, needs_recovery=needs_recovery
+            count_matrix,
+            adata,
+            matrix_root,
+            feature_ids=feature_ids,
+            needs_recovery=needs_recovery,
         )
+
+    def _write_hvg_ranking_parquet(
+        self,
+        *,
+        sum_log1p: np.ndarray,
+        sum_log1p_sq: np.ndarray,
+        n_cells_total: int,
+        feature_ids: Sequence[str],
+        meta_root: Path,
+    ) -> Path:
+        """Write the canonical per-dataset HVG ranking artifact."""
+        from .chunk_translation import _build_hvg_ranking_table
+
+        table = _build_hvg_ranking_table(
+            sum_log1p=sum_log1p,
+            sum_log1p_sq=sum_log1p_sq,
+            n_cells_total=n_cells_total,
+            feature_ids=feature_ids,
+            n_hvg=self.n_hvg,
+        )
+        output_path = meta_root / "hvg.parquet"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, output_path)
+        return output_path
 
     def _write_cells_federated(
         self,
@@ -738,17 +774,18 @@ class Stage2Materializer:
         adata: ad.AnnData,
         matrix_root: Path,
         *,
+        feature_ids: Sequence[str],
         needs_recovery: bool = False,
     ) -> tuple[dict[str, Path], np.ndarray, Path]:
         """Write federated (single-dataset) sparse cell data.
 
         Loops over the count matrix in chunks, calls ``_translate_chunk()`` per chunk,
         accumulates row sums and HVG statistics during the loop, then computes
-        global size factors and finalizes HVG selection after the loop.
+        global size factors and writes ``hvg.parquet`` after the loop.
 
-        Returns ``(paths_dict, size_factors_array, hvg_sidecar_dir)``.
+        Returns ``(paths_dict, size_factors_array, hvg_ranking_path)``.
         """
-        from .chunk_translation import DatasetSpec, _finalize_hvg, _translate_chunk
+        from .chunk_translation import DatasetSpec, _translate_chunk
 
         backend_fn = build_backend_fn(self.backend, "federated")
 
@@ -849,19 +886,16 @@ class Stage2Materializer:
             meta_root=Path(self.output_roots.metadata_root),
         )
 
-        # --- After loop: compute Seurat-style HVG from streaming accumulators ---
-        hvg_indices, nonhvg_indices = _finalize_hvg(
-            sum_log1p, sum_log1p_sq, n_cells_total, n_vars, n_hvg=self.n_hvg
+        meta_root = Path(self.output_roots.metadata_root)
+        hvg_ranking_path = self._write_hvg_ranking_parquet(
+            sum_log1p=sum_log1p,
+            sum_log1p_sq=sum_log1p_sq,
+            n_cells_total=n_cells_total,
+            feature_ids=feature_ids,
+            meta_root=meta_root,
         )
 
-        # --- After loop: write HVG sidecar ---
-        meta_root = Path(self.output_roots.metadata_root)
-        hvg_sidecar_dir = meta_root / "hvg_sidecar"
-        hvg_sidecar_dir.mkdir(parents=True, exist_ok=True)
-        np.save(str(hvg_sidecar_dir / "hvg.npy"), hvg_indices, allow_pickle=False)
-        np.save(str(hvg_sidecar_dir / "nonhvg.npy"), nonhvg_indices, allow_pickle=False)
-
-        return (all_paths, size_factors, hvg_sidecar_dir)
+        return (all_paths, size_factors, hvg_ranking_path)
 
     def _write_cells_aggregate(
         self,
@@ -869,6 +903,7 @@ class Stage2Materializer:
         adata: ad.AnnData,
         matrix_root: Path,
         *,
+        feature_ids: Sequence[str],
         needs_recovery: bool = False,
     ) -> tuple[dict[str, Path], np.ndarray, Path]:
         """Write aggregate (multi-dataset corpus) sparse cell data.
@@ -879,17 +914,17 @@ class Stage2Materializer:
         orchestrator sets before each ``materialize()`` call and reads afterward.
 
         Row sums and HVG statistics are accumulated during the chunk loop.
-        Global size factors and HVG selection are computed and written to
-        per-dataset sidecars after the loop (same as federated).
+        Global size factors and the canonical HVG ranking parquet are written
+        after the loop (same as federated).
 
-        Returns ``(paths_dict, size_factors_array, hvg_sidecar_dir)`` — same
+        Returns ``(paths_dict, size_factors_array, hvg_ranking_path)`` — same
         format as ``_write_cells_federated``.
 
         Note: Only ``lance``, ``zarr``, ``webdataset``, and ``tiledb`` backends support
         aggregate topology. ``arrow-parquet`` and ``arrow-ipc`` do not support
         aggregate because they lack true incremental append capability.
         """
-        from .chunk_translation import DatasetSpec, _finalize_hvg, _translate_chunk
+        from .chunk_translation import DatasetSpec, _translate_chunk
 
         backend_fn = build_backend_fn(self.backend, "aggregate")
 
@@ -988,19 +1023,16 @@ class Stage2Materializer:
             meta_root=Path(self.output_roots.metadata_root),
         )
 
-        # --- After loop: compute Seurat-style HVG from streaming accumulators ---
-        hvg_indices, nonhvg_indices = _finalize_hvg(
-            sum_log1p, sum_log1p_sq, n_cells_total, n_vars, n_hvg=self.n_hvg
+        meta_root = Path(self.output_roots.metadata_root)
+        hvg_ranking_path = self._write_hvg_ranking_parquet(
+            sum_log1p=sum_log1p,
+            sum_log1p_sq=sum_log1p_sq,
+            n_cells_total=n_cells_total,
+            feature_ids=feature_ids,
+            meta_root=meta_root,
         )
 
-        # --- After loop: write HVG sidecar ---
-        meta_root = Path(self.output_roots.metadata_root)
-        hvg_sidecar_dir = meta_root / "hvg_sidecar"
-        hvg_sidecar_dir.mkdir(parents=True, exist_ok=True)
-        np.save(str(hvg_sidecar_dir / "hvg.npy"), hvg_indices, allow_pickle=False)
-        np.save(str(hvg_sidecar_dir / "nonhvg.npy"), nonhvg_indices, allow_pickle=False)
-
-        return (all_paths, size_factors, hvg_sidecar_dir)
+        return (all_paths, size_factors, hvg_ranking_path)
 
 
 # ---------------------------------------------------------------------------

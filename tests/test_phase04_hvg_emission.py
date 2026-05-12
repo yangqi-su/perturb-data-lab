@@ -1,11 +1,11 @@
-"""Phase 4 tests: HVG/non-HVG materialization and corpus emission spec.
+"""HVG ranking artifact and corpus emission spec tests.
 
 Tests cover:
 - CorpusEmissionSpec round-trip (YAML read/write)
 - CorpusEmissionSpec field accessors
-- HVG/non-HVG arrays: content, shape, disjointness, index-space
-- Manifest hvg_sidecar_path wiring
-- Loader integration with emission spec and HVG sidecar loading
+- HVG ranking parquet schema and deterministic ranking semantics
+- Manifest hvg_ranking_path wiring
+- Loader integration with emission spec metadata wiring
 """
 
 from __future__ import annotations
@@ -25,6 +25,10 @@ from perturb_data_lab.materializers import (
     CorpusEmissionSpec,
     CorpusTokenizer,
     update_corpus_index,
+)
+from perturb_data_lab.materializers.chunk_translation import (
+    HVG_RANKING_SCHEMA,
+    _build_hvg_ranking_table,
 )
 from perturb_data_lab.materializers.models import (
     CountSourceSpec,
@@ -61,7 +65,8 @@ class TestCorpusEmissionSpecRoundTrip:
             perturbation_fields=("perturbation_label", "perturbation_type"),
             context_fields=("dataset_id", "tissue"),
             output_convention="dict",
-            hvg_sidecar_path="metadata/hvg_sidecar",
+            hvg_ranking_path="metadata/ds1/hvg.parquet",
+            default_n_hvg=2000,
         )
         path = tmp_path / "corpus-emission-spec.yaml"
         spec.write_yaml(path)
@@ -69,7 +74,8 @@ class TestCorpusEmissionSpecRoundTrip:
         assert loaded.corpus_id == "test-corpus"
         assert loaded.perturbation_fields == ("perturbation_label", "perturbation_type")
         assert loaded.context_fields == ("dataset_id", "tissue")
-        assert loaded.hvg_sidecar_path == "metadata/hvg_sidecar"
+        assert loaded.hvg_ranking_path == "metadata/ds1/hvg.parquet"
+        assert loaded.default_n_hvg == 2000
 
     def test_emitted_perturbation_fields(self):
         spec = CorpusEmissionSpec(
@@ -93,86 +99,91 @@ class TestCorpusEmissionSpecRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# HVG/non-HVG array content tests
+# HVG ranking parquet content tests
 # ---------------------------------------------------------------------------
 
 
-class TestHVGArrays:
-    def test_hvg_npy_saved_and_loadable(self, tmp_path: Path):
-        """HVG array is saved as .npy and can be loaded back."""
-        sidecar = tmp_path / "hvg_sidecar"
-        sidecar.mkdir(parents=True, exist_ok=True)
-        indices = np.array([0, 5, 10, 15, 20], dtype=np.int32)
-        np.save(str(sidecar / "hvg.npy"), indices, allow_pickle=False)
-        loaded = np.load(str(sidecar / "hvg.npy"), allow_pickle=False)
-        np.testing.assert_array_equal(loaded, indices)
+class TestHVGRankingParquet:
+    def test_hvg_parquet_saved_and_loadable(self, tmp_path: Path):
+        table = _build_hvg_ranking_table(
+            sum_log1p=np.array([3.0, 1.5, 2.0], dtype=np.float64),
+            sum_log1p_sq=np.array([5.0, 1.5, 2.8], dtype=np.float64),
+            n_cells_total=3,
+            feature_ids=["gene_a", "gene_b", "gene_c"],
+            n_hvg=2,
+        )
+        path = tmp_path / "hvg.parquet"
+        pq.write_table(table, path)
+        loaded = pq.read_table(path)
+        assert loaded.schema == HVG_RANKING_SCHEMA
+        assert loaded.num_rows == 3
 
-    def test_nonhvg_npy_saved_and_loadable(self, tmp_path: Path):
-        """non-HVG array is saved as .npy and can be loaded back."""
-        sidecar = tmp_path / "hvg_sidecar"
-        sidecar.mkdir(parents=True, exist_ok=True)
-        indices = np.array([1, 2, 3, 4, 6, 7, 8, 9], dtype=np.int32)
-        np.save(str(sidecar / "nonhvg.npy"), indices, allow_pickle=False)
-        loaded = np.load(str(sidecar / "nonhvg.npy"), allow_pickle=False)
-        np.testing.assert_array_equal(loaded, indices)
+    def test_hvg_ranking_schema_and_default_selection_equivalence(self):
+        table = _build_hvg_ranking_table(
+            sum_log1p=np.array([6.0, 2.0, 5.0, 1.5], dtype=np.float64),
+            sum_log1p_sq=np.array([12.0, 2.5, 9.0, 1.0], dtype=np.float64),
+            n_cells_total=4,
+            feature_ids=["g0", "g1", "g2", "g3"],
+            n_hvg=2,
+        )
+        frame = table.to_pandas()
+        assert frame.columns.tolist() == [field.name for field in HVG_RANKING_SCHEMA]
+        assert frame["origin_index"].tolist() == [0, 1, 2, 3]
+        assert frame["feature_id"].tolist() == ["g0", "g1", "g2", "g3"]
+        np.testing.assert_array_equal(
+            frame["selected_at_default_n_hvg"].to_numpy(dtype=bool),
+            (frame["hvg_rank"].to_numpy(dtype=np.int32) <= 2),
+        )
 
-    def test_hvg_nonhvg_disjoint(self, tmp_path: Path):
-        """hvg and nonhvg index sets must not overlap."""
-        sidecar = tmp_path / "hvg_sidecar"
-        sidecar.mkdir(parents=True, exist_ok=True)
-        n = 50
-        hvg = np.arange(0, 20, dtype=np.int32)
-        nonhvg = np.arange(20, n, dtype=np.int32)
-        np.save(str(sidecar / "hvg.npy"), hvg, allow_pickle=False)
-        np.save(str(sidecar / "nonhvg.npy"), nonhvg, allow_pickle=False)
-        loaded_hvg = np.load(str(sidecar / "hvg.npy"), allow_pickle=False)
-        loaded_nonhvg = np.load(str(sidecar / "nonhvg.npy"), allow_pickle=False)
-        intersection = set(loaded_hvg) & set(loaded_nonhvg)
-        assert len(intersection) == 0, f"hvg and nonhvg overlap: {intersection}"
+    def test_hvg_rank_tie_breaks_by_origin_index(self):
+        table = _build_hvg_ranking_table(
+            sum_log1p=np.array([4.0, 4.0, 4.0], dtype=np.float64),
+            sum_log1p_sq=np.array([7.0, 7.0, 7.0], dtype=np.float64),
+            n_cells_total=4,
+            feature_ids=["g0", "g1", "g2"],
+            n_hvg=2,
+        )
+        frame = table.to_pandas()
+        assert frame["hvg_rank"].tolist() == [1, 2, 3]
+        assert frame["selected_at_default_n_hvg"].tolist() == [True, True, False]
 
-    def test_hvg_nonhvg_cover_all_features(self, tmp_path: Path):
-        """hvg ∪ nonhvg should cover all feature indices 0..n_vars-1."""
-        sidecar = tmp_path / "hvg_sidecar"
-        sidecar.mkdir(parents=True, exist_ok=True)
-        n = 30
-        hvg = np.array([0, 5, 10, 15, 20, 25], dtype=np.int32)
-        nonhvg = np.array([i for i in range(n) if i not in {0, 5, 10, 15, 20, 25}], dtype=np.int32)
-        np.save(str(sidecar / "hvg.npy"), hvg, allow_pickle=False)
-        np.save(str(sidecar / "nonhvg.npy"), nonhvg, allow_pickle=False)
-        loaded_hvg = np.load(str(sidecar / "hvg.npy"), allow_pickle=False)
-        loaded_nonhvg = np.load(str(sidecar / "nonhvg.npy"), allow_pickle=False)
-        union = set(loaded_hvg) | set(loaded_nonhvg)
-        assert union == set(range(n))
+    def test_stage2_materializer_writes_hvg_parquet(self, tmp_path: Path):
+        from perturb_data_lab.materializers import Stage2Materializer
 
-    def test_hvg_indices_are_original_dataset_indices(self, tmp_path: Path):
-        """HVG indices must be in original dataset index space (not token IDs)."""
-        sidecar = tmp_path / "hvg_sidecar"
-        sidecar.mkdir(parents=True, exist_ok=True)
-        # Large indices that would be out of range for a small dataset confirm
-        # they're in dataset index space, not token space
-        indices = np.array([5000, 5001, 5002], dtype=np.int32)  # hypothetical large
-        np.save(str(sidecar / "hvg.npy"), indices, allow_pickle=False)
-        loaded = np.load(str(sidecar / "hvg.npy"), allow_pickle=False)
-        np.testing.assert_array_equal(loaded, indices)
-
-    def test_hvg_array_dtype_int32(self, tmp_path: Path):
-        """HVG/non-HVG arrays must be saved as int32."""
-        sidecar = tmp_path / "hvg_sidecar"
-        sidecar.mkdir(parents=True, exist_ok=True)
-        indices = np.array([0, 5, 10], dtype=np.int32)
-        np.save(str(sidecar / "hvg.npy"), indices, allow_pickle=False)
-        loaded = np.load(str(sidecar / "hvg.npy"), allow_pickle=False)
-        assert loaded.dtype == np.int32
+        materializer = Stage2Materializer(
+            source_path="/fake/source.h5ad",
+            review_bundle_path="/fake/dataset-summary.yaml",
+            output_roots=OutputRoots(
+                metadata_root=str(tmp_path / "meta"),
+                matrix_root=str(tmp_path / "matrix"),
+            ),
+            dataset_id="syn-ds",
+            n_hvg=2,
+        )
+        path = materializer._write_hvg_ranking_parquet(
+            sum_log1p=np.array([6.0, 2.0, 5.0], dtype=np.float64),
+            sum_log1p_sq=np.array([12.0, 2.5, 9.0], dtype=np.float64),
+            n_cells_total=4,
+            feature_ids=("g0", "g1", "g2"),
+            meta_root=tmp_path / "meta",
+        )
+        loaded = pq.read_table(path).to_pandas()
+        assert path.name == "hvg.parquet"
+        assert loaded["feature_id"].tolist() == ["g0", "g1", "g2"]
+        np.testing.assert_array_equal(
+            loaded["selected_at_default_n_hvg"].to_numpy(dtype=bool),
+            (loaded["hvg_rank"].to_numpy(dtype=np.int32) <= 2),
+        )
 
 
 # ---------------------------------------------------------------------------
-# MaterializationManifest hvg_sidecar_path wiring
+# MaterializationManifest HVG ranking wiring
 # ---------------------------------------------------------------------------
 
 
-class TestMaterializationManifestHVGPath:
-    def test_manifest_hvg_sidecar_path_set(self, tmp_path: Path):
-        """MaterializationManifest can hold hvg_sidecar_path."""
+class TestMaterializationManifestHVGRoundTrip:
+    def test_manifest_hvg_ranking_path_set(self, tmp_path: Path):
+        """MaterializationManifest can hold hvg_ranking_path and default_n_hvg."""
         manifest = MaterializationManifest(
             kind="materialization-manifest",
             contract_version=CONTRACT_VERSION,
@@ -189,13 +200,15 @@ class TestMaterializationManifestHVGPath:
                 source_path="/path/to/source.h5ad",
                 review_bundle="/path/to/dataset-summary.yaml",
             ),
-            hvg_sidecar_path=str(tmp_path / "meta/hvg_sidecar"),
+            hvg_ranking_path=str(tmp_path / "meta/hvg.parquet"),
+            default_n_hvg=2000,
         )
         path = tmp_path / "manifest.yaml"
         manifest.write_yaml(path)
         loaded = MaterializationManifest.from_yaml_file(path)
-        assert loaded.hvg_sidecar_path is not None
-        assert "hvg_sidecar" in loaded.hvg_sidecar_path
+        assert loaded.hvg_ranking_path is not None
+        assert loaded.hvg_ranking_path.endswith("hvg.parquet")
+        assert loaded.default_n_hvg == 2000
 
 
 # ---------------------------------------------------------------------------
@@ -375,18 +388,18 @@ class TestUpdateCorpusIndexWithEmissionSpec:
 
 
 # ---------------------------------------------------------------------------
-# Verify hvg_sidecar_path in manifest
+# Verify hvg_ranking_path in manifest
 # ---------------------------------------------------------------------------
 
 
-class TestMaterializationManifestHVGPath:
-    def test_materialization_manifest_includes_hvg_sidecar_path(self, tmp_path: Path):
-        """After Stage2Materializer materialization, manifest.hvg_sidecar_path is set."""
+class TestMaterializationManifestHVGRecord:
+    def test_materialization_manifest_includes_hvg_ranking_path(self, tmp_path: Path):
+        """After materialization, manifest.hvg_ranking_path records hvg.parquet."""
         output_roots = OutputRoots(
             metadata_root=str(tmp_path / "meta"),
             matrix_root=str(tmp_path / "matrix"),
         )
-        # Verify the manifest model accepts hvg_sidecar_path
+        # Verify the manifest model accepts hvg_ranking_path
         manifest = MaterializationManifest(
             kind="materialization-manifest",
             contract_version=CONTRACT_VERSION,
@@ -400,10 +413,12 @@ class TestMaterializationManifestHVGPath:
                 source_path="/fake/source.h5ad",
                 review_bundle="/fake/dataset-summary.yaml",
             ),
-            hvg_sidecar_path=str(tmp_path / "meta/hvg_sidecar"),
+            hvg_ranking_path=str(tmp_path / "meta/hvg.parquet"),
+            default_n_hvg=1500,
         )
         manifest_path = tmp_path / "test-manifest.yaml"
         manifest.write_yaml(manifest_path)
         loaded = MaterializationManifest.from_yaml_file(manifest_path)
-        assert loaded.hvg_sidecar_path is not None
-        assert "hvg_sidecar" in loaded.hvg_sidecar_path
+        assert loaded.hvg_ranking_path is not None
+        assert loaded.hvg_ranking_path.endswith("hvg.parquet")
+        assert loaded.default_n_hvg == 1500

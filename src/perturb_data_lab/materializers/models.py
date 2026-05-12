@@ -258,7 +258,9 @@ class MaterializationManifest(YamlDocument):
     size_factor_manifest_path: str | None = None  # deprecated: YAML size-factor manifest (no longer written)
     size_factor_parquet_path: str | None = None  # Parquet: per-cell size factors (separate from cells parquet)
     qa_manifest_path: str | None = None
-    hvg_sidecar_path: str | None = None
+    hvg_sidecar_path: str | None = None  # legacy fallback for older corpora
+    hvg_ranking_path: str | None = None  # canonical per-dataset hvg.parquet artifact
+    default_n_hvg: int | None = None
     integer_verified: bool = False
     cell_count: int = 0  # number of cells materialized (set by materialize() for corpus index use)
     feature_count: int = 0  # number of features in dataset-local feature space
@@ -337,6 +339,12 @@ class MaterializationManifest(YamlDocument):
             size_factor_parquet_path=data.get("size_factor_parquet_path"),
             qa_manifest_path=data.get("qa_manifest_path"),
             hvg_sidecar_path=data.get("hvg_sidecar_path"),
+            hvg_ranking_path=data.get("hvg_ranking_path"),
+            default_n_hvg=(
+                int(data["default_n_hvg"])
+                if data.get("default_n_hvg") is not None
+                else None
+            ),
             integer_verified=bool(data.get("integer_verified", False)),
             cell_count=int(data.get("cell_count", 0)),
             feature_count=int(data.get("feature_count", 0)),

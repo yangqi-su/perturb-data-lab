@@ -30,10 +30,10 @@ class CorpusEmissionSpec:
     spec remain available in the SQLite backing store but are not
     emitted.
 
-    The ``hvg_sidecar_path`` field points to the directory containing
-    per-dataset ``hvg.npy`` and ``nonhvg.npy`` artifacts (written during
-    materialization).  Loaders read these files to construct HVG token
-    ID sets for ``HVGRandomSampler``.
+    The ``hvg_ranking_path`` field points to the canonical per-dataset
+    ``hvg.parquet`` ranking artifact written during materialization.
+    ``hvg_sidecar_path`` is retained only as a legacy fallback for older corpora
+    that still ship ``hvg.npy`` / ``nonhvg.npy`` sidecars.
     """
 
     kind: str = "corpus-emission-spec"
@@ -60,7 +60,9 @@ class CorpusEmissionSpec:
         )
     )
     output_convention: str = "dict"  # only "dict" for now
-    hvg_sidecar_path: str | None = None  # relative path from corpus root
+    hvg_sidecar_path: str | None = None  # relative path from corpus root (legacy)
+    hvg_ranking_path: str | None = None  # relative path from corpus root
+    default_n_hvg: int | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -71,6 +73,8 @@ class CorpusEmissionSpec:
             "context_fields": list(self.context_fields),
             "output_convention": self.output_convention,
             "hvg_sidecar_path": self.hvg_sidecar_path,
+            "hvg_ranking_path": self.hvg_ranking_path,
+            "default_n_hvg": self.default_n_hvg,
         }
 
     def to_yaml(self) -> str:
@@ -90,6 +94,12 @@ class CorpusEmissionSpec:
             context_fields=tuple(str(f) for f in data.get("context_fields", [])),
             output_convention=str(data.get("output_convention", "dict")),
             hvg_sidecar_path=data.get("hvg_sidecar_path"),
+            hvg_ranking_path=data.get("hvg_ranking_path"),
+            default_n_hvg=(
+                int(data["default_n_hvg"])
+                if data.get("default_n_hvg") is not None
+                else None
+            ),
         )
 
     @classmethod
