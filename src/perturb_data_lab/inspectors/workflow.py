@@ -11,6 +11,7 @@ from scipy.sparse import issparse
 
 from ..contracts import CONTRACT_VERSION
 from .models import (
+    ControlLabelCandidate,
     CountSourceCandidate,
     CountSourceDecision,
     DatasetIdentity,
@@ -26,6 +27,38 @@ from .models import (
 
 DEFAULT_FIELD_SAMPLE_SIZE = 5
 DEFAULT_MATRIX_SAMPLE_ROWS = 32
+CONTROL_SCAN_LIMIT = 256
+
+_CONTROL_SCAN_COLUMNS: tuple[str, ...] = (
+    "perturbation",
+    "perturb_label",
+    "guide_id",
+    "sgRNA",
+    "target_gene",
+    "condition",
+    "treatment",
+    "genotype",
+    "control",
+    "is_control",
+)
+_STRONG_CONTROL_LABELS: frozenset[str] = frozenset(
+    {
+        "ctrl",
+        "control",
+        "ntc",
+        "nontargeting",
+        "nonperturbing",
+        "nonperturbed",
+        "scramble",
+        "scrambled",
+    }
+)
+_AMBIGUOUS_CONTROL_LABELS: frozenset[str] = frozenset(
+    {"wt", "wildtype", "untreated", "vehicle", "mock", "baseline"}
+)
+_BOOLEAN_CONTROL_LABELS: frozenset[str] = frozenset(
+    {"1", "t", "true", "y", "yes"}
+)
 
 
 @dataclass(frozen=True)
@@ -43,12 +76,21 @@ def _normalize_label(value: str) -> str:
 def _sample_examples(
     series: object, sample_size: int = DEFAULT_FIELD_SAMPLE_SIZE
 ) -> tuple[str, ...]:
+    return _sample_distinct_values(series, sample_size=sample_size)
+
+
+def _sample_distinct_values(
+    series: object,
+    *,
+    sample_size: int,
+    scan_limit: int = CONTROL_SCAN_LIMIT,
+) -> tuple[str, ...]:
     non_null = series.dropna()
     if non_null.empty:
         return ()
     values = []
     seen = set()
-    for value in non_null.astype(str).head(sample_size * 3).tolist():
+    for value in non_null.astype(str).head(scan_limit).tolist():
         if value not in seen:
             values.append(value)
             seen.add(value)
@@ -72,6 +114,78 @@ def _profile_fields(frame: object) -> tuple[FieldProfile, ...]:
             )
         )
     return tuple(profiles)
+
+
+def _detect_control_label_candidates(frame: object) -> tuple[ControlLabelCandidate, ...]:
+    columns_by_lower = {str(column).lower(): str(column) for column in frame.columns.tolist()}
+    candidates: list[ControlLabelCandidate] = []
+
+    for requested_column in _CONTROL_SCAN_COLUMNS:
+        actual_column = columns_by_lower.get(requested_column.lower())
+        if actual_column is None:
+            continue
+
+        sampled_values = _sample_distinct_values(
+            frame[actual_column],
+            sample_size=12,
+        )
+        if not sampled_values:
+            continue
+
+        strong_matches = [
+            value for value in sampled_values if _normalize_label(value) in _STRONG_CONTROL_LABELS
+        ]
+        ambiguous_matches = [
+            value for value in sampled_values if _normalize_label(value) in _AMBIGUOUS_CONTROL_LABELS
+        ]
+        boolean_matches = [
+            value
+            for value in sampled_values
+            if _normalize_label(value) in _BOOLEAN_CONTROL_LABELS
+        ]
+
+        if actual_column.lower() in {"control", "is_control"} and boolean_matches:
+            candidates.append(
+                ControlLabelCandidate(
+                    column=actual_column,
+                    candidate_values=tuple(boolean_matches),
+                    suggested_output="ctrl",
+                    confidence="high",
+                    reason=(
+                        f"explicit control indicator column `{actual_column}` includes true-like values"
+                    ),
+                )
+            )
+            continue
+
+        if strong_matches:
+            candidates.append(
+                ControlLabelCandidate(
+                    column=actual_column,
+                    candidate_values=tuple(strong_matches),
+                    suggested_output="ctrl",
+                    confidence="high",
+                    reason=(
+                        f"sampled values in `{actual_column}` include explicit control-like labels"
+                    ),
+                )
+            )
+            continue
+
+        if ambiguous_matches:
+            candidates.append(
+                ControlLabelCandidate(
+                    column=actual_column,
+                    candidate_values=tuple(ambiguous_matches),
+                    suggested_output="ctrl",
+                    confidence="low",
+                    reason=(
+                        f"sampled values in `{actual_column}` look baseline-like but are ambiguous"
+                    ),
+                )
+            )
+
+    return tuple(candidates)
 
 
 def _sample_row_indices(row_count: int, sample_rows: int) -> np.ndarray:
@@ -448,6 +562,7 @@ def inspect_target(target: InspectionTarget, output_root: Path) -> InspectionArt
     try:
         obs_fields = _profile_fields(adata.obs)
         var_fields = _profile_fields(adata.var)
+        control_label_candidates = _detect_control_label_candidates(adata.obs)
 
         candidates = []
         try:
@@ -496,12 +611,22 @@ def inspect_target(target: InspectionTarget, output_root: Path) -> InspectionArt
             ),
             obs_fields=obs_fields,
             var_fields=var_fields,
+            control_label_candidates=control_label_candidates,
             count_source_candidates=ranked_candidates,
             count_source_decision=count_decision,
             materialization_readiness=readiness,
-            inspector_notes=(
-                "metadata-first scan used backed h5ad access",
-                "matrix audit used sampled rows only and did not materialize the full matrix",
+            inspector_notes=tuple(
+                note
+                for note in (
+                    "metadata-first scan used backed h5ad access",
+                    "matrix audit used sampled rows only and did not materialize the full matrix",
+                    (
+                        f"detected {len(control_label_candidates)} control-label candidate columns"
+                        if control_label_candidates
+                        else None
+                    ),
+                )
+                if note is not None
             ),
         )
 

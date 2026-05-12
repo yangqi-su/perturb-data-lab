@@ -606,3 +606,92 @@ class TestHintOverrides:
         assert mappings["disease_state"].literal_value == "cancer"
         assert mappings["sex"].literal_value == "female"
         assert mappings["dataset_index"].literal_value == "3"
+
+
+class TestInspectionDrivenSuggestions:
+    def test_draft_schema_suggests_control_mapping_transform(self):
+        schema = draft_canonicalization_schema(
+            "test_control_suggestion",
+            obs_columns=["cell_id", "perturbation"],
+            var_columns=["feature_id"],
+            hints={
+                "sampled_obs_values": {
+                    "perturbation": [" NTC ", "STAT1", "IRF1"],
+                },
+                "control_label_candidates": [
+                    {
+                        "column": "perturbation",
+                        "candidate_values": ["NTC"],
+                        "suggested_output": "ctrl",
+                        "confidence": "high",
+                        "reason": "explicit control labels",
+                    }
+                ],
+            },
+        )
+
+        mapping = {m.canonical_name: m for m in schema.obs_column_mappings}["perturb_label"]
+        transform_names = [transform.name for transform in mapping.transforms]
+        assert "strip_whitespace" in transform_names
+        assert "map_control_labels" in transform_names
+        control_transform = next(
+            transform for transform in mapping.transforms if transform.name == "map_control_labels"
+        )
+        assert control_transform.args["candidates"] == ["NTC"]
+        assert control_transform.args["output"] == "ctrl"
+
+    def test_draft_schema_suggests_coalesce_for_complementary_columns(self):
+        schema = draft_canonicalization_schema(
+            "test_coalesce_suggestion",
+            obs_columns=["cell_id", "perturbation", "target_gene"],
+            var_columns=["feature_id"],
+            hints={
+                "sampled_obs_values": {
+                    "perturbation": ["", "NTC", ""],
+                    "target_gene": ["STAT1", "STAT1", "IRF1"],
+                },
+                "obs_field_profiles": {
+                    "perturbation": {
+                        "dtype": "object",
+                        "null_count": 2,
+                        "sampled_unique_values": 2,
+                    },
+                    "target_gene": {
+                        "dtype": "object",
+                        "null_count": 0,
+                        "sampled_unique_values": 2,
+                    },
+                },
+                "control_label_candidates": [
+                    {
+                        "column": "perturbation",
+                        "candidate_values": ["NTC"],
+                        "suggested_output": "ctrl",
+                        "confidence": "high",
+                        "reason": "explicit control labels",
+                    }
+                ],
+            },
+        )
+
+        mapping = {m.canonical_name: m for m in schema.obs_column_mappings}["perturb_label"]
+        assert mapping.strategy == "coalesce"
+        assert mapping.source_columns == ("perturbation", "target_gene")
+        assert any(transform.name == "map_control_labels" for transform in mapping.transforms)
+        assert any("coalesce" in note.lower() for note in schema.notes)
+
+    def test_draft_schema_suggests_stripping_ensembl_versions(self):
+        schema = draft_canonicalization_schema(
+            "test_ensembl_version_suggestion",
+            obs_columns=["cell_id", "perturbation"],
+            var_columns=["feature_id"],
+            hints={
+                "sampled_gene_ids": ["ENSG00000141510.18", "ENSG00000139618.12"],
+                "sampled_var_values": {
+                    "feature_id": ["ENSG00000141510.18", "ENSG00000139618.12"],
+                },
+            },
+        )
+
+        mapping = {m.canonical_name: m for m in schema.var_column_mappings}["gene_id"]
+        assert any(transform.name == "strip_ensembl_version" for transform in mapping.transforms)

@@ -8,6 +8,7 @@ Heuristics are explicit and auditable — no black-box LLM calls.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import re
 from typing import Any
 
@@ -304,6 +305,15 @@ def _suggest_transforms(
 
     # If sampled values are provided, run value-based detection
     if sampled_values:
+        if any(str(value) != str(value).strip() for value in sampled_values):
+            transforms.append(TransformRule(name="strip_whitespace", args={}))
+        if any(str(value).strip() == "" for value in sampled_values):
+            transforms.append(TransformRule(name="replace_empty_with_null", args={}))
+        if canonical == "perturb_label" and any(
+            _looks_like_guide_label(value) for value in sampled_values[:50]
+        ):
+            transforms.append(TransformRule(name="strip_guide_suffix", args={}))
+
         _dose_count = 0
         _time_count = 0
         for v in sampled_values[:50]:  # Sample up to 50 values
@@ -329,6 +339,8 @@ def _suggest_transforms(
 
 _DOSE_RE = re.compile(r"^[0-9.]+\s*(nM|uM|μM|mM|mg/kg|μg/kg|ug/kg)\s*$", re.IGNORECASE)
 _TIME_RE = re.compile(r"^[0-9.]+\s*(h|hr|hrs|d|day|days|m|min|mins)\s*$", re.IGNORECASE)
+_GUIDE_SUFFIX_RE = re.compile(r"(?i)(?:[_\-\s](?:sg|guide|grna)\d+|[_\-]\d+)$")
+_VERSIONED_ENSEMBL_RE = re.compile(r"^ENS[A-Z]*[GT]\d+\.\d+$", re.IGNORECASE)
 
 
 def _looks_like_dose(value: str) -> bool:
@@ -337,6 +349,229 @@ def _looks_like_dose(value: str) -> bool:
 
 def _looks_like_time(value: str) -> bool:
     return bool(_TIME_RE.match(str(value).strip()))
+
+
+def _looks_like_guide_label(value: str) -> bool:
+    return bool(_GUIDE_SUFFIX_RE.search(str(value).strip()))
+
+
+def _sampled_obs_values_from_hints(hints: dict[str, Any]) -> dict[str, list[str]]:
+    sampled = hints.get("sampled_obs_values", {})
+    return sampled if isinstance(sampled, dict) else {}
+
+
+def _sampled_var_values_from_hints(hints: dict[str, Any]) -> dict[str, list[str]]:
+    sampled = hints.get("sampled_var_values", {})
+    return sampled if isinstance(sampled, dict) else {}
+
+
+def _field_profiles_from_hints(hints: dict[str, Any], key: str) -> dict[str, dict[str, Any]]:
+    profiles = hints.get(key, {})
+    return profiles if isinstance(profiles, dict) else {}
+
+
+def _merge_transforms(*groups: tuple[TransformRule, ...]) -> tuple[TransformRule, ...]:
+    merged: list[TransformRule] = []
+    seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+    for group in groups:
+        for transform in group:
+            key = (
+                transform.name,
+                tuple(sorted((str(name), str(value)) for name, value in transform.args.items())),
+            )
+            if key in seen:
+                continue
+            merged.append(transform)
+            seen.add(key)
+    return tuple(merged)
+
+
+def _obs_source_columns(mapping: ObsColumnMapping) -> tuple[str, ...]:
+    if mapping.source_columns:
+        return mapping.source_columns
+    if mapping.source_column is not None:
+        return (mapping.source_column,)
+    return ()
+
+
+def _is_textual_profile(profile: dict[str, Any] | None) -> bool:
+    if not profile:
+        return False
+    dtype = str(profile.get("dtype", "")).lower()
+    return any(token in dtype for token in ("object", "string", "category"))
+
+
+def _collect_obs_candidate_columns(raw_columns: list[str], aliases: tuple[str, ...]) -> tuple[str, ...]:
+    matches: list[str] = []
+    seen: set[str] = set()
+    for alias in aliases:
+        alias_lower = alias.lower()
+        alias_norm = _normalize(alias)
+        for column in raw_columns:
+            if column in seen:
+                continue
+            column_lower = column.lower()
+            column_norm = _normalize(column)
+            if (
+                column_lower == alias_lower
+                or column_norm == alias_norm
+                or alias_lower in column_lower
+                or (alias_norm and alias_norm in column_norm)
+            ):
+                matches.append(column)
+                seen.add(column)
+                break
+    return tuple(matches)
+
+
+def _suggest_coalesce_columns(
+    canonical_name: str,
+    raw_columns: list[str],
+    hints: dict[str, Any],
+) -> tuple[str, ...]:
+    if canonical_name != "perturb_label":
+        return ()
+    profiles = _field_profiles_from_hints(hints, "obs_field_profiles")
+    columns = [
+        column
+        for column in _collect_obs_candidate_columns(
+            raw_columns,
+            _CANONICAL_OBS_ALIASES["perturb_label"],
+        )
+        if _is_textual_profile(profiles.get(column))
+    ]
+    if len(columns) < 2:
+        return ()
+    first_null_count = int(profiles.get(columns[0], {}).get("null_count", 0))
+    if first_null_count <= 0 and not any(
+        int(profiles.get(column, {}).get("null_count", 0)) < first_null_count
+        for column in columns[1:]
+    ):
+        return ()
+    return tuple(columns[:3])
+
+
+def _control_candidates_from_hints(hints: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_candidates = hints.get("control_label_candidates", ())
+    if not isinstance(raw_candidates, (list, tuple)):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for candidate in raw_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        values = candidate.get("candidate_values", ())
+        normalized.append(
+            {
+                "column": str(candidate.get("column", "")),
+                "candidate_values": tuple(str(value) for value in values),
+                "suggested_output": str(candidate.get("suggested_output", "ctrl")),
+                "confidence": str(candidate.get("confidence", "low")),
+                "reason": str(candidate.get("reason", "")),
+            }
+        )
+    return normalized
+
+
+def _apply_obs_suggestion_overrides(
+    obs_mappings: list[ObsColumnMapping],
+    obs_columns: list[str],
+    hints: dict[str, Any],
+    notes: list[str],
+) -> list[ObsColumnMapping]:
+    updated = list(obs_mappings)
+    mapping_by_name = {mapping.canonical_name: index for index, mapping in enumerate(updated)}
+    perturb_index = mapping_by_name.get("perturb_label")
+    if perturb_index is None:
+        return updated
+
+    mapping = updated[perturb_index]
+    sampled_obs_values = _sampled_obs_values_from_hints(hints)
+    coalesce_columns = _suggest_coalesce_columns("perturb_label", obs_columns, hints)
+    if coalesce_columns:
+        combined_samples = [
+            sample
+            for column in coalesce_columns
+            for sample in sampled_obs_values.get(column, [])
+        ]
+        mapping = replace(
+            mapping,
+            strategy="coalesce",
+            source_column=None,
+            source_columns=coalesce_columns,
+            transforms=_merge_transforms(
+                _suggest_transforms("perturb_label", coalesce_columns[0], combined_samples),
+                mapping.transforms,
+            ),
+        )
+        notes.append(
+            "[review-needed] suggested `coalesce` mapping for 'perturb_label' from "
+            f"{list(coalesce_columns)} because likely label columns show complementary coverage."
+        )
+
+    source_columns = set(_obs_source_columns(mapping))
+    for candidate in _control_candidates_from_hints(hints):
+        if candidate["column"] not in source_columns:
+            continue
+        if candidate["confidence"] == "high" and candidate["candidate_values"]:
+            mapping = replace(
+                mapping,
+                transforms=_merge_transforms(
+                    mapping.transforms,
+                    (
+                        TransformRule(
+                            name="map_control_labels",
+                            args={
+                                "candidates": list(candidate["candidate_values"]),
+                                "output": candidate["suggested_output"],
+                            },
+                        ),
+                    ),
+                ),
+            )
+            notes.append(
+                "[review-needed] suggested `map_control_labels` for 'perturb_label' from "
+                f"inspection evidence on `{candidate['column']}`: {list(candidate['candidate_values'])}."
+            )
+        else:
+            notes.append(
+                "[review-needed] inspection found ambiguous control-like labels for "
+                f"`{candidate['column']}` ({list(candidate['candidate_values'])}); no automatic control transform was added."
+            )
+
+    updated[perturb_index] = mapping
+    return updated
+
+
+def _apply_var_suggestion_overrides(
+    var_mappings: list[VarColumnMapping],
+    hints: dict[str, Any],
+    notes: list[str],
+) -> list[VarColumnMapping]:
+    updated = list(var_mappings)
+    mapping_by_name = {mapping.canonical_name: index for index, mapping in enumerate(updated)}
+    gene_index = mapping_by_name.get("gene_id")
+    if gene_index is None:
+        return updated
+    mapping = updated[gene_index]
+    if mapping.source_column is None:
+        return updated
+    sampled_var_values = _sampled_var_values_from_hints(hints)
+    sampled_values = sampled_var_values.get(mapping.source_column, [])
+    if sampled_values and sum(bool(_VERSIONED_ENSEMBL_RE.match(value)) for value in sampled_values) >= max(
+        1, len(sampled_values) // 2 + len(sampled_values) % 2
+    ):
+        mapping = replace(
+            mapping,
+            transforms=_merge_transforms(
+                mapping.transforms,
+                (TransformRule(name="strip_ensembl_version", args={}),),
+            ),
+        )
+        notes.append(
+            "[review-needed] suggested `strip_ensembl_version` for 'gene_id' because sampled IDs look versioned Ensembl-style."
+        )
+    updated[gene_index] = mapping
+    return updated
 
 
 # ---------------------------------------------------------------------------
@@ -435,26 +670,30 @@ def draft_canonicalization_schema(
 
     # --- Obs mappings ---
     obs_mappings: list[ObsColumnMapping] = []
-    mapped_obs_raw: set[str] = set()
 
     for canonical_name in CANONICAL_OBS_MUST_HAVE:
         mapping = _draft_obs_mapping(canonical_name, obs_columns, hints, notes)
         obs_mappings.append(mapping)
-        if mapping.source_column is not None:
-            mapped_obs_raw.add(mapping.source_column)
+    obs_mappings = _apply_obs_suggestion_overrides(obs_mappings, obs_columns, hints, notes)
+    mapped_obs_raw: set[str] = {
+        source_column
+        for mapping in obs_mappings
+        for source_column in _obs_source_columns(mapping)
+    }
 
     # --- Var mappings ---
     var_mappings: list[VarColumnMapping] = []
-    mapped_var_raw: set[str] = set()
 
     gene_id_col: str | None = None
     for canonical_name in CANONICAL_VAR_MUST_HAVE:
         mapping = _draft_var_mapping(canonical_name, var_columns, hints, notes)
         var_mappings.append(mapping)
-        if mapping.source_column is not None:
-            mapped_var_raw.add(mapping.source_column)
         if canonical_name == "gene_id":
             gene_id_col = mapping.source_column
+    var_mappings = _apply_var_suggestion_overrides(var_mappings, hints, notes)
+    mapped_var_raw: set[str] = {
+        mapping.source_column for mapping in var_mappings if mapping.source_column is not None
+    }
 
     # --- Gene mapping inference ---
     sampled_gene_ids = hints.get("sampled_gene_ids")

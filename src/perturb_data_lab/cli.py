@@ -988,10 +988,56 @@ def _cmd_draft_schema(args: argparse.Namespace) -> None:
             continue
 
         summary = DatasetSummaryDocument.from_yaml_file(summary_path)
+        sampled_obs_values = {
+            field.name: list(field.examples)
+            for field in summary.obs_fields
+        }
+        sampled_var_values = {
+            field.name: list(field.examples)
+            for field in summary.var_fields
+        }
+        sampled_gene_ids: list[str] = []
+        for field in summary.var_fields:
+            lowered = field.name.lower()
+            if lowered in {
+                "feature_id",
+                "gene_id",
+                "gene",
+                "gene_name",
+                "gene_symbol",
+                "symbol",
+                "feature_name",
+                "gene_identifier",
+            }:
+                sampled_gene_ids = list(field.examples)
+                break
         schema = draft_canonicalization_schema(
             dataset_id=dataset_id,
             obs_columns=[field.name for field in summary.obs_fields],
             var_columns=[field.name for field in summary.var_fields],
+            hints={
+                "sampled_obs_values": sampled_obs_values,
+                "sampled_var_values": sampled_var_values,
+                "sampled_gene_ids": sampled_gene_ids,
+                "obs_field_profiles": {
+                    field.name: {
+                        "dtype": field.dtype,
+                        "null_count": field.null_count,
+                        "sampled_unique_values": field.sampled_unique_values,
+                    }
+                    for field in summary.obs_fields
+                },
+                "control_label_candidates": [
+                    {
+                        "column": candidate.column,
+                        "candidate_values": list(candidate.candidate_values),
+                        "suggested_output": candidate.suggested_output,
+                        "confidence": candidate.confidence,
+                        "reason": candidate.reason,
+                    }
+                    for candidate in summary.control_label_candidates
+                ],
+            },
         )
         schema.write_yaml(draft_path)
         drafted += 1

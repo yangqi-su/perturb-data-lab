@@ -100,6 +100,25 @@ class FieldProfile:
 
 
 @dataclass(frozen=True)
+class ControlLabelCandidate:
+    column: str
+    candidate_values: tuple[str, ...]
+    suggested_output: str
+    confidence: str
+    reason: str
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ControlLabelCandidate":
+        return cls(
+            column=str(data["column"]),
+            candidate_values=tuple(str(item) for item in data.get("candidate_values", [])),
+            suggested_output=str(data.get("suggested_output", "ctrl")),
+            confidence=str(data.get("confidence", "low")),
+            reason=str(data.get("reason", "")),
+        )
+
+
+@dataclass(frozen=True)
 class CountSourceCandidate:
     candidate: str
     rank: int
@@ -167,6 +186,7 @@ class DatasetSummaryDocument(YamlDocument):
     count_source_candidates: tuple[CountSourceCandidate, ...]
     count_source_decision: CountSourceDecision
     materialization_readiness: str
+    control_label_candidates: tuple[ControlLabelCandidate, ...] = ()
     inspector_notes: tuple[str, ...] = ()
 
     def validate(self) -> None:
@@ -186,6 +206,9 @@ class DatasetSummaryDocument(YamlDocument):
             structure=StructureSummary.from_dict(data["structure"]),
             obs_fields=_coerce_tuple(data.get("obs_fields"), FieldProfile),
             var_fields=_coerce_tuple(data.get("var_fields"), FieldProfile),
+            control_label_candidates=_coerce_tuple(
+                data.get("control_label_candidates"), ControlLabelCandidate
+            ),
             count_source_candidates=_coerce_tuple(
                 data.get("count_source_candidates"), CountSourceCandidate
             ),

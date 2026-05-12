@@ -1429,6 +1429,103 @@ class TestDraftSchemaCmd:
 
         assert (meta_root / "draft-schema.yaml").exists()
 
+    def test_cmd_draft_schema_uses_inspection_suggestions(self, tmp_path: Path):
+        from perturb_data_lab.canonical.contract import CanonicalizationSchema
+        from perturb_data_lab.cli import _cmd_draft_schema
+
+        corpus_root = tmp_path / "corpus"
+        meta_root = corpus_root / "meta" / "dummy_00"
+        meta_root.mkdir(parents=True)
+
+        (meta_root / "dataset-summary.yaml").write_text(yaml.safe_dump({
+            "kind": "dataset-summary",
+            "contract_version": "0.3.0",
+            "dataset": {
+                "dataset_id": "dummy_00",
+                "source_release": "dummy_00",
+                "source_path": "/fake.h5ad",
+                "obs_rows": 10,
+                "var_rows": 5,
+                "obs_index_name": "index",
+                "var_index_name": "index",
+            },
+            "structure": {
+                "has_raw": False,
+                "raw_var_rows": 0,
+                "layers": [],
+            },
+            "obs_fields": [
+                {
+                    "name": "perturbation",
+                    "dtype": "object",
+                    "null_count": 0,
+                    "sampled_unique_values": 2,
+                    "examples": [" NTC ", "STAT1"],
+                },
+                {
+                    "name": "cell_id",
+                    "dtype": "object",
+                    "null_count": 0,
+                    "sampled_unique_values": 2,
+                    "examples": ["c1", "c2"],
+                },
+            ],
+            "var_fields": [
+                {
+                    "name": "feature_id",
+                    "dtype": "object",
+                    "null_count": 0,
+                    "sampled_unique_values": 2,
+                    "examples": ["ENSG00000141510.18", "ENSG00000139618.12"],
+                }
+            ],
+            "control_label_candidates": [
+                {
+                    "column": "perturbation",
+                    "candidate_values": ["NTC"],
+                    "suggested_output": "ctrl",
+                    "confidence": "high",
+                    "reason": "explicit control labels",
+                }
+            ],
+            "count_source_candidates": [],
+            "count_source_decision": {
+                "selected_candidate": ".X",
+                "status": "pass",
+                "confidence": "high",
+                "recovery_policy": "not-needed",
+                "rationale": "test",
+                "uses_recovery": False,
+            },
+            "materialization_readiness": "pass",
+            "inspector_notes": [],
+        }))
+
+        (corpus_root / "corpus-index.yaml").write_text(yaml.safe_dump({
+            "kind": "corpus-index",
+            "contract_version": "0.3.0",
+            "corpus_id": "test-v0",
+            "global_metadata": {"backend": "lance", "topology": "aggregate"},
+            "datasets": [{
+                "dataset_id": "dummy_00",
+                "join_mode": "create_new",
+                "manifest_path": "meta/dummy_00/materialization-manifest.yaml",
+                "dataset_index": 0,
+                "cell_count": 10,
+                "global_start": 0,
+                "global_end": 10,
+            }],
+        }))
+
+        args = argparse.Namespace(corpus=str(corpus_root), force_all=False)
+        _cmd_draft_schema(args)
+
+        schema = CanonicalizationSchema.from_yaml_file(meta_root / "draft-schema.yaml")
+        perturb_mapping = {m.canonical_name: m for m in schema.obs_column_mappings}["perturb_label"]
+        assert any(transform.name == "map_control_labels" for transform in perturb_mapping.transforms)
+        gene_mapping = {m.canonical_name: m for m in schema.var_column_mappings}["gene_id"]
+        assert any(transform.name == "strip_ensembl_version" for transform in gene_mapping.transforms)
+
 
 class TestMaterializeCmd:
     """Test _cmd_materialize backend/topology auto-detection behavior."""

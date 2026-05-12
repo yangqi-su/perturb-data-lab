@@ -108,3 +108,85 @@ def test_inspector_prefers_textual_guide_fields_over_numeric_scores(
     assert summary.count_source_decision.selected_candidate in {".X", ".raw.X"}
     # Readiness is count-only
     assert summary.materialization_readiness in {"pass", "needs-review"}
+
+
+def test_inspector_detects_high_confidence_control_candidates(tmp_path: Path) -> None:
+    obs = pd.DataFrame(
+        {
+            "perturbation": ["NTC", "STAT1", "non-targeting"],
+            "is_control": ["yes", "no", "yes"],
+        },
+        index=["cell-1", "cell-2", "cell-3"],
+    )
+    var = pd.DataFrame(index=["gene-a", "gene-b"])
+    counts = csr_matrix(np.array([[1, 0], [0, 2], [4, 1]], dtype=np.int32))
+    adata = ad.AnnData(X=counts, obs=obs, var=var)
+
+    source_path = tmp_path / "controls.h5ad"
+    adata.write_h5ad(source_path)
+
+    output_root = tmp_path / "outputs"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                f"output_root: {output_root}",
+                "datasets:",
+                "  - dataset_id: controls",
+                f"    source_path: {source_path}",
+                "    source_release: synthetic-v1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    run_batch(InspectionBatchConfig.from_yaml_file(config_path), workers=1)
+    summary = DatasetSummaryDocument.from_yaml_file(
+        output_root / "controls" / "dataset-summary.yaml"
+    )
+
+    candidates = {candidate.column: candidate for candidate in summary.control_label_candidates}
+    assert candidates["perturbation"].confidence == "high"
+    assert set(candidates["perturbation"].candidate_values) == {"NTC", "non-targeting"}
+    assert candidates["is_control"].confidence == "high"
+    assert set(candidates["is_control"].candidate_values) == {"yes"}
+
+
+def test_inspector_marks_ambiguous_control_candidates_for_review(tmp_path: Path) -> None:
+    obs = pd.DataFrame(
+        {
+            "condition": ["WT", "STAT1_KO", "WT"],
+        },
+        index=["cell-1", "cell-2", "cell-3"],
+    )
+    var = pd.DataFrame(index=["gene-a", "gene-b"])
+    counts = csr_matrix(np.array([[1, 0], [0, 2], [4, 1]], dtype=np.int32))
+    adata = ad.AnnData(X=counts, obs=obs, var=var)
+
+    source_path = tmp_path / "ambiguous-controls.h5ad"
+    adata.write_h5ad(source_path)
+
+    output_root = tmp_path / "outputs"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                f"output_root: {output_root}",
+                "datasets:",
+                "  - dataset_id: ambiguous_controls",
+                f"    source_path: {source_path}",
+                "    source_release: synthetic-v1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    run_batch(InspectionBatchConfig.from_yaml_file(config_path), workers=1)
+    summary = DatasetSummaryDocument.from_yaml_file(
+        output_root / "ambiguous_controls" / "dataset-summary.yaml"
+    )
+
+    candidates = {candidate.column: candidate for candidate in summary.control_label_candidates}
+    assert candidates["condition"].confidence == "low"
+    assert candidates["condition"].candidate_values == ("WT",)
+    assert "ambiguous" in candidates["condition"].reason.lower()
