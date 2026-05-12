@@ -54,6 +54,13 @@ from .gpu_pipeline import (
     GPUSparsePipeline,
     CPUPipeline,
 )
+from .adapters import (
+    CategoricalLabelMap,
+    PertTFAdapterConfig,
+    PertTFCorpusAdapter,
+    PertTFLabelAdapter,
+    PertTFVocabAdapter,
+)
 
 __all__ = [
     # Phase 1 — MetadataIndex
@@ -100,6 +107,12 @@ __all__ = [
     # Phase 3 — GPU Pipeline
     "GPUSparsePipeline",
     "CPUPipeline",
+    # Phase 4 — pertTF-local adapters
+    "CategoricalLabelMap",
+    "PertTFAdapterConfig",
+    "PertTFCorpusAdapter",
+    "PertTFLabelAdapter",
+    "PertTFVocabAdapter",
     # Phase N — Corpus loader factory
     "Corpus",
     "load_corpus",

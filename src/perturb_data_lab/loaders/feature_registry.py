@@ -515,6 +515,19 @@ class FeatureRegistry:
         return self._global_vocab_size
 
     @property
+    def global_feature_ids(self) -> tuple[str, ...]:
+        """Feature IDs ordered by global gene ID.
+
+        This preserves the exact shared-vocabulary order assigned by the
+        registry, which is useful for downstream adapters that must not
+        alphabetically reorder genes.
+        """
+        ordered = ["" for _ in range(self._global_vocab_size)]
+        for feature_id, global_id in self._feature_id_to_global.items():
+            ordered[int(global_id)] = str(feature_id)
+        return tuple(ordered)
+
+    @property
     def max_local_vocab(self) -> int:
         """Maximum local vocab size (``n_vars``) across all datasets."""
         return self._max_local_vocab
