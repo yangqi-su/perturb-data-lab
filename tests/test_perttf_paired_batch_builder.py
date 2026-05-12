@@ -53,7 +53,7 @@ def _write_hvg_ranking(path: Path, gene_names: list[str]) -> None:
             "dispersion_log": np.linspace(0.5, 1.5, len(gene_names), dtype=np.float32),
             "dispersion_norm": np.linspace(1.5, 0.5, len(gene_names), dtype=np.float32),
             "hvg_rank": np.arange(1, len(gene_names) + 1, dtype=np.int32),
-            "selected_at_default_n_hvg": np.asarray([True, True, False, False]),
+            "selected_at_default_n_hvg": np.arange(len(gene_names), dtype=np.int32) < 2,
         }
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,6 +107,81 @@ def _build_small_pair_corpus(tmp_path: Path) -> Path:
     )
     _write_hvg_ranking(dataset_root / "hvg.parquet", ["GENE_A", "GENE_B", "GENE_C", "GENE_D"])
     _write_aggregate_lance(corpus_root / "matrix" / "aggregated-cells.lance")
+    return corpus_root
+
+
+def _build_mixed_union_pair_corpus(tmp_path: Path) -> Path:
+    corpus_root = tmp_path / "perttf-union-pair-corpus"
+    index_doc = {
+        "kind": "corpus-index",
+        "contract_version": "0.3.0",
+        "corpus_id": "perttf-union-pair-corpus",
+        "global_metadata": {"backend": "lance", "topology": "aggregate"},
+        "datasets": [
+            {
+                "dataset_id": "ds0",
+                "join_mode": "create_new",
+                "dataset_index": 0,
+                "cell_count": 2,
+                "global_start": 0,
+                "global_end": 2,
+            },
+            {
+                "dataset_id": "ds1",
+                "join_mode": "append_routed",
+                "dataset_index": 1,
+                "cell_count": 2,
+                "global_start": 2,
+                "global_end": 4,
+            },
+        ],
+    }
+    corpus_root.mkdir(parents=True, exist_ok=True)
+    with open(corpus_root / "corpus-index.yaml", "w", encoding="utf-8") as handle:
+        yaml.safe_dump(index_doc, handle, sort_keys=False)
+
+    ds0_root = corpus_root / "meta" / "ds0"
+    _write_canonical_obs(ds0_root / "canonical_meta" / "canonical-obs.parquet")
+    _write_canonical_var(
+        ds0_root / "canonical_meta" / "canonical-var.parquet",
+        ["GENE_A", "GENE_B"],
+    )
+    _write_hvg_ranking(ds0_root / "hvg.parquet", ["GENE_A", "GENE_B"])
+
+    ds1_root = corpus_root / "meta" / "ds1"
+    frame = pl.DataFrame(
+        {
+            "cell_id": ["ds1_wt", "ds1_ko"],
+            "dataset_id": ["ds1", "ds1"],
+            "size_factor": [0.9, 1.1],
+            "cell_context": ["T_cell", "T_cell"],
+            "perturb_label": ["WT", "KO_STAT1"],
+            "batch_id": ["batch_2", "batch_3"],
+        }
+    )
+    (ds1_root / "canonical_meta").mkdir(parents=True, exist_ok=True)
+    frame.write_parquet(str(ds1_root / "canonical_meta" / "canonical-obs.parquet"))
+    _write_canonical_var(
+        ds1_root / "canonical_meta" / "canonical-var.parquet",
+        ["GENE_B", "GENE_C"],
+    )
+    _write_hvg_ranking(ds1_root / "hvg.parquet", ["GENE_B", "GENE_C"])
+
+    table = pa.table(
+        {
+            "expressed_gene_indices": pa.array(
+                [[0], [1], [0], [1]],
+                type=pa.list_(pa.int32()),
+            ),
+            "expression_counts": pa.array(
+                [[5], [4], [2], [7]],
+                type=pa.list_(pa.int32()),
+            ),
+        }
+    )
+    matrix_path = corpus_root / "matrix" / "aggregated-cells.lance"
+    matrix_path.parent.mkdir(parents=True, exist_ok=True)
+    lance.write_dataset(table, str(matrix_path), mode="overwrite")
     return corpus_root
 
 
@@ -238,3 +313,52 @@ def test_paired_batch_builder_accepts_precomputed_sampled_gene_ids_and_preserves
         2.0,
         float(config.pad_value),
     ]
+
+
+def test_paired_batch_builder_emits_union_full_expression_masks_for_mixed_datasets(
+    tmp_path: Path,
+) -> None:
+    config = PertTFAdapterConfig(
+        control_labels=("WT",),
+        mask_ratio=0.0,
+        include_full_expr=True,
+    )
+    corpus = load_corpus(str(_build_mixed_union_pair_corpus(tmp_path)))
+    pair_batch = PerturbationPairSampler(
+        corpus.metadata_index,
+        batch_size=2,
+        config=config,
+        seed=19,
+    ).pair_source_indices([0, 2], seed=23)
+    builder = PertTFPairedBatchBuilder(corpus, seq_len=2, config=config)
+
+    batch = builder.build_paired_batch(
+        pair_batch,
+        seed=29,
+        sampling_mode="hvg",
+        hvg_weight=4.0,
+        hvg_top_k=1,
+    )
+
+    cls_token_id = builder.adapter.vocab.to_simple_vocab_stoi()[config.cls_token]
+    assert batch["full_gene_ids"].shape == (2, 4)
+    assert batch["full_gene_ids"][0].tolist() == [cls_token_id, 4, 5, 6]
+    assert torch.equal(batch["full_gene_ids"][0], batch["full_gene_ids"][1])
+
+    assert batch["full_expr"].shape == (2, 4)
+    assert batch["full_expr_next"].shape == (2, 4)
+    assert batch["full_expr_mask"].dtype == torch.bool
+    assert batch["full_expr_next_mask"].dtype == torch.bool
+
+    assert batch["index"].tolist() == [0, 2]
+    assert batch["next_index"].tolist() == [1, 3]
+
+    assert batch["full_expr"][0].tolist() == [float(config.cls_value), 5.0, 0.0, 0.0]
+    assert batch["full_expr_mask"][0].tolist() == [True, True, True, False]
+    assert batch["full_expr_next"][0].tolist() == [float(config.cls_value), 0.0, 4.0, 0.0]
+    assert batch["full_expr_next_mask"][0].tolist() == [True, True, True, False]
+
+    assert batch["full_expr"][1].tolist() == [float(config.cls_value), 0.0, 2.0, 0.0]
+    assert batch["full_expr_mask"][1].tolist() == [True, False, True, True]
+    assert batch["full_expr_next"][1].tolist() == [float(config.cls_value), 0.0, 0.0, 7.0]
+    assert batch["full_expr_next_mask"][1].tolist() == [True, False, True, True]

@@ -75,6 +75,8 @@ class PertTFAdapterConfig:
     append_cls: bool = True
     mask_ratio: float = 0.15
     ps_width: int = 1
+    include_full_expr: bool = False
+    full_expr_mode: str = "union_padded"
 
     def __post_init__(self) -> None:
         if len(set(self.special_tokens)) != len(self.special_tokens):
@@ -93,6 +95,8 @@ class PertTFAdapterConfig:
             raise ValueError("mask_ratio must be between 0 and 1")
         if int(self.ps_width) <= 0:
             raise ValueError("ps_width must be positive")
+        if self.full_expr_mode != "union_padded":
+            raise ValueError("full_expr_mode must be 'union_padded'")
 
 
 class CategoricalLabelMap:
@@ -639,7 +643,13 @@ class PerturbationPairSampler:
 
 
 class PertTFPairedBatchBuilder:
-    """Build pertTF-compatible paired source/target batches from corpus rows."""
+    """Build pertTF-compatible paired source/target batches from corpus rows.
+
+    When ``include_full_expr=True``, this also emits union-vocabulary dense
+    expression tensors plus per-row presence masks. Those masks are intended
+    for future pertTF-side loss changes and are emitted here without modifying
+    the external ``pertTF`` repository.
+    """
 
     def __init__(
         self,
@@ -781,6 +791,16 @@ class PertTFPairedBatchBuilder:
                 device=self.device,
             ),
         }
+        if self.config.include_full_expr:
+            full_expr, full_expr_mask = self._build_full_expression_tensor(source_raw)
+            full_expr_next, full_expr_next_mask = self._build_full_expression_tensor(
+                target_raw
+            )
+            batch["full_gene_ids"] = self._full_gene_ids(batch_size)
+            batch["full_expr"] = full_expr
+            batch["full_expr_next"] = full_expr_next
+            batch["full_expr_mask"] = full_expr_mask
+            batch["full_expr_next_mask"] = full_expr_next_mask
         return batch
 
     __call__ = build_paired_batch
@@ -858,6 +878,76 @@ class PertTFPairedBatchBuilder:
             device=values.device,
         )
         return torch.cat([cls_column, values], dim=1)
+
+    def _prepend_cls_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        if not self.config.append_cls:
+            return mask
+        cls_column = torch.ones(
+            (mask.shape[0], 1),
+            dtype=torch.bool,
+            device=mask.device,
+        )
+        return torch.cat([cls_column, mask], dim=1)
+
+    def _full_gene_ids(self, batch_size: int) -> torch.Tensor:
+        full_gene_ids = torch.as_tensor(
+            self.adapter.vocab.gene_token_ids,
+            dtype=torch.long,
+            device=self.device,
+        ).unsqueeze(0)
+        full_gene_ids = self._prepend_cls_gene_ids(full_gene_ids)
+        return full_gene_ids.expand(batch_size, -1).clone()
+
+    def _build_full_expression_tensor(
+        self,
+        raw_batch: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(raw_batch["batch_size"])
+        global_vocab = self.corpus.feature_registry.global_vocab_size
+        full_expr = torch.zeros(
+            (batch_size, global_vocab),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        row_offsets = np.asarray(raw_batch["row_offsets"], dtype=np.int64)
+        local_gene_ids = np.asarray(raw_batch["expressed_gene_indices"], dtype=np.int64)
+        counts = np.asarray(raw_batch["expression_counts"], dtype=np.float32)
+        dataset_indices = np.asarray(raw_batch["dataset_index"], dtype=np.int64)
+
+        local_to_global = self.corpus.feature_registry.local_to_global_map
+        dataset_has_gene = self.corpus.feature_registry.dataset_has_gene
+        full_mask = torch.as_tensor(
+            dataset_has_gene[dataset_indices],
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        for row_idx in range(batch_size):
+            start = int(row_offsets[row_idx])
+            stop = int(row_offsets[row_idx + 1])
+            if start >= stop:
+                continue
+            dataset_index = int(dataset_indices[row_idx])
+            row_local_gene_ids = local_gene_ids[start:stop]
+            row_global_gene_ids = local_to_global[dataset_index, row_local_gene_ids]
+            if np.any(row_global_gene_ids < 0):
+                raise RuntimeError(
+                    "raw batch contained unmapped local gene IDs during full_expr build"
+                )
+            full_expr[
+                row_idx,
+                torch.as_tensor(
+                    row_global_gene_ids,
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+            ] = torch.as_tensor(
+                counts[start:stop],
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        return self._prepend_cls_values(full_expr), self._prepend_cls_mask(full_mask)
 
     def _mask_values(
         self,
