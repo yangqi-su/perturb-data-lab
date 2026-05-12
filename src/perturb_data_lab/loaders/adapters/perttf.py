@@ -8,6 +8,7 @@ This module prepares pertTF-compatible mapping objects from a loaded
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Sequence
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
 __all__ = [
     "CategoricalLabelMap",
     "PertTFAdapterConfig",
+    "PerturbationPairBatch",
+    "PerturbationPairSampler",
     "PertTFCorpusAdapter",
     "PertTFLabelAdapter",
     "PertTFVocabAdapter",
@@ -313,6 +316,316 @@ class PertTFLabelAdapter:
             "batch_to_index": self.batch.label_to_index,
             "control_label_ids": self.control_label_ids,
         }
+
+
+@dataclass(frozen=True)
+class PerturbationPairBatch:
+    """Paired source/target metadata spec for pertTF-style perturbation batches."""
+
+    source_indices: np.ndarray
+    target_indices: np.ndarray
+    source_dataset_indices: np.ndarray
+    target_dataset_indices: np.ndarray
+    source_cell_context_ids: np.ndarray
+    target_cell_context_ids: np.ndarray
+    source_perturbation_ids: np.ndarray
+    target_perturbation_ids: np.ndarray
+    source_batch_ids: np.ndarray
+    target_batch_ids: np.ndarray
+    source_cell_context_labels: tuple[str, ...]
+    target_cell_context_labels: tuple[str, ...]
+    source_perturbation_labels: tuple[str, ...]
+    target_perturbation_labels: tuple[str, ...]
+    source_batch_labels: tuple[str, ...]
+    target_batch_labels: tuple[str, ...]
+
+
+class PerturbationPairSampler:
+    """Sample same-dataset/context source-target perturbation pairs."""
+
+    def __init__(
+        self,
+        metadata_index: MetadataIndex,
+        *,
+        batch_size: int,
+        config: PertTFAdapterConfig | None = None,
+        label_adapter: PertTFLabelAdapter | None = None,
+        seed: int = 0,
+        drop_last: bool = True,
+        perturbed_target_policy: str = "self_to_control_label",
+        missing_target_policy: str = "error",
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if perturbed_target_policy not in {
+            "self_to_control_label",
+            "matched_control_cell",
+        }:
+            raise ValueError(
+                "perturbed_target_policy must be 'self_to_control_label' or "
+                "'matched_control_cell'"
+            )
+        if missing_target_policy not in {"error", "warn_skip"}:
+            raise ValueError(
+                "missing_target_policy must be 'error' or 'warn_skip'"
+            )
+
+        resolved_config = config or PertTFAdapterConfig()
+        resolved_labels = label_adapter or PertTFLabelAdapter.from_metadata_index(
+            metadata_index,
+            resolved_config,
+        )
+        self._meta = metadata_index
+        self.config = resolved_config
+        self.labels = resolved_labels
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.epoch = 0
+        self.perturbed_target_policy = perturbed_target_policy
+        self.missing_target_policy = missing_target_policy
+        self._control_labels = tuple(str(label) for label in self.config.control_labels)
+        self._control_label_set = frozenset(self._control_labels)
+        if not self._control_labels:
+            raise ValueError("control_labels must contain at least one label")
+
+        dataset_index = metadata_index.get_column("dataset_index")
+        context_labels = metadata_index.get_column(self.config.cell_context_column)
+        perturbation_labels = metadata_index.get_column(self.config.perturbation_column)
+        batch_labels = metadata_index.get_column(self.config.batch_column)
+        if dataset_index is None:
+            raise ValueError("metadata_index is missing required column 'dataset_index'")
+        if context_labels is None:
+            raise ValueError(
+                f"metadata_index is missing required column {self.config.cell_context_column!r}"
+            )
+        if perturbation_labels is None:
+            raise ValueError(
+                f"metadata_index is missing required column {self.config.perturbation_column!r}"
+            )
+        if batch_labels is None:
+            raise ValueError(
+                f"metadata_index is missing required column {self.config.batch_column!r}"
+            )
+
+        self.total_rows = len(metadata_index)
+        self._all_indices = np.arange(self.total_rows, dtype=np.int64)
+        self._dataset_index = np.asarray(dataset_index, dtype=np.int32)
+        self._context_labels = tuple(
+            _normalize_label(value, column=self.config.cell_context_column)
+            for value in context_labels
+        )
+        self._perturbation_labels = tuple(
+            _normalize_label(value, column=self.config.perturbation_column)
+            for value in perturbation_labels
+        )
+        self._batch_labels = tuple(
+            _normalize_label(value, column=self.config.batch_column)
+            for value in batch_labels
+        )
+        self._cell_context_ids = self.labels.cell_context.encode_many(self._context_labels)
+        self._perturbation_ids = self.labels.perturbation.encode_many(
+            self._perturbation_labels
+        )
+        self._batch_ids = self.labels.batch.encode_many(self._batch_labels)
+        self._pool_by_key = self._build_pool_by_key()
+        self._perturbations_by_context = self._build_perturbations_by_context()
+        self._control_pool_by_context = self._build_control_pool_by_context()
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return self.total_rows // self.batch_size
+        return (self.total_rows + self.batch_size - 1) // self.batch_size
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        if self.total_rows == 0:
+            return
+        rng = np.random.default_rng(self.seed + self.epoch)
+        source_order = self._all_indices.copy()
+        rng.shuffle(source_order)
+        for batch_idx, start in enumerate(range(0, self.total_rows, self.batch_size)):
+            source_indices = source_order[start : start + self.batch_size]
+            if len(source_indices) < self.batch_size and self.drop_last:
+                continue
+            batch_seed = self.seed + self.epoch * 10000 + batch_idx
+            yield self.pair_source_indices(source_indices, seed=batch_seed)
+
+    def pair_source_indices(
+        self,
+        source_indices: Sequence[int] | np.ndarray,
+        *,
+        seed: int | None = None,
+    ) -> PerturbationPairBatch:
+        source_array = np.asarray(source_indices, dtype=np.int64)
+        if source_array.ndim != 1:
+            raise ValueError("source_indices must be a 1-D sequence")
+        if source_array.size == 0:
+            return self._assemble_batch(
+                source_array,
+                np.asarray([], dtype=np.int64),
+                (),
+            )
+        if np.any(source_array < 0) or np.any(source_array >= self.total_rows):
+            raise IndexError("source_indices contain out-of-range rows")
+
+        rng = np.random.default_rng(self.seed if seed is None else int(seed))
+        target_indices: list[int] = []
+        target_perturbation_labels: list[str] = []
+        kept_sources: list[int] = []
+
+        for source_idx in source_array.tolist():
+            target = self._sample_target_for_source(source_idx, rng)
+            if target is None:
+                continue
+            target_idx, target_perturbation_label = target
+            kept_sources.append(source_idx)
+            target_indices.append(target_idx)
+            target_perturbation_labels.append(target_perturbation_label)
+
+        return self._assemble_batch(
+            np.asarray(kept_sources, dtype=np.int64),
+            np.asarray(target_indices, dtype=np.int64),
+            tuple(target_perturbation_labels),
+        )
+
+    def _build_pool_by_key(self) -> dict[tuple[int, str, str], np.ndarray]:
+        buckets: dict[tuple[int, str, str], list[int]] = {}
+        for row_idx in range(self.total_rows):
+            key = (
+                int(self._dataset_index[row_idx]),
+                self._context_labels[row_idx],
+                self._perturbation_labels[row_idx],
+            )
+            buckets.setdefault(key, []).append(row_idx)
+        return {
+            key: np.asarray(indices, dtype=np.int64)
+            for key, indices in buckets.items()
+        }
+
+    def _build_perturbations_by_context(
+        self,
+    ) -> dict[tuple[int, str], tuple[str, ...]]:
+        context_to_labels: dict[tuple[int, str], list[str]] = {}
+        for dataset_index, context_label, perturbation_label in self._pool_by_key:
+            if perturbation_label in self._control_label_set:
+                continue
+            key = (dataset_index, context_label)
+            labels = context_to_labels.setdefault(key, [])
+            if perturbation_label not in labels:
+                labels.append(perturbation_label)
+        return {
+            key: tuple(labels)
+            for key, labels in context_to_labels.items()
+        }
+
+    def _build_control_pool_by_context(
+        self,
+    ) -> dict[tuple[int, str], np.ndarray]:
+        context_to_indices: dict[tuple[int, str], list[np.ndarray]] = {}
+        for (dataset_index, context_label, perturbation_label), indices in self._pool_by_key.items():
+            if perturbation_label not in self._control_label_set:
+                continue
+            context_to_indices.setdefault((dataset_index, context_label), []).append(indices)
+        return {
+            key: np.concatenate(chunks).astype(np.int64, copy=False)
+            for key, chunks in context_to_indices.items()
+        }
+
+    def _sample_target_for_source(
+        self,
+        source_idx: int,
+        rng: np.random.Generator,
+    ) -> tuple[int, str] | None:
+        dataset_index = int(self._dataset_index[source_idx])
+        context_label = self._context_labels[source_idx]
+        perturbation_label = self._perturbation_labels[source_idx]
+        context_key = (dataset_index, context_label)
+        if perturbation_label in self._control_label_set:
+            candidate_perturbations = self._perturbations_by_context.get(context_key, ())
+            if not candidate_perturbations:
+                return self._handle_missing_target(
+                    source_idx,
+                    reason=(
+                        "no treated target pool exists for control source within "
+                        f"dataset_index={dataset_index}, context={context_label!r}"
+                    ),
+                )
+            target_perturbation = str(rng.choice(candidate_perturbations))
+            pool = self._pool_by_key[(dataset_index, context_label, target_perturbation)]
+            target_idx = int(rng.choice(pool))
+            return target_idx, target_perturbation
+
+        if self.perturbed_target_policy == "self_to_control_label":
+            return source_idx, self._control_labels[0]
+
+        control_pool = self._control_pool_by_context.get(context_key)
+        if control_pool is None or len(control_pool) == 0:
+            return self._handle_missing_target(
+                source_idx,
+                reason=(
+                    "no matched control pool exists for perturbed source within "
+                    f"dataset_index={dataset_index}, context={context_label!r}"
+                ),
+            )
+        target_idx = int(rng.choice(control_pool))
+        return target_idx, self._perturbation_labels[target_idx]
+
+    def _handle_missing_target(
+        self,
+        source_idx: int,
+        *,
+        reason: str,
+    ) -> tuple[int, str] | None:
+        message = f"unable to pair source row {source_idx}: {reason}"
+        if self.missing_target_policy == "warn_skip":
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+            return None
+        raise RuntimeError(message)
+
+    def _assemble_batch(
+        self,
+        source_indices: np.ndarray,
+        target_indices: np.ndarray,
+        target_perturbation_labels: tuple[str, ...],
+    ) -> PerturbationPairBatch:
+        source_dataset_indices = self._dataset_index[source_indices]
+        target_dataset_indices = self._dataset_index[target_indices]
+        source_context_ids = self._cell_context_ids[source_indices]
+        target_context_ids = self._cell_context_ids[target_indices]
+        source_perturbation_ids = self._perturbation_ids[source_indices]
+        target_perturbation_ids = self.labels.perturbation.encode_many(
+            target_perturbation_labels
+        )
+        source_batch_ids = self._batch_ids[source_indices]
+        target_batch_ids = self._batch_ids[target_indices]
+        source_context_labels = tuple(self._context_labels[int(idx)] for idx in source_indices)
+        target_context_labels = tuple(self._context_labels[int(idx)] for idx in target_indices)
+        source_perturbation_labels = tuple(
+            self._perturbation_labels[int(idx)] for idx in source_indices
+        )
+        source_batch_labels = tuple(self._batch_labels[int(idx)] for idx in source_indices)
+        target_batch_labels = tuple(self._batch_labels[int(idx)] for idx in target_indices)
+        return PerturbationPairBatch(
+            source_indices=source_indices,
+            target_indices=target_indices,
+            source_dataset_indices=source_dataset_indices,
+            target_dataset_indices=target_dataset_indices,
+            source_cell_context_ids=source_context_ids,
+            target_cell_context_ids=target_context_ids,
+            source_perturbation_ids=source_perturbation_ids,
+            target_perturbation_ids=target_perturbation_ids,
+            source_batch_ids=source_batch_ids,
+            target_batch_ids=target_batch_ids,
+            source_cell_context_labels=source_context_labels,
+            target_cell_context_labels=target_context_labels,
+            source_perturbation_labels=source_perturbation_labels,
+            target_perturbation_labels=target_perturbation_labels,
+            source_batch_labels=source_batch_labels,
+            target_batch_labels=target_batch_labels,
+        )
 
 
 @dataclass(frozen=True)
