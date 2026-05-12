@@ -70,6 +70,7 @@ from .expression import (
     build_expression_reader,
 )
 from .feature_registry import FeatureRegistry
+from .gene_tokenizer import GeneTokenizer
 from .gpu_pipeline import GPUSparsePipeline
 from .index import MetadataIndex, _CANONICAL_OBS_TYPED_DTYPES, _normalize_canonical_obs_dtypes
 from .loaders import (
@@ -886,6 +887,7 @@ def load_corpus(
     # ------------------------------------------------------------------
     index_doc = _read_yaml(index_path)
     metadata = index_doc.get("global_metadata", {})
+    corpus_id = str(index_doc.get("corpus_id", root.name))
     topology = str(metadata.get("topology", ""))
     raw_backend = str(metadata.get("backend", ""))
     backend = _normalize_backend(raw_backend)
@@ -1156,8 +1158,29 @@ def load_corpus(
     var_path_map: dict[str, str] = {
         ds_id: str(p) for ds_id, p in canonical_var_paths.items()
     }
+    dataset_order = [ds_id for ds_id, *_ in global_ranges]
+    tokenizer_path_value = metadata.get("tokenizer_path")
+    tokenizer_path = (
+        root / str(tokenizer_path_value)
+        if tokenizer_path_value
+        else root / "gene-tokenizer.json"
+    )
+    if tokenizer_path.exists():
+        gene_tokenizer = GeneTokenizer.from_json(tokenizer_path)
+        if gene_tokenizer.dataset_build_order != tuple(dataset_order):
+            raise ValueError(
+                "Persisted gene tokenizer dataset_build_order does not match corpus-index.yaml order"
+            )
+    else:
+        gene_tokenizer = GeneTokenizer.build_from_canonical_var_parquets(
+            corpus_id=corpus_id,
+            named_var_paths=var_path_map,
+            dataset_order=dataset_order,
+        )
     feature_registry = FeatureRegistry.from_canonical_var_parquets(
-        var_path_map
+        var_path_map,
+        dataset_order=dataset_order,
+        global_id_by_feature_id=gene_tokenizer.token_to_id,
     )
 
     # ------------------------------------------------------------------

@@ -25,6 +25,7 @@ from perturb_data_lab.loaders import (
     DatasetRoutingTable,
     ExpressionBatch,
     ExpressionBatchDataset,
+    GeneTokenizer,
     GPUSparsePipeline,
     MetadataIndex,
     collate_expression_batch,
@@ -899,6 +900,116 @@ class TestLoadCorpusAggregate:
         assert fr.global_vocab_size == N_GENES  # same gene pool
         assert fr.max_local_vocab == N_GENES
         assert fr.dataset_ids == ("mock_00", "mock_01")
+
+    def test_feature_registry_uses_persisted_gene_tokenizer_ids(self, tmp_path: Path) -> None:
+        ds_configs = [
+            {
+                "dataset_id": "z_old",
+                "dataset_index": 0,
+                "global_start": 0,
+                "n_genes": 2,
+                "rows": _make_lance_rows(2),
+            },
+            {
+                "dataset_id": "a_new",
+                "dataset_index": 1,
+                "global_start": 2,
+                "n_genes": 3,
+                "rows": _make_lance_rows(2),
+            },
+        ]
+        _build_mock_aggregate_backend_corpus_from_configs(
+            tmp_path,
+            backend="lance",
+            ds_configs=ds_configs,
+        )
+
+        pl.DataFrame(
+            {
+                "origin_index": ["0", "1"],
+                "gene_id": ["ENSG_Z_0", "ENSG_Z_1"],
+                "canonical_gene_id": ["GENE_B", "GENE_C"],
+                "global_id": ["0", "1"],
+            }
+        ).write_parquet(str(tmp_path / "meta" / "z_old" / "canonical_meta" / "canonical-var.parquet"))
+        pl.DataFrame(
+            {
+                "origin_index": ["0", "1", "2"],
+                "gene_id": ["ENSG_A_0", "ENSG_A_1", "ENSG_A_2"],
+                "canonical_gene_id": ["GENE_A", "GENE_C", "GENE_D"],
+                "global_id": ["0", "1", "2"],
+            }
+        ).write_parquet(str(tmp_path / "meta" / "a_new" / "canonical_meta" / "canonical-var.parquet"))
+
+        tokenizer = GeneTokenizer.empty(corpus_id="test-corpus")
+        tokenizer = tokenizer.append_dataset("z_old", ["GENE_B", "GENE_C"])
+        tokenizer = tokenizer.append_dataset("a_new", ["GENE_A", "GENE_C", "GENE_D"])
+        tokenizer.to_json(tmp_path / "gene-tokenizer.json")
+
+        corpus = load_corpus(str(tmp_path))
+
+        assert corpus.feature_registry.dataset_ids == ("z_old", "a_new")
+        assert corpus.feature_registry.global_vocab_size == 4
+        np.testing.assert_array_equal(
+            corpus.feature_registry.local_to_global_map[0, :2],
+            np.array([0, 1], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            corpus.feature_registry.local_to_global_map[1, :3],
+            np.array([2, 1, 3], dtype=np.int32),
+        )
+
+    def test_feature_registry_falls_back_to_corpus_order_without_tokenizer(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        ds_configs = [
+            {
+                "dataset_id": "z_old",
+                "dataset_index": 0,
+                "global_start": 0,
+                "n_genes": 2,
+                "rows": _make_lance_rows(2),
+            },
+            {
+                "dataset_id": "a_new",
+                "dataset_index": 1,
+                "global_start": 2,
+                "n_genes": 3,
+                "rows": _make_lance_rows(2),
+            },
+        ]
+        _build_mock_aggregate_backend_corpus_from_configs(
+            tmp_path,
+            backend="lance",
+            ds_configs=ds_configs,
+        )
+
+        pl.DataFrame(
+            {
+                "origin_index": ["0", "1"],
+                "gene_id": ["ENSG_Z_0", "ENSG_Z_1"],
+                "canonical_gene_id": ["GENE_B", "GENE_C"],
+                "global_id": ["0", "1"],
+            }
+        ).write_parquet(str(tmp_path / "meta" / "z_old" / "canonical_meta" / "canonical-var.parquet"))
+        pl.DataFrame(
+            {
+                "origin_index": ["0", "1", "2"],
+                "gene_id": ["ENSG_A_0", "ENSG_A_1", "ENSG_A_2"],
+                "canonical_gene_id": ["GENE_A", "GENE_C", "GENE_D"],
+                "global_id": ["0", "1", "2"],
+            }
+        ).write_parquet(str(tmp_path / "meta" / "a_new" / "canonical_meta" / "canonical-var.parquet"))
+
+        corpus = load_corpus(str(tmp_path))
+
+        assert corpus.feature_registry.dataset_ids == ("z_old", "a_new")
+        assert corpus.feature_registry.global_vocab_size == 4
+        np.testing.assert_array_equal(
+            corpus.feature_registry.local_to_global_map[1, :3],
+            np.array([2, 1, 3], dtype=np.int32),
+        )
 
     def test_metadata_index_properties(self, tmp_path: Path) -> None:
         """Metadata index has correct row count and columns."""

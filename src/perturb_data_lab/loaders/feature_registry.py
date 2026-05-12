@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import polars as pl
@@ -56,7 +56,7 @@ class FeatureRegistry:
     Attributes
     ----------
     dataset_ids : tuple[str, ...]
-        Ordered dataset identifiers (sorted alphabetically for determinism).
+        Ordered dataset identifiers.
     global_vocab_size : int
         Total number of unique genes across all registered datasets.
     max_local_vocab : int
@@ -67,6 +67,9 @@ class FeatureRegistry:
     def from_canonical_var_parquets(
         cls,
         named_var_paths: dict[str, str | Path],
+        *,
+        dataset_order: Sequence[str] | None = None,
+        global_id_by_feature_id: Mapping[str, int] | None = None,
     ) -> "FeatureRegistry":
         """Build a FeatureRegistry from canonical var parquet files.
 
@@ -90,8 +93,10 @@ class FeatureRegistry:
         """
         from pathlib import Path
 
+        order = list(dataset_order) if dataset_order is not None else list(named_var_paths.keys())
         named_var_dfs: dict[str, pl.DataFrame] = {}
-        for ds_id, path in named_var_paths.items():
+        for ds_id in order:
+            path = named_var_paths[ds_id]
             df = pl.read_parquet(str(path))
 
             required = {"origin_index", "canonical_gene_id"}
@@ -121,21 +126,41 @@ class FeatureRegistry:
 
             named_var_dfs[ds_id] = df
 
-        return cls(named_var_dfs)
+        return cls(
+            named_var_dfs,
+            dataset_order=order,
+            global_id_by_feature_id=global_id_by_feature_id,
+        )
 
     def __init__(
         self,
         named_var_dfs: dict[str, pl.DataFrame],
+        *,
+        dataset_order: Sequence[str] | None = None,
+        global_id_by_feature_id: Mapping[str, int] | None = None,
     ):
         if not named_var_dfs:
             raise ValueError("named_var_dfs must not be empty")
 
-        # Sort for deterministic ordering
-        self._dataset_ids: list[str] = sorted(named_var_dfs.keys())
+        if dataset_order is None:
+            self._dataset_ids = list(named_var_dfs.keys())
+        else:
+            self._dataset_ids = list(dataset_order)
+            if set(self._dataset_ids) != set(named_var_dfs.keys()):
+                raise ValueError(
+                    "dataset_order must contain exactly the named_var_dfs keys"
+                )
         self._n_datasets: int = len(self._dataset_ids)
 
         # ---- Pass 1: discover all unique feature_ids and assign global IDs ----
-        self._feature_id_to_global: dict[str, int] = {}
+        self._feature_id_to_global: dict[str, int] = dict(global_id_by_feature_id or {})
+        if self._feature_id_to_global:
+            expected_ids = list(range(len(self._feature_id_to_global)))
+            actual_ids = sorted(self._feature_id_to_global.values())
+            if actual_ids != expected_ids:
+                raise ValueError(
+                    "global_id_by_feature_id must define contiguous IDs 0..N-1"
+                )
         self._dataset_var_entries: dict[int, list[dict[str, Any]]] = {}
         # Per-dataset local HVG flags (None = no HVG column found)
         self._dataset_local_hvg: dict[int, np.ndarray | None] = {}
@@ -189,6 +214,13 @@ class FeatureRegistry:
             for row in var_df.iter_rows(named=True):
                 origin_idx = int(row["origin_index"])
                 feature_id = str(row[gene_id_col])
+                if (
+                    feature_id not in self._feature_id_to_global
+                    and global_id_by_feature_id is not None
+                ):
+                    raise ValueError(
+                        f"feature_id {feature_id!r} missing from persisted gene tokenizer"
+                    )
                 if feature_id not in self._feature_id_to_global:
                     self._feature_id_to_global[feature_id] = len(
                         self._feature_id_to_global

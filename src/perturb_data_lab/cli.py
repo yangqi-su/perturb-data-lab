@@ -794,7 +794,7 @@ def _cmd_corpus_validate(args: argparse.Namespace) -> None:
                 )
 
     # Check tokenizer
-    tokenizer_path = corpus_root / "tokenizer.json"
+    tokenizer_path = corpus_root / "gene-tokenizer.json"
     tokenizer_exists = tokenizer_path.exists()
     tokenizer_status = "\u2713" if tokenizer_exists else "\u2717 (optional since Phase 3)"
     print(f"\nTokenizer: {tokenizer_status} {tokenizer_path}")
@@ -866,7 +866,7 @@ def _cmd_corpus_gc(args: argparse.Namespace) -> None:
     known_metadata = {
         "corpus-index.yaml", "corpus-ledger.parquet",
         "global-metadata.yaml", "corpus-emission-spec.yaml",
-        "tokenizer.json",
+        "gene-tokenizer.json",
     }
 
     for entry in sorted(corpus_root.iterdir()):

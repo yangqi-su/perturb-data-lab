@@ -42,6 +42,10 @@ from .feature_registry import (
     FeatureRegistry,
     GlobalGeneSampler,
 )
+from .gene_tokenizer import (
+    DatasetTokenSpan,
+    GeneTokenizer,
+)
 from .corpus_loader import (
     Corpus,
     load_corpus,
@@ -91,6 +95,8 @@ __all__ = [
     # Phase 2 — Feature Registry
     "FeatureRegistry",
     "GlobalGeneSampler",
+    "DatasetTokenSpan",
+    "GeneTokenizer",
     # Phase 3 — GPU Pipeline
     "GPUSparsePipeline",
     "CPUPipeline",
