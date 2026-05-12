@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -70,6 +71,8 @@ class FeatureRegistry:
         *,
         dataset_order: Sequence[str] | None = None,
         global_id_by_feature_id: Mapping[str, int] | None = None,
+        named_hvg_rank_paths: Mapping[str, str | Path] | None = None,
+        default_n_hvg_by_dataset: Mapping[str, int] | None = None,
     ) -> "FeatureRegistry":
         """Build a FeatureRegistry from canonical var parquet files.
 
@@ -91,10 +94,9 @@ class FeatureRegistry:
         FeatureRegistry
             Registry with canonically-mapped gene identities.
         """
-        from pathlib import Path
-
         order = list(dataset_order) if dataset_order is not None else list(named_var_paths.keys())
         named_var_dfs: dict[str, pl.DataFrame] = {}
+        named_hvg_rank_dfs: dict[str, pl.DataFrame] = {}
         for ds_id in order:
             path = named_var_paths[ds_id]
             df = pl.read_parquet(str(path))
@@ -126,10 +128,29 @@ class FeatureRegistry:
 
             named_var_dfs[ds_id] = df
 
+            if named_hvg_rank_paths is None:
+                continue
+
+            hvg_path = named_hvg_rank_paths.get(ds_id)
+            if hvg_path is None:
+                continue
+
+            resolved_hvg_path = Path(hvg_path)
+            if not resolved_hvg_path.exists():
+                logger.warning(
+                    "Dataset '%s': HVG ranking parquet not found at %s; dynamic HVG sampling disabled for this dataset.",
+                    ds_id,
+                    resolved_hvg_path,
+                )
+                continue
+            named_hvg_rank_dfs[ds_id] = pl.read_parquet(str(resolved_hvg_path))
+
         return cls(
             named_var_dfs,
             dataset_order=order,
             global_id_by_feature_id=global_id_by_feature_id,
+            named_hvg_rank_dfs=named_hvg_rank_dfs or None,
+            default_n_hvg_by_dataset=default_n_hvg_by_dataset,
         )
 
     def __init__(
@@ -138,6 +159,8 @@ class FeatureRegistry:
         *,
         dataset_order: Sequence[str] | None = None,
         global_id_by_feature_id: Mapping[str, int] | None = None,
+        named_hvg_rank_dfs: Mapping[str, pl.DataFrame] | None = None,
+        default_n_hvg_by_dataset: Mapping[str, int] | None = None,
     ):
         if not named_var_dfs:
             raise ValueError("named_var_dfs must not be empty")
@@ -164,6 +187,9 @@ class FeatureRegistry:
         self._dataset_var_entries: dict[int, list[dict[str, Any]]] = {}
         # Per-dataset local HVG flags (None = no HVG column found)
         self._dataset_local_hvg: dict[int, np.ndarray | None] = {}
+        # Per-dataset local HVG ranks loaded from canonical hvg.parquet.
+        self._dataset_local_hvg_rank: dict[int, np.ndarray | None] = {}
+        self._dataset_default_n_hvg: dict[int, int | None] = {}
 
         _hvg_column_names = ("is_hvg", "highly_variable", "hvg", "is_highly_variable")
 
@@ -203,6 +229,24 @@ class FeatureRegistry:
                     ds_id, hvg_col,
                 )
             self._dataset_local_hvg[ds_idx] = local_hvg
+
+            local_hvg_rank: np.ndarray | None = None
+            default_n_hvg = (
+                int(default_n_hvg_by_dataset[ds_id])
+                if default_n_hvg_by_dataset is not None and ds_id in default_n_hvg_by_dataset
+                else None
+            )
+            if named_hvg_rank_dfs is not None and ds_id in named_hvg_rank_dfs:
+                local_hvg_rank, inferred_default_n_hvg = self._parse_hvg_ranking_df(
+                    named_hvg_rank_dfs[ds_id],
+                    ds_id=ds_id,
+                    n_vars=len(var_df),
+                    explicit_default_n_hvg=default_n_hvg,
+                )
+                if default_n_hvg is None:
+                    default_n_hvg = inferred_default_n_hvg
+            self._dataset_local_hvg_rank[ds_idx] = local_hvg_rank
+            self._dataset_default_n_hvg[ds_idx] = default_n_hvg
 
             entries: list[dict[str, Any]] = []
             # Determine gene identifier column: prefer canonical_gene_id if present
@@ -262,6 +306,7 @@ class FeatureRegistry:
 
         # ---- Build HVG mask from per-dataset local HVG flags ----
         self._hvg_mask: np.ndarray | None = None
+        self._hvg_rank_matrix: np.ndarray | None = None
         self._build_hvg_mask()
 
         # Lazy-computed fields
@@ -320,6 +365,57 @@ class FeatureRegistry:
             n_vars = len(local_map)
             dense[ds_idx, :n_vars] = local_map
         return dense
+
+    @staticmethod
+    def _parse_hvg_ranking_df(
+        hvg_df: pl.DataFrame,
+        *,
+        ds_id: str,
+        n_vars: int,
+        explicit_default_n_hvg: int | None,
+    ) -> tuple[np.ndarray | None, int | None]:
+        """Parse a canonical ``hvg.parquet`` table into dataset-local ranks."""
+        if "origin_index" not in hvg_df.columns:
+            logger.warning(
+                "Dataset '%s': hvg.parquet missing origin_index; dynamic HVG ranks disabled.",
+                ds_id,
+            )
+            return None, explicit_default_n_hvg
+        if "hvg_rank" not in hvg_df.columns:
+            logger.warning(
+                "Dataset '%s': hvg.parquet missing hvg_rank; dynamic HVG ranks disabled.",
+                ds_id,
+            )
+            return None, explicit_default_n_hvg
+
+        frame = hvg_df
+        if frame["origin_index"].dtype == pl.Utf8:
+            frame = frame.with_columns(pl.col("origin_index").cast(pl.Int32))
+        if frame["hvg_rank"].dtype == pl.Utf8:
+            frame = frame.with_columns(pl.col("hvg_rank").cast(pl.Int32))
+
+        origin_index = np.asarray(frame["origin_index"].to_numpy(), dtype=np.int64)
+        hvg_rank = np.asarray(frame["hvg_rank"].to_numpy(), dtype=np.int32)
+        local_hvg_rank = np.zeros(n_vars, dtype=np.int32)
+        valid = (origin_index >= 0) & (origin_index < n_vars) & (hvg_rank > 0)
+        if np.any(~valid):
+            logger.warning(
+                "Dataset '%s': ignored %d invalid hvg.parquet rank rows outside local vocab bounds.",
+                ds_id,
+                int((~valid).sum()),
+            )
+        local_hvg_rank[origin_index[valid]] = hvg_rank[valid]
+
+        inferred_default_n_hvg = explicit_default_n_hvg
+        if inferred_default_n_hvg is None and "selected_at_default_n_hvg" in frame.columns:
+            selected = np.asarray(
+                frame["selected_at_default_n_hvg"].to_numpy(),
+                dtype=bool,
+            )
+            if selected.shape[0] == origin_index.shape[0]:
+                inferred_default_n_hvg = int(selected.sum())
+
+        return local_hvg_rank, inferred_default_n_hvg
 
     # ------------------------------------------------------------------
     # Incremental append
@@ -397,6 +493,7 @@ class FeatureRegistry:
         self._dataset_has_gene = None
         self._dataset_gene_prob = None
         self._hvg_mask = None
+        self._hvg_rank_matrix = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -460,13 +557,27 @@ class FeatureRegistry:
     def hvg_mask(self) -> np.ndarray:
         """Per-dataset HVG mask ``(n_datasets, global_vocab_size)`` bool.
 
-        ``True`` where a global gene is classified as highly variable for a
-        given dataset.  All-zero when no var table contains an HVG column.
+        ``True`` where a global gene is selected by the dataset's default
+        HVG threshold. When canonical ``hvg.parquet`` rankings are available,
+        this uses their default top-k contract; otherwise it falls back to
+        legacy per-var HVG boolean columns.
         """
         if self._hvg_mask is None:
             self._build_hvg_mask()
         assert self._hvg_mask is not None
         return self._hvg_mask
+
+    @property
+    def hvg_rank_matrix(self) -> np.ndarray:
+        """Per-dataset HVG rank matrix ``(n_datasets, global_vocab_size)`` int32.
+
+        Sentinel ``0`` means absent or unranked; positive values are dataset-
+        specific HVG ranks mapped into the shared global vocabulary.
+        """
+        if self._hvg_rank_matrix is None:
+            self._build_hvg_rank_matrix()
+        assert self._hvg_rank_matrix is not None
+        return self._hvg_rank_matrix
 
     def _compute_masks(self) -> None:
         """Build dataset_has_gene and dataset_gene_prob arrays."""
@@ -493,12 +604,14 @@ class FeatureRegistry:
     def _build_hvg_mask(self) -> None:
         """Build per-dataset HVG mask ``(n_datasets, global_vocab_size)`` bool.
 
-        Uses per-dataset local HVG flags (captured in ``__init__``) mapped
-        through the local→global mapping.  If no dataset has an HVG column,
-        the mask is all-zeros.
+        Prefer canonical ``hvg.parquet`` rank tables when present; otherwise
+        fall back to per-dataset local HVG flags captured from var metadata.
         """
         any_hvg = any(
             local_hvg is not None for local_hvg in self._dataset_local_hvg.values()
+        ) or any(
+            local_hvg_rank is not None
+            for local_hvg_rank in self._dataset_local_hvg_rank.values()
         )
         if not any_hvg:
             self._hvg_mask = np.zeros(
@@ -506,10 +619,20 @@ class FeatureRegistry:
             )
             return
 
+        if self._hvg_rank_matrix is None:
+            self._build_hvg_rank_matrix()
+        assert self._hvg_rank_matrix is not None
+
         hvg_mask = np.zeros(
             (self._n_datasets, self._global_vocab_size), dtype=bool
         )
         for ds_idx in range(self._n_datasets):
+            default_n_hvg = self._dataset_default_n_hvg.get(ds_idx)
+            if default_n_hvg is not None and default_n_hvg > 0:
+                ranks = self._hvg_rank_matrix[ds_idx]
+                hvg_mask[ds_idx] = (ranks > 0) & (ranks <= int(default_n_hvg))
+                continue
+
             local_hvg = self._dataset_local_hvg.get(ds_idx)
             if local_hvg is None:
                 continue
@@ -527,6 +650,32 @@ class FeatureRegistry:
             hvg_mask[ds_idx, hvg_local_ids[valid]] = True
 
         self._hvg_mask = hvg_mask
+
+    def _build_hvg_rank_matrix(self) -> None:
+        """Build per-dataset HVG rank matrix in global gene space."""
+        hvg_rank_matrix = np.zeros(
+            (self._n_datasets, self._global_vocab_size),
+            dtype=np.int32,
+        )
+
+        for ds_idx in range(self._n_datasets):
+            local_hvg_rank = self._dataset_local_hvg_rank.get(ds_idx)
+            if local_hvg_rank is None:
+                continue
+            local_to_global = self._local_to_global[ds_idx]
+            n_vars = min(len(local_hvg_rank), len(local_to_global))
+            for local_idx in range(n_vars):
+                rank = int(local_hvg_rank[local_idx])
+                if rank <= 0:
+                    continue
+                global_id = int(local_to_global[local_idx])
+                if global_id < 0:
+                    continue
+                existing_rank = int(hvg_rank_matrix[ds_idx, global_id])
+                if existing_rank == 0 or rank < existing_rank:
+                    hvg_rank_matrix[ds_idx, global_id] = rank
+
+        self._hvg_rank_matrix = hvg_rank_matrix
 
     # ------------------------------------------------------------------
     # Reverse lookup helpers

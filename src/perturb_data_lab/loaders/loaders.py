@@ -487,6 +487,7 @@ def collate_expression_batch_cpu(
     *,
     expressed_weight: float = 3.0,
     hvg_weight: float = 3.0,
+    hvg_top_k: int | None = None,
     generator: torch.Generator | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
@@ -512,6 +513,8 @@ def collate_expression_batch_cpu(
         Weight bonus for expressed genes in ``"expressed"`` mode.
     hvg_weight : float, default 3.0
         Weight bonus for HVG genes in ``"hvg"`` mode.
+    hvg_top_k : int, optional
+        Dynamic top-k threshold for ``"hvg"`` mode.
     generator : torch.Generator, optional
         Torch RNG generator for reproducible sampling.
     **kwargs
@@ -547,6 +550,7 @@ def collate_expression_batch_cpu(
         sampling_mode=sampling_mode,
         expressed_weight=expressed_weight,
         hvg_weight=hvg_weight,
+        hvg_top_k=hvg_top_k,
         generator=generator,
         **kwargs,
     )

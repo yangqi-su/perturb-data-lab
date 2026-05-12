@@ -73,6 +73,7 @@ class GPUSparsePipeline:
         self._gene_prob_np = registry.dataset_gene_prob
         self._has_gene_np = registry.dataset_has_gene
         self._hvg_mask_np = registry.hvg_mask
+        self._hvg_rank_np = registry.hvg_rank_matrix
         self._max_local_vocab = registry.max_local_vocab
         self._global_vocab = registry.global_vocab_size
 
@@ -109,6 +110,9 @@ class GPUSparsePipeline:
                 "hvg_mask": torch.as_tensor(
                     self._hvg_mask_np, dtype=torch.bool, device=device
                 ),
+                "hvg_rank": torch.as_tensor(
+                    self._hvg_rank_np, dtype=torch.int32, device=device
+                ),
             }
         return self._device_caches[key]
 
@@ -126,8 +130,11 @@ class GPUSparsePipeline:
         sampling_mode: str = "uniform",
         expressed_weight: float = 3.0,
         hvg_weight: float = 3.0,
+        hvg_top_k: int | None = None,
         gene_prob_t: torch.Tensor | None = None,
+        has_gene_t: torch.Tensor | None = None,
         hvg_t: torch.Tensor | None = None,
+        hvg_rank_t: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Build per-cell probability tensors for weighted ``multinomial`` sampling.
 
@@ -173,13 +180,21 @@ class GPUSparsePipeline:
 
         if sampling_mode == "hvg":
             # HVG-biased: HVG genes get weight bonus per dataset
-            if hvg_t is None:
-                raise ValueError("hvg_t required for hvg mode")
+            if has_gene_t is None:
+                raise ValueError("has_gene_t required for hvg mode")
 
-            hvgs = hvg_t[dataset_indices]  # (bsz, global_vocab) bool
-            probs = torch.ones(
-                (bsz, self._global_vocab), dtype=torch.float32, device=device
-            )
+            valid_genes = has_gene_t[dataset_indices]  # (bsz, global_vocab) bool
+            if hvg_top_k is None:
+                if hvg_t is None:
+                    raise ValueError("hvg_t required for default hvg mode")
+                hvgs = hvg_t[dataset_indices] & valid_genes
+            else:
+                if hvg_rank_t is None:
+                    raise ValueError("hvg_rank_t required for dynamic hvg mode")
+                ranks = hvg_rank_t[dataset_indices]
+                hvgs = (ranks > 0) & (ranks <= int(hvg_top_k)) & valid_genes
+
+            probs = valid_genes.float()
             probs += hvgs.float() * float(hvg_weight)
             probs /= probs.sum(dim=1, keepdim=True)
             return probs
@@ -203,6 +218,7 @@ class GPUSparsePipeline:
         sampling_mode: str = "uniform",
         expressed_weight: float = 3.0,
         hvg_weight: float = 3.0,
+        hvg_top_k: int | None = None,
     ) -> dict[str, Any]:
         """Process a flat batch dict into dense ``(batch_size, seq_len)`` tensors.
 
@@ -233,6 +249,11 @@ class GPUSparsePipeline:
         hvg_weight : float, default 3.0
             Weight bonus for HVG genes in ``"hvg"`` mode.
             HVG genes receive base 1.0 + ``hvg_weight``.
+        hvg_top_k : int, optional
+            Dynamic top-k threshold for ``"hvg"`` mode. When provided, genes
+            with ``0 < hvg_rank <= hvg_top_k`` receive the HVG bonus from the
+            same canonical ``hvg.parquet`` ranking table without rematerializing
+            the corpus. When omitted, the dataset's default HVG selection is used.
 
         Returns
         -------
@@ -252,11 +273,15 @@ class GPUSparsePipeline:
         else:
             device = torch.device(device)
 
+        if hvg_top_k is not None and int(hvg_top_k) <= 0:
+            raise ValueError("hvg_top_k must be positive when provided")
+
         cached = self._cached_tensors(device)
         local_to_global_t = cached["local_to_global"]
         gene_prob_t = cached["gene_prob"]
         has_gene_t = cached["has_gene"]
         hvg_t = cached["hvg_mask"]
+        hvg_rank_t = cached["hvg_rank"]
 
         # ---- Move flat arrays to device ----
         flat_gene_indices = torch.as_tensor(
@@ -347,8 +372,11 @@ class GPUSparsePipeline:
                     sampling_mode=sampling_mode,
                     expressed_weight=expressed_weight,
                     hvg_weight=hvg_weight,
+                    hvg_top_k=hvg_top_k,
                     gene_prob_t=gene_prob_t,
+                    has_gene_t=has_gene_t,
                     hvg_t=hvg_t,
+                    hvg_rank_t=hvg_rank_t,
                 )
                 sampled_gids = torch.multinomial(
                     probs,
@@ -445,8 +473,11 @@ class GPUSparsePipeline:
                 sampling_mode=sampling_mode,
                 expressed_weight=expressed_weight,
                 hvg_weight=hvg_weight,
+                hvg_top_k=hvg_top_k,
                 gene_prob_t=gene_prob_t,
+                has_gene_t=has_gene_t,
                 hvg_t=hvg_t,
+                hvg_rank_t=hvg_rank_t,
             )
             sampled_gids = torch.multinomial(
                 probs,
@@ -556,6 +587,10 @@ class CPUPipeline:
         self._rng = np.random.default_rng(int(seed))
         self._sampler = GlobalGeneSampler(registry, self._rng)
         self._local_to_global = registry.local_to_global_map
+        self._has_gene = registry.dataset_has_gene
+        self._hvg_mask = registry.hvg_mask
+        self._hvg_rank = registry.hvg_rank_matrix
+        self._global_vocab = registry.global_vocab_size
 
     @property
     def seq_len(self) -> int:
@@ -571,6 +606,10 @@ class CPUPipeline:
         *,
         seed: int | None = None,
         sampled_gene_ids: np.ndarray | None = None,
+        sampling_mode: str = "uniform",
+        expressed_weight: float = 3.0,
+        hvg_weight: float = 3.0,
+        hvg_top_k: int | None = None,
     ) -> dict[str, Any]:
         """Process a flat batch dict into dense ``(batch_size, seq_len)`` arrays.
 
@@ -584,6 +623,15 @@ class CPUPipeline:
             Pre-computed ``(batch_size, seq_len)`` int32 array of global gene
             IDs.  When provided, skips sampling and uses these IDs directly.
             Useful for equivalence testing against the GPU pipeline.
+        sampling_mode : str, default "uniform"
+            Gene sampling strategy: ``"uniform"``, ``"expressed"``, or ``"hvg"``.
+        expressed_weight : float, default 3.0
+            Weight bonus for expressed genes in ``"expressed"`` mode.
+        hvg_weight : float, default 3.0
+            Weight bonus for HVG genes in ``"hvg"`` mode.
+        hvg_top_k : int, optional
+            Dynamic top-k threshold for ``"hvg"`` mode. When omitted, the
+            registry's default HVG selection is used.
 
         Returns
         -------
@@ -596,6 +644,9 @@ class CPUPipeline:
         if seed is not None:
             self._rng = np.random.default_rng(int(seed))
             self._sampler = GlobalGeneSampler(self._registry, self._rng)
+
+        if hvg_top_k is not None and int(hvg_top_k) <= 0:
+            raise ValueError("hvg_top_k must be positive when provided")
 
         bsz = int(batch["batch_size"])
 
@@ -632,8 +683,7 @@ class CPUPipeline:
                     f"!= expected ({bsz}, {self._seq_len})"
                 )
         else:
-            sids = self._sampler.sample(self._seq_len, dataset_indices)
-            # GlobalGeneSampler may produce -1 padding when seq_len > n_valid
+            sids = np.full((bsz, self._seq_len), -1, dtype=np.int32)
 
         # ---- Pre-allocate outputs ----
         sampled_counts = np.full(
@@ -642,7 +692,7 @@ class CPUPipeline:
         valid_mask = np.zeros((bsz, self._seq_len), dtype=bool)
         exact_match_mask = np.zeros((bsz, self._seq_len), dtype=bool)
 
-        has_gene = self._registry.dataset_has_gene
+        has_gene = self._has_gene
 
         # ---- Per-cell: validate and gather ----
         for i in range(bsz):
@@ -663,6 +713,54 @@ class CPUPipeline:
             else:
                 sorted_global = np.array([], dtype=np.int32)
                 sorted_counts = np.array([], dtype=np.float32)
+
+            if sampled_gene_ids is None:
+                if sampling_mode == "uniform":
+                    valid_genes = np.flatnonzero(has_gene[ds_idx])
+                    actual_len = min(self._seq_len, len(valid_genes))
+                    if actual_len > 0:
+                        sids[i, :actual_len] = self._rng.choice(
+                            valid_genes.astype(np.int32, copy=False),
+                            size=actual_len,
+                            replace=False,
+                        )
+                elif sampling_mode == "expressed":
+                    probs = np.ones(self._global_vocab, dtype=np.float64)
+                    if len(sorted_global) > 0:
+                        probs[np.unique(sorted_global)] += float(expressed_weight)
+                    probs /= probs.sum()
+                    actual_len = min(self._seq_len, self._global_vocab)
+                    if actual_len > 0:
+                        sids[i, :actual_len] = self._rng.choice(
+                            np.arange(self._global_vocab, dtype=np.int32),
+                            size=actual_len,
+                            replace=False,
+                            p=probs,
+                        )
+                elif sampling_mode == "hvg":
+                    weights = has_gene[ds_idx].astype(np.float64, copy=True)
+                    if hvg_top_k is None:
+                        hvgs = self._hvg_mask[ds_idx]
+                    else:
+                        ranks = self._hvg_rank[ds_idx]
+                        hvgs = (ranks > 0) & (ranks <= int(hvg_top_k))
+                    weights += hvgs.astype(np.float64, copy=False) * float(hvg_weight)
+                    valid_genes = np.flatnonzero(weights > 0.0)
+                    actual_len = min(self._seq_len, len(valid_genes))
+                    if actual_len > 0:
+                        probs = weights[valid_genes]
+                        probs /= probs.sum()
+                        sids[i, :actual_len] = self._rng.choice(
+                            valid_genes.astype(np.int32, copy=False),
+                            size=actual_len,
+                            replace=False,
+                            p=probs,
+                        )
+                else:
+                    raise ValueError(
+                        f"Unknown sampling_mode: {sampling_mode!r}. "
+                        "Valid options: 'uniform', 'expressed', 'hvg'."
+                    )
 
             for j in range(self._seq_len):
                 target = int(sids[i, j])

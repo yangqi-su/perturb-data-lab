@@ -85,6 +85,7 @@ from .loaders import (
 )
 
 # Import path resolver (Phase 1 output — canonical_meta under meta/)
+from ..materializers.models import MaterializationManifest
 from ..materializers.paths import resolve_corpus_paths
 
 __all__ = [
@@ -281,6 +282,7 @@ class Corpus:
         sampling_mode: str = "uniform",
         expressed_weight: float = 3.0,
         hvg_weight: float = 3.0,
+        hvg_top_k: int | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield processed sparse training batches for the requested route.
 
@@ -296,6 +298,10 @@ class Corpus:
         loader-local sampler arguments override it for that call and emit a
         ``UserWarning``. Lance-backed loaders default to
         ``multiprocessing_context="spawn"`` unless explicitly overridden.
+
+        ``sampling_mode="hvg"`` optionally accepts ``hvg_top_k`` to apply a
+        runtime top-k threshold from canonical per-dataset ``hvg.parquet``
+        rankings without rematerializing the corpus.
         """
         validated = _validate_loader_params(
             processing=processing,
@@ -349,6 +355,7 @@ class Corpus:
                 sampling_mode=sampling_mode,
                 expressed_weight=expressed_weight,
                 hvg_weight=hvg_weight,
+                hvg_top_k=hvg_top_k,
             )
         data_loader = DataLoader(
             dataset_obj,
@@ -389,6 +396,7 @@ class Corpus:
                     sampling_mode=sampling_mode,
                     expressed_weight=expressed_weight,
                     hvg_weight=hvg_weight,
+                    hvg_top_k=hvg_top_k,
                 )
                 yield _attach_requested_metadata(
                     processed_batch,
@@ -902,6 +910,8 @@ def load_corpus(
     # ------------------------------------------------------------------
     canonical_obs_paths: dict[str, Path] = {}
     canonical_var_paths: dict[str, Path] = {}
+    hvg_rank_paths: dict[str, str | Path] = {}
+    default_n_hvg_by_dataset: dict[str, int] = {}
     global_ranges: list[tuple[str, int, int, int]] = []
     # (dataset_id, dataset_index, global_start, global_end)
 
@@ -928,6 +938,16 @@ def load_corpus(
 
         canonical_obs_paths[ds_id] = obs_path
         canonical_var_paths[ds_id] = var_path
+        hvg_path, default_n_hvg = _resolve_dataset_hvg_inputs(
+            corpus_root=root,
+            topology=topology,
+            dataset_id=ds_id,
+            ds_entry=ds_entry,
+        )
+        if hvg_path is not None:
+            hvg_rank_paths[ds_id] = hvg_path
+        if default_n_hvg is not None:
+            default_n_hvg_by_dataset[ds_id] = int(default_n_hvg)
         global_ranges.append((ds_id, ds_index, g_start, g_end))
 
     # ------------------------------------------------------------------
@@ -1181,6 +1201,8 @@ def load_corpus(
         var_path_map,
         dataset_order=dataset_order,
         global_id_by_feature_id=gene_tokenizer.token_to_id,
+        named_hvg_rank_paths=hvg_rank_paths or None,
+        default_n_hvg_by_dataset=default_n_hvg_by_dataset or None,
     )
 
     # ------------------------------------------------------------------
@@ -1208,6 +1230,40 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     """Read a YAML file and return the parsed dict."""
     with open(path, "r") as fh:
         return yaml.safe_load(fh) or {}
+
+
+def _resolve_dataset_hvg_inputs(
+    *,
+    corpus_root: Path,
+    topology: str,
+    dataset_id: str,
+    ds_entry: dict[str, Any],
+) -> tuple[Path | None, int | None]:
+    """Resolve an optional canonical ``hvg.parquet`` plus default top-k."""
+    resolved_paths = resolve_corpus_paths(topology, corpus_root, dataset_id)
+    manifest_path_value = ds_entry.get("manifest_path")
+    manifest: MaterializationManifest | None = None
+
+    if manifest_path_value:
+        manifest_path = Path(str(manifest_path_value))
+        if not manifest_path.is_absolute():
+            manifest_path = corpus_root / manifest_path
+        if manifest_path.exists():
+            manifest = MaterializationManifest.from_yaml_file(manifest_path)
+
+    default_n_hvg = manifest.default_n_hvg if manifest is not None else None
+    candidates: list[Path] = []
+    if manifest is not None and manifest.hvg_ranking_path:
+        manifest_hvg_path = Path(manifest.hvg_ranking_path)
+        if not manifest_hvg_path.is_absolute():
+            manifest_hvg_path = corpus_root / manifest_hvg_path
+        candidates.append(manifest_hvg_path)
+    candidates.append(resolved_paths.meta_root / "hvg.parquet")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate, default_n_hvg
+    return None, default_n_hvg
 
 
 def _build_csr_entries(
