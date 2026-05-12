@@ -8,6 +8,7 @@ materialize      Materialize datasets with --mode {create,append} into a backend
                  input. Outputs go under --output-corpus.
 draft-schema     Auto-draft canonicalization schemas from corpus-local inspection summaries.
 canonicalize     Canonicalize using corpus-local final schemas.
+backfill-hvg     Backfill canonical hvg.parquet files for an existing Lance corpus.
 corpus-validate  Validate a corpus for logical completeness.
 corpus-gc        Garbage-collect orphaned Lance fragments not in the corpus ledger.
 
@@ -917,6 +918,104 @@ def _cmd_corpus_gc(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# backfill-hvg
+# ---------------------------------------------------------------------------
+
+
+def _add_backfill_hvg_args(sub: argparse.ArgumentParser) -> None:
+    sub.add_argument(
+        "--corpus-root",
+        required=True,
+        help="Path to the existing Lance corpus root (containing corpus-index.yaml).",
+    )
+    sub.add_argument(
+        "--dataset-id",
+        action="append",
+        default=None,
+        help="Optional dataset_id to backfill; may be repeated.",
+    )
+    sub.add_argument(
+        "--output-root",
+        default=None,
+        help=(
+            "Optional alternate root where hvg.parquet files are written. "
+            "Defaults to in-place writes under the corpus root."
+        ),
+    )
+    sub.add_argument(
+        "--chunk-rows",
+        type=int,
+        default=50_000,
+        help="Number of corpus rows to request per backfill batch (default: 50000).",
+    )
+    sub.add_argument(
+        "--n-hvg",
+        type=int,
+        default=2000,
+        help="Fallback default_n_hvg when the manifest does not already record one.",
+    )
+    sub.add_argument(
+        "--summary-json",
+        default=None,
+        help="Optional path where a JSON backfill summary should be written.",
+    )
+    sub.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite an existing hvg.parquet instead of failing.",
+    )
+    sub.add_argument(
+        "--no-update-manifests",
+        action="store_false",
+        dest="update_manifests",
+        help="Do not rewrite materialization-manifest.yaml with hvg_ranking_path/default_n_hvg.",
+    )
+    sub.set_defaults(update_manifests=True)
+
+
+def _cmd_backfill_hvg(args: argparse.Namespace) -> None:
+    from .materializers import backfill_hvg_rankings_for_corpus
+
+    corpus_root = Path(args.corpus_root).resolve()
+    if not corpus_root.exists():
+        print(f"[error] corpus root not found: {corpus_root}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        summary = backfill_hvg_rankings_for_corpus(
+            corpus_root,
+            dataset_ids=args.dataset_id,
+            output_root=args.output_root,
+            chunk_rows=args.chunk_rows,
+            n_hvg=args.n_hvg,
+            overwrite=args.overwrite,
+            update_manifests=args.update_manifests,
+            progress_callback=print,
+        )
+    except Exception as exc:
+        print(f"[backfill-hvg] FAILED: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.summary_json:
+        summary.write_json(args.summary_json)
+        print(f"[backfill-hvg] summary-json: {Path(args.summary_json).resolve()}")
+
+    print("[backfill-hvg] done")
+    print(f"  corpus_root: {summary.corpus_root}")
+    print(f"  topology: {summary.topology}")
+    print(f"  datasets: {summary.dataset_count}")
+    print(f"  output_root: {summary.output_root}")
+    print(f"  update_manifests: {summary.update_manifests}")
+    for dataset in summary.datasets:
+        print(
+            "  - "
+            f"{dataset.dataset_id}: cells={dataset.cell_count} "
+            f"features={dataset.feature_count} rows={dataset.row_count} "
+            f"output={dataset.output_path} sha256={dataset.sha256[:12]}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # draft-schema (Phase 3)
 # ---------------------------------------------------------------------------
 
@@ -1283,6 +1382,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_canonicalize_args(p_can)
 
+    # backfill-hvg
+    p_backfill_hvg = sub.add_parser(
+        "backfill-hvg",
+        help="Backfill canonical hvg.parquet files for an existing Lance corpus.",
+    )
+    _add_backfill_hvg_args(p_backfill_hvg)
+
     # corpus-validate (kept)
     p_cv = sub.add_parser(
         "corpus-validate", help="Validate a corpus for logical completeness."
@@ -1310,6 +1416,8 @@ def main() -> None:
         _cmd_draft_schema(args)
     elif args.command == "canonicalize":
         _cmd_canonicalize(args)
+    elif args.command == "backfill-hvg":
+        _cmd_backfill_hvg(args)
     elif args.command == "corpus-validate":
         _cmd_corpus_validate(args)
     elif args.command == "corpus-gc":

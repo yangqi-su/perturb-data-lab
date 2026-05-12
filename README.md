@@ -8,6 +8,7 @@ Corpus-first preprocessing and runtime-loading system for large-scale perturb-se
 - materialize new corpora and later append datasets through the public CLI
 - keep materialization count-first and schema-independent
 - draft and finalize canonical schemas after materialization, then canonicalize corpus metadata
+- backfill canonical `hvg.parquet` ranking tables for existing Lance corpora without reopening source h5ad files
 - expose a corpus-level `load_corpus()` / `Corpus` runtime API for unified access
 - keep aggregate Lance as the production-default backend while leaving other backends wired for controlled experiments
 
@@ -38,7 +39,7 @@ perturb-data-lab/
 
 ## Current outputs
 
-- `src/perturb_data_lab/cli.py`: public `inspect`, `materialize`, `draft-schema`, `canonicalize`, `corpus-validate`, and `corpus-gc` entrypoints
+- `src/perturb_data_lab/cli.py`: public `inspect`, `materialize`, `draft-schema`, `canonicalize`, `backfill-hvg`, `corpus-validate`, and `corpus-gc` entrypoints
 - `src/perturb_data_lab/inspectors/`: inspection models, count-source audits, recovery classification, and review-bundle generation
 - `src/perturb_data_lab/materializers/`: create/append corpus writers, aggregate/federated backends, manifests, and emission-spec helpers
 - `src/perturb_data_lab/canonical/`: draft/final schema application and canonical obs/var generation
