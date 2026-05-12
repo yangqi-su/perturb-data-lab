@@ -134,10 +134,13 @@ class CategoricalLabelMap:
         append_labels: Sequence[str] = (),
         unknown_label: str | None = None,
     ) -> "CategoricalLabelMap":
-        values = metadata_index.get_column(column)
-        if values is None:
+        if column not in metadata_index.df.columns:
             raise ValueError(f"metadata column '{column}' is not available")
-        observed = tuple(_normalize_label(value, column=column) for value in values)
+        unique_values = metadata_index.df[column].unique(maintain_order=True).to_list()
+        observed = tuple(
+            _normalize_label(value, column=column)
+            for value in unique_values
+        )
         labels = _ordered_unique(
             [
                 *[str(label) for label in prepend_labels],
