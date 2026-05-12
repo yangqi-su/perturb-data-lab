@@ -16,6 +16,7 @@ from perturb_data_lab.canonical.contract import (
     CANONICAL_VAR_MUST_HAVE,
     CanonicalVocab,
     CanonicalizationSchema,
+    ConditionalCase,
     ExtensibleColumn,
     GeneMappingConfig,
     ObsColumnMapping,
@@ -159,6 +160,57 @@ def _make_minimal_schema(path: Path, dataset_id: str = "test") -> Canonicalizati
     )
     schema.write_yaml(path)
     return schema
+
+
+def _replace_obs_mapping(
+    schema: CanonicalizationSchema,
+    mapping: ObsColumnMapping,
+) -> CanonicalizationSchema:
+    return CanonicalizationSchema(
+        kind=schema.kind,
+        contract_version=schema.contract_version,
+        dataset_id=schema.dataset_id,
+        status=schema.status,
+        description=schema.description,
+        obs_column_mappings=tuple(
+            mapping if existing.canonical_name == mapping.canonical_name else existing
+            for existing in schema.obs_column_mappings
+        ),
+        obs_extensible=schema.obs_extensible,
+        var_column_mappings=schema.var_column_mappings,
+        var_extensible=schema.var_extensible,
+        gene_mapping=schema.gene_mapping,
+        notes=schema.notes,
+    )
+
+
+def _run_with_custom_obs_mapping(
+    tmp_path: Path,
+    rows: list[dict[str, Any]],
+    mapping: ObsColumnMapping,
+) -> CanonicalizationResult:
+    raw_obs = tmp_path / "raw-obs.parquet"
+    raw_var = tmp_path / "raw-var.parquet"
+    sf_path = tmp_path / "size-factor.parquet"
+    schema_path = tmp_path / "canonicalization-schema.yaml"
+    out_root = tmp_path / "output"
+
+    cell_ids = [row.get("cell_id", f"cell_{index}") for index, row in enumerate(rows)]
+    _make_raw_obs_parquet(raw_obs, rows)
+    _make_raw_var_parquet(raw_var, ["gene1", "gene2"])
+    _make_size_factor_parquet(sf_path, cell_ids, [1.0] * len(rows))
+    base_schema = _make_minimal_schema(schema_path)
+    schema = _replace_obs_mapping(base_schema, mapping)
+    schema.write_yaml(schema_path)
+
+    runner = CanonicalizationRunner(
+        raw_obs_path=raw_obs,
+        raw_var_path=raw_var,
+        size_factor_path=sf_path,
+        schema_path=schema_path,
+        output_root=out_root,
+    )
+    return runner.run()
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +775,144 @@ class TestCanonicalizationRunner:
         obs = pq.read_table(str(result.obs_path))
         assert "extra" in obs.column_names
         assert obs.column("extra")[0].as_py() == "value1"
+
+
+class TestMultiColumnStrategies:
+    def test_coalesce_uses_first_present_value_and_applies_transforms(self, tmp_path: Path):
+        result = _run_with_custom_obs_mapping(
+            tmp_path,
+            rows=[
+                {"cell_id": "c1", "target_gene": None, "perturbation": "", "guide_id": "TP53_sg1", "treatment": "Drug_A", "cell_type": "B", "cellline": "CL1", "genotype": "WT", "batch": "B1", "donor_id": "D1"},
+                {"cell_id": "c2", "target_gene": None, "perturbation": " NTC ", "guide_id": "NTC_sg2", "treatment": "Drug_B", "cell_type": "B", "cellline": "CL1", "genotype": "WT", "batch": "B1", "donor_id": "D1"},
+                {"cell_id": "c3", "target_gene": "KRAS", "perturbation": "NTC", "guide_id": "KRAS_sg3", "treatment": "Drug_C", "cell_type": "B", "cellline": "CL1", "genotype": "WT", "batch": "B1", "donor_id": "D1"},
+            ],
+            mapping=ObsColumnMapping(
+                canonical_name="perturb_label",
+                strategy="coalesce",
+                source_columns=("target_gene", "perturbation", "guide_id"),
+                transforms=(
+                    TransformRule(name="strip_guide_suffix", args={}),
+                    TransformRule(name="map_control_labels", args={"candidates": ["ntc"]}),
+                ),
+            ),
+        )
+
+        obs = pq.read_table(str(result.obs_path))
+        assert obs.column("perturb_label").to_pylist() == ["TP53", "ctrl", "KRAS"]
+
+    def test_join_combines_columns_then_runs_output_transforms(self, tmp_path: Path):
+        result = _run_with_custom_obs_mapping(
+            tmp_path,
+            rows=[
+                {"cell_id": "c1", "cellline": "CL1", "treatment": "Drug_A", "time_raw": "24H", "guide_1": "TP53", "cell_type": "B", "genotype": "WT", "batch": "B1", "donor_id": "D1"},
+                {"cell_id": "c2", "cellline": "CL2", "treatment": "DMSO", "time_raw": None, "guide_1": "CTRL", "cell_type": "T", "genotype": "WT", "batch": "B2", "donor_id": "D2"},
+            ],
+            mapping=ObsColumnMapping(
+                canonical_name="condition",
+                strategy="join",
+                source_columns=("cellline", "treatment", "time_raw"),
+                separator=":",
+                skip_nulls=True,
+                transforms=(TransformRule(name="normalize_case", args={"mode": "lower"}),),
+            ),
+        )
+
+        obs = pq.read_table(str(result.obs_path))
+        assert obs.column("condition").to_pylist() == ["cl1:drug_a:24h", "cl2:dmso"]
+
+    def test_template_renders_with_configurable_missing_value_behavior(self, tmp_path: Path):
+        result = _run_with_custom_obs_mapping(
+            tmp_path,
+            rows=[
+                {"cell_id": "c1", "cellline": "CL1", "treatment": "Drug_A", "time_raw": "24H", "guide_1": "TP53", "cell_type": "B", "genotype": "WT", "batch": "B1", "donor_id": "D1"},
+                {"cell_id": "c2", "cellline": "CL2", "treatment": "DMSO", "time_raw": None, "guide_1": "CTRL", "cell_type": "T", "genotype": "WT", "batch": "B2", "donor_id": "D2"},
+            ],
+            mapping=ObsColumnMapping(
+                canonical_name="condition",
+                strategy="template",
+                template="{cellline}:{treatment}:{time_raw}",
+                missing_value_behavior="literal",
+                missing_value="unknown",
+                transforms=(TransformRule(name="normalize_case", args={"mode": "lower"}),),
+            ),
+        )
+
+        obs = pq.read_table(str(result.obs_path))
+        assert obs.column("condition").to_pylist() == [
+            "cl1:drug_a:24h",
+            "cl2:dmso:unknown",
+        ]
+
+    def test_conditional_resolves_cases_in_order_then_applies_transforms(self, tmp_path: Path):
+        result = _run_with_custom_obs_mapping(
+            tmp_path,
+            rows=[
+                {"cell_id": "c1", "is_control": "yes", "target_gene": None, "guide_id": "NTC_sg1", "guide_1": "NTC_sg1", "treatment": "Drug_A", "cell_type": "B", "cellline": "CL1", "genotype": "WT", "batch": "B1", "donor_id": "D1"},
+                {"cell_id": "c2", "is_control": "no", "target_gene": "KRAS", "guide_id": "KRAS_sg2", "guide_1": "KRAS_sg2", "treatment": "Drug_B", "cell_type": "B", "cellline": "CL1", "genotype": "WT", "batch": "B1", "donor_id": "D1"},
+                {"cell_id": "c3", "is_control": "no", "target_gene": None, "guide_id": "EGFR_sg3", "guide_1": "EGFR_sg3", "treatment": "Drug_C", "cell_type": "B", "cellline": "CL1", "genotype": "WT", "batch": "B1", "donor_id": "D1"},
+            ],
+            mapping=ObsColumnMapping(
+                canonical_name="perturb_label",
+                strategy="conditional",
+                cases=(
+                    ConditionalCase(
+                        source_column="is_control",
+                        predicate="equals",
+                        value="yes",
+                        result_literal="NTC",
+                    ),
+                    ConditionalCase(
+                        source_column="target_gene",
+                        predicate="not_null",
+                        result_source_column="target_gene",
+                    ),
+                ),
+                default_source_column="guide_id",
+                transforms=(
+                    TransformRule(name="strip_guide_suffix", args={}),
+                    TransformRule(name="map_control_labels", args={"candidates": ["ntc"]}),
+                ),
+            ),
+        )
+
+        obs = pq.read_table(str(result.obs_path))
+        assert obs.column("perturb_label").to_pylist() == ["ctrl", "KRAS", "EGFR"]
+
+    def test_missing_multi_column_source_raises_actionable_error(self, tmp_path: Path):
+        raw_obs = tmp_path / "raw-obs.parquet"
+        raw_var = tmp_path / "raw-var.parquet"
+        sf_path = tmp_path / "size-factor.parquet"
+        schema_path = tmp_path / "canonicalization-schema.yaml"
+        out_root = tmp_path / "output"
+
+        _make_raw_obs_parquet(raw_obs, [
+            {"cell_id": "c1", "guide_1": "TP53", "treatment": "Drug_A", "cell_type": "B", "cellline": "CL1", "genotype": "WT", "batch": "B1", "donor_id": "D1"},
+        ])
+        _make_raw_var_parquet(raw_var, ["gene1"])
+        _make_size_factor_parquet(sf_path, ["c1"], [1.0])
+
+        base_schema = _make_minimal_schema(schema_path)
+        schema = _replace_obs_mapping(
+            base_schema,
+            ObsColumnMapping(
+                canonical_name="condition",
+                strategy="join",
+                source_columns=("cellline", "missing_column"),
+                separator=":",
+            ),
+        )
+        schema.write_yaml(schema_path)
+
+        runner = CanonicalizationRunner(
+            raw_obs_path=raw_obs,
+            raw_var_path=raw_var,
+            size_factor_path=sf_path,
+            schema_path=schema_path,
+            output_root=out_root,
+        )
+
+        with pytest.raises(ValueError, match="join mapping for 'condition' references missing raw obs columns: missing_column"):
+            runner.run()
 
 
 # ---------------------------------------------------------------------------

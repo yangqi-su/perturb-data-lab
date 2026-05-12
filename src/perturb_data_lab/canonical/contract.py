@@ -148,6 +148,10 @@ _OBS_STRATEGIES: frozenset[str] = frozenset({
     "passthrough",
     "row-index",
     "null",
+    "coalesce",
+    "join",
+    "template",
+    "conditional",
 })
 _VAR_STRATEGIES: frozenset[str] = frozenset({
     "source-field",
@@ -157,6 +161,62 @@ _VAR_STRATEGIES: frozenset[str] = frozenset({
     "auto",
     "null",
 })
+_CONDITIONAL_PREDICATES: frozenset[str] = frozenset({"equals", "in", "not_null"})
+_TEMPLATE_MISSING_BEHAVIORS: frozenset[str] = frozenset({"fallback", "empty", "literal"})
+
+
+@dataclass(frozen=True)
+class ConditionalCase:
+    """Single ordered case used by ``strategy: conditional`` obs mappings."""
+
+    source_column: str
+    predicate: str
+    value: str | None = None
+    values: tuple[str, ...] = ()
+    case_sensitive: bool = False
+    strip_whitespace: bool = True
+    result_literal: str | None = None
+    result_source_column: str | None = None
+
+    def __post_init__(self):
+        if self.predicate not in _CONDITIONAL_PREDICATES:
+            raise ValueError(
+                f"Unknown conditional predicate {self.predicate!r}; "
+                f"allowed: {sorted(_CONDITIONAL_PREDICATES)}"
+            )
+        if self.predicate == "equals" and self.value is None:
+            raise ValueError("conditional equals predicate requires `value`")
+        if self.predicate == "in" and not self.values:
+            raise ValueError("conditional in predicate requires non-empty `values`")
+        if (self.result_literal is None) == (self.result_source_column is None):
+            raise ValueError(
+                "conditional case requires exactly one of `result_literal` or "
+                "`result_source_column`"
+            )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ConditionalCase":
+        raw_values = data.get("values", ())
+        if isinstance(raw_values, str):
+            values = (raw_values,)
+        else:
+            values = tuple(str(value) for value in raw_values)
+        return cls(
+            source_column=str(data["source_column"]),
+            predicate=str(data["predicate"]),
+            value=None if data.get("value") is None else str(data.get("value")),
+            values=values,
+            case_sensitive=bool(data.get("case_sensitive", False)),
+            strip_whitespace=bool(data.get("strip_whitespace", True)),
+            result_literal=(
+                None if data.get("result_literal") is None else str(data.get("result_literal"))
+            ),
+            result_source_column=(
+                None
+                if data.get("result_source_column") is None
+                else str(data.get("result_source_column"))
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -172,8 +232,35 @@ class ObsColumnMapping:
     source_column: str | None = None
     """Raw obs column to read from when strategy is ``source-field``."""
 
+    source_columns: tuple[str, ...] = ()
+    """Ordered raw obs columns for multi-column strategies such as coalesce/join."""
+
     literal_value: str | None = None
     """Static value when strategy is ``literal``."""
+
+    separator: str = "+"
+    """Join separator when strategy is ``join``."""
+
+    skip_nulls: bool = True
+    """Whether ``join`` skips null-like values instead of inserting fallback markers."""
+
+    template: str | None = None
+    """Format template used by ``strategy: template``."""
+
+    missing_value_behavior: str = "fallback"
+    """How ``template`` fills missing values: ``fallback``, ``empty``, or ``literal``."""
+
+    missing_value: str | None = None
+    """Literal placeholder for missing template values when behavior is ``literal``."""
+
+    cases: tuple[ConditionalCase, ...] = ()
+    """Ordered cases used by ``strategy: conditional``."""
+
+    default_literal: str | None = None
+    """Fallback literal used by ``strategy: conditional`` when no case matches."""
+
+    default_source_column: str | None = None
+    """Fallback raw column used by ``strategy: conditional`` when no case matches."""
 
     transforms: tuple[TransformRule, ...] = ()
     """Ordered list of value transforms applied after source extraction."""
@@ -187,6 +274,28 @@ class ObsColumnMapping:
                 f"Unknown obs mapping strategy {self.strategy!r}; "
                 f"allowed: {sorted(_OBS_STRATEGIES)}"
             )
+        if self.strategy in {"coalesce", "join"} and not self.source_columns:
+            raise ValueError(
+                f"obs strategy {self.strategy!r} requires non-empty `source_columns`"
+            )
+        if self.strategy == "template":
+            if not self.template:
+                raise ValueError("obs strategy 'template' requires `template`")
+            if self.missing_value_behavior not in _TEMPLATE_MISSING_BEHAVIORS:
+                raise ValueError(
+                    "template missing_value_behavior must be one of "
+                    f"{sorted(_TEMPLATE_MISSING_BEHAVIORS)}"
+                )
+        if self.strategy == "conditional":
+            if (self.default_literal is not None) and (self.default_source_column is not None):
+                raise ValueError(
+                    "conditional mapping requires at most one of `default_literal` or "
+                    "`default_source_column`"
+                )
+            if not self.cases and self.default_literal is None and self.default_source_column is None:
+                raise ValueError(
+                    "conditional mapping requires at least one case or a default result"
+                )
 
 
 @dataclass(frozen=True)
@@ -390,7 +499,26 @@ class CanonicalizationSchema:
                 canonical_name=str(m["canonical_name"]),
                 strategy=_nullsafe_str(m.get("strategy"), "null"),
                 source_column=m.get("source_column"),
+                source_columns=tuple(str(col) for col in m.get("source_columns", [])),
                 literal_value=m.get("literal_value"),
+                separator=str(m.get("separator", "+")),
+                skip_nulls=bool(m.get("skip_nulls", True)),
+                template=(None if m.get("template") is None else str(m.get("template"))),
+                missing_value_behavior=str(m.get("missing_value_behavior", "fallback")),
+                missing_value=(
+                    None if m.get("missing_value") is None else str(m.get("missing_value"))
+                ),
+                cases=tuple(
+                    ConditionalCase.from_dict(case) for case in m.get("cases", [])
+                ),
+                default_literal=(
+                    None if m.get("default_literal") is None else str(m.get("default_literal"))
+                ),
+                default_source_column=(
+                    None
+                    if m.get("default_source_column") is None
+                    else str(m.get("default_source_column"))
+                ),
                 transforms=tuple(
                     TransformRule.from_dict(t) for t in m.get("transforms", [])
                 ),
@@ -491,13 +619,51 @@ def _obs_mapping_to_dict(m: ObsColumnMapping) -> dict[str, Any]:
     }
     if m.source_column is not None:
         d["source_column"] = m.source_column
+    if m.source_columns:
+        d["source_columns"] = list(m.source_columns)
     if m.literal_value is not None:
         d["literal_value"] = m.literal_value
+    if m.separator != "+":
+        d["separator"] = m.separator
+    if m.skip_nulls is not True:
+        d["skip_nulls"] = m.skip_nulls
+    if m.template is not None:
+        d["template"] = m.template
+    if m.missing_value_behavior != "fallback":
+        d["missing_value_behavior"] = m.missing_value_behavior
+    if m.missing_value is not None:
+        d["missing_value"] = m.missing_value
+    if m.cases:
+        d["cases"] = [_conditional_case_to_dict(case) for case in m.cases]
+    if m.default_literal is not None:
+        d["default_literal"] = m.default_literal
+    if m.default_source_column is not None:
+        d["default_source_column"] = m.default_source_column
     if m.transforms:
         d["transforms"] = [{"name": t.name, "args": t.args} for t in m.transforms]
     if m.fallback != MISSING_VALUE_LITERAL:
         d["fallback"] = m.fallback
     return d
+
+
+def _conditional_case_to_dict(case: ConditionalCase) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "source_column": case.source_column,
+        "predicate": case.predicate,
+    }
+    if case.value is not None:
+        payload["value"] = case.value
+    if case.values:
+        payload["values"] = list(case.values)
+    if case.case_sensitive is not False:
+        payload["case_sensitive"] = case.case_sensitive
+    if case.strip_whitespace is not True:
+        payload["strip_whitespace"] = case.strip_whitespace
+    if case.result_literal is not None:
+        payload["result_literal"] = case.result_literal
+    if case.result_source_column is not None:
+        payload["result_source_column"] = case.result_source_column
+    return payload
 
 
 def _var_mapping_to_dict(m: VarColumnMapping) -> dict[str, Any]:

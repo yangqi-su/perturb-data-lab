@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import string
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from .contract import (
     CANONICAL_VAR_MUST_HAVE,
     CanonicalVocab,
     CanonicalizationSchema,
+    ConditionalCase,
     ExtensibleColumn,
     ObsColumnMapping,
     VarColumnMapping,
@@ -36,6 +38,7 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+_TEMPLATE_FORMATTER = string.Formatter()
 
 _TYPED_OBS_ARROW_TYPES: dict[str, pa.DataType] = {
     "global_row_index": pa.int64(),
@@ -428,7 +431,206 @@ class CanonicalizationRunner:
                 fallback=mapping.fallback,
             )
 
+        if strategy == "coalesce":
+            self._ensure_obs_columns_present(
+                mapping,
+                obs_raw,
+                mapping.source_columns,
+            )
+            resolved = [
+                self._apply_transforms(
+                    self._resolve_coalesce_value(mapping, obs_raw, row_index),
+                    mapping.transforms,
+                    fallback=mapping.fallback,
+                )
+                for row_index in range(n_rows)
+            ]
+            return _build_obs_array(
+                mapping.canonical_name,
+                resolved,
+                fallback=mapping.fallback,
+            )
+
+        if strategy == "join":
+            self._ensure_obs_columns_present(
+                mapping,
+                obs_raw,
+                mapping.source_columns,
+            )
+            resolved = [
+                self._apply_transforms(
+                    self._resolve_join_value(mapping, obs_raw, row_index),
+                    mapping.transforms,
+                    fallback=mapping.fallback,
+                )
+                for row_index in range(n_rows)
+            ]
+            return _build_obs_array(
+                mapping.canonical_name,
+                resolved,
+                fallback=mapping.fallback,
+            )
+
+        if strategy == "template":
+            template_fields = _extract_template_fields(mapping.template or "")
+            self._ensure_obs_columns_present(mapping, obs_raw, template_fields)
+            resolved = [
+                self._apply_transforms(
+                    self._resolve_template_value(mapping, obs_raw, row_index, template_fields),
+                    mapping.transforms,
+                    fallback=mapping.fallback,
+                )
+                for row_index in range(n_rows)
+            ]
+            return _build_obs_array(
+                mapping.canonical_name,
+                resolved,
+                fallback=mapping.fallback,
+            )
+
+        if strategy == "conditional":
+            required_columns = [case.source_column for case in mapping.cases]
+            required_columns.extend(
+                case.result_source_column
+                for case in mapping.cases
+                if case.result_source_column is not None
+            )
+            if mapping.default_source_column is not None:
+                required_columns.append(mapping.default_source_column)
+            self._ensure_obs_columns_present(mapping, obs_raw, required_columns)
+            resolved = [
+                self._apply_transforms(
+                    self._resolve_conditional_value(mapping, obs_raw, row_index),
+                    mapping.transforms,
+                    fallback=mapping.fallback,
+                )
+                for row_index in range(n_rows)
+            ]
+            return _build_obs_array(
+                mapping.canonical_name,
+                resolved,
+                fallback=mapping.fallback,
+            )
+
         raise ValueError(f"Unhandled obs strategy: {strategy!r}")
+
+    def _resolve_coalesce_value(
+        self,
+        mapping: ObsColumnMapping,
+        obs_raw: dict[str, list[Any]],
+        row_index: int,
+    ) -> str:
+        for source_column in mapping.source_columns:
+            value = obs_raw[source_column][row_index]
+            if not _is_null_like_value(value):
+                return str(value)
+        return MISSING_VALUE_LITERAL
+
+    def _resolve_join_value(
+        self,
+        mapping: ObsColumnMapping,
+        obs_raw: dict[str, list[Any]],
+        row_index: int,
+    ) -> str:
+        parts: list[str] = []
+        for source_column in mapping.source_columns:
+            value = obs_raw[source_column][row_index]
+            if _is_null_like_value(value):
+                if mapping.skip_nulls:
+                    continue
+                parts.append(mapping.fallback)
+                continue
+            parts.append(str(value))
+        return mapping.separator.join(parts)
+
+    def _resolve_template_value(
+        self,
+        mapping: ObsColumnMapping,
+        obs_raw: dict[str, list[Any]],
+        row_index: int,
+        template_fields: tuple[str, ...],
+    ) -> str:
+        rendered_values: dict[str, str] = {}
+        saw_missing = False
+        for field_name in template_fields:
+            value = obs_raw[field_name][row_index]
+            if _is_null_like_value(value):
+                saw_missing = True
+                if mapping.missing_value_behavior == "fallback":
+                    return mapping.fallback
+                if mapping.missing_value_behavior == "empty":
+                    rendered_values[field_name] = ""
+                else:
+                    rendered_values[field_name] = (
+                        mapping.missing_value
+                        if mapping.missing_value is not None
+                        else mapping.fallback
+                    )
+                continue
+            rendered_values[field_name] = str(value)
+
+        if not template_fields and saw_missing:
+            return mapping.fallback
+        return (mapping.template or "").format_map(rendered_values)
+
+    def _resolve_conditional_value(
+        self,
+        mapping: ObsColumnMapping,
+        obs_raw: dict[str, list[Any]],
+        row_index: int,
+    ) -> str:
+        for case in mapping.cases:
+            if self._conditional_case_matches(case, obs_raw[case.source_column][row_index]):
+                if case.result_literal is not None:
+                    return case.result_literal
+                resolved = obs_raw[case.result_source_column][row_index]
+                return MISSING_VALUE_LITERAL if resolved is None else str(resolved)
+        if mapping.default_literal is not None:
+            return mapping.default_literal
+        if mapping.default_source_column is not None:
+            resolved = obs_raw[mapping.default_source_column][row_index]
+            return MISSING_VALUE_LITERAL if resolved is None else str(resolved)
+        return mapping.fallback
+
+    def _conditional_case_matches(self, case: ConditionalCase, value: Any) -> bool:
+        if case.predicate == "not_null":
+            return not _is_null_like_value(value)
+
+        candidate = _normalize_conditional_value(
+            value,
+            case_sensitive=case.case_sensitive,
+            strip_whitespace=case.strip_whitespace,
+        )
+        if case.predicate == "equals":
+            return candidate == _normalize_conditional_value(
+                case.value,
+                case_sensitive=case.case_sensitive,
+                strip_whitespace=case.strip_whitespace,
+            )
+        if case.predicate == "in":
+            normalized_values = {
+                _normalize_conditional_value(
+                    probe,
+                    case_sensitive=case.case_sensitive,
+                    strip_whitespace=case.strip_whitespace,
+                )
+                for probe in case.values
+            }
+            return candidate in normalized_values
+        raise ValueError(f"Unhandled conditional predicate: {case.predicate!r}")
+
+    def _ensure_obs_columns_present(
+        self,
+        mapping: ObsColumnMapping,
+        obs_raw: dict[str, list[Any]],
+        columns: list[str] | tuple[str, ...],
+    ) -> None:
+        missing = [column for column in _ordered_unique(columns) if column not in obs_raw]
+        if missing:
+            raise ValueError(
+                f"{mapping.strategy} mapping for '{mapping.canonical_name}' references "
+                f"missing raw obs columns: {', '.join(missing)}"
+            )
 
     # ------------------------------------------------------------------
     # Var canonicalization
@@ -795,6 +997,40 @@ def run_canonicalization(
 # ---------------------------------------------------------------------------
 
 _NA_LITERALS: frozenset[str] = frozenset({"", "na", "n/a", "none", "null", "nan", ".", "-"})
+
+
+def _ordered_unique(values: list[str] | tuple[str, ...]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
+
+def _extract_template_fields(template: str) -> tuple[str, ...]:
+    fields: list[str] = []
+    for _, field_name, _, _ in _TEMPLATE_FORMATTER.parse(template):
+        if field_name:
+            fields.append(field_name)
+    return tuple(_ordered_unique(fields))
+
+
+def _normalize_conditional_value(
+    value: Any,
+    *,
+    case_sensitive: bool,
+    strip_whitespace: bool,
+) -> str:
+    text = "" if value is None else str(value)
+    if strip_whitespace:
+        text = text.strip()
+    return text if case_sensitive else text.lower()
+
+
+def _is_null_like_value(value: Any) -> bool:
+    return value is None or _is_null_like_str(str(value))
 
 
 def _is_null_like_str(value: str | None) -> bool:
