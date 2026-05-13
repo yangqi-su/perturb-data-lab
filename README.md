@@ -45,7 +45,7 @@ perturb-data-lab/
 - `src/perturb_data_lab/materializers/`: create/append corpus writers, aggregate/federated backends, manifests, and emission-spec helpers
 - `src/perturb_data_lab/canonical/`: draft/final schema application and canonical obs/var generation
 - `src/perturb_data_lab/loaders/corpus_loader.py`: `load_corpus()` and `Corpus` for unified runtime access
-- `scripts/perttf_marson_xorion_smoke.py`: bounded full-corpus Phase 8 adapter smoke for Marson/Xorion
+- `scripts/perttf_marson_xorion_smoke.py`: bounded full-corpus Phase 7 public-loader smoke for Marson/Xorion
 - `docs/v0-onboarding-workflow.md`: current inspect → materialize → draft-schema → finalize-schema → canonicalize → load workflow
 - `docs/canonicalization_handbook.md`: canonical schema review rules, transform behavior, tokenizer notes, and common failure modes
 - `docs/perttf_marson_xorion_adapter_smoke.md`: user-facing handoff notes for the pertTF-local adapter smoke path

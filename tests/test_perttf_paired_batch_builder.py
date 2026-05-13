@@ -14,6 +14,7 @@ from perturb_data_lab.loaders import (
     PertTFAdapterConfig,
     PertTFPairedBatchLoader,
     PertTFPairedBatchBuilder,
+    PertTFCorpusAdapter,
     PerturbationPairSampler,
     load_corpus,
 )
@@ -631,6 +632,9 @@ def _build_public_pair_loader(
     multiprocessing_context: str | None,
     drop_last: bool = True,
     config: PertTFAdapterConfig | None = None,
+    adapter: PertTFCorpusAdapter | None = None,
+    source_indices=None,
+    target_candidate_indices=None,
 ):
     resolved_config = config or PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
     return PertTFPairedBatchLoader(
@@ -638,8 +642,11 @@ def _build_public_pair_loader(
         batch_size=batch_size,
         seq_len=seq_len,
         config=resolved_config,
+        adapter=adapter,
         seed=seed,
         drop_last=drop_last,
+        source_indices=source_indices,
+        target_candidate_indices=target_candidate_indices,
         sampling_mode="hvg",
         hvg_weight=4.0,
         hvg_top_k=2,
@@ -804,6 +811,46 @@ def test_public_paired_batch_loader_omits_full_expression_fields_by_default(
     assert "full_expr_mask" not in batch
     assert "full_expr_next" not in batch
     assert "full_expr_next_mask" not in batch
+
+
+def test_public_paired_batch_loader_supports_restricted_row_pool_with_null_labels(
+    tmp_path: Path,
+) -> None:
+    corpus_path = _build_small_pair_corpus(tmp_path)
+    obs_path = corpus_path / "meta" / "ds0" / "canonical_meta" / "canonical-obs.parquet"
+    frame = pl.read_parquet(obs_path).with_columns(
+        pl.Series("perturb_label", [None, "KO_TP53"]),
+    )
+    frame.write_parquet(obs_path)
+
+    corpus = load_corpus(str(corpus_path))
+    restricted_rows = np.asarray([1], dtype=np.int64)
+    config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
+    adapter = PertTFCorpusAdapter.from_corpus(
+        corpus,
+        config,
+        row_indices=restricted_rows,
+    )
+    loader = _build_public_pair_loader(
+        corpus,
+        batch_size=1,
+        seq_len=3,
+        seed=7,
+        num_workers=0,
+        multiprocessing_context=None,
+        drop_last=False,
+        config=config,
+        adapter=adapter,
+        source_indices=restricted_rows,
+        target_candidate_indices=restricted_rows,
+    )
+
+    batch = next(iter(loader))
+
+    assert batch["index"].tolist() == [1]
+    assert batch["next_index"].tolist() == [1]
+    assert loader.pair_sampler._source_indices.tolist() == [1]
+    assert loader.pair_sampler._target_candidate_indices.tolist() == [1]
 
 
 def test_pair_read_dataloader_supports_spawn_workers(tmp_path: Path) -> None:

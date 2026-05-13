@@ -154,10 +154,22 @@ class CategoricalLabelMap:
         prepend_labels: Sequence[str] = (),
         append_labels: Sequence[str] = (),
         unknown_label: str | None = None,
+        row_indices: Sequence[int] | np.ndarray | None = None,
     ) -> "CategoricalLabelMap":
         if column not in metadata_index.df.columns:
             raise ValueError(f"metadata column '{column}' is not available")
-        unique_values = metadata_index.df[column].unique(maintain_order=True).to_list()
+        normalized_row_indices = _normalize_candidate_row_indices(
+            metadata_index,
+            row_indices,
+        )
+        if normalized_row_indices is None:
+            unique_values = metadata_index.df[column].unique(maintain_order=True).to_list()
+        else:
+            selected_values = metadata_index.take(
+                normalized_row_indices,
+                columns=[column],
+            )[column]
+            unique_values = list(selected_values)
         observed = tuple(
             _normalize_label(value, column=column)
             for value in unique_values
@@ -310,6 +322,7 @@ class PertTFLabelAdapter:
         cls,
         metadata_index: MetadataIndex,
         config: PertTFAdapterConfig | None = None,
+        row_indices: Sequence[int] | np.ndarray | None = None,
     ) -> "PertTFLabelAdapter":
         resolved = config or PertTFAdapterConfig()
         unknown_label = resolved.unknown_label
@@ -322,6 +335,7 @@ class PertTFLabelAdapter:
                 column=resolved.cell_context_column,
                 append_labels=append_unknown,
                 unknown_label=unknown_label,
+                row_indices=row_indices,
             ),
             perturbation=CategoricalLabelMap.from_metadata_column(
                 metadata_index,
@@ -330,6 +344,7 @@ class PertTFLabelAdapter:
                 prepend_labels=resolved.control_labels,
                 append_labels=append_unknown,
                 unknown_label=unknown_label,
+                row_indices=row_indices,
             ),
             batch=CategoricalLabelMap.from_metadata_column(
                 metadata_index,
@@ -337,6 +352,7 @@ class PertTFLabelAdapter:
                 column=resolved.batch_column,
                 append_labels=append_unknown,
                 unknown_label=unknown_label,
+                row_indices=row_indices,
             ),
         )
 
@@ -499,23 +515,62 @@ class PerturbationPairSampler:
         self._target_candidate_mask[self._target_candidate_indices] = True
         self._source_row_count = int(self._source_indices.size)
         self._dataset_index = np.asarray(dataset_index, dtype=np.int32)
-        self._context_labels = tuple(
+        if normalized_source_indices is None and normalized_target_candidate_indices is None:
+            relevant_indices = self._all_indices
+        else:
+            relevant_indices = np.unique(
+                np.concatenate([self._source_indices, self._target_candidate_indices]).astype(
+                    np.int64,
+                    copy=False,
+                )
+            )
+        relevant_metadata = metadata_index.take(
+            relevant_indices,
+            columns=[
+                self.config.cell_context_column,
+                self.config.perturbation_column,
+                self.config.batch_column,
+            ],
+        )
+        context_labels_by_row = [""] * self.total_rows
+        perturbation_labels_by_row = [""] * self.total_rows
+        batch_labels_by_row = [""] * self.total_rows
+        cell_context_ids = np.full(self.total_rows, -1, dtype=np.int64)
+        perturbation_ids = np.full(self.total_rows, -1, dtype=np.int64)
+        batch_ids = np.full(self.total_rows, -1, dtype=np.int64)
+
+        relevant_context_labels = tuple(
             _normalize_label(value, column=self.config.cell_context_column)
-            for value in context_labels
+            for value in relevant_metadata[self.config.cell_context_column]
         )
-        self._perturbation_labels = tuple(
+        relevant_perturbation_labels = tuple(
             _normalize_label(value, column=self.config.perturbation_column)
-            for value in perturbation_labels
+            for value in relevant_metadata[self.config.perturbation_column]
         )
-        self._batch_labels = tuple(
+        relevant_batch_labels = tuple(
             _normalize_label(value, column=self.config.batch_column)
-            for value in batch_labels
+            for value in relevant_metadata[self.config.batch_column]
         )
-        self._cell_context_ids = self.labels.cell_context.encode_many(self._context_labels)
-        self._perturbation_ids = self.labels.perturbation.encode_many(
-            self._perturbation_labels
+        relevant_context_ids = self.labels.cell_context.encode_many(relevant_context_labels)
+        relevant_perturbation_ids = self.labels.perturbation.encode_many(
+            relevant_perturbation_labels
         )
-        self._batch_ids = self.labels.batch.encode_many(self._batch_labels)
+        relevant_batch_ids = self.labels.batch.encode_many(relevant_batch_labels)
+
+        for offset, row_idx in enumerate(relevant_indices.tolist()):
+            context_labels_by_row[row_idx] = relevant_context_labels[offset]
+            perturbation_labels_by_row[row_idx] = relevant_perturbation_labels[offset]
+            batch_labels_by_row[row_idx] = relevant_batch_labels[offset]
+            cell_context_ids[row_idx] = int(relevant_context_ids[offset])
+            perturbation_ids[row_idx] = int(relevant_perturbation_ids[offset])
+            batch_ids[row_idx] = int(relevant_batch_ids[offset])
+
+        self._context_labels = tuple(context_labels_by_row)
+        self._perturbation_labels = tuple(perturbation_labels_by_row)
+        self._batch_labels = tuple(batch_labels_by_row)
+        self._cell_context_ids = cell_context_ids
+        self._perturbation_ids = perturbation_ids
+        self._batch_ids = batch_ids
         self._pool_by_key = self._build_pool_by_key()
         self._perturbations_by_context = self._build_perturbations_by_context()
         self._control_pool_by_context = self._build_control_pool_by_context()
@@ -1483,6 +1538,7 @@ class PertTFCorpusAdapter:
         cls,
         corpus: Corpus,
         config: PertTFAdapterConfig | None = None,
+        row_indices: Sequence[int] | np.ndarray | None = None,
     ) -> "PertTFCorpusAdapter":
         resolved = config or PertTFAdapterConfig()
         return cls(
@@ -1494,6 +1550,7 @@ class PertTFCorpusAdapter:
             labels=PertTFLabelAdapter.from_metadata_index(
                 corpus.metadata_index,
                 resolved,
+                row_indices=row_indices,
             ),
         )
 
@@ -1521,6 +1578,8 @@ class PertTFPairedBatchLoader:
         drop_last: bool = True,
         perturbed_target_policy: str = "self_to_control_label",
         missing_target_policy: str = "error",
+        source_indices: Sequence[int] | np.ndarray | None = None,
+        target_candidate_indices: Sequence[int] | np.ndarray | None = None,
         sampling_mode: str = "hvg",
         expressed_weight: float = 3.0,
         hvg_weight: float = 3.0,
@@ -1551,6 +1610,8 @@ class PertTFPairedBatchLoader:
             drop_last=drop_last,
             perturbed_target_policy=perturbed_target_policy,
             missing_target_policy=missing_target_policy,
+            source_indices=source_indices,
+            target_candidate_indices=target_candidate_indices,
         )
         self._request_sampler = _PertTFPairReadBatchSampler(self.pair_sampler)
         self._dataset = _PertTFPairExpressionDataset(
