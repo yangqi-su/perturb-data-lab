@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import polars as pl
+import pytest
 import pyarrow as pa
 from scipy import sparse
 from scipy.stats import t as student_t
@@ -354,6 +355,100 @@ def _dense_reference_truncated_svd(
         "singular_values": singular_values,
         "explained_variance_ratio": np.square(singular_values) / frobenius_norm_sq,
     }
+
+
+def _dense_reference_incremental_pca(
+    corpus,
+    dataset_id: str,
+    *,
+    n_components: int,
+    batch_size: int,
+    selected_global_feature_ids: np.ndarray | None = None,
+    fit_row_indices: np.ndarray | None = None,
+    transform_row_indices: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    sklearn = pytest.importorskip("sklearn.decomposition")
+    combined, global_row_index, local_row_index = _dense_reference_lognorm_matrix(
+        corpus,
+        dataset_id,
+        selected_global_feature_ids=selected_global_feature_ids,
+    )
+    fit_matrix = _subset_dense_rows(combined, global_row_index, fit_row_indices)
+    transform_matrix = _subset_dense_rows(combined, global_row_index, transform_row_indices)
+    transform_global_row_index = _subset_index_values(global_row_index, global_row_index, transform_row_indices)
+    transform_local_row_index = _subset_index_values(local_row_index, global_row_index, transform_row_indices)
+
+    fit_chunk_size = max(batch_size, n_components)
+    fit_chunks = [fit_matrix[start : start + fit_chunk_size] for start in range(0, fit_matrix.shape[0], fit_chunk_size)]
+    if len(fit_chunks) > 1 and fit_chunks[-1].shape[0] < n_components:
+        fit_chunks[-2] = np.vstack([fit_chunks[-2], fit_chunks[-1]])
+        fit_chunks.pop()
+
+    model = sklearn.IncrementalPCA(n_components=n_components, batch_size=fit_chunk_size)
+    for chunk in fit_chunks:
+        model.partial_fit(chunk)
+
+    components = np.asarray(model.components_, dtype=np.float64).copy()
+    signs = np.ones(components.shape[0], dtype=np.float64)
+    for component_index in range(components.shape[0]):
+        pivot = int(np.argmax(np.abs(components[component_index])))
+        if components[component_index, pivot] < 0:
+            components[component_index] *= -1.0
+            signs[component_index] = -1.0
+
+    embeddings = np.asarray(model.transform(transform_matrix), dtype=np.float64)
+    embeddings *= signs[None, :]
+    return {
+        "embeddings": embeddings,
+        "components": components,
+        "singular_values": np.asarray(model.singular_values_, dtype=np.float64),
+        "explained_variance": np.asarray(model.explained_variance_, dtype=np.float64),
+        "explained_variance_ratio": np.asarray(model.explained_variance_ratio_, dtype=np.float64),
+        "global_row_index": transform_global_row_index,
+        "local_row_index": transform_local_row_index,
+    }
+
+
+def _dense_reference_lognorm_matrix(
+    corpus,
+    dataset_id: str,
+    *,
+    selected_global_feature_ids: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    matrices = []
+    global_rows = []
+    local_rows = []
+    for batch in iter_dataset_batches(corpus, dataset_id=dataset_id, batch_size=3):
+        dense = batch.expression.toarray().astype(np.float64, copy=False)
+        dense = np.log1p(dense / batch.size_factor[:, None].astype(np.float64, copy=False))
+        if selected_global_feature_ids is not None:
+            dense = dense[:, selected_global_feature_ids]
+        matrices.append(dense)
+        global_rows.append(np.asarray(batch.global_row_index, dtype=np.int64))
+        local_rows.append(np.asarray(batch.local_row_index, dtype=np.int64))
+    return np.vstack(matrices), np.concatenate(global_rows), np.concatenate(local_rows)
+
+
+def _subset_dense_rows(
+    matrix: np.ndarray,
+    global_row_index: np.ndarray,
+    row_indices: np.ndarray | None,
+) -> np.ndarray:
+    if row_indices is None:
+        return matrix
+    positions = {int(value): pos for pos, value in enumerate(global_row_index.tolist())}
+    return matrix[[positions[int(value)] for value in row_indices.tolist()]]
+
+
+def _subset_index_values(
+    values: np.ndarray,
+    global_row_index: np.ndarray,
+    row_indices: np.ndarray | None,
+) -> np.ndarray:
+    if row_indices is None:
+        return values
+    positions = {int(value): pos for pos, value in enumerate(global_row_index.tolist())}
+    return values[[positions[int(value)] for value in row_indices.tolist()]]
 
 
 def _reference_benjamini_hochberg(p_value: np.ndarray) -> np.ndarray:
@@ -770,6 +865,141 @@ def test_run_pca_streams_all_datasets_respects_hvgs_and_writes_artifacts(tmp_pat
         assert provenance["parameters"]["method"] == "truncated_svd"
         assert provenance["parameters"]["method_semantics"] == "uncentered_truncated_svd_on_lognorm_expression"
         assert provenance["parameters"]["n_components"] == 2
+
+
+def test_run_pca_incremental_pca_fit_subset_transforms_all_and_respects_hvgs(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("sklearn.decomposition")
+    _build_mock_federated_lance_corpus(tmp_path)
+    corpus = load_corpus(str(tmp_path))
+    hvgs = calculate_hvgs(corpus, dataset_id="mock_00", batch_size=4, n_hvg=7)
+    fit_selection = corpus.select_obs_indices(
+        dataset_id="mock_00",
+        strategy="random",
+        max_cells=6,
+        seed=13,
+    )
+
+    result = run_pca(
+        corpus,
+        dataset_id="mock_00",
+        method="incremental_pca",
+        batch_size=4,
+        n_components=3,
+        hvg_frame=hvgs,
+        fit_row_indices=fit_selection.row_indices,
+    )
+
+    selected = result.selected_features.sort("selected_feature_index")
+    reference = _dense_reference_incremental_pca(
+        corpus,
+        "mock_00",
+        n_components=3,
+        batch_size=4,
+        selected_global_feature_ids=selected["global_feature_id"].to_numpy(),
+        fit_row_indices=np.asarray(fit_selection.row_indices, dtype=np.int64),
+    )
+
+    assert result.embeddings.shape == (10, 7)
+    assert result.components["component_index"].unique().sort().to_list() == [1, 2, 3]
+    assert result.component_stats["method"].unique().to_list() == ["incremental_pca"]
+    assert result.component_stats["is_centered"].unique().to_list() == [True]
+    assert result.component_stats["method_semantics"].unique().to_list() == [
+        "centered_incremental_pca_on_lognorm_expression"
+    ]
+    np.testing.assert_array_equal(
+        result.selected_features["global_feature_id"].to_numpy(),
+        (
+            hvgs.filter(pl.col("dataset_id") == "mock_00")
+            .filter(pl.col("is_hvg"))
+            .sort("hvg_rank")["global_feature_id"]
+            .to_numpy()
+        ),
+    )
+    np.testing.assert_array_equal(
+        result.embeddings["global_row_index"].to_numpy(),
+        reference["global_row_index"],
+    )
+    np.testing.assert_array_equal(
+        result.embeddings["local_row_index"].to_numpy(),
+        reference["local_row_index"],
+    )
+    np.testing.assert_allclose(
+        result.embeddings.select(["component_1", "component_2", "component_3"]).to_numpy(),
+        reference["embeddings"],
+        atol=1e-6,
+    )
+    for component_index in range(3):
+        subset = result.components.filter(pl.col("component_index") == component_index + 1).sort(
+            "selected_feature_index"
+        )
+        np.testing.assert_allclose(
+            subset["loading"].to_numpy(),
+            reference["components"][component_index],
+            atol=1e-6,
+        )
+    np.testing.assert_allclose(
+        result.component_stats["singular_value"].to_numpy(),
+        reference["singular_values"],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        result.component_stats["explained_variance"].to_numpy(),
+        reference["explained_variance"],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        result.component_stats["explained_variance_ratio"].to_numpy(),
+        reference["explained_variance_ratio"],
+        atol=1e-6,
+    )
+    assert result.component_stats["n_obs"].unique().to_list() == [len(fit_selection.row_indices)]
+
+
+def test_run_pca_incremental_pca_memory_guard_raises_before_writes(tmp_path: Path) -> None:
+    pytest.importorskip("sklearn.decomposition")
+    corpus_root = tmp_path / "corpus"
+    _build_mock_federated_lance_corpus(corpus_root)
+    corpus = load_corpus(str(corpus_root))
+    output_dir = tmp_path / "pp-output"
+
+    with pytest.raises(MemoryError, match="max_dense_batch_bytes"):
+        run_pca(
+            corpus,
+            dataset_id="mock_00",
+            method="incremental_pca",
+            batch_size=4,
+            n_components=2,
+            max_dense_batch_bytes=1024,
+            output_dir=output_dir,
+        )
+
+    assert not output_dir.exists()
+
+
+def test_run_pca_incremental_pca_errors_clearly_when_sklearn_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import perturb_data_lab.pp.pca as pca_module
+
+    _build_mock_federated_lance_corpus(tmp_path)
+    corpus = load_corpus(str(tmp_path))
+
+    def _raise_import_error() -> type[Any]:
+        raise ImportError("method='incremental_pca' requires optional dependency scikit-learn")
+
+    monkeypatch.setattr(pca_module, "_load_incremental_pca_class", _raise_import_error)
+
+    with pytest.raises(ImportError, match="requires optional dependency scikit-learn"):
+        run_pca(
+            corpus,
+            dataset_id="mock_00",
+            method="incremental_pca",
+            batch_size=4,
+            n_components=2,
+        )
 
 
 def test_rank_genes_ttest_matches_dense_reference_for_single_dataset(tmp_path: Path) -> None:

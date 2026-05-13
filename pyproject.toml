@@ -21,6 +21,9 @@ dependencies = [
 hf-datasets = [
     "datasets>=4.2",
 ]
+pca = [
+    "scikit-learn>=1.4",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
