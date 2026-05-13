@@ -9,7 +9,7 @@ editing the external `pertTF` repository.
 - loads the existing aggregate Marson/Xorion Lance corpus with `load_corpus(...)`
 - verifies that all 14 datasets expose canonical `hvg.parquet` rankings at runtime
 - constructs a public `PertTFPairedBatchLoader`
-- filters out rows missing required pertTF label columns before loader sampling
+- exercises the loader's default null-label drop behavior and records the effective row/drop stats
 - scans a bounded number of public-loader batches until it finds a small mixed-dataset batch with `sampling_mode="hvg"`
 - validates:
   - same-dataset and same-context source/target invariants
@@ -35,8 +35,8 @@ until it finds one that mixes datasets.
 That means the smoke exercises the same `for batch in perttf_loader:` path that
 normal callers use while still avoiding an unnecessarily broad full-corpus run
 just to prove the end-to-end tensor contract. Rows with null `cell_context`,
-`perturb_label`, or `batch_id` are excluded from the smoke row pool so the
-public loader only samples valid pertTF label rows.
+`perturb_label`, or `batch_id` are now dropped by the public loader's default
+null-label policy, and the smoke records the resulting effective row counts.
 
 ## Typical Slurm invocation
 

@@ -1,3 +1,4 @@
+import warnings
 from dataclasses import replace
 from pathlib import Path
 
@@ -70,15 +71,20 @@ def _write_hvg_ranking(path: Path, gene_names: list[str]) -> None:
     frame.write_parquet(str(path))
 
 
-def _write_aggregate_lance(path: Path) -> None:
+def _write_aggregate_lance(
+    path: Path,
+    *,
+    rows: list[tuple[list[int], list[int]]] | None = None,
+) -> None:
+    resolved_rows = rows or [([0, 2], [5, 1]), ([1, 3], [3, 2])]
     table = pa.table(
         {
             "expressed_gene_indices": pa.array(
-                [[0, 2], [1, 3]],
+                [genes for genes, _ in resolved_rows],
                 type=pa.list_(pa.int32()),
             ),
             "expression_counts": pa.array(
-                [[5, 1], [3, 2]],
+                [counts for _, counts in resolved_rows],
                 type=pa.list_(pa.int32()),
             ),
         }
@@ -117,6 +123,53 @@ def _build_small_pair_corpus(tmp_path: Path) -> Path:
     )
     _write_hvg_ranking(dataset_root / "hvg.parquet", ["GENE_A", "GENE_B", "GENE_C", "GENE_D"])
     _write_aggregate_lance(corpus_root / "matrix" / "aggregated-cells.lance")
+    return corpus_root
+
+
+def _build_three_row_pair_corpus(tmp_path: Path) -> Path:
+    corpus_root = tmp_path / "perttf-three-row-corpus"
+    index_doc = {
+        "kind": "corpus-index",
+        "contract_version": "0.3.0",
+        "corpus_id": "perttf-three-row-corpus",
+        "global_metadata": {"backend": "lance", "topology": "aggregate"},
+        "datasets": [
+            {
+                "dataset_id": "ds0",
+                "join_mode": "create_new",
+                "dataset_index": 0,
+                "cell_count": 3,
+                "global_start": 0,
+                "global_end": 3,
+            }
+        ],
+    }
+    corpus_root.mkdir(parents=True, exist_ok=True)
+    with open(corpus_root / "corpus-index.yaml", "w", encoding="utf-8") as handle:
+        yaml.safe_dump(index_doc, handle, sort_keys=False)
+
+    dataset_root = corpus_root / "meta" / "ds0"
+    frame = pl.DataFrame(
+        {
+            "cell_id": ["ds0_wt", "ds0_ko0", "ds0_ko1"],
+            "dataset_id": ["ds0", "ds0", "ds0"],
+            "size_factor": [1.0, 1.1, 1.2],
+            "cell_context": ["T_cell", "T_cell", "T_cell"],
+            "perturb_label": ["WT", "KO_TP53", "KO_STAT1"],
+            "batch_id": ["batch_0", "batch_1", "batch_2"],
+        }
+    )
+    (dataset_root / "canonical_meta").mkdir(parents=True, exist_ok=True)
+    frame.write_parquet(str(dataset_root / "canonical_meta" / "canonical-obs.parquet"))
+    _write_canonical_var(
+        dataset_root / "canonical_meta" / "canonical-var.parquet",
+        ["GENE_A", "GENE_B", "GENE_C", "GENE_D"],
+    )
+    _write_hvg_ranking(dataset_root / "hvg.parquet", ["GENE_A", "GENE_B", "GENE_C", "GENE_D"])
+    _write_aggregate_lance(
+        corpus_root / "matrix" / "aggregated-cells.lance",
+        rows=[([0, 2], [5, 1]), ([1, 3], [3, 2]), ([0, 1], [4, 6])],
+    )
     return corpus_root
 
 
@@ -815,14 +868,34 @@ def test_public_paired_batch_loader_omits_full_expression_fields_by_default(
     assert "full_expr_next_mask" not in batch
 
 
-def test_public_paired_batch_loader_drops_null_rows_and_defaults_row_indices_pool(
+@pytest.mark.parametrize(
+    ("column", "expected_counts"),
+    [
+        (
+            "cell_context",
+            {"cell_context": 1, "perturb_label": 0, "batch_id": 0},
+        ),
+        (
+            "perturb_label",
+            {"cell_context": 0, "perturb_label": 1, "batch_id": 0},
+        ),
+        (
+            "batch_id",
+            {"cell_context": 0, "perturb_label": 0, "batch_id": 1},
+        ),
+    ],
+)
+def test_public_paired_batch_loader_drops_null_required_label_rows_by_default(
     tmp_path: Path,
+    column: str,
+    expected_counts: dict[str, int],
 ) -> None:
     corpus_path = _build_small_pair_corpus(tmp_path)
     obs_path = corpus_path / "meta" / "ds0" / "canonical_meta" / "canonical-obs.parquet"
-    frame = pl.read_parquet(obs_path).with_columns(
-        pl.Series("perturb_label", [None, "KO_TP53"]),
-    )
+    frame = pl.read_parquet(obs_path)
+    values = frame[column].to_list()
+    values[0] = None
+    frame = frame.with_columns(pl.Series(column, values))
     frame.write_parquet(obs_path)
 
     corpus = load_corpus(str(corpus_path))
@@ -845,17 +918,124 @@ def test_public_paired_batch_loader_drops_null_rows_and_defaults_row_indices_poo
 
     batch = next(iter(loader))
 
+    assert loader.row_indices.tolist() == [0, 1]
     assert batch["index"].tolist() == [1]
     assert batch["next_index"].tolist() == [1]
     assert loader.effective_label_row_indices.tolist() == [1]
     assert loader.effective_source_indices.tolist() == [1]
     assert loader.effective_target_candidate_indices.tolist() == [1]
     assert loader.null_label_filter_stats.dropped_row_count == 1
+    assert loader.null_label_filter_stats.per_column_null_counts == expected_counts
+
+
+def test_public_paired_batch_loader_reports_warning_and_drop_counts(
+    tmp_path: Path,
+) -> None:
+    corpus_path = _build_three_row_pair_corpus(tmp_path)
+    obs_path = corpus_path / "meta" / "ds0" / "canonical_meta" / "canonical-obs.parquet"
+    frame = pl.read_parquet(obs_path).with_columns(
+        pl.Series("cell_context", [None, "T_cell", "T_cell"]),
+        pl.Series("perturb_label", ["WT", None, "KO_STAT1"]),
+        pl.Series("batch_id", ["batch_0", None, "batch_2"]),
+    )
+    frame.write_parquet(obs_path)
+
+    corpus = load_corpus(str(corpus_path))
+    with pytest.warns(
+        RuntimeWarning,
+        match=(
+            "PertTFPairedBatchLoader dropped 2 of 3 rows with null required pertTF labels "
+            "\\(cell_context=1, perturb_label=1, batch_id=1\\)"
+        ),
+    ):
+        loader = _build_public_pair_loader(
+            corpus,
+            batch_size=1,
+            seq_len=3,
+            seed=7,
+            num_workers=0,
+            multiprocessing_context=None,
+            drop_last=False,
+        )
+
+    batch = next(iter(loader))
+
+    assert batch["index"].tolist() == [2]
+    assert batch["next_index"].tolist() == [2]
+    assert loader.null_label_filter_stats.checked_row_count == 3
+    assert loader.null_label_filter_stats.kept_row_count == 1
+    assert loader.null_label_filter_stats.dropped_row_count == 2
     assert loader.null_label_filter_stats.per_column_null_counts == {
-        "cell_context": 0,
+        "cell_context": 1,
         "perturb_label": 1,
-        "batch_id": 0,
+        "batch_id": 1,
     }
+
+
+def test_public_paired_batch_loader_selected_row_pool_ignores_null_rows_outside_subset(
+    tmp_path: Path,
+) -> None:
+    corpus_path = _build_small_pair_corpus(tmp_path)
+    obs_path = corpus_path / "meta" / "ds0" / "canonical_meta" / "canonical-obs.parquet"
+    frame = pl.read_parquet(obs_path).with_columns(
+        pl.Series("perturb_label", [None, "KO_TP53"]),
+    )
+    frame.write_parquet(obs_path)
+
+    corpus = load_corpus(str(corpus_path))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        loader = _build_public_pair_loader(
+            corpus,
+            batch_size=1,
+            seq_len=3,
+            seed=7,
+            num_workers=0,
+            multiprocessing_context=None,
+            drop_last=False,
+            row_indices=np.asarray([1], dtype=np.int64),
+        )
+
+    batch = next(iter(loader))
+
+    assert len(caught) == 0
+    assert batch["index"].tolist() == [1]
+    assert batch["next_index"].tolist() == [1]
+    assert loader.null_label_filter_stats.checked_row_count == 1
+    assert loader.null_label_filter_stats.dropped_row_count == 0
+    assert loader.effective_label_row_indices.tolist() == [1]
+    assert loader.effective_source_indices.tolist() == [1]
+    assert loader.effective_target_candidate_indices.tolist() == [1]
+
+
+def test_public_paired_batch_loader_strict_mode_raises_on_null_required_labels(
+    tmp_path: Path,
+) -> None:
+    corpus_path = _build_small_pair_corpus(tmp_path)
+    obs_path = corpus_path / "meta" / "ds0" / "canonical_meta" / "canonical-obs.parquet"
+    frame = pl.read_parquet(obs_path).with_columns(
+        pl.Series("perturb_label", [None, "KO_TP53"]),
+    )
+    frame.write_parquet(obs_path)
+
+    corpus = load_corpus(str(corpus_path))
+
+    with pytest.raises(ValueError, match="null_label_policy='error'"):
+        _build_public_pair_loader(
+            corpus,
+            batch_size=1,
+            seq_len=3,
+            seed=7,
+            num_workers=0,
+            multiprocessing_context=None,
+            drop_last=False,
+            config=PertTFAdapterConfig(
+                control_labels=("WT",),
+                mask_ratio=0.0,
+                null_label_policy="strict",
+            ),
+            row_indices=np.asarray([0, 1], dtype=np.int64),
+        )
 
 
 def test_public_paired_batch_loader_explicit_pools_override_row_indices(

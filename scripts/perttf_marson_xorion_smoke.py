@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import polars as pl
 import torch
 import yaml
 
@@ -50,6 +49,27 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 def _max_rss_mib() -> float:
     return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
+
+
+def _null_label_filter_stats_summary(stats) -> dict[str, Any]:
+    if stats is None:
+        return {
+            "policy": "none",
+            "checked_row_count": 0,
+            "kept_row_count": 0,
+            "dropped_row_count": 0,
+            "per_column_null_counts": {},
+        }
+    return {
+        "policy": str(stats.policy),
+        "checked_row_count": int(stats.checked_row_count),
+        "kept_row_count": int(stats.kept_row_count),
+        "dropped_row_count": int(stats.dropped_row_count),
+        "per_column_null_counts": {
+            str(column): int(count)
+            for column, count in stats.per_column_null_counts.items()
+        },
+    }
 
 
 @dataclass(frozen=True)
@@ -106,18 +126,6 @@ def _load_dataset_entries(corpus_root: Path) -> list[DatasetEntry]:
 def _dataset_ids_from_indices(corpus, dataset_indices: np.ndarray) -> tuple[str, ...]:
     dataset_ids = corpus.feature_registry.dataset_ids
     return tuple(str(dataset_ids[int(idx)]) for idx in dataset_indices.tolist())
-
-
-def _valid_public_loader_rows(corpus, config: PertTFAdapterConfig) -> np.ndarray:
-    filtered = corpus.metadata_index.df.filter(
-        pl.col(config.cell_context_column).is_not_null()
-        & pl.col(config.perturbation_column).is_not_null()
-        & pl.col(config.batch_column).is_not_null()
-    )
-    valid_rows = filtered["global_row_index"].to_numpy()
-    if valid_rows.size == 0:
-        raise RuntimeError("no rows remain after filtering null pertTF label columns")
-    return np.asarray(valid_rows, dtype=np.int64)
 
 
 def _observe_loader_batch(
@@ -348,7 +356,10 @@ def _write_markdown_summary(path: Path, summary: dict[str, Any]) -> None:
                 f"- `HVG Top K`: `{summary['batch']['hvg_top_k']}`",
                 f"- `Public Loader Batch Index`: `{summary['batch']['public_loader_batch_index']}`",
                 f"- `Public Loader Workers`: `{summary['loader']['num_workers']}` ({summary['loader']['multiprocessing_context']})",
-                f"- `Valid Loader Rows`: `{summary['loader']['valid_row_count']}` / `{summary['loader']['total_row_count']}`",
+                f"- `Effective Label Rows`: `{summary['loader']['effective_label_row_count']}` / `{summary['loader']['total_row_count']}`",
+                f"- `Effective Source Rows`: `{summary['loader']['effective_source_row_count']}`",
+                f"- `Effective Target Candidate Rows`: `{summary['loader']['effective_target_candidate_row_count']}`",
+                f"- `Dropped Null-Label Rows`: `{summary['loader']['null_label_filter_stats']['dropped_row_count']}` ({summary['loader']['null_label_filter_stats']['per_column_null_counts']})",
                 "",
                 "## HVG Discovery",
                 "",
@@ -491,34 +502,31 @@ def main() -> None:
         include_full_expr=True,
         mask_ratio=0.0,
     )
-    valid_loader_rows = _valid_public_loader_rows(corpus, config)
-    filtered_null_rows = int(len(corpus.metadata_index) - len(valid_loader_rows))
-    adapter = PertTFCorpusAdapter.from_corpus(
-        corpus,
-        config,
-        row_indices=valid_loader_rows,
-    )
     multiprocessing_context = command_snapshot["multiprocessing_context"]
     loader = PertTFPairedBatchLoader(
         corpus,
         batch_size=int(args.batch_size),
         seq_len=int(args.seq_len),
         config=config,
-        adapter=adapter,
         seed=int(args.seed),
-        source_indices=valid_loader_rows,
-        target_candidate_indices=valid_loader_rows,
         sampling_mode="hvg",
         hvg_weight=float(args.hvg_weight),
         hvg_top_k=int(args.hvg_top_k),
         num_workers=int(args.num_workers),
         multiprocessing_context=multiprocessing_context,
     )
+    null_label_filter_stats = _null_label_filter_stats_summary(loader.null_label_filter_stats)
+    if not loader.effective_label_row_indices.size:
+        raise RuntimeError("public pertTF loader resolved no usable rows after null-label dropping")
     loader_seconds = time.monotonic() - loader_start
     _log(
         "Built public pertTF loader in "
-        f"{loader_seconds:.2f}s using {len(valid_loader_rows)} valid rows "
-        f"(filtered {filtered_null_rows} rows with null pertTF labels)"
+        f"{loader_seconds:.2f}s with "
+        f"{len(loader.effective_label_row_indices)} effective label rows, "
+        f"{len(loader.effective_source_indices)} effective source rows, "
+        f"{len(loader.effective_target_candidate_indices)} effective target rows, "
+        f"dropped {null_label_filter_stats['dropped_row_count']} rows "
+        f"{null_label_filter_stats['per_column_null_counts']}"
     )
 
     dataset_state = dict(loader._data_loader.dataset.__dict__)
@@ -569,9 +577,13 @@ def main() -> None:
             ),
             "expression_only_state_passed": bool(expression_only_state_passed),
             "dataset_state_keys": sorted(dataset_state.keys()),
-            "valid_row_count": int(len(valid_loader_rows)),
             "total_row_count": int(len(corpus.metadata_index)),
-            "filtered_null_row_count": int(filtered_null_rows),
+            "effective_label_row_count": int(len(loader.effective_label_row_indices)),
+            "effective_source_row_count": int(len(loader.effective_source_indices)),
+            "effective_target_candidate_row_count": int(
+                len(loader.effective_target_candidate_indices)
+            ),
+            "null_label_filter_stats": null_label_filter_stats,
         },
         "batch": {
             "hvg_top_k": int(args.hvg_top_k),

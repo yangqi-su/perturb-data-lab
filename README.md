@@ -172,6 +172,10 @@ for batch in perttf_loader:
 - `PertTFPairedBatchLoader` yields final pertTF-ready batch dictionaries; normal
   callers do not need to assemble raw pair requests or call
   `build_from_raw_pair_batch(...)` directly.
+- Rows with null required pertTF labels (`cell_context`, `perturb_label`,
+  `batch_id`) are dropped by default with a `RuntimeWarning`; the effective row
+  counts remain visible via `perttf_loader.null_label_filter_stats` and the
+  `effective_*_indices` attributes.
 - `set_epoch(epoch)` is available for deterministic reshuffling between epochs.
 - When `num_workers > 0`, the loader keeps pair planning in the main process and
   uses worker processes only for source/target expression reads.
@@ -230,6 +234,9 @@ pair_sampler = PerturbationPairSampler(
 
 - `row_indices` are corpus-global row positions; they restrict loader/sampler
   candidate pools without rebuilding the full metadata index.
+- On `PertTFPairedBatchLoader`, `row_indices=...` is the simple public shortcut:
+  when explicit `source_indices` / `target_candidate_indices` are omitted, both
+  source and target candidate pools default to that row subset.
 - `source_indices` restrict which rows can be sampled as pertTF sources.
 - `target_candidate_indices` further restrict valid paired targets and is
   accepted only when `source_indices` is also provided.
