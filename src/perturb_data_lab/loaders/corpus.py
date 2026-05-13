@@ -33,8 +33,9 @@ def read_raw_obs_parquet(parquet_path: Path) -> list[dict[str, Any]]:
     ----------
     parquet_path : Path
         Path to ``raw-obs.parquet`` written by ``Stage2Materializer``.
-        Schema: cell_id (string), dataset_id (string),
-        raw_fields (string, JSON-serialized dict).
+        Schema: cell_id (string), dataset_id (string), raw_fields
+        (string, JSON-serialized dict), plus optional top-level provenance
+        fields such as source_row_index/source_obs_index.
 
     Returns
     -------
@@ -44,11 +45,11 @@ def read_raw_obs_parquet(parquet_path: Path) -> list[dict[str, Any]]:
     table = pq.read_table(str(parquet_path))
     result: list[dict[str, Any]] = []
     for row in table.to_pylist():
-        result.append({
-            "cell_id": str(row["cell_id"]),
-            "dataset_id": str(row["dataset_id"]),
-            "raw_fields": json.loads(row["raw_fields"]),
-        })
+        item = dict(row)
+        item["cell_id"] = str(item["cell_id"])
+        item["dataset_id"] = str(item["dataset_id"])
+        item["raw_fields"] = json.loads(item["raw_fields"])
+        result.append(item)
     return result
 
 

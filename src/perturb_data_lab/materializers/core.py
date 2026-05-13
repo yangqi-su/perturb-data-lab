@@ -32,6 +32,7 @@ import scipy.sparse as sp
 from scipy.sparse import csr_matrix, issparse
 
 from .backends import build_backend_fn
+from .obs_filter import ObsFilterError, filter_obs_rows
 
 
 def _safe_serialize(val: Any) -> Any:
@@ -277,7 +278,16 @@ class Stage2Materializer:
             raise FileNotFoundError(f"source h5ad not found: {source_h5ad}")
         adata = ad.read_h5ad(str(source_h5ad), backed="r")
         try:
-            n_obs = adata.n_obs
+            source_obs = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
+            retained_source_rows = filter_obs_rows(source_obs, summary.obs_filter)
+            if len(retained_source_rows) == 0:
+                raise ObsFilterError(
+                    f"obs_filter retained zero rows for dataset {self.dataset_id}"
+                )
+            filtered_obs = source_obs.iloc[retained_source_rows].copy()
+            n_obs = len(filtered_obs)
+            filter_applied = summary.obs_filter is not None and bool(summary.obs_filter.strip())
+            source_obs_rows = int(adata.n_obs)
 
             # Determine var space for the selected count source
             if count_source.selected == ".raw.X":
@@ -288,6 +298,10 @@ class Stage2Materializer:
                 n_vars = adata.n_vars
                 var_ref = adata.var
                 var_index = adata.var.index
+
+            count_matrix = self._select_count_matrix(adata, count_source.selected)
+            if filter_applied:
+                count_matrix = _RowSubsetMatrixView(count_matrix, retained_source_rows)
 
             # --- Ensure output directories exist ---
             meta_root = Path(self.output_roots.metadata_root)
@@ -303,7 +317,8 @@ class Stage2Materializer:
 
             # --- Write raw cell metadata (Parquet, not SQLite) ---
             raw_cell_meta_parquet_path = self._write_raw_cell_metadata_parquet(
-                adata=adata,
+                obs=filtered_obs,
+                source_row_indices=(retained_source_rows if filter_applied else None),
                 meta_root=meta_root,
             )
 
@@ -316,9 +331,11 @@ class Stage2Materializer:
 
             # --- Write per-dataset metadata summary ---
             metadata_summary_path = self._write_metadata_summary(
-                adata=adata,
+                obs=filtered_obs,
                 var_mem=var_mem,
                 meta_root=meta_root,
+                source_obs_rows=source_obs_rows,
+                obs_filter=summary.obs_filter,
             )
 
             # --- Write feature provenance Parquet ---
@@ -330,9 +347,6 @@ class Stage2Materializer:
                 source_path=str(source_h5ad),
             )
 
-            # --- Select count matrix from the approved count source ---
-            count_matrix = self._select_count_matrix(adata, count_source.selected)
-
             # --- Write backend-specific sparse cell data ---
             # HVG statistics are accumulated during the chunk loop via np.add.at.
             # Global size factors are computed after the loop from all row_sums.
@@ -340,8 +354,8 @@ class Stage2Materializer:
             backend_result: tuple[dict[str, Path], np.ndarray, Path] | dict[str, Path]
             backend_result = self._write_cells(
                 count_matrix=count_matrix,
-                adata=adata,
                 matrix_root=matrix_root,
+                cell_ids=filtered_obs.index,
                 feature_ids=tuple(str(v) for v in var_index),
                 needs_recovery=count_source.uses_recovery,
             )
@@ -349,7 +363,7 @@ class Stage2Materializer:
                 backend_paths, size_factors, hvg_ranking_path = backend_result
                 size_factor_parquet_path = self._write_size_factor_parquet(
                     size_factors=size_factors,
-                    cell_ids=adata.obs.index,
+                    cell_ids=filtered_obs.index,
                     meta_root=meta_root,
                 )
             else:
@@ -398,6 +412,13 @@ class Stage2Materializer:
                 notes=(
                     f"materialized via Stage2Materializer (schema-independent, count-first)",
                     f"topology={self.topology}",
+                    *(
+                        (
+                            f"obs_filter retained {n_obs}/{source_obs_rows} rows",
+                        )
+                        if filter_applied
+                        else ()
+                    ),
                 ),
             )
             manifest.validate()
@@ -511,7 +532,8 @@ class Stage2Materializer:
 
     def _write_raw_cell_metadata_parquet(
         self,
-        adata: ad.AnnData,
+        obs: pd.DataFrame,
+        source_row_indices: np.ndarray | None,
         meta_root: Path,
     ) -> Path:
         """Write raw cell metadata (obs) as a Parquet sidecar.
@@ -519,6 +541,7 @@ class Stage2Materializer:
         Each row contains:
         - cell_id: the obs index value (string)
         - dataset_id: stable dataset identifier
+        - optional source_row_index/source_obs_index provenance for filtered runs
         - raw_fields: JSON string of all obs fields for this cell
 
         This is the Stage 2 Parquet replacement for the legacy SQLite
@@ -528,7 +551,6 @@ class Stage2Materializer:
         import pyarrow.parquet as pq
 
         parquet_path = meta_root / "raw-obs.parquet"
-        obs = adata.obs
         n = len(obs)
 
         cell_ids = [str(idx) for idx in obs.index]
@@ -536,7 +558,9 @@ class Stage2Materializer:
 
         # Efficiently build raw_fields as JSON strings per row.
         # Use Series.to_list() for each column and avoid iterrows().
-        col_names = list(obs.columns)
+        col_names = [
+            col for col in obs.columns if col not in {"source_row_index", "source_obs_index"}
+        ]
         col_lists = {col: obs[col].apply(_safe_serialize).to_list() for col in col_names}
 
         raw_fields = [
@@ -544,11 +568,17 @@ class Stage2Materializer:
             for i in range(n)
         ]
 
-        table = pa.table({
+        columns: dict[str, pa.Array] = {
             "cell_id": pa.array(cell_ids, type=pa.string()),
             "dataset_id": pa.array(dataset_ids, type=pa.string()),
             "raw_fields": pa.array(raw_fields, type=pa.string()),
-        })
+        }
+        if source_row_indices is not None:
+            columns["source_row_index"] = pa.array(
+                source_row_indices.tolist(), type=pa.int64()
+            )
+            columns["source_obs_index"] = pa.array(cell_ids, type=pa.string())
+        table = pa.table(columns)
         pq.write_table(table, parquet_path)
         return parquet_path
 
@@ -592,17 +622,18 @@ class Stage2Materializer:
 
     def _write_metadata_summary(
         self,
-        adata: ad.AnnData,
+        obs: pd.DataFrame,
         var_mem: pd.DataFrame,
         meta_root: Path,
+        *,
+        source_obs_rows: int,
+        obs_filter: str | None,
     ) -> Path:
         """Write a per-dataset metadata summary YAML file.
 
         Summarizes field-level coverage statistics (null fractions, dtypes)
         extracted from the raw obs/var before any canonical mapping.
         """
-        obs = adata.obs
-
         obs_null_fractions: dict[str, float] = {}
         obs_dtypes: dict[str, str] = {}
         for col in obs.columns:
@@ -632,6 +663,14 @@ class Stage2Materializer:
             var_index_name=str(var_mem.index.name or "index"),
             notes=(
                 f"materialized via Stage2Materializer (schema-independent)",
+                *(
+                    (
+                        f"obs_filter retained {len(obs)}/{source_obs_rows} rows",
+                        f"obs_filter expression: {obs_filter}",
+                    )
+                    if obs_filter is not None and obs_filter.strip()
+                    else ()
+                ),
             ),
         )
 
@@ -710,9 +749,9 @@ class Stage2Materializer:
     def _write_cells(
         self,
         count_matrix: Any,
-        adata: ad.AnnData,
         matrix_root: Path,
         *,
+        cell_ids: pd.Index,
         feature_ids: Sequence[str],
         needs_recovery: bool = False,
     ) -> tuple[dict[str, Path], np.ndarray, Path] | dict[str, Path]:
@@ -731,15 +770,15 @@ class Stage2Materializer:
         if self.topology == "aggregate":
             return self._write_cells_aggregate(
                 count_matrix,
-                adata,
                 matrix_root,
+                cell_ids=cell_ids,
                 feature_ids=feature_ids,
                 needs_recovery=needs_recovery,
             )
         return self._write_cells_federated(
             count_matrix,
-            adata,
             matrix_root,
+            cell_ids=cell_ids,
             feature_ids=feature_ids,
             needs_recovery=needs_recovery,
         )
@@ -771,9 +810,9 @@ class Stage2Materializer:
     def _write_cells_federated(
         self,
         count_matrix: Any,
-        adata: ad.AnnData,
         matrix_root: Path,
         *,
+        cell_ids: pd.Index,
         feature_ids: Sequence[str],
         needs_recovery: bool = False,
     ) -> tuple[dict[str, Path], np.ndarray, Path]:
@@ -854,7 +893,7 @@ class Stage2Materializer:
             # On last chunk: _is_last_chunk=True, writer closes/commits, returns None.
             cell_ids_chunk: tuple[str, ...] | None = None
             if self.backend == "webdataset":
-                cell_ids_chunk = tuple(adata.obs.index[chunk_start:chunk_end])
+                cell_ids_chunk = tuple(cell_ids[chunk_start:chunk_end])
 
             paths, writer_state = backend_fn(
                 bundle=bundle,
@@ -882,7 +921,7 @@ class Stage2Materializer:
         # --- After loop: write size factor Parquet sidecar ---
         size_factor_parquet_path = self._write_size_factor_parquet(
             size_factors=size_factors,
-            cell_ids=adata.obs.index,
+            cell_ids=cell_ids,
             meta_root=Path(self.output_roots.metadata_root),
         )
 
@@ -900,9 +939,9 @@ class Stage2Materializer:
     def _write_cells_aggregate(
         self,
         count_matrix: Any,
-        adata: ad.AnnData,
         matrix_root: Path,
         *,
+        cell_ids: pd.Index,
         feature_ids: Sequence[str],
         needs_recovery: bool = False,
     ) -> tuple[dict[str, Path], np.ndarray, Path]:
@@ -988,7 +1027,7 @@ class Stage2Materializer:
             # Call the aggregate backend writer with streaming state.
             cell_ids_chunk: tuple[str, ...] | None = None
             if self.backend == "webdataset":
-                cell_ids_chunk = tuple(adata.obs.index[chunk_start:chunk_end])
+                cell_ids_chunk = tuple(cell_ids[chunk_start:chunk_end])
 
             paths, writer_state = backend_fn(
                 bundle=bundle,
@@ -1019,7 +1058,7 @@ class Stage2Materializer:
         # --- After loop: write size factor Parquet sidecar ---
         size_factor_parquet_path = self._write_size_factor_parquet(
             size_factors=size_factors,
-            cell_ids=adata.obs.index,
+            cell_ids=cell_ids,
             meta_root=Path(self.output_roots.metadata_root),
         )
 
@@ -1079,6 +1118,25 @@ class CanonicalCellRecord:
         indices = np.array(self.expressed_gene_indices, dtype=np.int32)
         indptr = np.array([0, n], dtype=np.int32)
         return data, indices, indptr
+
+
+class _RowSubsetMatrixView:
+    """Minimal row-subset view for backed count matrices."""
+
+    def __init__(self, matrix: Any, row_indices: np.ndarray):
+        self._matrix = matrix
+        self._row_indices = np.asarray(row_indices, dtype=np.int64)
+        self.shape = (len(self._row_indices), int(matrix.shape[1]))
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, slice):
+            rows = self._row_indices[key]
+        else:
+            rows = self._row_indices[key]
+        return self._matrix[rows]
+
+    def local_slice(self, start: int, end: int) -> Any:
+        return self._matrix[self._row_indices[start:end]]
 
 
 # ---------------------------------------------------------------------------

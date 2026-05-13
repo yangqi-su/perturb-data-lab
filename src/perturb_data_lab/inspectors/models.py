@@ -186,8 +186,15 @@ class DatasetSummaryDocument(YamlDocument):
     count_source_candidates: tuple[CountSourceCandidate, ...]
     count_source_decision: CountSourceDecision
     materialization_readiness: str
+    obs_filter: str | None = None
     control_label_candidates: tuple[ControlLabelCandidate, ...] = ()
     inspector_notes: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _serialize(self)
+        if payload.get("obs_filter") is None:
+            payload.pop("obs_filter", None)
+        return payload
 
     def validate(self) -> None:
         if self.kind != "dataset-summary":
@@ -216,6 +223,9 @@ class DatasetSummaryDocument(YamlDocument):
                 data["count_source_decision"]
             ),
             materialization_readiness=str(data["materialization_readiness"]),
+            obs_filter=(
+                str(data["obs_filter"]) if data.get("obs_filter") is not None else None
+            ),
             inspector_notes=tuple(
                 str(item) for item in data.get("inspector_notes", [])
             ),
