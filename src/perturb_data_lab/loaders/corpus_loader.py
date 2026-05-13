@@ -49,11 +49,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+import sys
 from typing import Any, Iterator, Sequence
 import warnings
 
+import anndata as ad
 import numpy as np
+import pandas as pd
 import polars as pl
+from scipy import sparse
 import torch
 import yaml
 from torch.utils.data import DataLoader
@@ -118,6 +122,23 @@ _RAW_BATCH_RESERVED_KEYS: frozenset[str] = frozenset(
 _LOADER_METADATA_RESERVED_OVERRIDES: frozenset[str] = frozenset(
     {"local_row_index", "size_factor"}
 )
+
+_TO_ANNDATA_REQUIRED_OBS_COLUMNS: tuple[str, ...] = (
+    "cell_id",
+    "dataset_id",
+    "dataset_index",
+    "global_row_index",
+    "local_row_index",
+)
+
+_TO_ANNDATA_REQUIRED_VAR_COLUMNS: tuple[str, ...] = (
+    "origin_index",
+    "gene_id",
+    "canonical_gene_id",
+    "global_id",
+)
+
+_TO_ANNDATA_READ_CHUNK_SIZE: int = 2048
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +259,58 @@ class Corpus:
             normalized_indices,
             metadata_columns=resolved_columns,
         )
+
+    def to_anndata(
+        self,
+        *,
+        dataset_id: str,
+        row_indices: Sequence[int] | np.ndarray | None = None,
+        obs_columns: Sequence[str] | None = None,
+        var_columns: Sequence[str] | None = None,
+        dry_run: bool = False,
+        max_memory_bytes: int | None = None,
+        on_exceed: str = "raise",
+    ) -> ad.AnnData | dict[str, Any]:
+        """Materialize one dataset as a counts-only in-memory ``AnnData``.
+
+        ``row_indices`` uses corpus-global row-index semantics and must stay
+        within the requested ``dataset_id``. When ``dry_run=True``, returns a
+        preflight estimate without constructing ``adata.X``.
+        """
+        prepared = _prepare_to_anndata_inputs(
+            self,
+            dataset_id=dataset_id,
+            row_indices=row_indices,
+            obs_columns=obs_columns,
+            var_columns=var_columns,
+            max_memory_bytes=max_memory_bytes,
+            on_exceed=on_exceed,
+        )
+        estimate = prepared["estimate"]
+        if dry_run:
+            return estimate
+
+        if estimate["memory_limit_exceeded"]:
+            message = str(estimate["memory_guard_message"])
+            if on_exceed == "raise":
+                raise MemoryError(message)
+            warnings.warn(message, UserWarning, stacklevel=2)
+
+        matrix = _materialize_csr_matrix(
+            self.expression_reader,
+            prepared["selected_row_indices"],
+            n_vars=prepared["n_vars"],
+            chunk_size=_TO_ANNDATA_READ_CHUNK_SIZE,
+        )
+        obs = _build_pandas_frame(
+            prepared["obs_data"],
+            index_column="cell_id",
+        )
+        var = _build_pandas_frame(
+            prepared["var_data"],
+            index_column=_select_var_index_column(prepared["var_data"]),
+        )
+        return ad.AnnData(X=matrix, obs=obs, var=var)
 
     def _expression_dataset(self) -> ExpressionBatchDataset:
         """Build the backend-neutral expression-only dataset route."""
@@ -1302,6 +1375,324 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     """Read a YAML file and return the parsed dict."""
     with open(path, "r") as fh:
         return yaml.safe_load(fh) or {}
+
+
+def _prepare_to_anndata_inputs(
+    corpus: Corpus,
+    *,
+    dataset_id: str,
+    row_indices: Sequence[int] | np.ndarray | None,
+    obs_columns: Sequence[str] | None,
+    var_columns: Sequence[str] | None,
+    max_memory_bytes: int | None,
+    on_exceed: str,
+) -> dict[str, Any]:
+    if on_exceed not in {"raise", "warn"}:
+        raise ValueError("on_exceed must be 'raise' or 'warn'")
+    if max_memory_bytes is not None and int(max_memory_bytes) <= 0:
+        raise ValueError("max_memory_bytes must be positive when provided")
+
+    dataset_entry = _resolve_dataset_entry(corpus.dataset_entries, dataset_id)
+    selected_row_indices = _normalize_dataset_row_indices(
+        dataset_entry,
+        row_indices,
+    )
+    resolved_obs_columns = _normalize_selected_columns(
+        available_columns=corpus.metadata_index.df.columns,
+        requested_columns=obs_columns,
+        required_columns=_TO_ANNDATA_REQUIRED_OBS_COLUMNS,
+        label="obs_columns",
+    )
+    obs_data = corpus.metadata_index.take(
+        selected_row_indices,
+        columns=resolved_obs_columns,
+    )
+
+    var_frame = _load_dataset_var_frame(corpus, dataset_id)
+    resolved_var_columns = _normalize_selected_columns(
+        available_columns=var_frame.columns,
+        requested_columns=var_columns,
+        required_columns=_TO_ANNDATA_REQUIRED_VAR_COLUMNS,
+        label="var_columns",
+    )
+    var_data = _polars_frame_to_columnar(var_frame.select(resolved_var_columns))
+
+    nnz = _count_selected_nnz(
+        corpus.expression_reader,
+        selected_row_indices,
+        chunk_size=_TO_ANNDATA_READ_CHUNK_SIZE,
+    )
+    csr_memory_bytes = {
+        "data": int(nnz * np.dtype(np.int32).itemsize),
+        "indices": int(nnz * np.dtype(np.int32).itemsize),
+        "indptr": int((selected_row_indices.size + 1) * np.dtype(np.int64).itemsize),
+    }
+    csr_memory_bytes["total"] = int(
+        csr_memory_bytes["data"]
+        + csr_memory_bytes["indices"]
+        + csr_memory_bytes["indptr"]
+    )
+    obs_memory_bytes = _estimate_columnar_memory_bytes(obs_data)
+    var_memory_bytes = _estimate_columnar_memory_bytes(var_data)
+    estimated_total_memory_bytes = int(
+        csr_memory_bytes["total"] + obs_memory_bytes + var_memory_bytes
+    )
+
+    limit = None if max_memory_bytes is None else int(max_memory_bytes)
+    exceeds_limit = limit is not None and estimated_total_memory_bytes > limit
+    guard_message = None
+    if exceeds_limit:
+        guard_message = (
+            f"Estimated AnnData materialization for dataset '{dataset_id}' "
+            f"requires {estimated_total_memory_bytes} bytes "
+            f"(csr={csr_memory_bytes['total']}, obs≈{obs_memory_bytes}, var≈{var_memory_bytes}), "
+            f"which exceeds max_memory_bytes={limit}."
+        )
+
+    estimate = {
+        "dataset_id": dataset_id,
+        "n_obs": int(selected_row_indices.size),
+        "n_vars": int(var_frame.height),
+        "nnz": int(nnz),
+        "csr_memory_bytes": csr_memory_bytes,
+        "obs_memory_bytes": int(obs_memory_bytes),
+        "var_memory_bytes": int(var_memory_bytes),
+        "estimated_total_memory_bytes": estimated_total_memory_bytes,
+        "selected_row_index_summary": {
+            "source": "dataset-full" if row_indices is None else "user-specified",
+            "selection_size": int(selected_row_indices.size),
+            "min_global_row_index": int(selected_row_indices.min()),
+            "max_global_row_index": int(selected_row_indices.max()),
+            "is_contiguous": bool(
+                np.array_equal(
+                    selected_row_indices,
+                    np.arange(
+                        int(selected_row_indices[0]),
+                        int(selected_row_indices[0]) + selected_row_indices.size,
+                        dtype=np.int64,
+                    ),
+                )
+            ),
+        },
+        "obs_columns": tuple(resolved_obs_columns),
+        "var_columns": tuple(resolved_var_columns),
+        "memory_limit_bytes": limit,
+        "memory_limit_exceeded": bool(exceeds_limit),
+        "memory_guard_action": on_exceed if exceeds_limit else "none",
+        "memory_guard_message": guard_message,
+    }
+    return {
+        "estimate": estimate,
+        "selected_row_indices": selected_row_indices,
+        "obs_data": obs_data,
+        "var_data": var_data,
+        "n_vars": int(var_frame.height),
+    }
+
+
+def _resolve_dataset_entry(
+    dataset_entries: Sequence[DatasetEntry],
+    dataset_id: str,
+) -> DatasetEntry:
+    for entry in dataset_entries:
+        if entry.dataset_id == dataset_id:
+            return entry
+    available = ", ".join(sorted(entry.dataset_id for entry in dataset_entries))
+    raise KeyError(
+        f"dataset_id '{dataset_id}' not found; available datasets: {available}"
+    )
+
+
+def _normalize_dataset_row_indices(
+    dataset_entry: DatasetEntry,
+    row_indices: Sequence[int] | np.ndarray | None,
+) -> np.ndarray:
+    if row_indices is None:
+        return np.arange(
+            dataset_entry.global_start,
+            dataset_entry.global_end,
+            dtype=np.int64,
+        )
+
+    raw = np.asarray(row_indices)
+    if raw.ndim != 1:
+        raise ValueError(
+            "row_indices must be a 1-D sequence of corpus-global row indices"
+        )
+    if raw.size == 0:
+        raise ValueError("row_indices must contain at least one corpus-global row index")
+    if raw.dtype.kind not in {"i", "u"}:
+        raise ValueError(
+            "row_indices must contain only integer corpus-global row indices"
+        )
+
+    normalized = raw.astype(np.int64, copy=False)
+    if np.unique(normalized).size != normalized.size:
+        raise ValueError("row_indices must be unique corpus-global row indices")
+    if np.any(normalized < dataset_entry.global_start) or np.any(
+        normalized >= dataset_entry.global_end
+    ):
+        raise IndexError(
+            f"row_indices must stay within dataset '{dataset_entry.dataset_id}' "
+            f"global range [{dataset_entry.global_start}, {dataset_entry.global_end})"
+        )
+    return normalized.copy()
+
+
+def _normalize_selected_columns(
+    *,
+    available_columns: Sequence[str],
+    requested_columns: Sequence[str] | None,
+    required_columns: Sequence[str],
+    label: str,
+) -> list[str]:
+    available = set(available_columns)
+    if requested_columns is None:
+        requested = list(available_columns)
+    else:
+        requested = [str(column) for column in requested_columns]
+        missing = sorted({column for column in requested if column not in available})
+        if missing:
+            raise ValueError(f"{label} contains unknown columns: {missing}")
+
+    resolved: list[str] = []
+    for column in (*required_columns, *requested):
+        if column in available and column not in resolved:
+            resolved.append(column)
+    return resolved
+
+
+def _load_dataset_var_frame(corpus: Corpus, dataset_id: str) -> pl.DataFrame:
+    paths = resolve_corpus_paths(corpus.topology, corpus.corpus_root, dataset_id)
+    var_path = paths.canonical_meta_root / "canonical-var.parquet"
+    if not var_path.exists():
+        raise FileNotFoundError(
+            f"canonical-var.parquet not found for dataset '{dataset_id}' at {var_path}"
+        )
+    frame = pl.read_parquet(str(var_path))
+    expressions: list[pl.Expr] = []
+    if "origin_index" in frame.columns and frame["origin_index"].dtype == pl.Utf8:
+        expressions.append(pl.col("origin_index").cast(pl.Int64))
+    if "global_id" in frame.columns and frame["global_id"].dtype == pl.Utf8:
+        expressions.append(pl.col("global_id").cast(pl.Int64))
+    if expressions:
+        frame = frame.with_columns(expressions)
+    if "origin_index" in frame.columns:
+        frame = frame.sort("origin_index")
+    return frame
+
+
+def _polars_frame_to_columnar(frame: pl.DataFrame) -> dict[str, np.ndarray | tuple]:
+    result: dict[str, np.ndarray | tuple] = {}
+    for column_name in frame.columns:
+        dtype = frame[column_name].dtype
+        if dtype in MetadataIndex._NUMERIC_DTYPES:
+            result[column_name] = frame[column_name].to_numpy()
+            continue
+        result[column_name] = tuple(frame[column_name].to_list())
+    return result
+
+
+def _count_selected_nnz(
+    expression_reader: ExpressionReader,
+    row_indices: np.ndarray,
+    *,
+    chunk_size: int,
+) -> int:
+    total_nnz = 0
+    for chunk in _chunk_global_indices(row_indices, chunk_size=chunk_size):
+        batch = expression_reader.read_expression_flat(chunk.tolist())
+        total_nnz += int(batch.row_offsets[-1])
+    return total_nnz
+
+
+def _chunk_global_indices(
+    row_indices: np.ndarray,
+    *,
+    chunk_size: int,
+) -> Iterator[np.ndarray]:
+    for start in range(0, row_indices.size, chunk_size):
+        yield row_indices[start : start + chunk_size]
+
+
+def _materialize_csr_matrix(
+    expression_reader: ExpressionReader,
+    row_indices: np.ndarray,
+    *,
+    n_vars: int,
+    chunk_size: int,
+) -> sparse.csr_matrix:
+    data_parts: list[np.ndarray] = []
+    index_parts: list[np.ndarray] = []
+    indptr_parts: list[np.ndarray] = [np.array([0], dtype=np.int64)]
+    nnz_offset = 0
+
+    for chunk in _chunk_global_indices(row_indices, chunk_size=chunk_size):
+        batch = expression_reader.read_expression_flat(chunk.tolist())
+        data = np.asarray(batch.expression_counts, dtype=np.int32)
+        indices = np.asarray(batch.expressed_gene_indices, dtype=np.int32)
+        if data.size:
+            data_parts.append(data)
+            index_parts.append(indices)
+        indptr_parts.append(np.asarray(batch.row_offsets[1:], dtype=np.int64) + nnz_offset)
+        nnz_offset += int(batch.row_offsets[-1])
+
+    matrix_data = (
+        np.concatenate(data_parts) if data_parts else np.array([], dtype=np.int32)
+    )
+    matrix_indices = (
+        np.concatenate(index_parts) if index_parts else np.array([], dtype=np.int32)
+    )
+    matrix_indptr = np.concatenate(indptr_parts)
+    return sparse.csr_matrix(
+        (matrix_data, matrix_indices, matrix_indptr),
+        shape=(int(row_indices.size), int(n_vars)),
+        dtype=np.int32,
+    )
+
+
+def _build_pandas_frame(
+    data: dict[str, np.ndarray | tuple],
+    *,
+    index_column: str | None,
+) -> pd.DataFrame:
+    frame = pd.DataFrame(
+        {
+            column_name: list(values) if isinstance(values, tuple) else values
+            for column_name, values in data.items()
+        }
+    )
+    if index_column is not None and index_column in frame.columns:
+        frame.index = pd.Index(frame[index_column].astype(str), name=index_column)
+    return frame
+
+
+def _select_var_index_column(data: dict[str, np.ndarray | tuple]) -> str | None:
+    for candidate in ("gene_id", "canonical_gene_id", "global_id", "origin_index"):
+        if candidate in data:
+            return candidate
+    return None
+
+
+def _estimate_columnar_memory_bytes(
+    data: dict[str, np.ndarray | tuple],
+) -> int:
+    total = 0
+    for values in data.values():
+        if isinstance(values, np.ndarray):
+            total += int(values.nbytes)
+            continue
+        total += int(sys.getsizeof(values))
+        total += sum(_estimate_python_value_bytes(value) for value in values)
+    return total
+
+
+def _estimate_python_value_bytes(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    return int(sys.getsizeof(value))
 
 
 def _resolve_dataset_hvg_inputs(

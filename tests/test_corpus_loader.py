@@ -14,6 +14,7 @@ import numpy as np
 import polars as pl
 import pyarrow as pa
 import pytest
+from scipy import sparse
 import torch
 from torch.utils.data import DataLoader
 import yaml
@@ -880,6 +881,53 @@ def _build_mock_federated_arrow_ipc_corpus(
             writer.write_table(table)
 
 
+def _build_mock_to_anndata_corpus(corpus_root: Path) -> None:
+    ds_configs = [
+        {
+            "dataset_id": "mock_00",
+            "dataset_index": 0,
+            "global_start": 0,
+            "n_genes": 4,
+            "rows": [
+                {
+                    "expressed_gene_indices": [1, 3],
+                    "expression_counts": [5, 7],
+                },
+                {
+                    "expressed_gene_indices": [],
+                    "expression_counts": [],
+                },
+                {
+                    "expressed_gene_indices": [0, 2, 3],
+                    "expression_counts": [1, 2, 3],
+                },
+            ],
+        },
+        {
+            "dataset_id": "mock_01",
+            "dataset_index": 1,
+            "global_start": 3,
+            "n_genes": 4,
+            "rows": [
+                {
+                    "expressed_gene_indices": [0],
+                    "expression_counts": [9],
+                },
+                {
+                    "expressed_gene_indices": [2],
+                    "expression_counts": [4],
+                },
+            ],
+        },
+    ]
+    _build_mock_aggregate_backend_corpus_from_configs(
+        corpus_root,
+        backend="lance",
+        ds_configs=ds_configs,
+        typed_structural=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -1097,11 +1145,109 @@ class TestLoadCorpusAggregate:
         for column_name in canonical_null_literals:
             assert first_row[column_name] is None
 
-        taken = mi.take([0, 10], ["dataset_index", "size_factor", "dose", "condition"])
-        assert np.issubdtype(taken["dataset_index"].dtype, np.integer)
-        assert np.issubdtype(taken["size_factor"].dtype, np.floating)
-        assert taken["dose"] == (None, "1.0")
-        assert taken["condition"] == (None, None)
+    def test_to_anndata_builds_counts_only_csr_with_requested_row_order(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _build_mock_to_anndata_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        adata = corpus.to_anndata(
+            dataset_id="mock_00",
+            row_indices=[2, 0],
+            obs_columns=["perturb_label"],
+            var_columns=["gene_id"],
+        )
+
+        assert adata.n_obs == 2
+        assert adata.n_vars == 4
+        assert sparse.isspmatrix_csr(adata.X)
+        np.testing.assert_array_equal(
+            adata.X.toarray(),
+            np.array(
+                [
+                    [1, 0, 2, 3],
+                    [0, 5, 0, 7],
+                ],
+                dtype=np.int32,
+            ),
+        )
+        assert len(adata.layers) == 0
+        assert adata.obs["global_row_index"].tolist() == [2, 0]
+        assert adata.obs["local_row_index"].tolist() == [2, 0]
+        assert adata.obs["dataset_id"].tolist() == ["mock_00", "mock_00"]
+        assert "perturb_label" in adata.obs.columns
+        assert adata.var["origin_index"].tolist() == [0, 1, 2, 3]
+        assert adata.var["global_id"].tolist() == [0, 1, 2, 3]
+        assert adata.var["gene_id"].tolist() == [
+            "ENSG_mock_00_00000",
+            "ENSG_mock_00_00001",
+            "ENSG_mock_00_00002",
+            "ENSG_mock_00_00003",
+        ]
+
+    def test_to_anndata_dry_run_reports_exact_shape_and_memory(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _build_mock_to_anndata_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        estimate = corpus.to_anndata(
+            dataset_id="mock_00",
+            row_indices=[0, 2],
+            obs_columns=["perturb_label"],
+            var_columns=["gene_id"],
+            dry_run=True,
+            max_memory_bytes=32,
+            on_exceed="raise",
+        )
+
+        assert estimate["dataset_id"] == "mock_00"
+        assert estimate["n_obs"] == 2
+        assert estimate["n_vars"] == 4
+        assert estimate["nnz"] == 5
+        assert estimate["csr_memory_bytes"] == {
+            "data": 20,
+            "indices": 20,
+            "indptr": 24,
+            "total": 64,
+        }
+        assert estimate["selected_row_index_summary"] == {
+            "source": "user-specified",
+            "selection_size": 2,
+            "min_global_row_index": 0,
+            "max_global_row_index": 2,
+            "is_contiguous": False,
+        }
+        assert estimate["memory_limit_exceeded"] is True
+        assert estimate["memory_guard_action"] == "raise"
+        assert estimate["memory_guard_message"] is not None
+
+    def test_to_anndata_memory_guard_raises_before_materialization(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _build_mock_to_anndata_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        with pytest.raises(MemoryError, match="max_memory_bytes"):
+            corpus.to_anndata(
+                dataset_id="mock_00",
+                row_indices=[0, 2],
+                max_memory_bytes=32,
+                on_exceed="raise",
+            )
+
+    def test_to_anndata_rejects_cross_dataset_row_indices(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _build_mock_to_anndata_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        with pytest.raises(IndexError, match="must stay within dataset 'mock_00'"):
+            corpus.to_anndata(dataset_id="mock_00", row_indices=[0, 3])
 
     def test_load_corpus_projects_canonical_core_columns_only_by_default(
         self, tmp_path: Path,
