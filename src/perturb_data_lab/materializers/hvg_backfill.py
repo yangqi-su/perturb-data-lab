@@ -12,7 +12,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from ..loaders.expression import DatasetEntry, LanceDatasetEntry, build_expression_reader
-from .chunk_translation import _build_hvg_ranking_table
+from ..pp.hvg import build_ranked_hvg_frame
 from .models import CorpusIndexDocument, MaterializationManifest
 from .paths import resolve_corpus_paths
 
@@ -205,11 +205,25 @@ def _resolve_feature_meta_path(
     return resolved
 
 
-def _read_feature_ids(feature_meta_path: Path) -> tuple[str, ...]:
-    table = pq.read_table(feature_meta_path, columns=["feature_id"])
-    if "feature_id" not in table.column_names:
-        raise ValueError(f"feature_id column missing in {feature_meta_path}")
-    return tuple(str(value) for value in table.column("feature_id").to_pylist())
+def _read_feature_metadata(feature_meta_path: Path) -> tuple[tuple[str, ...], np.ndarray | None]:
+    schema = pq.read_schema(feature_meta_path)
+    available = set(schema.names)
+    gene_id_col = "feature_id" if "feature_id" in available else "canonical_gene_id"
+    if gene_id_col not in available:
+        raise ValueError(
+            f"feature_id/canonical_gene_id column missing in {feature_meta_path}"
+        )
+
+    columns = [gene_id_col]
+    has_global_id = "global_id" in available
+    if has_global_id:
+        columns.append("global_id")
+    table = pq.read_table(feature_meta_path, columns=columns)
+    gene_ids = tuple(str(value) for value in table.column(gene_id_col).to_pylist())
+    global_feature_ids = None
+    if has_global_id:
+        global_feature_ids = np.asarray(table.column("global_id").to_pylist(), dtype=np.int64)
+    return gene_ids, global_feature_ids
 
 
 def _sha256_file(path: Path) -> str:
@@ -284,7 +298,7 @@ def backfill_hvg_rankings_for_corpus(
             dataset_id=dataset.dataset_id,
             manifest=manifest,
         )
-        feature_ids = _read_feature_ids(feature_meta_path)
+        feature_ids, global_feature_ids = _read_feature_metadata(feature_meta_path)
         feature_count = len(feature_ids)
         if feature_count == 0:
             raise ValueError(f"no feature_id rows found for {dataset.dataset_id}")
@@ -303,6 +317,7 @@ def backfill_hvg_rankings_for_corpus(
 
         sum_log1p = np.zeros(feature_count, dtype=np.float64)
         sum_log1p_sq = np.zeros(feature_count, dtype=np.float64)
+        n_cells_detected = np.zeros(feature_count, dtype=np.int64)
         processed_cells = 0
         chunk_counter = 0
 
@@ -324,6 +339,13 @@ def backfill_hvg_rankings_for_corpus(
                 log1p_counts = np.log1p(batch.expression_counts.astype(np.float64, copy=False))
                 np.add.at(sum_log1p, batch.expressed_gene_indices, log1p_counts)
                 np.add.at(sum_log1p_sq, batch.expressed_gene_indices, log1p_counts ** 2)
+                detected_mask = batch.expression_counts > 0
+                if np.any(detected_mask):
+                    np.add.at(
+                        n_cells_detected,
+                        batch.expressed_gene_indices[detected_mask],
+                        1,
+                    )
             processed_cells += batch.batch_size
             chunk_counter += 1
 
@@ -345,15 +367,19 @@ def backfill_hvg_rankings_for_corpus(
                 f"expected {dataset.cell_count}"
             )
 
-        table = _build_hvg_ranking_table(
+        frame = build_ranked_hvg_frame(
+            dataset_id=dataset.dataset_id,
+            dataset_index=dataset.dataset_index,
+            gene_ids=feature_ids,
+            global_feature_ids=global_feature_ids,
             sum_log1p=sum_log1p,
             sum_log1p_sq=sum_log1p_sq,
             n_cells_total=processed_cells,
-            feature_ids=feature_ids,
+            n_cells_detected=n_cells_detected,
             n_hvg=effective_n_hvg,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(table, output_path)
+        frame.write_parquet(output_path)
 
         manifest_updated = False
         if update_manifests:
@@ -373,7 +399,7 @@ def backfill_hvg_rankings_for_corpus(
             output_path=str(output_path),
             cell_count=dataset.cell_count,
             feature_count=feature_count,
-            row_count=table.num_rows,
+            row_count=frame.height,
             default_n_hvg=effective_n_hvg,
             chunk_rows=chunk_rows,
             sha256=_sha256_file(output_path),
@@ -383,7 +409,7 @@ def backfill_hvg_rankings_for_corpus(
 
         if progress_callback is not None:
             progress_callback(
-                f"[backfill-hvg] {dataset.dataset_id}: wrote {output_path} rows={table.num_rows} sha256={result.sha256[:12]}"
+                f"[backfill-hvg] {dataset.dataset_id}: wrote {output_path} rows={frame.height} sha256={result.sha256[:12]}"
             )
 
     return HVGBackfillSummary(

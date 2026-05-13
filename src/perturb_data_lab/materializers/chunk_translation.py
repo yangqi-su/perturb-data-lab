@@ -510,72 +510,16 @@ def _compute_hvg_ranking_arrays(
         with ties broken by ``origin_index`` ascending after
         ``dispersion_norm`` descending.
     """
-    import pandas as pd
+    from ..pp.hvg import compute_hvg_ranking_arrays
 
-    if n_cells_total <= 0:
-        raise ValueError("n_cells_total must be positive")
-    if n_hvg < 0:
-        raise ValueError("n_hvg must be non-negative")
     if len(sum_log1p) != n_vars or len(sum_log1p_sq) != n_vars:
         raise ValueError("streaming HVG accumulators must match n_vars")
-
-    origin_index = np.arange(n_vars, dtype=np.int32)
-    mean_log1p_expr = sum_log1p / n_cells_total
-    variance_log1p_expr = (sum_log1p_sq - sum_log1p**2 / n_cells_total) / max(
-        n_cells_total - 1, 1
+    return compute_hvg_ranking_arrays(
+        sum_log1p,
+        sum_log1p_sq,
+        n_cells_total,
+        n_hvg=n_hvg,
     )
-
-    mean_for_dispersion = mean_log1p_expr.copy()
-    mean_for_dispersion[mean_for_dispersion == 0] = 1e-12
-    dispersion = variance_log1p_expr / mean_for_dispersion
-    dispersion[dispersion == 0] = np.nan
-    dispersion_log = np.log(dispersion)
-
-    # Preserve the legacy selection semantics exactly: Seurat-style mean binning
-    # is performed on log1p(mean(log1p(counts))). The artifact stores the
-    # pre-binning mean/variance columns explicitly, while ``dispersion_norm``
-    # still follows the historical binning path for backward-compatible top-N.
-    mean_for_binning = np.log1p(mean_log1p_expr)
-
-    df = pd.DataFrame(
-        {
-            "origin_index": origin_index,
-            "means": mean_for_binning,
-            "dispersions": dispersion_log,
-        },
-        index=origin_index,
-    )
-    # pd.cut(bins=20) can produce empty bins when gene count < 20.
-    # Lines below handle the single-gene-bin edge case: when a bin contains
-    # exactly one gene, dev=std is NaN; it is replaced with dev=avg so the
-    # normalization does not crash (single-gene bins end up with deviation=0).
-    df["mean_bin"] = pd.cut(df["means"], bins=20)
-    disp_grouped = df.groupby("mean_bin", observed=True)["dispersions"]
-    disp_stats = disp_grouped.agg(avg="mean", dev="std")
-    one_gene_per_bin = disp_stats["dev"].isnull()
-    disp_stats.loc[one_gene_per_bin, "dev"] = disp_stats.loc[one_gene_per_bin, "avg"]
-    disp_stats.loc[one_gene_per_bin, "avg"] = 0
-
-    df["dispersions_norm"] = (
-        df["dispersions"] - disp_stats.loc[df["mean_bin"], "avg"].values
-    ) / disp_stats.loc[df["mean_bin"], "dev"].values
-
-    dispersion_norm = df["dispersions_norm"].to_numpy(dtype=np.float64, copy=False)
-    ranked_dispersion = np.nan_to_num(dispersion_norm, nan=-np.inf)
-    rank_order = np.lexsort((origin_index, -ranked_dispersion))
-    hvg_rank = np.empty(n_vars, dtype=np.int32)
-    hvg_rank[rank_order] = np.arange(1, n_vars + 1, dtype=np.int32)
-    selected_at_default_n_hvg = hvg_rank <= min(n_hvg, n_vars)
-
-    return {
-        "origin_index": origin_index,
-        "mean_log1p_expr": mean_log1p_expr.astype(np.float64, copy=False),
-        "variance_log1p_expr": variance_log1p_expr.astype(np.float64, copy=False),
-        "dispersion_log": dispersion_log.astype(np.float64, copy=False),
-        "dispersion_norm": dispersion_norm.astype(np.float64, copy=False),
-        "hvg_rank": hvg_rank,
-        "selected_at_default_n_hvg": selected_at_default_n_hvg.astype(bool, copy=False),
-    }
 
 
 def _build_hvg_ranking_table(

@@ -17,6 +17,7 @@ from perturb_data_lab.materializers.backends import build_backend_fn
 from perturb_data_lab.materializers.chunk_translation import ChunkBundle
 from perturb_data_lab.pp import (
     build_pp_provenance,
+    calculate_hvgs,
     calculate_lognorm_stats,
     iter_dataset_batches,
     log1p_size_factor_batch,
@@ -289,6 +290,21 @@ def _dense_reference_lognorm_stats(corpus, dataset_id: str) -> dict[str, np.ndar
     }
 
 
+def _dense_reference_hvgs(corpus, dataset_id: str) -> dict[str, np.ndarray | int]:
+    matrices = []
+    for batch in iter_dataset_batches(corpus, dataset_id=dataset_id, batch_size=3):
+        matrices.append(batch.expression.toarray().astype(np.float64, copy=False))
+
+    combined = np.vstack(matrices)
+    log1p = np.log1p(combined)
+    return {
+        "mean": log1p.mean(axis=0),
+        "var": log1p.var(axis=0, ddof=1),
+        "n_cells_detected": np.count_nonzero(combined > 0, axis=0).astype(np.int64, copy=False),
+        "n_obs": int(combined.shape[0]),
+    }
+
+
 def test_calculate_lognorm_stats_matches_dense_reference_for_single_dataset(
     tmp_path: Path,
 ) -> None:
@@ -369,3 +385,47 @@ def test_calculate_lognorm_stats_streams_all_datasets_and_writes_artifacts(
         assert payload["parameters"]["size_factor_source"] == "canonical_obs.size_factor"
         assert payload["parameters"]["variance_ddof"] == 0
         assert payload["extra"]["n_obs"] == expected_n_obs
+
+
+def test_calculate_hvgs_matches_dense_reference_for_single_dataset(tmp_path: Path) -> None:
+    _build_mock_federated_lance_corpus(tmp_path)
+    corpus = load_corpus(str(tmp_path))
+
+    hvgs = calculate_hvgs(corpus, dataset_id="mock_00", batch_size=4, n_hvg=7)
+    reference = _dense_reference_hvgs(corpus, "mock_00")
+
+    assert hvgs.columns == [
+        "dataset_id",
+        "dataset_index",
+        "origin_index",
+        "gene_id",
+        "feature_id",
+        "mean",
+        "variance",
+        "dispersion",
+        "dispersion_log",
+        "dispersion_norm",
+        "hvg_rank",
+        "is_hvg",
+        "selected_at_default_n_hvg",
+        "n_cells_detected",
+        "mean_log1p_expr",
+        "variance_log1p_expr",
+        "global_feature_id",
+    ]
+    assert hvgs.shape == (N_GENES, 17)
+    assert hvgs["dataset_id"].unique().to_list() == ["mock_00"]
+    assert hvgs["dataset_index"].unique().to_list() == [0]
+    np.testing.assert_array_equal(hvgs["origin_index"].to_numpy(), np.arange(N_GENES, dtype=np.int32))
+    np.testing.assert_array_equal(hvgs["global_feature_id"].to_numpy(), np.arange(N_GENES, dtype=np.int64))
+    np.testing.assert_allclose(hvgs["mean"].to_numpy(), reference["mean"])
+    np.testing.assert_allclose(hvgs["variance"].to_numpy(), reference["var"])
+    np.testing.assert_allclose(hvgs["mean_log1p_expr"].to_numpy(), reference["mean"])
+    np.testing.assert_allclose(hvgs["variance_log1p_expr"].to_numpy(), reference["var"])
+    np.testing.assert_array_equal(hvgs["n_cells_detected"].to_numpy(), reference["n_cells_detected"])
+    np.testing.assert_array_equal(
+        np.sort(hvgs["hvg_rank"].to_numpy()),
+        np.arange(1, N_GENES + 1, dtype=np.int32),
+    )
+    assert hvgs["is_hvg"].sum() == 7
+    assert hvgs["selected_at_default_n_hvg"].sum() == 7

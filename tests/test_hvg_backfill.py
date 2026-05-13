@@ -7,11 +7,14 @@ import json
 from pathlib import Path
 
 import lance
+import numpy as np
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 
 from perturb_data_lab.cli import _cmd_backfill_hvg, build_parser
+from perturb_data_lab.loaders import load_corpus
 from perturb_data_lab.materializers import backfill_hvg_rankings_for_corpus
 from perturb_data_lab.materializers.models import (
     CountSourceSpec,
@@ -19,6 +22,7 @@ from perturb_data_lab.materializers.models import (
     OutputRoots,
     ProvenanceSpec,
 )
+from perturb_data_lab.pp import calculate_hvgs
 
 
 def _write_feature_meta(meta_root: Path, feature_ids: list[str]) -> Path:
@@ -35,6 +39,38 @@ def _write_feature_meta(meta_root: Path, feature_ids: list[str]) -> Path:
     )
     pq.write_table(table, path)
     return path
+
+
+def _write_canonical_obs(
+    canonical_meta_root: Path,
+    *,
+    dataset_id: str,
+    global_start: int,
+    cell_count: int,
+) -> None:
+    canonical_meta_root.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "global_row_index": np.arange(global_start, global_start + cell_count, dtype=np.int64),
+            "cell_id": [f"{dataset_id}_cell_{i}" for i in range(cell_count)],
+            "dataset_id": [dataset_id] * cell_count,
+            "local_row_index": np.arange(cell_count, dtype=np.int64),
+            "size_factor": np.ones(cell_count, dtype=np.float64),
+            "perturb_label": ["control"] * cell_count,
+        }
+    ).write_parquet(canonical_meta_root / "canonical-obs.parquet")
+
+
+def _write_canonical_var(canonical_meta_root: Path, feature_ids: list[str]) -> None:
+    canonical_meta_root.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "origin_index": np.arange(len(feature_ids), dtype=np.int32),
+            "gene_id": feature_ids,
+            "canonical_gene_id": feature_ids,
+            "global_id": np.arange(len(feature_ids), dtype=np.int32),
+        }
+    ).write_parquet(canonical_meta_root / "canonical-var.parquet")
 
 
 def _write_manifest(
@@ -114,7 +150,15 @@ def _build_mock_aggregate_lance_corpus(corpus_root: Path) -> None:
         dataset_id = dataset["dataset_id"]
         meta_root = corpus_root / "meta" / dataset_id
         meta_root.mkdir(parents=True, exist_ok=True)
+        canonical_meta_root = meta_root / "canonical_meta"
         raw_var_path = _write_feature_meta(meta_root, dataset["feature_ids"])
+        _write_canonical_obs(
+            canonical_meta_root,
+            dataset_id=dataset_id,
+            global_start=dataset["global_start"],
+            cell_count=dataset["global_end"] - dataset["global_start"],
+        )
+        _write_canonical_var(canonical_meta_root, dataset["feature_ids"])
         manifest_path = meta_root / "materialization-manifest.yaml"
         raw_feature_meta_path = str(raw_var_path)
         if dataset_id == "ds_a":
@@ -221,3 +265,50 @@ class TestHVGBackfill:
         payload = json.loads(summary_json.read_text(encoding="utf-8"))
         assert payload["dataset_count"] == 2
         assert sorted(dataset["dataset_id"] for dataset in payload["datasets"]) == ["ds_a", "ds_b"]
+
+    def test_backfill_writes_same_ranked_metrics_as_pp_calculate_hvgs(self, tmp_path: Path):
+        _build_mock_aggregate_lance_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        pp_hvgs = calculate_hvgs(corpus, batch_size=2, n_hvg=2).select(
+            [
+                "dataset_id",
+                "dataset_index",
+                "origin_index",
+                "gene_id",
+                "mean",
+                "variance",
+                "dispersion_norm",
+                "hvg_rank",
+                "is_hvg",
+                "n_cells_detected",
+                "mean_log1p_expr",
+                "variance_log1p_expr",
+            ]
+        )
+
+        summary = backfill_hvg_rankings_for_corpus(tmp_path, chunk_rows=2, n_hvg=2)
+        written = pl.concat(
+            [pl.read_parquet(dataset.output_path) for dataset in summary.datasets],
+            rechunk=True,
+        ).sort(["dataset_index", "origin_index"])
+
+        assert {
+            "dataset_id",
+            "dataset_index",
+            "origin_index",
+            "gene_id",
+            "feature_id",
+            "mean",
+            "variance",
+            "dispersion",
+            "dispersion_log",
+            "dispersion_norm",
+            "hvg_rank",
+            "is_hvg",
+            "selected_at_default_n_hvg",
+            "n_cells_detected",
+            "mean_log1p_expr",
+            "variance_log1p_expr",
+        }.issubset(set(written.columns))
+        assert written.select(pp_hvgs.columns).to_dict(as_series=False) == pp_hvgs.to_dict(as_series=False)
