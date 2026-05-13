@@ -17,6 +17,7 @@ from perturb_data_lab.materializers.backends import build_backend_fn
 from perturb_data_lab.materializers.chunk_translation import ChunkBundle
 from perturb_data_lab.pp import (
     build_pp_provenance,
+    calculate_lognorm_stats,
     iter_dataset_batches,
     log1p_size_factor_batch,
     prepare_pp_output,
@@ -269,3 +270,102 @@ def test_pp_artifact_helpers_write_dataset_local_provenance(tmp_path: Path) -> N
     assert payload["dataset_id"] == "mock_01"
     assert payload["parameters"] == {"batch_size": 32}
     assert payload["extra"]["artifact_path"] == str(output.artifact_path)
+
+
+def _dense_reference_lognorm_stats(corpus, dataset_id: str) -> dict[str, np.ndarray | int]:
+    matrices = []
+    for batch in iter_dataset_batches(corpus, dataset_id=dataset_id, batch_size=3):
+        dense = batch.expression.toarray().astype(np.float64, copy=False)
+        dense = np.log1p(dense / batch.size_factor[:, None].astype(np.float64, copy=False))
+        matrices.append(dense)
+
+    combined = np.vstack(matrices)
+    return {
+        "mean": combined.mean(axis=0),
+        "var": combined.var(axis=0),
+        "std": combined.std(axis=0),
+        "n_obs": int(combined.shape[0]),
+        "n_nonzero": np.count_nonzero(combined, axis=0).astype(np.int64, copy=False),
+    }
+
+
+def test_calculate_lognorm_stats_matches_dense_reference_for_single_dataset(
+    tmp_path: Path,
+) -> None:
+    _build_mock_federated_lance_corpus(tmp_path)
+    corpus = load_corpus(str(tmp_path))
+
+    stats = calculate_lognorm_stats(corpus, dataset_id="mock_00", batch_size=4)
+    reference = _dense_reference_lognorm_stats(corpus, "mock_00")
+
+    assert stats.columns == [
+        "dataset_id",
+        "dataset_index",
+        "gene_id",
+        "global_feature_id",
+        "mean_lognorm",
+        "var_lognorm",
+        "std_lognorm",
+        "n_obs",
+        "n_nonzero",
+    ]
+    assert stats.shape == (N_GENES, 9)
+    assert stats["dataset_id"].unique().to_list() == ["mock_00"]
+    assert stats["dataset_index"].unique().to_list() == [0]
+    assert stats["n_obs"].unique().to_list() == [10]
+    np.testing.assert_array_equal(
+        stats["global_feature_id"].to_numpy(),
+        np.arange(N_GENES, dtype=np.int64),
+    )
+    np.testing.assert_allclose(stats["mean_lognorm"].to_numpy(), reference["mean"])
+    np.testing.assert_allclose(stats["var_lognorm"].to_numpy(), reference["var"])
+    np.testing.assert_allclose(stats["std_lognorm"].to_numpy(), reference["std"])
+    np.testing.assert_array_equal(stats["n_nonzero"].to_numpy(), reference["n_nonzero"])
+
+
+def test_calculate_lognorm_stats_streams_all_datasets_and_writes_artifacts(
+    tmp_path: Path,
+) -> None:
+    corpus_root = tmp_path / "corpus"
+    _build_mock_federated_lance_corpus(corpus_root)
+    corpus = load_corpus(str(corpus_root))
+    output_dir = tmp_path / "pp-output"
+
+    first = calculate_lognorm_stats(corpus, batch_size=6, output_dir=output_dir)
+    second = calculate_lognorm_stats(
+        corpus,
+        batch_size=6,
+        output_dir=output_dir,
+        overwrite=True,
+    )
+
+    assert first.sort(["dataset_index", "global_feature_id"]).to_dict(as_series=False) == second.sort(
+        ["dataset_index", "global_feature_id"]
+    ).to_dict(as_series=False)
+    assert first["dataset_id"].unique().sort().to_list() == ["mock_00", "mock_01"]
+
+    for dataset_id, expected_n_obs in (("mock_00", 10), ("mock_01", 15)):
+        reference = _dense_reference_lognorm_stats(corpus, dataset_id)
+        subset = first.filter(pl.col("dataset_id") == dataset_id).sort("global_feature_id")
+        np.testing.assert_allclose(subset["mean_lognorm"].to_numpy(), reference["mean"])
+        np.testing.assert_allclose(subset["var_lognorm"].to_numpy(), reference["var"])
+        np.testing.assert_allclose(subset["std_lognorm"].to_numpy(), reference["std"])
+        np.testing.assert_array_equal(subset["n_nonzero"].to_numpy(), reference["n_nonzero"])
+        assert subset["n_obs"].unique().to_list() == [expected_n_obs]
+
+        stats_path = output_dir / dataset_id / "lognorm-stats.parquet"
+        provenance_path = output_dir / dataset_id / "lognorm-stats.provenance.json"
+        assert stats_path.exists()
+        assert provenance_path.exists()
+        assert pl.read_parquet(stats_path).sort("global_feature_id").to_dict(as_series=False) == subset.to_dict(
+            as_series=False
+        )
+
+        payload = json.loads(provenance_path.read_text(encoding="utf-8"))
+        assert payload["operation"] == "calculate_lognorm_stats"
+        assert payload["dataset_id"] == dataset_id
+        assert payload["parameters"]["dataset_scope"] == "dataset"
+        assert payload["parameters"]["normalization"] == "log1p(count / size_factor)"
+        assert payload["parameters"]["size_factor_source"] == "canonical_obs.size_factor"
+        assert payload["parameters"]["variance_ddof"] == 0
+        assert payload["extra"]["n_obs"] == expected_n_obs

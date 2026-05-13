@@ -12,12 +12,14 @@ from .streaming import (
     iter_dataset_batches,
     log1p_size_factor_batch,
 )
+from .stats import calculate_lognorm_stats
 
 __all__ = [
     "PpArtifactSpec",
     "PpBatch",
     "PpFeatureContext",
     "build_pp_provenance",
+    "calculate_lognorm_stats",
     "iter_dataset_batches",
     "log1p_size_factor_batch",
     "prepare_pp_output",
