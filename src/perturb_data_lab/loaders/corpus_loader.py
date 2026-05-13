@@ -182,7 +182,9 @@ class Corpus:
         """Build and store a metadata-index-backed sampler for ``loader()``.
 
         A later ``Corpus.loader(...)`` call reuses this sampler when that call
-        does not provide loader-local sampler overrides.
+        does not provide loader-local sampler overrides. Optional
+        ``row_indices`` restricts sampling to a validated set of unique
+        corpus-global row indices.
         """
         normalized = _normalize_sampler_params(params)
         self._sampler = _build_sampler(self.metadata_index, normalized)
@@ -290,6 +292,7 @@ class Corpus:
         expressed_weight: float = 3.0,
         hvg_weight: float = 3.0,
         hvg_top_k: int | None = None,
+        row_indices: Sequence[int] | np.ndarray | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield processed sparse training batches for the requested route.
 
@@ -303,7 +306,9 @@ class Corpus:
         arguments are supplied, ``Corpus.loader(...)`` falls back to a default
         random sampler with ``batch_size=128``. If a stored sampler exists,
         loader-local sampler arguments override it for that call and emit a
-        ``UserWarning``. Lance-backed loaders default to
+        ``UserWarning``. Optional ``row_indices`` restricts the sampler to a
+        validated subset of corpus-global rows without rebuilding the metadata
+        index. Lance-backed loaders default to
         ``multiprocessing_context="spawn"`` unless explicitly overridden.
 
         ``sampling_mode="hvg"`` optionally accepts ``hvg_top_k`` to apply a
@@ -335,6 +340,7 @@ class Corpus:
             shuffle=shuffle,
             dataset_index=dataset_index,
             context_field=context_field,
+            row_indices=row_indices,
         )
         resolved_seq_len = _resolve_loader_seq_len(seq_len=seq_len)
         _validate_processing_device(
@@ -555,6 +561,15 @@ def _normalize_sampler_params(params: dict[str, Any]) -> dict[str, Any]:
         "seed": int(params.get("seed", 0)),
     }
 
+    row_indices = params.get("row_indices")
+    if row_indices is not None:
+        row_indices_arr = np.asarray(row_indices)
+        if row_indices_arr.ndim != 1:
+            raise ValueError(
+                "row_indices must be a 1-D sequence of corpus-global row indices"
+            )
+        normalized["row_indices"] = tuple(row_indices_arr.tolist())
+
     if kind == "corpus_random":
         return normalized
 
@@ -585,6 +600,7 @@ def _build_sampler(
         return CorpusRandomBatchSampler(
             metadata_index=metadata_index,
             batch_size=params["batch_size"],
+            row_indices=params.get("row_indices"),
             drop_last=params["drop_last"],
             seed=params["seed"],
         )
@@ -593,6 +609,7 @@ def _build_sampler(
             metadata_index=metadata_index,
             dataset_index=params["dataset_index"],
             batch_size=params["batch_size"],
+            row_indices=params.get("row_indices"),
             drop_last=params["drop_last"],
             shuffle=params["shuffle"],
             seed=params["seed"],
@@ -603,6 +620,7 @@ def _build_sampler(
             batch_size=params["batch_size"],
             context_field=params["context_field"],
             dataset_index=params["dataset_index"],
+            row_indices=params.get("row_indices"),
             drop_last=params["drop_last"],
             shuffle=params["shuffle"],
             seed=params["seed"],
@@ -620,9 +638,12 @@ def _resolve_loader_sampler(
     shuffle: bool,
     dataset_index: int | None,
     context_field: str,
+    row_indices: Sequence[int] | None,
 ) -> Any:
     """Resolve the sampler to use for one loader invocation."""
-    has_loader_local_sampler = sampler is not None or batch_size is not None
+    has_loader_local_sampler = (
+        sampler is not None or batch_size is not None or row_indices is not None
+    )
     if not has_loader_local_sampler:
         if corpus.sampler is None:
             return _build_sampler(
@@ -635,6 +656,44 @@ def _resolve_loader_sampler(
                 },
             )
         return corpus.sampler
+
+    if (
+        row_indices is not None
+        and sampler is None
+        and batch_size is None
+        and corpus.sampler is None
+    ):
+        return _build_sampler(
+            corpus.metadata_index,
+            {
+                "sampler": "corpus_random",
+                "batch_size": 128,
+                "drop_last": False,
+                "seed": 0,
+                "row_indices": row_indices,
+            },
+        )
+
+    if (
+        row_indices is not None
+        and sampler is None
+        and batch_size is None
+        and corpus.sampler is not None
+    ):
+        warnings.warn(
+            "Corpus.loader(...) received loader-local sampler arguments while "
+            "a stored sampler exists; using the loader-local sampler for this "
+            "call.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return _build_sampler(
+            corpus.metadata_index,
+            {
+                **corpus.sampler_params,
+                "row_indices": row_indices,
+            },
+        )
 
     if corpus.sampler is not None:
         warnings.warn(
@@ -656,6 +715,7 @@ def _resolve_loader_sampler(
                 "shuffle": shuffle,
                 "dataset_index": dataset_index,
                 "context_field": context_field,
+                "row_indices": row_indices,
             }
         )
     )

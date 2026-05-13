@@ -45,6 +45,32 @@ def _coerce_optional_float32_array(values: np.ndarray | None) -> np.ndarray | No
     return arr
 
 
+def _normalize_candidate_row_indices(
+    metadata_index: "MetadataIndex",
+    row_indices: Sequence[int] | np.ndarray | None,
+) -> np.ndarray | None:
+    """Validate an optional corpus-global candidate row universe."""
+    if row_indices is None:
+        return None
+
+    raw = np.asarray(row_indices)
+    if raw.ndim != 1:
+        raise ValueError(
+            "row_indices must be a 1-D sequence of corpus-global row indices"
+        )
+    if raw.size == 0:
+        raise ValueError("row_indices must contain at least one corpus-global row index")
+    if raw.dtype.kind not in {"i", "u"}:
+        raise ValueError("row_indices must contain only integer corpus-global row indices")
+
+    normalized = raw.astype(np.int64, copy=False)
+    if np.unique(normalized).size != normalized.size:
+        raise ValueError("row_indices must be unique corpus-global row indices")
+    if np.any(normalized < 0) or np.any(normalized >= len(metadata_index)):
+        raise IndexError("row_indices contains out-of-range corpus-global row indices")
+    return normalized.copy()
+
+
 @dataclass(frozen=True)
 class ExpressionBatch:
     """Flat expression arrays for a batch — zero per-cell Python objects.
@@ -188,13 +214,21 @@ class CorpusRandomBatchSampler:
         *,
         metadata_index: "MetadataIndex",
         batch_size: int,
+        row_indices: Sequence[int] | np.ndarray | None = None,
         drop_last: bool = True,
         seed: int = 0,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         self._meta = metadata_index
-        self.total_rows = len(metadata_index)
+        candidate_row_indices = _normalize_candidate_row_indices(
+            metadata_index,
+            row_indices,
+        )
+        if candidate_row_indices is None:
+            candidate_row_indices = np.arange(len(metadata_index), dtype=np.int64)
+        self._candidate_row_indices = candidate_row_indices
+        self.total_rows = len(candidate_row_indices)
         self.batch_size = int(batch_size)
         self.drop_last = bool(drop_last)
         self.seed = int(seed)
@@ -221,9 +255,10 @@ class CorpusRandomBatchSampler:
                 and batch_idx == num_batches - 1
             ):
                 current_batch_size = tail_size
-            indices = rng.choice(
+            positions = rng.choice(
                 self.total_rows, size=current_batch_size, replace=False
             )
+            indices = self._candidate_row_indices[positions]
             yield sorted(indices.tolist())
 
 
@@ -236,6 +271,7 @@ class DatasetBatchSampler:
         metadata_index: "MetadataIndex",
         dataset_index: int,
         batch_size: int,
+        row_indices: Sequence[int] | np.ndarray | None = None,
         drop_last: bool = True,
         shuffle: bool = True,
         seed: int = 0,
@@ -246,10 +282,26 @@ class DatasetBatchSampler:
         self._meta = metadata_index.filter(
             pl.col("dataset_index") == int(dataset_index)
         )
-        self._row_count = len(self._meta)
+        self._row_indices = np.asarray(
+            self._meta.df["global_row_index"].to_numpy(),
+            dtype=np.int64,
+        ).copy()
+        candidate_row_indices = _normalize_candidate_row_indices(
+            metadata_index,
+            row_indices,
+        )
+        if candidate_row_indices is not None:
+            self._row_indices = self._row_indices[
+                np.isin(
+                    self._row_indices,
+                    candidate_row_indices,
+                    assume_unique=True,
+                )
+            ]
+        self._row_count = len(self._row_indices)
         if self._row_count == 0:
             raise ValueError(
-                f"dataset_index {dataset_index} has no rows in metadata"
+                f"dataset_index {dataset_index} has no rows under the requested row_indices restriction"
             )
         self.dataset_index = int(dataset_index)
         self.batch_size = int(batch_size)
@@ -268,11 +320,7 @@ class DatasetBatchSampler:
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)
-        # Get all global indices for this dataset
-        all_indices = np.asarray(
-            self._meta.df["global_row_index"].to_numpy(),
-            dtype=np.int64,
-        ).copy()
+        all_indices = self._row_indices.copy()
         if self.shuffle:
             rng.shuffle(all_indices)
         for start in range(0, len(all_indices), self.batch_size):
@@ -296,6 +344,7 @@ class DatasetContextBatchSampler:
         batch_size: int,
         context_field: str = "raw_cell_type",
         dataset_index: int | None = None,
+        row_indices: Sequence[int] | np.ndarray | None = None,
         drop_last: bool = True,
         shuffle: bool = True,
         seed: int = 0,
@@ -306,6 +355,14 @@ class DatasetContextBatchSampler:
         if dataset_index is not None:
             self._meta = self._meta.filter(
                 pl.col("dataset_index") == int(dataset_index)
+            )
+        candidate_row_indices = _normalize_candidate_row_indices(
+            metadata_index,
+            row_indices,
+        )
+        if candidate_row_indices is not None:
+            self._meta = self._meta.filter(
+                pl.col("global_row_index").is_in(candidate_row_indices.tolist())
             )
         self.batch_size = int(batch_size)
         self.context_field = context_field

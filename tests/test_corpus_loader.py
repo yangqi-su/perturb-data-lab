@@ -1977,6 +1977,21 @@ class TestCorpusApiPhase2:
             "seed": 7,
         }
 
+    def test_set_sampler_stores_row_index_subset(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        sampler = corpus.set_sampler(batch_size=3, seed=7, row_indices=[1, 3, 20])
+
+        assert sampler is corpus.sampler
+        assert corpus.sampler_params == {
+            "sampler": "corpus_random",
+            "batch_size": 3,
+            "drop_last": True,
+            "seed": 7,
+            "row_indices": (1, 3, 20),
+        }
+
     def test_dataset_rejects_metadata_columns(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
@@ -2080,6 +2095,21 @@ class TestCorpusApiPhase2:
 
         assert captured["batch_sampler"].batch_size == 128
 
+    def test_loader_row_indices_supports_inline_default_sampler(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        batch = next(
+            corpus.loader(
+                processing="cpu",
+                row_indices=[2, 7, 10, 14],
+                seq_len=LOADER_SEQ_LEN,
+            )
+        )
+
+        _assert_processed_loader_batch(batch, batch_size=4)
+        assert set(batch["global_row_index"].cpu().numpy().tolist()) == {2, 7, 10, 14}
+
     def test_loader_accepts_inline_sampler_defaults(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
@@ -2181,6 +2211,26 @@ class TestCorpusApiPhase2:
 
         _assert_processed_loader_batch(batch, batch_size=4)
 
+    @pytest.mark.parametrize(
+        ("row_indices", "message"),
+        [
+            ([[0, 1], [2, 3]], "row_indices must be a 1-D sequence"),
+            ([1, 1, 2], "row_indices must be unique corpus-global row indices"),
+            ([25], "row_indices contains out-of-range corpus-global row indices"),
+        ],
+    )
+    def test_row_indices_validation_fails_clearly(
+        self,
+        tmp_path: Path,
+        row_indices: Any,
+        message: str,
+    ) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        with pytest.raises((ValueError, IndexError), match=message):
+            corpus.set_sampler(batch_size=2, row_indices=row_indices)
+
 
 class TestAggregateLancePhase4:
     """Phase 4 aggregate Lance worker-safe dataset tests."""
@@ -2273,6 +2323,26 @@ class TestAggregateLancePhase4:
         assert np.all(global_indices >= 10)
         assert np.all(global_indices < 25)
 
+    def test_loader_dataset_sampler_intersects_row_indices(self, tmp_path: Path) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+        corpus.set_sampler(
+            sampler="dataset",
+            dataset_index=1,
+            batch_size=5,
+            drop_last=False,
+            shuffle=False,
+            row_indices=[4, 9, 10, 12, 20],
+        )
+
+        batch = next(corpus.loader(processing="cpu", seq_len=LOADER_SEQ_LEN))
+
+        _assert_processed_loader_batch(batch, batch_size=3)
+        np.testing.assert_array_equal(
+            batch["global_row_index"].cpu().numpy(),
+            np.array([10, 12, 20]),
+        )
+
     def test_loader_dataset_context_sampler_preserves_context_group(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
@@ -2291,6 +2361,34 @@ class TestAggregateLancePhase4:
 
         _assert_processed_loader_batch(batch, batch_size=3)
         assert len(set(batch["meta_columns"]["perturb_label"])) == 1
+
+    def test_loader_dataset_context_sampler_preserves_context_inside_row_indices(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        batches = list(
+            corpus.loader(
+                processing="cpu",
+                sampler="dataset_context",
+                dataset_index=1,
+                context_field="perturb_label",
+                batch_size=2,
+                drop_last=False,
+                shuffle=False,
+                row_indices=[10, 11, 13, 14, 16, 17],
+                seq_len=LOADER_SEQ_LEN,
+                metadata_columns=["perturb_label"],
+            )
+        )
+
+        assert len(batches) == 2
+        for batch in batches:
+            _assert_processed_loader_batch(batch, batch_size=2)
+            assert set(batch["global_row_index"].cpu().numpy().tolist()) <= {10, 11, 13, 14, 16, 17}
+            assert len(set(batch["meta_columns"]["perturb_label"])) == 1
 
 
 class TestFederatedLancePhase5:
