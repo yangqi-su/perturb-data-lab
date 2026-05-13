@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import partial
+import json
 import pickle
 import shutil
 import tempfile
@@ -31,6 +32,7 @@ from perturb_data_lab.loaders import (
     MetadataIndex,
     PertTFAdapterConfig,
     PertTFLabelAdapter,
+    select_obs_indices,
     collate_expression_batch,
     collate_expression_batch_cpu,
 )
@@ -928,6 +930,61 @@ def _build_mock_to_anndata_corpus(corpus_root: Path) -> None:
     )
 
 
+def _build_mock_selection_corpus(corpus_root: Path) -> None:
+    ds_configs = [
+        {
+            "dataset_id": "mock_00",
+            "dataset_index": 0,
+            "global_start": 0,
+            "n_genes": 4,
+            "rows": [
+                {"expressed_gene_indices": [0], "expression_counts": [1]},
+                {"expressed_gene_indices": [1], "expression_counts": [2]},
+                {"expressed_gene_indices": [2], "expression_counts": [3]},
+                {"expressed_gene_indices": [3], "expression_counts": [4]},
+                {"expressed_gene_indices": [0, 2], "expression_counts": [5, 1]},
+                {"expressed_gene_indices": [], "expression_counts": []},
+            ],
+        },
+        {
+            "dataset_id": "mock_01",
+            "dataset_index": 1,
+            "global_start": 6,
+            "n_genes": 4,
+            "rows": [
+                {"expressed_gene_indices": [1], "expression_counts": [9]},
+                {"expressed_gene_indices": [0, 3], "expression_counts": [2, 2]},
+            ],
+        },
+    ]
+    _build_mock_aggregate_backend_corpus_from_configs(
+        corpus_root,
+        backend="lance",
+        ds_configs=ds_configs,
+        typed_structural=True,
+    )
+    _rewrite_canonical_obs_columns(
+        corpus_root,
+        "mock_00",
+        lambda frame: frame.with_columns(
+            [
+                pl.Series(
+                    "perturb_label",
+                    ["ctrl", "ctrl", "ctrl", "ctrl", "treat", "treat"],
+                ),
+                pl.Series(
+                    "batch_id",
+                    ["batch_a", "batch_a", "batch_b", None, "batch_b", None],
+                ),
+                pl.Series(
+                    "donor_id",
+                    ["donor_0", "donor_0", "donor_1", "donor_1", "donor_1", "donor_2"],
+                ),
+            ]
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -1248,6 +1305,163 @@ class TestLoadCorpusAggregate:
 
         with pytest.raises(IndexError, match="must stay within dataset 'mock_00'"):
             corpus.to_anndata(dataset_id="mock_00", row_indices=[0, 3])
+
+    def test_select_obs_indices_random_is_deterministic_and_feeds_to_anndata(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _build_mock_selection_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        selection_a = select_obs_indices(
+            corpus,
+            dataset_id="mock_00",
+            strategy="random",
+            max_cells=3,
+            seed=17,
+        )
+        selection_b = corpus.select_obs_indices(
+            dataset_id="mock_00",
+            strategy="random",
+            max_cells=3,
+            seed=17,
+        )
+
+        assert selection_a.row_indices == selection_b.row_indices
+        assert len(selection_a.row_indices) == 3
+        assert all(0 <= idx < 6 for idx in selection_a.row_indices)
+
+        adata = corpus.to_anndata(
+            dataset_id="mock_00",
+            row_indices=selection_a.row_indices,
+        )
+        assert adata.obs["global_row_index"].tolist() == list(selection_a.row_indices)
+
+    def test_select_obs_indices_balanced_reports_group_counts_and_respects_candidate_universe(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _build_mock_selection_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+        candidate_indices = [0, 1, 2, 4, 5]
+
+        selection = corpus.select_obs_indices(
+            dataset_id="mock_00",
+            strategy="balanced",
+            row_indices=candidate_indices,
+            max_cells=4,
+            stratify_by=["perturb_label"],
+            max_per_group=2,
+            seed=5,
+        )
+
+        assert set(selection.row_indices).issubset(set(candidate_indices))
+        assert selection.selected_local_row_indices == selection.row_indices
+        counts = {
+            record["group_values"]["perturb_label"]: record
+            for record in selection.group_counts
+        }
+        assert counts["ctrl"]["available_count"] == 3
+        assert counts["ctrl"]["selected_count"] == 2
+        assert counts["treat"]["available_count"] == 2
+        assert counts["treat"]["selected_count"] == 2
+        assert sum(record["selected_count"] for record in selection.group_counts) == 4
+
+    def test_select_obs_indices_drop_null_groups_records_summary(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _build_mock_selection_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        selection = corpus.select_obs_indices(
+            dataset_id="mock_00",
+            strategy="stratified",
+            max_cells=3,
+            stratify_by=["batch_id"],
+            drop_null_groups=True,
+            seed=9,
+        )
+
+        assert set(selection.row_indices).isdisjoint({3, 5})
+        assert selection.dropped_or_underfilled_groups == (
+            {
+                "group_key": '{"batch_id": null}',
+                "group_values": {"batch_id": None},
+                "available_count": 2,
+                "selected_count": 0,
+                "reason": "null-group-dropped",
+                "min_per_group": None,
+            },
+        )
+
+    def test_select_obs_indices_rejects_invalid_metadata_column(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _build_mock_selection_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        with pytest.raises(ValueError, match="metadata column 'missing_col' not found"):
+            corpus.select_obs_indices(
+                dataset_id="mock_00",
+                strategy="balanced",
+                stratify_by=["missing_col"],
+                max_cells=2,
+            )
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"row_indices": [0, 0]}, "must be unique"),
+            ({"row_indices": [0, 6]}, "must stay within dataset 'mock_00'"),
+            (
+                {
+                    "row_indices": [3, 5],
+                    "strategy": "balanced",
+                    "stratify_by": ["batch_id"],
+                    "drop_null_groups": True,
+                    "max_cells": 1,
+                },
+                "selection is empty after dropping null groups",
+            ),
+        ],
+    )
+    def test_select_obs_indices_failures_are_clear(
+        self,
+        tmp_path: Path,
+        kwargs: dict[str, Any],
+        match: str,
+    ) -> None:
+        _build_mock_selection_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+
+        with pytest.raises((ValueError, IndexError), match=match):
+            corpus.select_obs_indices(dataset_id="mock_00", **kwargs)
+
+    def test_select_obs_indices_write_provenance_is_json_and_parquet_safe(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _build_mock_selection_corpus(tmp_path)
+        corpus = load_corpus(str(tmp_path))
+        selection = corpus.select_obs_indices(
+            dataset_id="mock_00",
+            strategy="balanced",
+            max_cells=4,
+            stratify_by=["perturb_label", "donor_id"],
+            seed=13,
+        )
+
+        paths = selection.write_provenance(tmp_path / "selection-artifacts")
+
+        summary_payload = json.loads(paths["summary_path"].read_text(encoding="utf-8"))
+        assert summary_payload["selected_global_row_indices"] == list(selection.row_indices)
+        assert summary_payload["strategy"] == "balanced"
+
+        row_frame = pl.read_parquet(paths["rows_path"])
+        assert row_frame["global_row_index"].to_list() == list(selection.row_indices)
+        assert row_frame["strategy"].to_list() == ["balanced"] * len(selection.row_indices)
 
     def test_load_corpus_projects_canonical_core_columns_only_by_default(
         self, tmp_path: Path,

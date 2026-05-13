@@ -46,6 +46,7 @@ when no sampler has been configured, and defaults Lance workers to ``spawn``.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -101,7 +102,9 @@ from ..materializers.paths import resolve_corpus_paths
 
 __all__ = [
     "Corpus",
+    "ObsSelection",
     "load_corpus",
+    "select_obs_indices",
 ]
 
 
@@ -140,10 +143,96 @@ _TO_ANNDATA_REQUIRED_VAR_COLUMNS: tuple[str, ...] = (
 
 _TO_ANNDATA_READ_CHUNK_SIZE: int = 2048
 
+_OBS_SELECTION_ALLOWED_RESERVED_COLUMNS: frozenset[str] = frozenset(
+    {
+        "global_row_index",
+        "dataset_index",
+        "local_row_index",
+        "size_factor",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Corpus dataclass
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ObsSelection:
+    """Structured deterministic observation selection result."""
+
+    dataset_id: str
+    dataset_index: int
+    strategy: str
+    seed: int
+    stratify_by: tuple[str, ...]
+    max_cells: int | None
+    min_per_group: int | None
+    max_per_group: int | None
+    drop_null_groups: bool
+    candidate_count: int
+    selected_global_row_indices: tuple[int, ...]
+    selected_local_row_indices: tuple[int, ...]
+    group_counts: tuple[dict[str, Any], ...]
+    dropped_or_underfilled_groups: tuple[dict[str, Any], ...]
+
+    @property
+    def row_indices(self) -> tuple[int, ...]:
+        """Alias the selected corpus-global row indices."""
+        return self.selected_global_row_indices
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe summary of the selection."""
+        return {
+            "dataset_id": self.dataset_id,
+            "dataset_index": int(self.dataset_index),
+            "strategy": self.strategy,
+            "seed": int(self.seed),
+            "stratify_by": list(self.stratify_by),
+            "max_cells": self.max_cells,
+            "min_per_group": self.min_per_group,
+            "max_per_group": self.max_per_group,
+            "drop_null_groups": bool(self.drop_null_groups),
+            "candidate_count": int(self.candidate_count),
+            "selected_count": len(self.selected_global_row_indices),
+            "selected_global_row_indices": list(self.selected_global_row_indices),
+            "selected_local_row_indices": list(self.selected_local_row_indices),
+            "group_counts": [
+                _json_safe_mapping(record) for record in self.group_counts
+            ],
+            "dropped_or_underfilled_groups": [
+                _json_safe_mapping(record)
+                for record in self.dropped_or_underfilled_groups
+            ],
+        }
+
+    def write_provenance(self, output_dir: str | Path) -> dict[str, Path]:
+        """Write selection provenance as JSON summary plus row parquet."""
+        root = Path(output_dir)
+        root.mkdir(parents=True, exist_ok=True)
+
+        summary_path = root / "selection-summary.json"
+        summary_path.write_text(
+            json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        rows_path = root / "selected-rows.parquet"
+        pl.DataFrame(
+            {
+                "dataset_id": [self.dataset_id] * len(self.selected_global_row_indices),
+                "dataset_index": [int(self.dataset_index)] * len(self.selected_global_row_indices),
+                "strategy": [self.strategy] * len(self.selected_global_row_indices),
+                "seed": [int(self.seed)] * len(self.selected_global_row_indices),
+                "global_row_index": list(self.selected_global_row_indices),
+                "local_row_index": list(self.selected_local_row_indices),
+            }
+        ).write_parquet(rows_path)
+        return {
+            "summary_path": summary_path,
+            "rows_path": rows_path,
+        }
 
 
 @dataclass
@@ -311,6 +400,33 @@ class Corpus:
             index_column=_select_var_index_column(prepared["var_data"]),
         )
         return ad.AnnData(X=matrix, obs=obs, var=var)
+
+    def select_obs_indices(
+        self,
+        *,
+        dataset_id: str,
+        strategy: str = "all",
+        row_indices: Sequence[int] | np.ndarray | None = None,
+        max_cells: int | None = None,
+        stratify_by: Sequence[str] | None = None,
+        min_per_group: int | None = None,
+        max_per_group: int | None = None,
+        seed: int = 0,
+        drop_null_groups: bool = False,
+    ) -> ObsSelection:
+        """Select deterministic corpus-global observation indices for one dataset."""
+        return _select_obs_indices(
+            self,
+            dataset_id=dataset_id,
+            strategy=strategy,
+            row_indices=row_indices,
+            max_cells=max_cells,
+            stratify_by=stratify_by,
+            min_per_group=min_per_group,
+            max_per_group=max_per_group,
+            seed=seed,
+            drop_null_groups=drop_null_groups,
+        )
 
     def _expression_dataset(self) -> ExpressionBatchDataset:
         """Build the backend-neutral expression-only dataset route."""
@@ -1366,6 +1482,14 @@ def load_corpus(
     )
 
 
+def select_obs_indices(
+    corpus: Corpus,
+    **kwargs: Any,
+) -> ObsSelection:
+    """Public function-style alias around ``Corpus.select_obs_indices(...)``."""
+    return corpus.select_obs_indices(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -1375,6 +1499,470 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     """Read a YAML file and return the parsed dict."""
     with open(path, "r") as fh:
         return yaml.safe_load(fh) or {}
+
+
+@dataclass
+class _SelectionGroup:
+    group_key: str
+    group_values: dict[str, Any]
+    candidate_positions: np.ndarray
+    available_count: int
+    is_null_group: bool
+
+
+def _select_obs_indices(
+    corpus: Corpus,
+    *,
+    dataset_id: str,
+    strategy: str,
+    row_indices: Sequence[int] | np.ndarray | None,
+    max_cells: int | None,
+    stratify_by: Sequence[str] | None,
+    min_per_group: int | None,
+    max_per_group: int | None,
+    seed: int,
+    drop_null_groups: bool,
+) -> ObsSelection:
+    resolved_strategy = _normalize_obs_selection_strategy(strategy)
+    resolved_seed = int(seed)
+    resolved_max_cells = _normalize_optional_positive_int(max_cells, label="max_cells")
+    resolved_min_per_group = _normalize_optional_positive_int(
+        min_per_group,
+        label="min_per_group",
+    )
+    resolved_max_per_group = _normalize_optional_positive_int(
+        max_per_group,
+        label="max_per_group",
+    )
+    if (
+        resolved_min_per_group is not None
+        and resolved_max_per_group is not None
+        and resolved_max_per_group < resolved_min_per_group
+    ):
+        raise ValueError("max_per_group must be >= min_per_group when both are provided")
+
+    group_columns = _normalize_selection_group_columns(
+        corpus.metadata_index,
+        stratify_by,
+    )
+    _validate_obs_selection_request(
+        strategy=resolved_strategy,
+        max_cells=resolved_max_cells,
+        group_columns=group_columns,
+        min_per_group=resolved_min_per_group,
+        max_per_group=resolved_max_per_group,
+    )
+
+    dataset_entry = _resolve_dataset_entry(corpus.dataset_entries, dataset_id)
+    candidate_row_indices = _normalize_dataset_row_indices(dataset_entry, row_indices)
+    candidate_frame = _build_obs_selection_frame(
+        corpus,
+        row_indices=candidate_row_indices,
+        group_columns=group_columns,
+    )
+    groups = _build_obs_selection_groups(candidate_frame, group_columns)
+
+    active_groups: list[_SelectionGroup] = []
+    group_records: list[dict[str, Any]] = []
+    flagged_groups: list[dict[str, Any]] = []
+    for group in groups:
+        if group.is_null_group and drop_null_groups:
+            flagged_groups.append(
+                _build_group_status_record(
+                    group,
+                    selected_count=0,
+                    reason="null-group-dropped",
+                    min_per_group=resolved_min_per_group,
+                )
+            )
+        else:
+            active_groups.append(group)
+
+    if not active_groups:
+        raise ValueError("selection is empty after dropping null groups")
+
+    target_counts = _resolve_obs_selection_targets(
+        groups=active_groups,
+        strategy=resolved_strategy,
+        max_cells=resolved_max_cells,
+        min_per_group=resolved_min_per_group,
+        max_per_group=resolved_max_per_group,
+    )
+
+    rng = np.random.default_rng(resolved_seed)
+    sampled_position_parts: list[np.ndarray] = []
+    selected_counts_by_key: dict[str, int] = {}
+    for group, target_count in zip(active_groups, target_counts, strict=True):
+        sampled_positions = _sample_candidate_positions(
+            group.candidate_positions,
+            target_count=int(target_count),
+            rng=rng,
+        )
+        sampled_position_parts.append(sampled_positions)
+        selected_count = int(sampled_positions.size)
+        selected_counts_by_key[group.group_key] = selected_count
+        if (
+            resolved_min_per_group is not None
+            and group.available_count < resolved_min_per_group
+        ):
+            flagged_groups.append(
+                _build_group_status_record(
+                    group,
+                    selected_count=selected_count,
+                    reason="underfilled-min-per-group",
+                    min_per_group=resolved_min_per_group,
+                )
+            )
+
+    selected_positions = (
+        np.concatenate(sampled_position_parts)
+        if sampled_position_parts
+        else np.array([], dtype=np.int64)
+    )
+    if selected_positions.size == 0:
+        raise ValueError("selection produced zero rows; adjust max_cells or grouping parameters")
+    selected_positions.sort()
+
+    for group in groups:
+        group_records.append(
+            {
+                "group_key": group.group_key,
+                "group_values": dict(group.group_values),
+                "available_count": int(group.available_count),
+                "selected_count": int(selected_counts_by_key.get(group.group_key, 0)),
+            }
+        )
+
+    global_row_index = candidate_frame["global_row_index"].to_numpy()
+    local_row_index = candidate_frame["local_row_index"].to_numpy()
+    dataset_index = int(corpus.dataset_index_by_id[dataset_id])
+    return ObsSelection(
+        dataset_id=dataset_id,
+        dataset_index=dataset_index,
+        strategy=resolved_strategy,
+        seed=resolved_seed,
+        stratify_by=group_columns,
+        max_cells=resolved_max_cells,
+        min_per_group=resolved_min_per_group,
+        max_per_group=resolved_max_per_group,
+        drop_null_groups=bool(drop_null_groups),
+        candidate_count=int(candidate_row_indices.size),
+        selected_global_row_indices=tuple(
+            int(value) for value in global_row_index[selected_positions].tolist()
+        ),
+        selected_local_row_indices=tuple(
+            int(value) for value in local_row_index[selected_positions].tolist()
+        ),
+        group_counts=tuple(group_records),
+        dropped_or_underfilled_groups=tuple(flagged_groups),
+    )
+
+
+def _normalize_obs_selection_strategy(strategy: str) -> str:
+    normalized = str(strategy).strip().lower().replace("_", "-")
+    aliases = {
+        "all": "all",
+        "pass-through": "all",
+        "passthrough": "all",
+        "random": "random",
+        "stratified": "stratified",
+        "balanced": "balanced",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "strategy must be one of 'all', 'random', 'stratified', or 'balanced'"
+        )
+    return aliases[normalized]
+
+
+def _normalize_optional_positive_int(value: int | None, *, label: str) -> int | None:
+    if value is None:
+        return None
+    normalized = int(value)
+    if normalized <= 0:
+        raise ValueError(f"{label} must be positive when provided")
+    return normalized
+
+
+def _normalize_selection_group_columns(
+    metadata_index: MetadataIndex,
+    stratify_by: Sequence[str] | None,
+) -> tuple[str, ...]:
+    if stratify_by is None:
+        return ()
+    return _normalize_metadata_columns(
+        metadata_index,
+        stratify_by,
+        allow_reserved=_OBS_SELECTION_ALLOWED_RESERVED_COLUMNS,
+    )
+
+
+def _validate_obs_selection_request(
+    *,
+    strategy: str,
+    max_cells: int | None,
+    group_columns: tuple[str, ...],
+    min_per_group: int | None,
+    max_per_group: int | None,
+) -> None:
+    if strategy in {"all", "random"} and group_columns:
+        raise ValueError(
+            f"strategy='{strategy}' does not accept stratify_by; use 'stratified' or 'balanced'"
+        )
+    if strategy in {"stratified", "balanced"} and not group_columns:
+        raise ValueError(
+            f"strategy='{strategy}' requires at least one stratify_by column"
+        )
+    if strategy == "all" and max_cells is not None:
+        raise ValueError(
+            "strategy='all' cannot trim rows; use 'random', 'stratified', or 'balanced'"
+        )
+    if strategy == "random" and (min_per_group is not None or max_per_group is not None):
+        raise ValueError(
+            "strategy='random' does not accept min_per_group or max_per_group"
+        )
+    if strategy == "all" and (min_per_group is not None or max_per_group is not None):
+        raise ValueError(
+            "strategy='all' does not accept min_per_group or max_per_group"
+        )
+
+
+def _build_obs_selection_frame(
+    corpus: Corpus,
+    *,
+    row_indices: np.ndarray,
+    group_columns: tuple[str, ...],
+) -> pl.DataFrame:
+    columns = [
+        "global_row_index",
+        "dataset_id",
+        "dataset_index",
+        "local_row_index",
+        *group_columns,
+    ]
+    data = corpus.metadata_index.take(row_indices, columns=columns)
+    frame = pl.DataFrame(
+        {
+            column_name: list(values) if isinstance(values, tuple) else values
+            for column_name, values in data.items()
+        }
+    )
+    return frame.with_columns(
+        pl.Series("_candidate_position", np.arange(len(frame), dtype=np.int64))
+    )
+
+
+def _build_obs_selection_groups(
+    frame: pl.DataFrame,
+    group_columns: tuple[str, ...],
+) -> list[_SelectionGroup]:
+    if not group_columns:
+        positions = frame["_candidate_position"].to_numpy().astype(np.int64, copy=False)
+        return [
+            _SelectionGroup(
+                group_key="__all__",
+                group_values={},
+                candidate_positions=positions,
+                available_count=int(positions.size),
+                is_null_group=False,
+            )
+        ]
+
+    grouped = frame.group_by(list(group_columns), maintain_order=True).agg(
+        pl.len().alias("available_count"),
+        pl.col("_candidate_position").alias("candidate_positions"),
+    )
+    groups: list[_SelectionGroup] = []
+    for row in grouped.iter_rows(named=True):
+        group_values = {
+            column_name: _json_safe_value(row[column_name])
+            for column_name in group_columns
+        }
+        groups.append(
+            _SelectionGroup(
+                group_key=_format_group_key(group_values),
+                group_values=group_values,
+                candidate_positions=np.asarray(
+                    row["candidate_positions"],
+                    dtype=np.int64,
+                ),
+                available_count=int(row["available_count"]),
+                is_null_group=any(value is None for value in group_values.values()),
+            )
+        )
+    return groups
+
+
+def _resolve_obs_selection_targets(
+    *,
+    groups: Sequence[_SelectionGroup],
+    strategy: str,
+    max_cells: int | None,
+    min_per_group: int | None,
+    max_per_group: int | None,
+) -> np.ndarray:
+    available = np.asarray([group.available_count for group in groups], dtype=np.int64)
+    capacity = available.copy()
+    if max_per_group is not None:
+        capacity = np.minimum(capacity, max_per_group)
+    total_capacity = int(capacity.sum())
+
+    if strategy == "all":
+        return available.copy()
+    if strategy == "random":
+        total_available = int(available.sum())
+        total_target = total_available if max_cells is None else min(max_cells, total_available)
+        return np.asarray([total_target], dtype=np.int64)
+
+    baseline = np.zeros(len(groups), dtype=np.int64)
+    if min_per_group is not None:
+        baseline = np.minimum(capacity, min_per_group)
+    if max_cells is not None and int(baseline.sum()) > max_cells:
+        raise ValueError(
+            "max_cells is too small to satisfy the requested min_per_group across groups"
+        )
+
+    total_target = total_capacity if max_cells is None else min(max_cells, total_capacity)
+    if strategy == "balanced":
+        return _allocate_balanced_targets(capacity, baseline, total_target)
+    return _allocate_stratified_targets(available, capacity, baseline, total_target)
+
+
+def _allocate_balanced_targets(
+    capacity: np.ndarray,
+    baseline: np.ndarray,
+    total_target: int,
+) -> np.ndarray:
+    targets = baseline.copy()
+    if targets.sum() >= total_target:
+        return targets
+    if np.array_equal(capacity, baseline):
+        return capacity.copy()
+
+    residual = int(total_target - targets.sum())
+    active = np.where(targets < capacity)[0]
+    while residual > 0 and active.size > 0:
+        per_group = max(1, residual // active.size)
+        increment = np.minimum(capacity[active] - targets[active], per_group)
+        targets[active] += increment
+        used = int(increment.sum())
+        residual -= used
+        if residual <= 0:
+            break
+        active = np.where(targets < capacity)[0]
+        if used == 0 and active.size > 0:
+            for idx in active:
+                if residual == 0:
+                    break
+                targets[idx] += 1
+                residual -= 1
+            break
+    return targets
+
+
+def _allocate_stratified_targets(
+    available: np.ndarray,
+    capacity: np.ndarray,
+    baseline: np.ndarray,
+    total_target: int,
+) -> np.ndarray:
+    targets = baseline.copy()
+    if targets.sum() >= total_target:
+        return targets
+    if np.array_equal(capacity, baseline):
+        return capacity.copy()
+
+    residual = int(total_target - targets.sum())
+    extra_capacity = capacity - baseline
+    weights = np.maximum(available - baseline, 0)
+    if int(weights.sum()) == 0:
+        weights = extra_capacity.copy()
+    proportional = residual * (weights / weights.sum())
+    floor_allocation = np.minimum(
+        np.floor(proportional).astype(np.int64),
+        extra_capacity,
+    )
+    targets += floor_allocation
+    residual -= int(floor_allocation.sum())
+    if residual <= 0:
+        return targets
+
+    remainders = proportional - np.floor(proportional)
+    candidate_order = np.argsort(-remainders, kind="stable")
+    for idx in candidate_order:
+        if residual == 0:
+            break
+        if targets[idx] >= capacity[idx]:
+            continue
+        targets[idx] += 1
+        residual -= 1
+    if residual <= 0:
+        return targets
+
+    for idx in np.where(targets < capacity)[0]:
+        if residual == 0:
+            break
+        room = int(capacity[idx] - targets[idx])
+        if room <= 0:
+            continue
+        step = min(room, residual)
+        targets[idx] += step
+        residual -= step
+    return targets
+
+
+def _sample_candidate_positions(
+    candidate_positions: np.ndarray,
+    *,
+    target_count: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if target_count <= 0:
+        return np.array([], dtype=np.int64)
+    if target_count >= candidate_positions.size:
+        return np.sort(candidate_positions.astype(np.int64, copy=True))
+    sampled = rng.choice(candidate_positions, size=target_count, replace=False)
+    sampled.sort()
+    return sampled.astype(np.int64, copy=False)
+
+
+def _build_group_status_record(
+    group: _SelectionGroup,
+    *,
+    selected_count: int,
+    reason: str,
+    min_per_group: int | None,
+) -> dict[str, Any]:
+    return {
+        "group_key": group.group_key,
+        "group_values": dict(group.group_values),
+        "available_count": int(group.available_count),
+        "selected_count": int(selected_count),
+        "reason": reason,
+        "min_per_group": min_per_group,
+    }
+
+
+def _format_group_key(group_values: dict[str, Any]) -> str:
+    if not group_values:
+        return "__all__"
+    return json.dumps(group_values, sort_keys=True)
+
+
+def _json_safe_mapping(record: dict[str, Any]) -> dict[str, Any]:
+    return {key: _json_safe_value(value) for key, value in record.items()}
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe_value(item) for item in value]
+    return value
 
 
 def _prepare_to_anndata_inputs(

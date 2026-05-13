@@ -48,7 +48,9 @@ from .gene_tokenizer import (
 )
 from .corpus_loader import (
     Corpus,
+    ObsSelection,
     load_corpus,
+    select_obs_indices,
 )
 from .gpu_pipeline import (
     GPUSparsePipeline,
@@ -125,7 +127,9 @@ __all__ = [
     "PertTFVocabAdapter",
     # Phase N — Corpus loader factory
     "Corpus",
+    "ObsSelection",
     "load_corpus",
+    "select_obs_indices",
     # Utilities
     "read_raw_obs_parquet",
     "read_raw_var_parquet",
