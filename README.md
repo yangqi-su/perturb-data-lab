@@ -30,10 +30,11 @@ perturb-data-lab/
 │       ├── materializers/
 │       │   ├── tokenizer.py      # corpus-level JSON tokenizer
 │       │   └── emission_spec.py # corpus-level emission spec
-│       └── loaders/
-│           ├── corpus_loader.py  # load_corpus(), Corpus, sampler/loader API
-│           ├── loaders.py        # datasets, samplers, collate helpers
-│           └── corpus.py         # legacy raw parquet utilities
+│       ├── loaders/
+│       │   ├── corpus_loader.py  # load_corpus(), Corpus, sampler/loader API
+│       │   ├── loaders.py        # datasets, samplers, collate helpers
+│       │   └── corpus.py         # legacy raw parquet utilities
+│       └── pp/                   # streamed per-dataset stats/HVG/PCA/DE helpers
 ├── tests/
 └── pyproject.toml
 ```
@@ -45,6 +46,7 @@ perturb-data-lab/
 - `src/perturb_data_lab/materializers/`: create/append corpus writers, aggregate/federated backends, manifests, and emission-spec helpers
 - `src/perturb_data_lab/canonical/`: draft/final schema application and canonical obs/var generation
 - `src/perturb_data_lab/loaders/corpus_loader.py`: `load_corpus()` and `Corpus` for unified runtime access
+- `src/perturb_data_lab/pp/`: backend-agnostic streamed per-dataset stats, HVG, PCA/SVD, and Welch DE helpers
 - `scripts/perttf_marson_xorion_smoke.py`: bounded full-corpus Phase 8 adapter smoke for Marson/Xorion
 - `docs/v0-onboarding-workflow.md`: current inspect → materialize → draft-schema → finalize-schema → canonicalize → load workflow
 - `docs/canonicalization_handbook.md`: canonical schema review rules, transform behavior, tokenizer notes, and common failure modes
@@ -73,6 +75,24 @@ Important constraints:
 - Treat `data/`, `pertTF/`, and `perturb/` as read-only sources; write outputs only to repo-local real directories.
 
 See `docs/v0-onboarding-workflow.md` for concrete create/append CLI examples and `docs/canonicalization_handbook.md` for draft-to-final schema review guidance.
+
+### Materialization-time obs filtering
+
+Add the dataset-summary `obs_filter:` field when you want to materialize only a
+safe subset of cells before expression emission:
+
+```yaml
+obs_filter: "cell_line_or_type == 'T_cell' and donor_id in ['D1', 'D2'] and disease_state is not null"
+```
+
+- Supported filter language is intentionally small: comparisons, `is null`,
+  `is not null`, `in [...]`, `not in [...]`, `and`, `or`, and parentheses.
+- Filtering is applied before expression, raw obs, and size-factor emission.
+- Filtered raw-obs outputs preserve `source_row_index` and `source_obs_index`
+  so retained cells still map back to the original source rows.
+- Keep materialized outputs in repo-local real directories only; never write
+  generated artifacts into the read-only `data/`, `pertTF/`, or `perturb/`
+  symlink roots.
 
 ## Preferred corpus-first API
 
@@ -104,6 +124,29 @@ for batch in corpus.loader(seq_len=1024, processing="gpu", num_workers=4):
 - If no sampler is stored and no loader-local sampler config is passed,
   `corpus.loader(...)` uses a default random sampler with `batch_size=128`.
 
+### Canonical metadata loading defaults
+
+```python
+from perturb_data_lab.loaders import load_corpus
+
+corpus = load_corpus("/path/to/corpus")
+
+corpus_with_extra = load_corpus(
+    "/path/to/corpus",
+    extra_metadata_columns=["raw_cell_type", "donor_age"],
+)
+```
+
+- `load_corpus(...)` now projects only canonical/core columns from
+  `canonical-obs.parquet` by default instead of eagerly loading every stored
+  column.
+- Use `extra_metadata_columns=[...]` when a downstream workflow needs specific
+  extra canonical-obs columns; missing requested extras fail early.
+- Canonical string columns normalize null-like literals such as `"NA"`,
+  `"null"`, `"."`, and empty strings at read time.
+- Canonicalization write behavior is unchanged: the on-disk canonical parquet
+  files are not rewritten or normalized by `load_corpus(...)`.
+
 ### Metadata and inspection helpers
 
 ```python
@@ -133,6 +176,36 @@ for batch in corpus.loader(
   metadata columns for spot checks and debugging.
 - `corpus.loader(metadata_columns=...)` attaches rich metadata after sparse
   processing, so workers stay expression-only.
+
+### Custom row subsets and pertTF pairing pools
+
+```python
+from perturb_data_lab.loaders.adapters.perttf import PerturbationPairSampler
+
+row_subset = [0, 3, 10, 22]
+
+for batch in corpus.loader(
+    seq_len=1024,
+    row_indices=row_subset,
+    metadata_columns=["dataset_id", "perturb_label"],
+):
+    ...
+
+pair_sampler = PerturbationPairSampler(
+    corpus.metadata_index,
+    batch_size=64,
+    source_indices=row_subset,
+    target_candidate_indices=[0, 3, 10, 41, 52],
+)
+```
+
+- `row_indices` are corpus-global row positions; they restrict loader/sampler
+  candidate pools without rebuilding the full metadata index.
+- `source_indices` restrict which rows can be sampled as pertTF sources.
+- `target_candidate_indices` further restrict valid paired targets and is
+  accepted only when `source_indices` is also provided.
+- Same-dataset and same-context pairing invariants are still enforced inside
+  the configured source/target pools.
 
 ### Stored sampler reuse and loader-local override warning
 
@@ -215,6 +288,52 @@ cpu_batch = next(iter(cpu_loader))
   input.
 - Lance-backed loaders default to `multiprocessing_context="spawn"` for worker
   safety.
+
+## Streamed `pp` helpers
+
+```python
+from perturb_data_lab.pp import (
+    calculate_hvgs,
+    calculate_lognorm_stats,
+    rank_genes_ttest,
+    run_pca,
+)
+
+output_dir = "./artifacts/pp"
+
+stats = calculate_lognorm_stats(corpus, batch_size=2048, output_dir=output_dir)
+hvg_frame = calculate_hvgs(corpus, batch_size=2048, n_hvg=2000)
+pca = run_pca(
+    corpus,
+    batch_size=2048,
+    n_components=32,
+    hvg_frame=hvg_frame,
+    output_dir=output_dir,
+    overwrite=True,
+)
+de = rank_genes_ttest(
+    corpus,
+    control_label="CRISPR_control",
+    batch_size=2048,
+    top_k=50,
+    output_dir=output_dir,
+    overwrite=True,
+)
+```
+
+- `calculate_lognorm_stats(...)` streams `log1p(count / size_factor)` summary
+  stats and can write per-dataset `lognorm-stats.parquet` outputs plus
+  provenance sidecars.
+- `calculate_hvgs(...)` returns a ranked per-dataset HVG frame that can be fed
+  into `run_pca(..., hvg_frame=...)`.
+- `run_pca(...)` currently exposes uncentered sparse `method="truncated_svd"`
+  semantics while keeping a PCA-like public API.
+- `rank_genes_ttest(...)` runs streamed per-dataset Welch DE against an
+  explicit control label and writes top-k `ttest-degs.parquet` artifacts when
+  `output_dir` is set.
+- Write generated `pp` outputs only to repo-local real directories such as
+  `./artifacts/pp`, never into the protected `data/`, `pertTF/`, or
+  `perturb/` symlink roots.
 
 ## Migration note
 
