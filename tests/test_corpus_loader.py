@@ -28,6 +28,7 @@ from perturb_data_lab.loaders import (
     GeneTokenizer,
     GPUSparsePipeline,
     MetadataIndex,
+    PertTFLabelAdapter,
     collate_expression_batch,
     collate_expression_batch_cpu,
 )
@@ -1046,14 +1047,42 @@ class TestLoadCorpusAggregate:
         assert schema["local_row_index"] == pl.Int64
         assert schema["size_factor"] == pl.Float64
 
-    def test_load_corpus_preserves_typed_structural_fields_and_safe_nulls(
+    def test_load_corpus_normalizes_null_like_literals_in_canonical_string_columns(
         self, tmp_path: Path,
     ) -> None:
-        """Typed canonical obs and safe nulls round-trip through load_corpus()."""
-        _build_mock_aggregate_corpus(
+        """Canonical string columns load null-like literals as true nulls."""
+        _build_mock_aggregate_corpus(tmp_path, typed_structural=True)
+        canonical_null_literals = {
+            "cell_id": "",
+            "perturb_label": " nan ",
+            "perturb_type": " None ",
+            "dose": " null ",
+            "dose_unit": " . ",
+            "timepoint": " - ",
+            "timepoint_unit": " NA ",
+            "cell_context": " nan ",
+            "cell_line_or_type": " None ",
+            "species": " null ",
+            "tissue": " . ",
+            "assay": " - ",
+            "condition": " NA ",
+            "batch_id": " nan ",
+            "donor_id": " None ",
+            "sex": " null ",
+            "disease_state": " . ",
+        }
+        _rewrite_canonical_obs_columns(
             tmp_path,
-            typed_structural=True,
-            safe_nulls=True,
+            "mock_00",
+            lambda frame: frame.with_columns(
+                [
+                    pl.Series(
+                        column_name,
+                        [literal, *frame[column_name].to_list()[1:]],
+                    )
+                    for column_name, literal in canonical_null_literals.items()
+                ]
+            ),
         )
         corpus = load_corpus(str(tmp_path))
 
@@ -1063,13 +1092,15 @@ class TestLoadCorpusAggregate:
         assert schema["dataset_index"] == pl.Int32
         assert schema["local_row_index"] == pl.Int64
         assert schema["size_factor"] == pl.Float64
-        assert mi.df["dose"].null_count() == len(mi)
-        assert mi.df["timepoint"].null_count() == len(mi)
+        first_row = mi.df.row(0, named=True)
+        for column_name in canonical_null_literals:
+            assert first_row[column_name] is None
 
-        taken = mi.take([0, 10], ["dataset_index", "size_factor", "dose"])
+        taken = mi.take([0, 10], ["dataset_index", "size_factor", "dose", "condition"])
         assert np.issubdtype(taken["dataset_index"].dtype, np.integer)
         assert np.issubdtype(taken["size_factor"].dtype, np.floating)
-        assert taken["dose"] == (None, None)
+        assert taken["dose"] == (None, "1.0")
+        assert taken["condition"] == (None, None)
 
     def test_load_corpus_projects_canonical_core_columns_only_by_default(
         self, tmp_path: Path,
@@ -1103,14 +1134,14 @@ class TestLoadCorpusAggregate:
             tmp_path,
             "mock_00",
             lambda frame: frame.with_columns(
-                pl.Series("qc_bucket", [f"qc_{idx}" for idx in range(len(frame))]),
+                pl.Series("qc_bucket", [" NA ", *[f"qc_{idx}" for idx in range(1, len(frame))]]),
             ),
         )
         _rewrite_canonical_obs_columns(
             tmp_path,
             "mock_01",
             lambda frame: frame.with_columns(
-                pl.Series("qc_bucket", [f"qc_{idx}" for idx in range(len(frame))]),
+                pl.Series("qc_bucket", ["-", *[f"qc_{idx}" for idx in range(1, len(frame))]]),
             ),
         )
 
@@ -1121,7 +1152,7 @@ class TestLoadCorpusAggregate:
 
         assert "qc_bucket" in corpus.metadata_index.df.columns
         taken = corpus.take_metadata([0, 10], columns=["qc_bucket"])
-        assert taken["qc_bucket"] == ("qc_0", "qc_0")
+        assert taken["qc_bucket"] == (" NA ", "-")
 
     def test_load_corpus_rejects_missing_requested_extra_metadata_column(
         self, tmp_path: Path,
@@ -1148,7 +1179,39 @@ class TestLoadCorpusAggregate:
 
         assert "condition" in corpus.metadata_index.df.columns
         assert corpus.take_metadata([0], columns=["condition"])["condition"] == (None,)
-        assert corpus.take_metadata([10], columns=["condition"])["condition"] == ("NA",)
+        assert corpus.take_metadata([10], columns=["condition"])["condition"] == (None,)
+
+    def test_load_corpus_exposes_null_labels_to_downstream_adapters(
+        self, tmp_path: Path,
+    ) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        _rewrite_canonical_obs_columns(
+            tmp_path,
+            "mock_00",
+            lambda frame: frame.with_columns(
+                pl.Series("cell_context", ["context"] * len(frame)),
+                pl.Series(
+                    "perturb_label",
+                    [" NA ", *frame["perturb_label"].to_list()[1:]],
+                ),
+            ),
+        )
+        _rewrite_canonical_obs_columns(
+            tmp_path,
+            "mock_01",
+            lambda frame: frame.with_columns(
+                pl.Series("cell_context", ["context"] * len(frame)),
+            ),
+        )
+
+        corpus = load_corpus(str(tmp_path))
+
+        assert corpus.take_metadata([0], columns=["perturb_label"])["perturb_label"] == (None,)
+        with pytest.raises(
+            ValueError,
+            match="metadata column 'perturb_label' contains null labels",
+        ):
+            PertTFLabelAdapter.from_metadata_index(corpus.metadata_index)
 
     def test_global_row_indices_contiguous(self, tmp_path: Path) -> None:
         """Global row indices are 0..N-1 contiguous."""

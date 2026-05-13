@@ -55,12 +55,14 @@ _CANONICAL_OBS_CORE_COLUMNS: tuple[str, ...] = (
     _CANONICAL_OBS_STRUCTURAL_COLUMNS + _CANONICAL_OBS_CONTENT_COLUMNS
 )
 
-_CANONICAL_SAFE_NULL_STRING_COLUMNS: frozenset[str] = frozenset(
-    {"dose", "dose_unit", "timepoint", "timepoint_unit"}
+_CANONICAL_NULL_NORMALIZED_STRING_COLUMNS: frozenset[str] = frozenset(
+    column_name
+    for column_name in _CANONICAL_OBS_CORE_COLUMNS
+    if column_name not in _CANONICAL_OBS_TYPED_DTYPES
 )
 
 _CANONICAL_NULL_LITERALS: frozenset[str] = frozenset(
-    {"", "na", "n/a", "none", "null", "nan", ".", "-"}
+    {"", "na", "none", "null", "nan", ".", "-"}
 )
 
 _STRINGLIKE_DTYPES: set[pl.DataType] = {pl.Utf8, pl.Categorical, pl.Enum}
@@ -930,7 +932,7 @@ class MetadataIndex:
 
 
 def _normalize_canonical_obs_dtypes(df: pl.DataFrame) -> pl.DataFrame:
-    """Normalize typed and null-aware canonical obs columns."""
+    """Normalize typed and read-time-null-aware canonical obs columns."""
     expressions: list[pl.Expr] = []
 
     for col_name, dtype in _CANONICAL_OBS_TYPED_DTYPES.items():
@@ -941,7 +943,7 @@ def _normalize_canonical_obs_dtypes(df: pl.DataFrame) -> pl.DataFrame:
             expr = _null_if_legacy_missing(expr)
         expressions.append(expr.cast(dtype, strict=True).alias(col_name))
 
-    for col_name in _CANONICAL_SAFE_NULL_STRING_COLUMNS:
+    for col_name in _CANONICAL_NULL_NORMALIZED_STRING_COLUMNS:
         if col_name not in df.columns or df[col_name].dtype not in _STRINGLIKE_DTYPES:
             continue
         expressions.append(
@@ -1023,7 +1025,7 @@ def _normalize_extra_metadata_columns(
 
 
 def _null_if_legacy_missing(expr: pl.Expr) -> pl.Expr:
-    """Convert legacy NA-like strings to true nulls."""
+    """Convert configured canonical null-like strings to true nulls."""
     normalized = expr.cast(pl.Utf8).str.strip_chars().str.to_lowercase()
     return (
         pl.when(expr.is_null())
