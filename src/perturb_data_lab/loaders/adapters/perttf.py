@@ -11,15 +11,16 @@ import json
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Sequence
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 from ..feature_registry import FeatureRegistry
 from ..gpu_pipeline import GPUSparsePipeline
 from ..index import MetadataIndex
-from ..loaders import _normalize_candidate_row_indices
+from ..loaders import DatasetRoutingTable, _normalize_candidate_row_indices
 
 if TYPE_CHECKING:
     from ..corpus_loader import Corpus
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CategoricalLabelMap",
     "PertTFAdapterConfig",
+    "PertTFPairedBatchLoader",
     "PertTFPairedBatchBuilder",
     "PerturbationPairBatch",
     "PerturbationPairSampler",
@@ -54,6 +56,24 @@ def _ordered_unique(labels: Iterable[str]) -> tuple[str, ...]:
         seen.add(label)
         ordered.append(label)
     return tuple(ordered)
+
+
+def _derive_perttf_stream_seed(
+    base_seed: int,
+    *,
+    epoch: int,
+    batch_index: int,
+    stream_id: int,
+) -> int:
+    seed_sequence = np.random.SeedSequence(
+        [
+            int(base_seed),
+            int(epoch),
+            int(batch_index),
+            int(stream_id),
+        ]
+    )
+    return int(seed_sequence.generate_state(1, dtype=np.uint64)[0])
 
 
 @dataclass(frozen=True)
@@ -134,10 +154,22 @@ class CategoricalLabelMap:
         prepend_labels: Sequence[str] = (),
         append_labels: Sequence[str] = (),
         unknown_label: str | None = None,
+        row_indices: Sequence[int] | np.ndarray | None = None,
     ) -> "CategoricalLabelMap":
         if column not in metadata_index.df.columns:
             raise ValueError(f"metadata column '{column}' is not available")
-        unique_values = metadata_index.df[column].unique(maintain_order=True).to_list()
+        normalized_row_indices = _normalize_candidate_row_indices(
+            metadata_index,
+            row_indices,
+        )
+        if normalized_row_indices is None:
+            unique_values = metadata_index.df[column].unique(maintain_order=True).to_list()
+        else:
+            selected_values = metadata_index.take(
+                normalized_row_indices,
+                columns=[column],
+            )[column]
+            unique_values = list(selected_values)
         observed = tuple(
             _normalize_label(value, column=column)
             for value in unique_values
@@ -290,6 +322,7 @@ class PertTFLabelAdapter:
         cls,
         metadata_index: MetadataIndex,
         config: PertTFAdapterConfig | None = None,
+        row_indices: Sequence[int] | np.ndarray | None = None,
     ) -> "PertTFLabelAdapter":
         resolved = config or PertTFAdapterConfig()
         unknown_label = resolved.unknown_label
@@ -302,6 +335,7 @@ class PertTFLabelAdapter:
                 column=resolved.cell_context_column,
                 append_labels=append_unknown,
                 unknown_label=unknown_label,
+                row_indices=row_indices,
             ),
             perturbation=CategoricalLabelMap.from_metadata_column(
                 metadata_index,
@@ -310,6 +344,7 @@ class PertTFLabelAdapter:
                 prepend_labels=resolved.control_labels,
                 append_labels=append_unknown,
                 unknown_label=unknown_label,
+                row_indices=row_indices,
             ),
             batch=CategoricalLabelMap.from_metadata_column(
                 metadata_index,
@@ -317,6 +352,7 @@ class PertTFLabelAdapter:
                 column=resolved.batch_column,
                 append_labels=append_unknown,
                 unknown_label=unknown_label,
+                row_indices=row_indices,
             ),
         )
 
@@ -356,6 +392,21 @@ class PerturbationPairBatch:
     target_perturbation_labels: tuple[str, ...]
     source_batch_labels: tuple[str, ...]
     target_batch_labels: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _PertTFPairBatchPlan:
+    """Deterministic source-batch plan for one pertTF paired request.
+
+    Future distributed support can shard this plan stream by ``batch_index``
+    before worker reads without changing the worker dataset or tensor-builder
+    contracts.
+    """
+
+    source_indices: np.ndarray
+    batch_index: int
+    seed: int
+    epoch: int
 
 
 class PerturbationPairSampler:
@@ -464,23 +515,62 @@ class PerturbationPairSampler:
         self._target_candidate_mask[self._target_candidate_indices] = True
         self._source_row_count = int(self._source_indices.size)
         self._dataset_index = np.asarray(dataset_index, dtype=np.int32)
-        self._context_labels = tuple(
+        if normalized_source_indices is None and normalized_target_candidate_indices is None:
+            relevant_indices = self._all_indices
+        else:
+            relevant_indices = np.unique(
+                np.concatenate([self._source_indices, self._target_candidate_indices]).astype(
+                    np.int64,
+                    copy=False,
+                )
+            )
+        relevant_metadata = metadata_index.take(
+            relevant_indices,
+            columns=[
+                self.config.cell_context_column,
+                self.config.perturbation_column,
+                self.config.batch_column,
+            ],
+        )
+        context_labels_by_row = [""] * self.total_rows
+        perturbation_labels_by_row = [""] * self.total_rows
+        batch_labels_by_row = [""] * self.total_rows
+        cell_context_ids = np.full(self.total_rows, -1, dtype=np.int64)
+        perturbation_ids = np.full(self.total_rows, -1, dtype=np.int64)
+        batch_ids = np.full(self.total_rows, -1, dtype=np.int64)
+
+        relevant_context_labels = tuple(
             _normalize_label(value, column=self.config.cell_context_column)
-            for value in context_labels
+            for value in relevant_metadata[self.config.cell_context_column]
         )
-        self._perturbation_labels = tuple(
+        relevant_perturbation_labels = tuple(
             _normalize_label(value, column=self.config.perturbation_column)
-            for value in perturbation_labels
+            for value in relevant_metadata[self.config.perturbation_column]
         )
-        self._batch_labels = tuple(
+        relevant_batch_labels = tuple(
             _normalize_label(value, column=self.config.batch_column)
-            for value in batch_labels
+            for value in relevant_metadata[self.config.batch_column]
         )
-        self._cell_context_ids = self.labels.cell_context.encode_many(self._context_labels)
-        self._perturbation_ids = self.labels.perturbation.encode_many(
-            self._perturbation_labels
+        relevant_context_ids = self.labels.cell_context.encode_many(relevant_context_labels)
+        relevant_perturbation_ids = self.labels.perturbation.encode_many(
+            relevant_perturbation_labels
         )
-        self._batch_ids = self.labels.batch.encode_many(self._batch_labels)
+        relevant_batch_ids = self.labels.batch.encode_many(relevant_batch_labels)
+
+        for offset, row_idx in enumerate(relevant_indices.tolist()):
+            context_labels_by_row[row_idx] = relevant_context_labels[offset]
+            perturbation_labels_by_row[row_idx] = relevant_perturbation_labels[offset]
+            batch_labels_by_row[row_idx] = relevant_batch_labels[offset]
+            cell_context_ids[row_idx] = int(relevant_context_ids[offset])
+            perturbation_ids[row_idx] = int(relevant_perturbation_ids[offset])
+            batch_ids[row_idx] = int(relevant_batch_ids[offset])
+
+        self._context_labels = tuple(context_labels_by_row)
+        self._perturbation_labels = tuple(perturbation_labels_by_row)
+        self._batch_labels = tuple(batch_labels_by_row)
+        self._cell_context_ids = cell_context_ids
+        self._perturbation_ids = perturbation_ids
+        self._batch_ids = batch_ids
         self._pool_by_key = self._build_pool_by_key()
         self._perturbations_by_context = self._build_perturbations_by_context()
         self._control_pool_by_context = self._build_control_pool_by_context()
@@ -494,19 +584,54 @@ class PerturbationPairSampler:
         self.epoch = int(epoch)
 
     def __iter__(self):
+        for _, pair_batch in self._iter_planned_batches():
+            yield pair_batch
+
+    def _iter_planned_batches(
+        self,
+    ) -> Iterator[tuple[_PertTFPairBatchPlan, PerturbationPairBatch]]:
+        for batch_plan in self._iter_batch_plans():
+            yield batch_plan, self.pair_source_indices(
+                batch_plan.source_indices,
+                seed=batch_plan.seed,
+            )
+
+    def _iter_batch_plans(self) -> Iterator[_PertTFPairBatchPlan]:
         if self._source_row_count == 0:
             return
-        rng = np.random.default_rng(self.seed + self.epoch)
+        epoch = int(self.epoch)
         source_order = self._source_indices.copy()
-        rng.shuffle(source_order)
-        for batch_idx, start in enumerate(
+        if self._source_row_count > 1:
+            rng = np.random.default_rng(self._shuffle_seed(epoch))
+            rng.shuffle(source_order)
+        for batch_index, start in enumerate(
             range(0, self._source_row_count, self.batch_size)
         ):
             source_indices = source_order[start : start + self.batch_size]
             if len(source_indices) < self.batch_size and self.drop_last:
                 continue
-            batch_seed = self.seed + self.epoch * 10000 + batch_idx
-            yield self.pair_source_indices(source_indices, seed=batch_seed)
+            yield _PertTFPairBatchPlan(
+                source_indices=source_indices.copy(),
+                batch_index=batch_index,
+                seed=self._batch_seed(epoch, batch_index),
+                epoch=epoch,
+            )
+
+    def _shuffle_seed(self, epoch: int) -> int:
+        return _derive_perttf_stream_seed(
+            self.seed,
+            epoch=epoch,
+            batch_index=0,
+            stream_id=0,
+        )
+
+    def _batch_seed(self, epoch: int, batch_index: int) -> int:
+        return _derive_perttf_stream_seed(
+            self.seed,
+            epoch=epoch,
+            batch_index=batch_index,
+            stream_id=1,
+        )
 
     def pair_source_indices(
         self,
@@ -695,6 +820,261 @@ class PerturbationPairSampler:
         )
 
 
+@dataclass(frozen=True)
+class _PertTFPairReadRequest:
+    """Compact worker-facing request for one paired raw-expression read."""
+
+    pair_batch: PerturbationPairBatch
+    batch_index: int
+    seed: int
+    epoch: int
+
+    @property
+    def request_index(self) -> int:
+        """Stable per-epoch request position for future sharding wrappers."""
+
+        return self.batch_index
+
+
+class _PertTFPairReadBatchSampler:
+    """Wrap ``PerturbationPairSampler`` into pre-batched raw-read requests."""
+
+    def __init__(self, pair_sampler: PerturbationPairSampler) -> None:
+        self._pair_sampler = pair_sampler
+
+    def __len__(self) -> int:
+        return len(self._pair_sampler)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._pair_sampler.set_epoch(epoch)
+
+    def __iter__(self):
+        for batch_plan, pair_batch in self._pair_sampler._iter_planned_batches():
+            yield [
+                _PertTFPairReadRequest(
+                    pair_batch=pair_batch,
+                    batch_index=batch_plan.batch_index,
+                    seed=batch_plan.seed,
+                    epoch=batch_plan.epoch,
+                )
+            ]
+
+
+class _PertTFPairExpressionDataset:
+    """Worker-light dataset that reads paired source/target raw expression only."""
+
+    def __init__(
+        self,
+        expression_reader: Any,
+        *,
+        routing_table: DatasetRoutingTable,
+        topology: str = "aggregate",
+        backend: str = "lance",
+    ) -> None:
+        self._reader = expression_reader
+        self._routing_table = routing_table
+        self._topology = topology
+        self._backend = backend
+
+    @property
+    def routing_table(self) -> DatasetRoutingTable:
+        return self._routing_table
+
+    @property
+    def topology(self) -> str:
+        return self._topology
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    def __len__(self) -> int:
+        return self._routing_table.total_rows
+
+    def __getitems__(
+        self,
+        requests: Sequence[_PertTFPairReadRequest],
+    ) -> list[dict[str, Any]]:
+        request = _unwrap_single_pair_read_request(requests)
+        pair_batch = request.pair_batch
+        return [
+            {
+                "request": request,
+                "source_raw": self._read_raw_batch(pair_batch.source_indices),
+                "target_raw": self._read_raw_batch(pair_batch.target_indices),
+            }
+        ]
+
+    def _read_raw_batch(self, indices: np.ndarray) -> dict[str, Any]:
+        index_array = np.asarray(indices, dtype=np.int64)
+        expr = self._reader.read_expression_flat(index_array.tolist())
+        dataset_index = self._routing_table.resolve_dataset_indices(index_array)
+        batch: dict[str, Any] = {
+            "batch_size": expr.batch_size,
+            "global_row_index": expr.global_row_index,
+            "dataset_index": dataset_index,
+            "row_offsets": expr.row_offsets,
+            "expressed_gene_indices": expr.expressed_gene_indices,
+            "expression_counts": expr.expression_counts,
+        }
+        size_factor = self._routing_table.take_size_factor(index_array)
+        if size_factor is not None:
+            batch["size_factor"] = size_factor
+        return batch
+
+
+def _unwrap_single_pair_read_request(
+    requests: Sequence[_PertTFPairReadRequest],
+) -> _PertTFPairReadRequest:
+    if not requests:
+        raise ValueError("paired read dataset received empty request batch")
+    if len(requests) != 1:
+        raise ValueError(
+            "paired read dataset expected a single pre-batched request, "
+            f"got {len(requests)}"
+        )
+    request = requests[0]
+    if not isinstance(request, _PertTFPairReadRequest):
+        raise TypeError(
+            "paired read dataset expected _PertTFPairReadRequest items, "
+            f"got {type(request)!r}"
+        )
+    return request
+
+
+def _unwrap_single_prebatched_pair_item(
+    items: list[dict[str, Any]],
+    *,
+    collate_name: str,
+) -> dict[str, Any]:
+    if not items:
+        raise ValueError(f"{collate_name} received empty list")
+    if len(items) != 1:
+        raise ValueError(
+            f"{collate_name} expected a single pre-batched item, got {len(items)}"
+        )
+    return items[0]
+
+
+def _collate_expression_like_raw_batch(raw_batch: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "batch_size": raw_batch["batch_size"],
+        "global_row_index": torch.as_tensor(
+            raw_batch["global_row_index"],
+            dtype=torch.long,
+        ),
+        "dataset_index": torch.as_tensor(
+            raw_batch["dataset_index"],
+            dtype=torch.long,
+        ),
+        "row_offsets": torch.as_tensor(raw_batch["row_offsets"], dtype=torch.long),
+        "expressed_gene_indices": torch.as_tensor(
+            raw_batch["expressed_gene_indices"],
+            dtype=torch.long,
+        ),
+        "expression_counts": torch.as_tensor(
+            raw_batch["expression_counts"],
+            dtype=torch.float32,
+        ),
+    }
+    if "size_factor" in raw_batch:
+        result["size_factor"] = torch.as_tensor(
+            raw_batch["size_factor"],
+            dtype=torch.float32,
+        )
+    return result
+
+
+def _collate_perttf_raw_pair_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Unwrap one paired raw-read item for main-process pertTF assembly."""
+
+    batch = _unwrap_single_prebatched_pair_item(
+        items,
+        collate_name="_collate_perttf_raw_pair_batch",
+    )
+    return {
+        "request": batch["request"],
+        "source_raw": _collate_expression_like_raw_batch(batch["source_raw"]),
+        "target_raw": _collate_expression_like_raw_batch(batch["target_raw"]),
+    }
+
+
+def _validate_perttf_loader_kwargs(
+    *,
+    num_workers: int,
+    multiprocessing_context: str | None,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int | None,
+) -> dict[str, Any]:
+    workers = int(num_workers)
+    if workers < 0:
+        raise ValueError("num_workers must be >= 0")
+    if not isinstance(pin_memory, bool):
+        raise TypeError("pin_memory must be a bool")
+    if not isinstance(persistent_workers, bool):
+        raise TypeError("persistent_workers must be a bool")
+
+    if workers == 0:
+        if multiprocessing_context is not None:
+            raise ValueError("multiprocessing_context requires num_workers > 0")
+        if persistent_workers:
+            raise ValueError("persistent_workers requires num_workers > 0")
+        if prefetch_factor is not None:
+            raise ValueError("prefetch_factor requires num_workers > 0")
+        normalized_context = None
+        normalized_prefetch = None
+    else:
+        if multiprocessing_context is None:
+            normalized_context = None
+        else:
+            normalized_context = str(multiprocessing_context).strip().lower()
+            if normalized_context not in {"fork", "spawn", "forkserver"}:
+                raise ValueError(
+                    "multiprocessing_context must be one of 'fork', 'spawn', "
+                    f"or 'forkserver', got {multiprocessing_context!r}"
+                )
+        if prefetch_factor is None:
+            normalized_prefetch = None
+        else:
+            normalized_prefetch = int(prefetch_factor)
+            if normalized_prefetch <= 0:
+                raise ValueError("prefetch_factor must be positive")
+
+    return {
+        "num_workers": workers,
+        "multiprocessing_context": normalized_context,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+        "prefetch_factor": normalized_prefetch,
+    }
+
+
+def _build_perttf_loader_kwargs(
+    *,
+    num_workers: int,
+    multiprocessing_context: str | None,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int | None,
+    backend: str,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers if num_workers > 0 else False,
+    }
+    if num_workers > 0:
+        kwargs["multiprocessing_context"] = (
+            multiprocessing_context
+            if multiprocessing_context is not None
+            else ("spawn" if backend == "lance" else None)
+        )
+        if prefetch_factor is not None:
+            kwargs["prefetch_factor"] = prefetch_factor
+    return kwargs
+
+
 class PertTFPairedBatchBuilder:
     """Build pertTF-compatible paired source/target batches from corpus rows.
 
@@ -738,10 +1118,47 @@ class PertTFPairedBatchBuilder:
         hvg_weight: float = 3.0,
         hvg_top_k: int | None = None,
     ) -> dict[str, torch.Tensor]:
-        self._validate_pair_batch(pair_batch)
-
         source_raw = self.corpus.inspect_batch(pair_batch.source_indices)
         target_raw = self.corpus.inspect_batch(pair_batch.target_indices)
+
+        return self.build_from_raw_pair_batch(
+            pair_batch,
+            source_raw,
+            target_raw,
+            seed=seed,
+            sampled_gene_ids=sampled_gene_ids,
+            sampling_mode=sampling_mode,
+            expressed_weight=expressed_weight,
+            hvg_weight=hvg_weight,
+            hvg_top_k=hvg_top_k,
+        )
+
+    def build_from_raw_pair_batch(
+        self,
+        pair_batch: PerturbationPairBatch,
+        source_raw: dict[str, Any],
+        target_raw: dict[str, Any],
+        *,
+        seed: int | None = None,
+        sampled_gene_ids: torch.Tensor | None = None,
+        sampling_mode: str = "hvg",
+        expressed_weight: float = 3.0,
+        hvg_weight: float = 3.0,
+        hvg_top_k: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        self._validate_pair_batch(pair_batch)
+        self._validate_raw_batch_alignment(
+            "source_raw",
+            source_raw,
+            expected_indices=pair_batch.source_indices,
+            expected_dataset_indices=pair_batch.source_dataset_indices,
+        )
+        self._validate_raw_batch_alignment(
+            "target_raw",
+            target_raw,
+            expected_indices=pair_batch.target_indices,
+            expected_dataset_indices=pair_batch.target_dataset_indices,
+        )
 
         source_processed = self._pipeline.process_batch(
             source_raw,
@@ -871,6 +1288,58 @@ class PertTFPairedBatchBuilder:
             pair_batch.target_cell_context_ids,
         ):
             raise ValueError("pair_batch must preserve same-context pairing")
+
+    def _validate_raw_batch_alignment(
+        self,
+        name: str,
+        raw_batch: dict[str, Any],
+        *,
+        expected_indices: np.ndarray,
+        expected_dataset_indices: np.ndarray,
+    ) -> None:
+        batch_size = int(raw_batch.get("batch_size", -1))
+        expected_size = int(expected_indices.shape[0])
+        if batch_size != expected_size:
+            raise ValueError(
+                f"{name} batch_size {batch_size} does not match paired batch size {expected_size}"
+            )
+
+        raw_indices = self._raw_batch_numpy(raw_batch, "global_row_index", dtype=np.int64)
+        if raw_indices.shape != expected_indices.shape or not np.array_equal(
+            raw_indices,
+            expected_indices,
+        ):
+            raise ValueError(
+                f"{name} global_row_index does not match pair_batch ordering"
+            )
+
+        raw_dataset_indices = self._raw_batch_numpy(
+            raw_batch,
+            "dataset_index",
+            dtype=np.int64,
+        )
+        expected_dataset_indices64 = np.asarray(expected_dataset_indices, dtype=np.int64)
+        if (
+            raw_dataset_indices.shape != expected_dataset_indices64.shape
+            or not np.array_equal(raw_dataset_indices, expected_dataset_indices64)
+        ):
+            raise ValueError(
+                f"{name} dataset_index does not match pair_batch dataset routing"
+            )
+
+    def _raw_batch_numpy(
+        self,
+        raw_batch: dict[str, Any],
+        key: str,
+        *,
+        dtype: Any,
+    ) -> np.ndarray:
+        if key not in raw_batch:
+            raise KeyError(f"raw batch is missing required key {key!r}")
+        values = raw_batch[key]
+        if isinstance(values, torch.Tensor):
+            return values.detach().cpu().numpy().astype(dtype, copy=False)
+        return np.asarray(values, dtype=dtype)
 
     def _torch_generator(self, seed: int | None) -> torch.Generator | None:
         if seed is None:
@@ -1069,6 +1538,7 @@ class PertTFCorpusAdapter:
         cls,
         corpus: Corpus,
         config: PertTFAdapterConfig | None = None,
+        row_indices: Sequence[int] | np.ndarray | None = None,
     ) -> "PertTFCorpusAdapter":
         resolved = config or PertTFAdapterConfig()
         return cls(
@@ -1080,6 +1550,7 @@ class PertTFCorpusAdapter:
             labels=PertTFLabelAdapter.from_metadata_index(
                 corpus.metadata_index,
                 resolved,
+                row_indices=row_indices,
             ),
         )
 
@@ -1090,3 +1561,107 @@ class PertTFCorpusAdapter:
             "simple_vocab_stoi": self.vocab.to_simple_vocab_stoi(),
             **self.labels.to_reference_dict(),
         }
+
+
+class PertTFPairedBatchLoader:
+    """Slim public iterable that yields final pertTF paired batches."""
+
+    def __init__(
+        self,
+        corpus: Corpus,
+        *,
+        batch_size: int,
+        seq_len: int,
+        config: PertTFAdapterConfig | None = None,
+        adapter: PertTFCorpusAdapter | None = None,
+        seed: int = 0,
+        drop_last: bool = True,
+        perturbed_target_policy: str = "self_to_control_label",
+        missing_target_policy: str = "error",
+        source_indices: Sequence[int] | np.ndarray | None = None,
+        target_candidate_indices: Sequence[int] | np.ndarray | None = None,
+        sampling_mode: str = "hvg",
+        expressed_weight: float = 3.0,
+        hvg_weight: float = 3.0,
+        hvg_top_k: int | None = None,
+        num_workers: int = 0,
+        multiprocessing_context: str | None = None,
+        pin_memory: bool = False,
+        persistent_workers: bool = False,
+        prefetch_factor: int | None = None,
+        device: torch.device | str | None = "cpu",
+    ) -> None:
+        self.corpus = corpus
+        self._builder = PertTFPairedBatchBuilder(
+            corpus,
+            seq_len=seq_len,
+            config=config,
+            adapter=adapter,
+            device=device,
+        )
+        self.adapter = self._builder.adapter
+        self.config = self._builder.config
+        self.pair_sampler = PerturbationPairSampler(
+            corpus.metadata_index,
+            batch_size=batch_size,
+            config=self.config,
+            label_adapter=self.adapter.labels,
+            seed=seed,
+            drop_last=drop_last,
+            perturbed_target_policy=perturbed_target_policy,
+            missing_target_policy=missing_target_policy,
+            source_indices=source_indices,
+            target_candidate_indices=target_candidate_indices,
+        )
+        self._request_sampler = _PertTFPairReadBatchSampler(self.pair_sampler)
+        self._dataset = _PertTFPairExpressionDataset(
+            corpus.expression_reader,
+            routing_table=corpus.routing_table,
+            topology=corpus.topology,
+            backend=corpus.backend,
+        )
+        validated_loader = _validate_perttf_loader_kwargs(
+            num_workers=num_workers,
+            multiprocessing_context=multiprocessing_context,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        )
+        self._loader_kwargs = _build_perttf_loader_kwargs(
+            backend=corpus.backend,
+            **validated_loader,
+        )
+        self._sampling_mode = sampling_mode
+        self._expressed_weight = float(expressed_weight)
+        self._hvg_weight = float(hvg_weight)
+        self._hvg_top_k = hvg_top_k
+        self._data_loader = DataLoader(
+            self._dataset,
+            batch_sampler=self._request_sampler,
+            collate_fn=_collate_perttf_raw_pair_batch,
+            **self._loader_kwargs,
+        )
+
+    def __len__(self) -> int:
+        return len(self._request_sampler)
+
+    @property
+    def epoch(self) -> int:
+        return int(self.pair_sampler.epoch)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._request_sampler.set_epoch(epoch)
+
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        for raw_pair_batch in self._data_loader:
+            request = raw_pair_batch["request"]
+            yield self._builder.build_from_raw_pair_batch(
+                request.pair_batch,
+                raw_pair_batch["source_raw"],
+                raw_pair_batch["target_raw"],
+                seed=request.seed,
+                sampling_mode=self._sampling_mode,
+                expressed_weight=self._expressed_weight,
+                hvg_weight=self._hvg_weight,
+                hvg_top_k=self._hvg_top_k,
+            )

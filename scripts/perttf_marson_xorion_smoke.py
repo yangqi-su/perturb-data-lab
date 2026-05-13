@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run a bounded pertTF-adapter smoke on the Marson/Xorion aggregate corpus.
+"""Run a bounded pertTF public-loader smoke on the Marson/Xorion aggregate corpus.
 
 This script stays entirely on the ``perturb-data-lab`` side: it loads an
-existing corpus, verifies per-dataset ``hvg.parquet`` discovery, builds the
-local pertTF adapter objects, constructs a small mixed-dataset paired batch,
-and writes lightweight smoke summaries without touching the external ``pertTF``
-repository.
+existing corpus, verifies per-dataset ``hvg.parquet`` discovery, exercises the
+public ``PertTFPairedBatchLoader`` path until it finds a bounded mixed-dataset
+batch, and writes lightweight smoke summaries without touching the external
+``pertTF`` repository.
 """
 
 from __future__ import annotations
@@ -17,19 +17,19 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
+import polars as pl
 import torch
 import yaml
 
 from perturb_data_lab.loaders import (
     PertTFAdapterConfig,
-    PertTFPairedBatchBuilder,
+    PertTFPairedBatchLoader,
     PertTFCorpusAdapter,
     load_corpus,
 )
-from perturb_data_lab.loaders.adapters.perttf import PerturbationPairBatch
 
 
 def _utc_now() -> str:
@@ -61,6 +61,22 @@ class DatasetEntry:
     manifest_path: Path
 
 
+@dataclass(frozen=True)
+class ObservedLoaderBatch:
+    batch: dict[str, torch.Tensor]
+    batch_index: int
+    source_indices: np.ndarray
+    target_indices: np.ndarray
+    source_dataset_indices: np.ndarray
+    target_dataset_indices: np.ndarray
+    source_dataset_ids: tuple[str, ...]
+    target_dataset_ids: tuple[str, ...]
+    source_cell_context_labels: tuple[str, ...]
+    target_cell_context_labels: tuple[str, ...]
+    source_perturbation_labels: tuple[str, ...]
+    target_perturbation_labels: tuple[str, ...]
+
+
 def _load_dataset_entries(corpus_root: Path) -> list[DatasetEntry]:
     index_doc = _read_yaml(corpus_root / "corpus-index.yaml")
     entries: list[DatasetEntry] = []
@@ -87,105 +103,90 @@ def _load_dataset_entries(corpus_root: Path) -> list[DatasetEntry]:
     return entries
 
 
-def _choose_mixed_dataset_ids(
-    entries: list[DatasetEntry],
-    *,
-    requested: tuple[str, ...],
-    batch_size: int,
-) -> list[str]:
-    if requested:
-        available = {entry.dataset_id for entry in entries}
-        missing = [dataset_id for dataset_id in requested if dataset_id not in available]
-        if missing:
-            raise ValueError(f"requested dataset ids not found in corpus: {missing}")
-        return list(requested[:batch_size])
+def _dataset_ids_from_indices(corpus, dataset_indices: np.ndarray) -> tuple[str, ...]:
+    dataset_ids = corpus.feature_registry.dataset_ids
+    return tuple(str(dataset_ids[int(idx)]) for idx in dataset_indices.tolist())
 
-    selected: list[str] = []
-    by_prefix = {
-        "marson": [entry.dataset_id for entry in entries if entry.dataset_id.startswith("marson")],
-        "xorion": [entry.dataset_id for entry in entries if entry.dataset_id.startswith("xorion")],
-    }
-    for prefix in ("marson", "xorion"):
-        if by_prefix[prefix]:
-            selected.append(by_prefix[prefix][0])
-    for entry in entries:
-        if entry.dataset_id in selected:
-            continue
-        selected.append(entry.dataset_id)
-        if len(selected) >= batch_size:
+
+def _valid_public_loader_rows(corpus, config: PertTFAdapterConfig) -> np.ndarray:
+    filtered = corpus.metadata_index.df.filter(
+        pl.col(config.cell_context_column).is_not_null()
+        & pl.col(config.perturbation_column).is_not_null()
+        & pl.col(config.batch_column).is_not_null()
+    )
+    valid_rows = filtered["global_row_index"].to_numpy()
+    if valid_rows.size == 0:
+        raise RuntimeError("no rows remain after filtering null pertTF label columns")
+    return np.asarray(valid_rows, dtype=np.int64)
+
+
+def _observe_loader_batch(
+    corpus,
+    config: PertTFAdapterConfig,
+    batch_index: int,
+    batch: dict[str, torch.Tensor],
+) -> ObservedLoaderBatch:
+    source_indices = np.asarray(batch["index"].detach().cpu().tolist(), dtype=np.int64)
+    target_indices = np.asarray(batch["next_index"].detach().cpu().tolist(), dtype=np.int64)
+    metadata_columns = ["dataset_index", config.cell_context_column, config.perturbation_column]
+    source_meta = corpus.take_metadata(source_indices.tolist(), columns=metadata_columns)
+    target_meta = corpus.take_metadata(target_indices.tolist(), columns=metadata_columns)
+    source_dataset_indices = np.asarray(source_meta["dataset_index"], dtype=np.int32)
+    target_dataset_indices = np.asarray(target_meta["dataset_index"], dtype=np.int32)
+    return ObservedLoaderBatch(
+        batch=batch,
+        batch_index=batch_index,
+        source_indices=source_indices,
+        target_indices=target_indices,
+        source_dataset_indices=source_dataset_indices,
+        target_dataset_indices=target_dataset_indices,
+        source_dataset_ids=_dataset_ids_from_indices(corpus, source_dataset_indices),
+        target_dataset_ids=_dataset_ids_from_indices(corpus, target_dataset_indices),
+        source_cell_context_labels=tuple(
+            str(value) for value in source_meta[config.cell_context_column]
+        ),
+        target_cell_context_labels=tuple(
+            str(value) for value in target_meta[config.cell_context_column]
+        ),
+        source_perturbation_labels=tuple(
+            str(value) for value in source_meta[config.perturbation_column]
+        ),
+        target_perturbation_labels=tuple(
+            str(value) for value in target_meta[config.perturbation_column]
+        ),
+    )
+
+
+def _select_public_loader_batch(
+    corpus,
+    loader: PertTFPairedBatchLoader,
+    *,
+    requested_dataset_ids: tuple[str, ...],
+    max_batches: int,
+) -> ObservedLoaderBatch:
+    requested = tuple(dict.fromkeys(requested_dataset_ids))
+    for batch_index, batch in enumerate(loader):
+        if batch_index >= max_batches:
             break
-    return selected[:batch_size]
-
-
-def _iter_probe_windows(entry: DatasetEntry, chunk_size: int) -> Iterable[tuple[int, int]]:
-    for start in range(entry.global_start, entry.global_end, chunk_size):
-        end = min(start + chunk_size, entry.global_end)
-        yield start, end
-
-
-def _find_first_perturbed_index(
-    corpus,
-    entry: DatasetEntry,
-    *,
-    perturbation_column: str,
-    control_labels: frozenset[str],
-    chunk_size: int = 4096,
-) -> tuple[int, str]:
-    for start, end in _iter_probe_windows(entry, chunk_size):
-        indices = list(range(start, end))
-        metadata = corpus.take_metadata(indices, columns=[perturbation_column])
-        labels = metadata[perturbation_column]
-        for offset, label in enumerate(labels):
-            label_str = str(label)
-            if label_str not in control_labels:
-                return start + offset, label_str
+        observed = _observe_loader_batch(corpus, loader.config, batch_index, batch)
+        unique_dataset_ids = tuple(dict.fromkeys(observed.source_dataset_ids))
+        _log(
+            "Observed public loader batch "
+            f"{batch_index}: source datasets {', '.join(unique_dataset_ids)}"
+        )
+        if len(set(unique_dataset_ids)) < 2:
+            continue
+        if requested and not set(requested).issubset(set(unique_dataset_ids)):
+            continue
+        return observed
+    requested_note = (
+        f" containing requested dataset ids {list(requested)}"
+        if requested
+        else ""
+    )
     raise RuntimeError(
-        f"failed to find a non-control source row in dataset {entry.dataset_id!r}"
-    )
-
-
-def _build_self_to_control_pair_batch(
-    corpus,
-    adapter: PertTFCorpusAdapter,
-    *,
-    source_indices: list[int],
-    control_label: str,
-) -> PerturbationPairBatch:
-    config = adapter.config
-    metadata = corpus.take_metadata(
-        source_indices,
-        columns=[
-            "dataset_index",
-            config.cell_context_column,
-            config.perturbation_column,
-            config.batch_column,
-        ],
-    )
-    dataset_indices = np.asarray(metadata["dataset_index"], dtype=np.int32)
-    source_context_labels = tuple(str(value) for value in metadata[config.cell_context_column])
-    source_perturbation_labels = tuple(
-        str(value) for value in metadata[config.perturbation_column]
-    )
-    source_batch_labels = tuple(str(value) for value in metadata[config.batch_column])
-    target_perturbation_labels = tuple(control_label for _ in source_indices)
-
-    return PerturbationPairBatch(
-        source_indices=np.asarray(source_indices, dtype=np.int64),
-        target_indices=np.asarray(source_indices, dtype=np.int64),
-        source_dataset_indices=dataset_indices.copy(),
-        target_dataset_indices=dataset_indices.copy(),
-        source_cell_context_ids=adapter.labels.cell_context.encode_many(source_context_labels),
-        target_cell_context_ids=adapter.labels.cell_context.encode_many(source_context_labels),
-        source_perturbation_ids=adapter.labels.perturbation.encode_many(source_perturbation_labels),
-        target_perturbation_ids=adapter.labels.perturbation.encode_many(target_perturbation_labels),
-        source_batch_ids=adapter.labels.batch.encode_many(source_batch_labels),
-        target_batch_ids=adapter.labels.batch.encode_many(source_batch_labels),
-        source_cell_context_labels=source_context_labels,
-        target_cell_context_labels=source_context_labels,
-        source_perturbation_labels=source_perturbation_labels,
-        target_perturbation_labels=target_perturbation_labels,
-        source_batch_labels=source_batch_labels,
-        target_batch_labels=source_batch_labels,
+        f"failed to find a mixed-dataset public-loader batch{requested_note} "
+        f"within {max_batches} batches"
     )
 
 
@@ -206,11 +207,11 @@ def _row_global_counts(raw_batch: dict[str, Any], row_pos: int, local_to_global:
 def _verify_sampled_alignment(
     corpus,
     adapter: PertTFCorpusAdapter,
-    pair_batch: PerturbationPairBatch,
+    observed: ObservedLoaderBatch,
     batch: dict[str, torch.Tensor],
 ) -> dict[str, Any]:
-    source_raw = corpus.inspect_batch(pair_batch.source_indices.tolist())
-    target_raw = corpus.inspect_batch(pair_batch.target_indices.tolist())
+    source_raw = corpus.inspect_batch(observed.source_indices.tolist())
+    target_raw = corpus.inspect_batch(observed.target_indices.tolist())
     pad_token_id = adapter.vocab.to_simple_vocab_stoi()[adapter.config.pad_token]
     cls_offset = 1 if adapter.config.append_cls else 0
     token_offset = adapter.vocab.special_token_offset
@@ -218,16 +219,16 @@ def _verify_sampled_alignment(
     checked_positions = 0
     mismatches: list[str] = []
 
-    for row_pos in range(len(pair_batch.source_indices)):
+    for row_pos in range(len(observed.source_indices)):
         source_counts = _row_global_counts(
             source_raw,
             row_pos,
-            local_to_global[int(pair_batch.source_dataset_indices[row_pos])],
+            local_to_global[int(observed.source_dataset_indices[row_pos])],
         )
         target_counts = _row_global_counts(
             target_raw,
             row_pos,
-            local_to_global[int(pair_batch.target_dataset_indices[row_pos])],
+            local_to_global[int(observed.target_dataset_indices[row_pos])],
         )
         for col in range(cls_offset, batch["gene_ids"].shape[1]):
             token_id = int(batch["gene_ids"][row_pos, col])
@@ -260,16 +261,16 @@ def _verify_sampled_alignment(
 def _verify_full_expression_masks(
     corpus,
     adapter: PertTFCorpusAdapter,
-    pair_batch: PerturbationPairBatch,
+    observed: ObservedLoaderBatch,
     batch: dict[str, torch.Tensor],
 ) -> dict[str, Any]:
     cls_offset = 1 if adapter.config.append_cls else 0
     source_expected = torch.as_tensor(
-        corpus.feature_registry.dataset_has_gene[pair_batch.source_dataset_indices],
+        corpus.feature_registry.dataset_has_gene[observed.source_dataset_indices],
         dtype=torch.bool,
     )
     target_expected = torch.as_tensor(
-        corpus.feature_registry.dataset_has_gene[pair_batch.target_dataset_indices],
+        corpus.feature_registry.dataset_has_gene[observed.target_dataset_indices],
         dtype=torch.bool,
     )
     source_mask = batch["full_expr_mask"][:, cls_offset:].cpu()
@@ -326,7 +327,6 @@ def _dataset_hvg_summary(corpus, entries: list[DatasetEntry]) -> list[dict[str, 
 
 
 def _write_markdown_summary(path: Path, summary: dict[str, Any]) -> None:
-    forced = summary["batch"].get("forced_mixed_dataset_batch", False)
     dataset_lines = "\n".join(
         f"- `{item['dataset_id']}`: ranked `{item['ranked_feature_count']}` / feature `{item['feature_count']}`, default_n_hvg `{item['default_n_hvg']}`, manifest path exists `{item['hvg_ranking_exists']}`"
         for item in summary["hvg_discovery"]
@@ -338,7 +338,7 @@ def _write_markdown_summary(path: Path, summary: dict[str, Any]) -> None:
     path.write_text(
         "\n".join(
             [
-                "# Marson/Xorion pertTF Adapter Smoke",
+                "# Marson/Xorion pertTF Public Loader Smoke",
                 "",
                 f"- `Timestamp`: `{summary['timestamp']}`",
                 f"- `Corpus Root`: `{summary['corpus_root']}`",
@@ -346,7 +346,9 @@ def _write_markdown_summary(path: Path, summary: dict[str, Any]) -> None:
                 f"- `Global Vocab Size`: `{summary['global_vocab_size']}`",
                 f"- `Batch Size`: `{summary['batch']['paired_rows_sampled']}`",
                 f"- `HVG Top K`: `{summary['batch']['hvg_top_k']}`",
-                f"- `Forced Mixed Batch`: `{str(forced).lower()}`",
+                f"- `Public Loader Batch Index`: `{summary['batch']['public_loader_batch_index']}`",
+                f"- `Public Loader Workers`: `{summary['loader']['num_workers']}` ({summary['loader']['multiprocessing_context']})",
+                f"- `Valid Loader Rows`: `{summary['loader']['valid_row_count']}` / `{summary['loader']['total_row_count']}`",
                 "",
                 "## HVG Discovery",
                 "",
@@ -362,18 +364,19 @@ def _write_markdown_summary(path: Path, summary: dict[str, Any]) -> None:
                 f"- Same-context invariant: `{summary['batch']['same_context_check']}`",
                 f"- Sampled source/target gene alignment: `{summary['alignment']['passed']}` ({summary['alignment']['checked_positions']} checked positions)",
                 f"- Union full-expression masks: `{summary['full_expression_masks']['passed']}`",
+                f"- Worker dataset stayed expression-only: `{summary['loader']['expression_only_state_passed']}`",
                 "",
                 "## Runtime Notes",
                 "",
                 f"- `load_corpus_seconds`: `{summary['timing_seconds']['load_corpus']:.2f}`",
-                f"- `adapter_seconds`: `{summary['timing_seconds']['build_adapter']:.2f}`",
-                f"- `batch_build_seconds`: `{summary['timing_seconds']['build_batch']:.2f}`",
+                f"- `loader_setup_seconds`: `{summary['timing_seconds']['build_loader']:.2f}`",
+                f"- `batch_search_seconds`: `{summary['timing_seconds']['find_batch']:.2f}`",
                 f"- `max_rss_mib`: `{summary['runtime_notes']['max_rss_mib']:.1f}`",
                 "",
                 "## Limitations",
                 "",
                 "- This smoke keeps all work inside `perturb-data-lab`; it does not modify or import from the external `pertTF` repository.",
-                "- The paired batch uses the adapter-side `self_to_control_label` semantics for perturbed sources, so it validates the current source→target tensor contract without full pertTF training.",
+                "- The smoke validates the public `PertTFPairedBatchLoader` path on bounded batches, not full pertTF training or throughput.",
                 "- `full_expr_mask` / `full_expr_next_mask` are emitted and validated here, but pertTF-side loss consumption remains future work.",
             ]
         )
@@ -384,7 +387,7 @@ def _write_markdown_summary(path: Path, summary: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the Phase 8 Marson/Xorion pertTF adapter smoke.",
+        description="Run the Phase 7 Marson/Xorion pertTF public-loader smoke.",
     )
     parser.add_argument("--corpus-root", required=True, help="Aggregate corpus root.")
     parser.add_argument("--output-dir", required=True, help="Directory for smoke outputs.")
@@ -393,6 +396,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hvg-top-k", type=int, default=2000, help="Runtime HVG top-k threshold.")
     parser.add_argument("--hvg-weight", type=float, default=4.0, help="Runtime HVG bonus weight.")
     parser.add_argument("--seed", type=int, default=13, help="Deterministic RNG seed.")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Public-loader DataLoader worker count.",
+    )
+    parser.add_argument(
+        "--multiprocessing-context",
+        default="spawn",
+        help="Optional multiprocessing context for the public loader.",
+    )
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=32,
+        help="Maximum public-loader batches to scan before failing to find a mixed batch.",
+    )
     parser.add_argument(
         "--control-label",
         action="append",
@@ -403,7 +423,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset-id",
         action="append",
         default=[],
-        help="Optional dataset IDs to force into the mixed batch (repeatable).",
+        help="Optional dataset IDs that must appear in the selected mixed batch (repeatable).",
     )
     return parser.parse_args()
 
@@ -424,10 +444,15 @@ def main() -> None:
         "hvg_top_k": int(args.hvg_top_k),
         "hvg_weight": float(args.hvg_weight),
         "seed": int(args.seed),
+        "num_workers": int(args.num_workers),
+        "multiprocessing_context": (
+            None if args.multiprocessing_context in ("", "none", "None") else str(args.multiprocessing_context)
+        ),
+        "max_batches": int(args.max_batches),
         "control_labels": list(dict.fromkeys(str(value) for value in args.control_label)),
         "requested_dataset_ids": list(dict.fromkeys(str(value) for value in args.dataset_id)),
     }
-    (output_dir / "phase-08-smoke-command.json").write_text(
+    (output_dir / "phase-07-smoke-command.json").write_text(
         json.dumps(command_snapshot, indent=2),
         encoding="utf-8",
     )
@@ -460,73 +485,76 @@ def main() -> None:
         )
     _log("Verified hvg.parquet discovery for all datasets")
 
-    adapter_start = time.monotonic()
+    loader_start = time.monotonic()
     config = PertTFAdapterConfig(
         control_labels=tuple(dict.fromkeys(str(value) for value in args.control_label)),
         include_full_expr=True,
         mask_ratio=0.0,
     )
-    adapter = PertTFCorpusAdapter.from_corpus(corpus, config)
-    builder = PertTFPairedBatchBuilder(corpus, seq_len=int(args.seq_len), config=config, adapter=adapter)
-    adapter_seconds = time.monotonic() - adapter_start
-    _log(f"Built pertTF adapter objects in {adapter_seconds:.2f}s")
-
-    selected_dataset_ids = _choose_mixed_dataset_ids(
-        entries,
-        requested=tuple(dict.fromkeys(str(value) for value in args.dataset_id)),
-        batch_size=int(args.batch_size),
-    )
-    entry_by_id = {entry.dataset_id: entry for entry in entries}
-    control_label_set = frozenset(config.control_labels)
-    source_indices: list[int] = []
-    selected_sources: list[dict[str, Any]] = []
-    for dataset_id in selected_dataset_ids:
-        source_index, perturbation_label = _find_first_perturbed_index(
-            corpus,
-            entry_by_id[dataset_id],
-            perturbation_column=config.perturbation_column,
-            control_labels=control_label_set,
-        )
-        source_indices.append(source_index)
-        selected_sources.append(
-            {
-                "dataset_id": dataset_id,
-                "source_index": int(source_index),
-                "source_perturbation_label": perturbation_label,
-            }
-        )
-    _log(
-        "Selected mixed-dataset source rows: "
-        + ", ".join(f"{item['dataset_id']}@{item['source_index']}" for item in selected_sources)
-    )
-
-    pair_batch = _build_self_to_control_pair_batch(
+    valid_loader_rows = _valid_public_loader_rows(corpus, config)
+    filtered_null_rows = int(len(corpus.metadata_index) - len(valid_loader_rows))
+    adapter = PertTFCorpusAdapter.from_corpus(
         corpus,
-        adapter,
-        source_indices=source_indices,
-        control_label=config.control_labels[0],
+        config,
+        row_indices=valid_loader_rows,
     )
-
-    batch_start = time.monotonic()
-    batch = builder.build_paired_batch(
-        pair_batch,
+    multiprocessing_context = command_snapshot["multiprocessing_context"]
+    loader = PertTFPairedBatchLoader(
+        corpus,
+        batch_size=int(args.batch_size),
+        seq_len=int(args.seq_len),
+        config=config,
+        adapter=adapter,
         seed=int(args.seed),
+        source_indices=valid_loader_rows,
+        target_candidate_indices=valid_loader_rows,
         sampling_mode="hvg",
         hvg_weight=float(args.hvg_weight),
         hvg_top_k=int(args.hvg_top_k),
+        num_workers=int(args.num_workers),
+        multiprocessing_context=multiprocessing_context,
+    )
+    loader_seconds = time.monotonic() - loader_start
+    _log(
+        "Built public pertTF loader in "
+        f"{loader_seconds:.2f}s using {len(valid_loader_rows)} valid rows "
+        f"(filtered {filtered_null_rows} rows with null pertTF labels)"
+    )
+
+    dataset_state = dict(loader._data_loader.dataset.__dict__)
+    expression_only_state_passed = (
+        set(dataset_state) == {"_reader", "_routing_table", "_topology", "_backend"}
+        and all(value is not corpus.metadata_index for value in dataset_state.values())
+        and not any(isinstance(value, PertTFCorpusAdapter) for value in dataset_state.values())
+    )
+    requested_dataset_ids = tuple(dict.fromkeys(str(value) for value in args.dataset_id))
+    batch_start = time.monotonic()
+    observed = _select_public_loader_batch(
+        corpus,
+        loader,
+        requested_dataset_ids=requested_dataset_ids,
+        max_batches=int(args.max_batches),
     )
     batch_seconds = time.monotonic() - batch_start
-    _log(f"Built paired batch in {batch_seconds:.2f}s")
+    batch = observed.batch
+    _log(
+        "Selected public loader batch "
+        f"{observed.batch_index} with source datasets "
+        f"{', '.join(dict.fromkeys(observed.source_dataset_ids))}"
+    )
 
     same_dataset = bool(
-        np.array_equal(pair_batch.source_dataset_indices, pair_batch.target_dataset_indices)
+        np.array_equal(observed.source_dataset_indices, observed.target_dataset_indices)
     )
     same_context = bool(
-        np.array_equal(pair_batch.source_cell_context_ids, pair_batch.target_cell_context_ids)
+        np.array_equal(
+            np.asarray(observed.source_cell_context_labels, dtype=object),
+            np.asarray(observed.target_cell_context_labels, dtype=object),
+        )
     )
-    mixed_dataset = bool(len(np.unique(pair_batch.source_dataset_indices)) > 1)
-    alignment = _verify_sampled_alignment(corpus, adapter, pair_batch, batch)
-    full_expr_masks = _verify_full_expression_masks(corpus, adapter, pair_batch, batch)
+    mixed_dataset = bool(len(set(observed.source_dataset_ids)) > 1)
+    alignment = _verify_sampled_alignment(corpus, loader.adapter, observed, batch)
+    full_expr_masks = _verify_full_expression_masks(corpus, loader.adapter, observed, batch)
 
     summary = {
         "timestamp": _utc_now(),
@@ -534,22 +562,50 @@ def main() -> None:
         "dataset_count": len(entries),
         "global_vocab_size": int(corpus.feature_registry.global_vocab_size),
         "hvg_discovery": hvg_summary,
+        "loader": {
+            "num_workers": int(args.num_workers),
+            "multiprocessing_context": (
+                str(multiprocessing_context) if multiprocessing_context is not None else "none"
+            ),
+            "expression_only_state_passed": bool(expression_only_state_passed),
+            "dataset_state_keys": sorted(dataset_state.keys()),
+            "valid_row_count": int(len(valid_loader_rows)),
+            "total_row_count": int(len(corpus.metadata_index)),
+            "filtered_null_row_count": int(filtered_null_rows),
+        },
         "batch": {
             "hvg_top_k": int(args.hvg_top_k),
             "hvg_weight": float(args.hvg_weight),
             "seq_len": int(args.seq_len),
-            "paired_rows_sampled": int(len(pair_batch.source_indices)),
+            "paired_rows_sampled": int(len(observed.source_indices)),
             "mixed_dataset_batch": mixed_dataset,
-            "forced_mixed_dataset_batch": True,
+            "public_loader_batch_index": int(observed.batch_index),
+            "requested_dataset_ids": list(requested_dataset_ids),
+            "requested_dataset_ids_satisfied": bool(
+                set(requested_dataset_ids).issubset(set(observed.source_dataset_ids))
+            ),
             "same_dataset_check": same_dataset,
             "same_context_check": same_context,
-            "selected_sources": selected_sources,
-            "source_indices": [int(value) for value in pair_batch.source_indices.tolist()],
-            "target_indices": [int(value) for value in pair_batch.target_indices.tolist()],
-            "source_dataset_ids": selected_dataset_ids,
-            "source_cell_context_labels": list(pair_batch.source_cell_context_labels),
-            "source_perturbation_labels": list(pair_batch.source_perturbation_labels),
-            "target_perturbation_labels": list(pair_batch.target_perturbation_labels),
+            "selected_sources": [
+                {
+                    "dataset_id": dataset_id,
+                    "source_index": int(source_index),
+                    "source_perturbation_label": perturbation_label,
+                }
+                for dataset_id, source_index, perturbation_label in zip(
+                    observed.source_dataset_ids,
+                    observed.source_indices.tolist(),
+                    observed.source_perturbation_labels,
+                )
+            ],
+            "source_indices": [int(value) for value in observed.source_indices.tolist()],
+            "target_indices": [int(value) for value in observed.target_indices.tolist()],
+            "source_dataset_ids": list(observed.source_dataset_ids),
+            "target_dataset_ids": list(observed.target_dataset_ids),
+            "source_cell_context_labels": list(observed.source_cell_context_labels),
+            "target_cell_context_labels": list(observed.target_cell_context_labels),
+            "source_perturbation_labels": list(observed.source_perturbation_labels),
+            "target_perturbation_labels": list(observed.target_perturbation_labels),
             "batch_field_shapes": {
                 key: list(value.shape)
                 for key, value in batch.items()
@@ -560,20 +616,20 @@ def main() -> None:
         "full_expression_masks": full_expr_masks,
         "runtime_notes": {
             "max_rss_mib": _max_rss_mib(),
-            "device": str(builder.device),
+            "device": str(loader._builder.device),
             "control_labels": list(config.control_labels),
         },
         "timing_seconds": {
             "load_corpus": load_seconds,
-            "build_adapter": adapter_seconds,
-            "build_batch": batch_seconds,
+            "build_loader": loader_seconds,
+            "find_batch": batch_seconds,
             "total": time.monotonic() - start_time,
         },
     }
 
-    summary_path = output_dir / "phase-08-smoke-summary.json"
+    summary_path = output_dir / "phase-07-smoke-summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    _write_markdown_summary(output_dir / "phase-08-smoke-summary.md", summary)
+    _write_markdown_summary(output_dir / "phase-07-smoke-summary.md", summary)
     _log(f"Wrote smoke summaries to {summary_path}")
 
     if not same_dataset:

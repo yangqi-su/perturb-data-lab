@@ -230,3 +230,33 @@ def test_sampler_iteration_is_seed_deterministic_and_preserves_pairing_invariant
             batch_a.target_dataset_indices,
         )
         assert batch_a.source_cell_context_labels == batch_a.target_cell_context_labels
+
+
+def test_sampler_set_epoch_is_repeatable_and_changes_pair_sequence() -> None:
+    sampler = PerturbationPairSampler(
+        _build_metadata_index(),
+        batch_size=1,
+        config=PertTFAdapterConfig(control_labels=("WT",)),
+        source_indices=[0, 1, 5, 6],
+        seed=17,
+        drop_last=True,
+    )
+
+    sampler.set_epoch(0)
+    epoch0_first = [
+        (tuple(batch.source_indices.tolist()), tuple(batch.target_indices.tolist()))
+        for batch in sampler
+    ]
+    sampler.set_epoch(0)
+    epoch0_second = [
+        (tuple(batch.source_indices.tolist()), tuple(batch.target_indices.tolist()))
+        for batch in sampler
+    ]
+    sampler.set_epoch(1)
+    epoch1 = [
+        (tuple(batch.source_indices.tolist()), tuple(batch.target_indices.tolist()))
+        for batch in sampler
+    ]
+
+    assert epoch0_first == epoch0_second
+    assert epoch1 != epoch0_first

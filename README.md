@@ -47,7 +47,7 @@ perturb-data-lab/
 - `src/perturb_data_lab/canonical/`: draft/final schema application and canonical obs/var generation
 - `src/perturb_data_lab/loaders/corpus_loader.py`: `load_corpus()` and `Corpus` for unified runtime access
 - `src/perturb_data_lab/pp/`: backend-agnostic streamed per-dataset stats, HVG, PCA/SVD, and Welch DE helpers
-- `scripts/perttf_marson_xorion_smoke.py`: bounded full-corpus Phase 8 adapter smoke for Marson/Xorion
+- `scripts/perttf_marson_xorion_smoke.py`: bounded full-corpus public-loader smoke for Marson/Xorion
 - `docs/v0-onboarding-workflow.md`: current inspect → materialize → draft-schema → finalize-schema → canonicalize → load workflow
 - `docs/canonicalization_handbook.md`: canonical schema review rules, transform behavior, tokenizer notes, and common failure modes
 - `docs/perttf_marson_xorion_adapter_smoke.md`: user-facing handoff notes for the pertTF-local adapter smoke path
@@ -146,6 +146,35 @@ corpus_with_extra = load_corpus(
   `"null"`, `"."`, and empty strings at read time.
 - Canonicalization write behavior is unchanged: the on-disk canonical parquet
   files are not rewritten or normalized by `load_corpus(...)`.
+
+### pertTF paired loader
+
+```python
+from perturb_data_lab.loaders import (
+    PertTFAdapterConfig,
+    PertTFPairedBatchLoader,
+    load_corpus,
+)
+
+corpus = load_corpus("/path/to/corpus")
+perttf_loader = PertTFPairedBatchLoader(
+    corpus,
+    batch_size=8,
+    seq_len=1024,
+    config=PertTFAdapterConfig(control_labels=("WT",)),
+    num_workers=2,
+)
+
+for batch in perttf_loader:
+    train_step(batch)
+```
+
+- `PertTFPairedBatchLoader` yields final pertTF-ready batch dictionaries; normal
+  callers do not need to assemble raw pair requests or call
+  `build_from_raw_pair_batch(...)` directly.
+- `set_epoch(epoch)` is available for deterministic reshuffling between epochs.
+- When `num_workers > 0`, the loader keeps pair planning in the main process and
+  uses worker processes only for source/target expression reads.
 
 ### Metadata and inspection helpers
 
