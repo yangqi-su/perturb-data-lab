@@ -13,17 +13,20 @@ from .streaming import (
     log1p_size_factor_batch,
 )
 from .hvg import calculate_hvgs
+from .pca import PpPcaResult, run_pca
 from .stats import calculate_lognorm_stats
 
 __all__ = [
     "PpArtifactSpec",
     "PpBatch",
     "PpFeatureContext",
+    "PpPcaResult",
     "calculate_hvgs",
     "build_pp_provenance",
     "calculate_lognorm_stats",
     "iter_dataset_batches",
     "log1p_size_factor_batch",
     "prepare_pp_output",
+    "run_pca",
     "write_pp_provenance",
 ]

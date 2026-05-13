@@ -22,6 +22,7 @@ from perturb_data_lab.pp import (
     iter_dataset_batches,
     log1p_size_factor_batch,
     prepare_pp_output,
+    run_pca,
     write_pp_provenance,
 )
 
@@ -305,6 +306,54 @@ def _dense_reference_hvgs(corpus, dataset_id: str) -> dict[str, np.ndarray | int
     }
 
 
+def _canonicalize_dense_svd(
+    singular_values: np.ndarray,
+    right_singular_vectors: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    order = np.argsort(singular_values)[::-1]
+    values = np.asarray(singular_values, dtype=np.float64)[order]
+    vectors = np.asarray(right_singular_vectors, dtype=np.float64)[order].copy()
+    signs = np.ones(values.shape[0], dtype=np.float64)
+    for component_index in range(vectors.shape[0]):
+        pivot = int(np.argmax(np.abs(vectors[component_index])))
+        if vectors[component_index, pivot] < 0:
+            vectors[component_index] *= -1.0
+            signs[component_index] = -1.0
+    return values, vectors, signs
+
+
+def _dense_reference_truncated_svd(
+    corpus,
+    dataset_id: str,
+    *,
+    n_components: int,
+    selected_global_feature_ids: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    matrices = []
+    for batch in iter_dataset_batches(corpus, dataset_id=dataset_id, batch_size=3):
+        dense = batch.expression.toarray().astype(np.float64, copy=False)
+        dense = np.log1p(dense / batch.size_factor[:, None].astype(np.float64, copy=False))
+        if selected_global_feature_ids is not None:
+            dense = dense[:, selected_global_feature_ids]
+        matrices.append(dense)
+
+    combined = np.vstack(matrices)
+    left, singular_values, right = np.linalg.svd(combined, full_matrices=False)
+    singular_values, right, signs = _canonicalize_dense_svd(
+        singular_values[:n_components],
+        right[:n_components],
+    )
+    left = left[:, :n_components] * signs[None, :]
+    embeddings = left * singular_values[None, :]
+    frobenius_norm_sq = float(np.square(combined).sum())
+    return {
+        "embeddings": embeddings,
+        "components": right,
+        "singular_values": singular_values,
+        "explained_variance_ratio": np.square(singular_values) / frobenius_norm_sq,
+    }
+
+
 def test_calculate_lognorm_stats_matches_dense_reference_for_single_dataset(
     tmp_path: Path,
 ) -> None:
@@ -429,3 +478,149 @@ def test_calculate_hvgs_matches_dense_reference_for_single_dataset(tmp_path: Pat
     )
     assert hvgs["is_hvg"].sum() == 7
     assert hvgs["selected_at_default_n_hvg"].sum() == 7
+
+
+def test_run_pca_matches_dense_reference_and_is_deterministic(tmp_path: Path) -> None:
+    _build_mock_federated_lance_corpus(tmp_path)
+    corpus = load_corpus(str(tmp_path))
+
+    first = run_pca(corpus, dataset_id="mock_00", batch_size=4, n_components=3)
+    second = run_pca(corpus, dataset_id="mock_00", batch_size=4, n_components=3)
+    reference = _dense_reference_truncated_svd(corpus, "mock_00", n_components=3)
+
+    assert first.embeddings.columns == [
+        "dataset_id",
+        "dataset_index",
+        "global_row_index",
+        "local_row_index",
+        "component_1",
+        "component_2",
+        "component_3",
+    ]
+    assert first.embeddings.shape == (10, 7)
+    assert first.components["component_index"].unique().sort().to_list() == [1, 2, 3]
+    assert first.component_stats["method_semantics"].unique().to_list() == [
+        "uncentered_truncated_svd_on_lognorm_expression"
+    ]
+    assert first.selected_features["selection_source"].unique().to_list() == ["all_features"]
+    np.testing.assert_array_equal(
+        first.embeddings["global_row_index"].to_numpy(),
+        np.arange(10, dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        first.embeddings["local_row_index"].to_numpy(),
+        np.arange(10, dtype=np.int64),
+    )
+    np.testing.assert_allclose(
+        first.embeddings.select(["component_1", "component_2", "component_3"]).to_numpy(),
+        reference["embeddings"],
+        atol=1e-6,
+    )
+    for component_index in range(3):
+        subset = first.components.filter(pl.col("component_index") == component_index + 1).sort(
+            "selected_feature_index"
+        )
+        np.testing.assert_allclose(
+            subset["loading"].to_numpy(),
+            reference["components"][component_index],
+            atol=1e-6,
+        )
+    np.testing.assert_allclose(
+        first.component_stats["singular_value"].to_numpy(),
+        reference["singular_values"],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        first.component_stats["explained_variance_ratio"].to_numpy(),
+        reference["explained_variance_ratio"],
+        atol=1e-6,
+    )
+    assert first.embeddings.to_dict(as_series=False) == second.embeddings.to_dict(as_series=False)
+    assert first.components.to_dict(as_series=False) == second.components.to_dict(as_series=False)
+    assert first.component_stats.to_dict(as_series=False) == second.component_stats.to_dict(as_series=False)
+    assert first.selected_features.to_dict(as_series=False) == second.selected_features.to_dict(as_series=False)
+
+
+def test_run_pca_streams_all_datasets_respects_hvgs_and_writes_artifacts(tmp_path: Path) -> None:
+    corpus_root = tmp_path / "corpus"
+    _build_mock_federated_lance_corpus(corpus_root)
+    corpus = load_corpus(str(corpus_root))
+    hvgs = calculate_hvgs(corpus, batch_size=5, n_hvg=7)
+    output_dir = tmp_path / "pp-output"
+
+    first = run_pca(
+        corpus,
+        batch_size=5,
+        n_components=2,
+        hvg_frame=hvgs,
+        output_dir=output_dir,
+    )
+    second = run_pca(
+        corpus,
+        batch_size=5,
+        n_components=2,
+        hvg_frame=hvgs,
+        output_dir=output_dir,
+        overwrite=True,
+    )
+
+    assert first.embeddings["dataset_id"].unique().sort().to_list() == ["mock_00", "mock_01"]
+    assert first.component_stats.group_by("dataset_id").len().sort("dataset_id")["len"].to_list() == [2, 2]
+    assert first.selected_features.group_by("dataset_id").len().sort("dataset_id")["len"].to_list() == [7, 7]
+    assert first.embeddings.to_dict(as_series=False) == second.embeddings.to_dict(as_series=False)
+    assert first.components.to_dict(as_series=False) == second.components.to_dict(as_series=False)
+    assert first.component_stats.to_dict(as_series=False) == second.component_stats.to_dict(as_series=False)
+    assert first.selected_features.to_dict(as_series=False) == second.selected_features.to_dict(as_series=False)
+
+    for dataset_id, global_start, global_stop in (("mock_00", 0, 10), ("mock_01", 10, 25)):
+        expected_hvgs = (
+            hvgs.filter(pl.col("dataset_id") == dataset_id)
+            .filter(pl.col("is_hvg"))
+            .sort("hvg_rank")
+        )
+        selected = first.selected_features.filter(pl.col("dataset_id") == dataset_id).sort(
+            "selected_feature_index"
+        )
+        np.testing.assert_array_equal(
+            selected["global_feature_id"].to_numpy(),
+            expected_hvgs["global_feature_id"].to_numpy(),
+        )
+        np.testing.assert_array_equal(
+            selected["hvg_rank"].to_numpy(),
+            expected_hvgs["hvg_rank"].to_numpy(),
+        )
+
+        embeddings = first.embeddings.filter(pl.col("dataset_id") == dataset_id).sort("global_row_index")
+        np.testing.assert_array_equal(
+            embeddings["global_row_index"].to_numpy(),
+            np.arange(global_start, global_stop, dtype=np.int64),
+        )
+
+        reference = _dense_reference_truncated_svd(
+            corpus,
+            dataset_id,
+            n_components=2,
+            selected_global_feature_ids=selected["global_feature_id"].to_numpy(),
+        )
+        np.testing.assert_allclose(
+            embeddings.select(["component_1", "component_2"]).to_numpy(),
+            reference["embeddings"],
+            atol=1e-6,
+        )
+
+        for stem in (
+            "pca-embeddings.parquet",
+            "pca-components.parquet",
+            "pca-component-stats.parquet",
+            "pca-selected-features.parquet",
+            "pca-component-stats.provenance.json",
+        ):
+            assert (output_dir / dataset_id / stem).exists()
+
+        provenance = json.loads(
+            (output_dir / dataset_id / "pca-component-stats.provenance.json").read_text(encoding="utf-8")
+        )
+        assert provenance["operation"] == "run_pca"
+        assert provenance["parameters"]["method"] == "truncated_svd"
+        assert provenance["parameters"]["method_semantics"] == "uncentered_truncated_svd_on_lognorm_expression"
+        assert provenance["parameters"]["n_components"] == 2
