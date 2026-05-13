@@ -10,6 +10,7 @@ import numpy as np
 import polars as pl
 import pyarrow as pa
 from scipy import sparse
+from scipy.stats import t as student_t
 import yaml
 
 from perturb_data_lab.loaders import load_corpus
@@ -22,6 +23,7 @@ from perturb_data_lab.pp import (
     iter_dataset_batches,
     log1p_size_factor_batch,
     prepare_pp_output,
+    rank_genes_ttest,
     run_pca,
     write_pp_provenance,
 )
@@ -354,6 +356,150 @@ def _dense_reference_truncated_svd(
     }
 
 
+def _reference_benjamini_hochberg(p_value: np.ndarray) -> np.ndarray:
+    adjusted = np.full(p_value.shape, np.nan, dtype=np.float64)
+    finite_mask = np.isfinite(p_value)
+    if not np.any(finite_mask):
+        return adjusted
+
+    finite = np.clip(np.asarray(p_value[finite_mask], dtype=np.float64), 0.0, 1.0)
+    order = np.argsort(finite, kind="mergesort")
+    sorted_p = finite[order]
+    n_tests = sorted_p.shape[0]
+    sorted_adj = np.minimum.accumulate(
+        (sorted_p * float(n_tests) / np.arange(1, n_tests + 1, dtype=np.float64))[::-1]
+    )[::-1]
+    sorted_adj = np.clip(sorted_adj, 0.0, 1.0)
+
+    finite_adjusted = np.empty_like(sorted_adj)
+    finite_adjusted[order] = sorted_adj
+    adjusted[finite_mask] = finite_adjusted
+    return adjusted
+
+
+def _reference_welch_ttest(
+    mean_reference: np.ndarray,
+    var_reference: np.ndarray,
+    n_reference: int,
+    mean_perturbed: np.ndarray,
+    var_perturbed: np.ndarray,
+    n_perturbed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    ref_term = var_reference / float(n_reference)
+    pert_term = var_perturbed / float(n_perturbed)
+    stderr_sq = ref_term + pert_term
+    diff = mean_perturbed - mean_reference
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_stat = diff / np.sqrt(stderr_sq)
+
+    zero_stderr = stderr_sq == 0.0
+    t_stat = np.where(zero_stderr & (diff > 0.0), np.inf, t_stat)
+    t_stat = np.where(zero_stderr & (diff < 0.0), -np.inf, t_stat)
+    t_stat = np.where(zero_stderr & (diff == 0.0), 0.0, t_stat)
+
+    ref_df_term = np.square(ref_term) / float(n_reference - 1)
+    pert_df_term = np.square(pert_term) / float(n_perturbed - 1)
+    df_denominator = ref_df_term + pert_df_term
+    with np.errstate(divide="ignore", invalid="ignore"):
+        degrees_of_freedom = np.square(stderr_sq) / df_denominator
+    degrees_of_freedom = np.where(zero_stderr, np.inf, degrees_of_freedom)
+
+    p_value = np.full(diff.shape, np.nan, dtype=np.float64)
+    finite = np.isfinite(t_stat) & np.isfinite(degrees_of_freedom) & (degrees_of_freedom > 0.0)
+    if np.any(finite):
+        p_value[finite] = student_t.sf(np.abs(t_stat[finite]), degrees_of_freedom[finite]) * 2.0
+    p_value[zero_stderr & (diff == 0.0)] = 1.0
+    p_value[zero_stderr & (diff != 0.0)] = 0.0
+    return t_stat.astype(np.float64, copy=False), np.clip(p_value, 0.0, 1.0)
+
+
+def _dense_reference_rank_genes_ttest(
+    corpus,
+    dataset_id: str,
+    *,
+    control_label: str,
+    top_k: int,
+) -> pl.DataFrame:
+    matrices = []
+    labels: list[str] = []
+    context = None
+    for batch in iter_dataset_batches(corpus, dataset_id=dataset_id, batch_size=3):
+        context = batch.feature_context
+        dense = batch.expression.toarray().astype(np.float64, copy=False)
+        matrices.append(np.log1p(dense / batch.size_factor[:, None].astype(np.float64, copy=False)))
+        metadata = corpus.take_metadata(batch.global_row_index, columns=("perturb_label",))
+        labels.extend(str(value) for value in metadata["perturb_label"])
+
+    assert context is not None
+    combined = np.vstack(matrices)
+    label_array = np.asarray(labels, dtype=object)
+    control = combined[label_array == control_label]
+    global_feature_id = np.asarray(context.local_to_global, dtype=np.int64)
+
+    frames = []
+    for perturbation in sorted({label for label in labels if label != control_label}):
+        perturbed = combined[label_array == perturbation]
+        mean_reference = control.mean(axis=0)
+        mean_perturbed = perturbed.mean(axis=0)
+        var_reference = control.var(axis=0, ddof=1)
+        var_perturbed = perturbed.var(axis=0, ddof=1)
+        t_stat, p_value = _reference_welch_ttest(
+            mean_reference,
+            var_reference,
+            control.shape[0],
+            mean_perturbed,
+            var_perturbed,
+            perturbed.shape[0],
+        )
+        p_adj = _reference_benjamini_hochberg(p_value)
+        rank_order = np.lexsort(
+            (
+                global_feature_id,
+                -np.abs(t_stat),
+                np.nan_to_num(p_value, nan=np.inf, posinf=np.inf, neginf=np.inf),
+                np.nan_to_num(p_adj, nan=np.inf, posinf=np.inf, neginf=np.inf),
+            )
+        )
+        top_indices = rank_order[: min(top_k, context.n_features)]
+        frames.append(
+            pl.DataFrame(
+                {
+                    "dataset_id": [dataset_id] * len(top_indices),
+                    "dataset_index": np.full(len(top_indices), context.dataset_index, dtype=np.int32),
+                    "perturbation": [perturbation] * len(top_indices),
+                    "reference_label": [control_label] * len(top_indices),
+                    "gene_id": [context.local_feature_ids[int(index)] for index in top_indices],
+                    "gene_token_id": global_feature_id[top_indices],
+                    "global_feature_id": global_feature_id[top_indices],
+                    "rank": np.arange(1, len(top_indices) + 1, dtype=np.int32),
+                    "t_stat": t_stat[top_indices],
+                    "p_value": p_value[top_indices],
+                    "p_adj": p_adj[top_indices],
+                    "logfoldchange": (mean_perturbed[top_indices] - mean_reference[top_indices]) / np.log(2.0),
+                    "mean_reference": mean_reference[top_indices],
+                    "mean_perturbed": mean_perturbed[top_indices],
+                    "pct_reference": np.count_nonzero(control, axis=0)[top_indices] / float(control.shape[0]),
+                    "pct_perturbed": np.count_nonzero(perturbed, axis=0)[top_indices] / float(perturbed.shape[0]),
+                    "n_reference": np.full(len(top_indices), control.shape[0], dtype=np.int64),
+                    "n_perturbed": np.full(len(top_indices), perturbed.shape[0], dtype=np.int64),
+                }
+            )
+        )
+
+    return pl.concat(frames, rechunk=True).sort(["dataset_index", "perturbation", "rank"])
+
+
+def _assert_de_frame_matches_reference(actual: pl.DataFrame, reference: pl.DataFrame) -> None:
+    assert actual.columns == reference.columns
+    assert actual.shape == reference.shape
+    for column in actual.columns:
+        if actual.schema[column] in (pl.Float32, pl.Float64):
+            np.testing.assert_allclose(actual[column].to_numpy(), reference[column].to_numpy())
+        else:
+            assert actual[column].to_list() == reference[column].to_list()
+
+
 def test_calculate_lognorm_stats_matches_dense_reference_for_single_dataset(
     tmp_path: Path,
 ) -> None:
@@ -624,3 +770,104 @@ def test_run_pca_streams_all_datasets_respects_hvgs_and_writes_artifacts(tmp_pat
         assert provenance["parameters"]["method"] == "truncated_svd"
         assert provenance["parameters"]["method_semantics"] == "uncentered_truncated_svd_on_lognorm_expression"
         assert provenance["parameters"]["n_components"] == 2
+
+
+def test_rank_genes_ttest_matches_dense_reference_for_single_dataset(tmp_path: Path) -> None:
+    _build_mock_federated_lance_corpus(tmp_path)
+    corpus = load_corpus(str(tmp_path))
+
+    degs = rank_genes_ttest(
+        corpus,
+        dataset_id="mock_00",
+        batch_size=4,
+        control_label="CRISPR_control",
+        top_k=5,
+    )
+    reference = _dense_reference_rank_genes_ttest(
+        corpus,
+        "mock_00",
+        control_label="CRISPR_control",
+        top_k=5,
+    )
+
+    assert degs.columns == [
+        "dataset_id",
+        "dataset_index",
+        "perturbation",
+        "reference_label",
+        "gene_id",
+        "gene_token_id",
+        "global_feature_id",
+        "rank",
+        "t_stat",
+        "p_value",
+        "p_adj",
+        "logfoldchange",
+        "mean_reference",
+        "mean_perturbed",
+        "pct_reference",
+        "pct_perturbed",
+        "n_reference",
+        "n_perturbed",
+    ]
+    assert degs.shape == (5, 18)
+    assert degs["dataset_id"].unique().to_list() == ["mock_00"]
+    assert degs["perturbation"].unique().to_list() == ["CRISPR_geneX"]
+    assert degs["reference_label"].unique().to_list() == ["CRISPR_control"]
+    assert degs["rank"].to_list() == [1, 2, 3, 4, 5]
+    np.testing.assert_array_equal(degs["gene_token_id"].to_numpy(), degs["global_feature_id"].to_numpy())
+    _assert_de_frame_matches_reference(degs, reference)
+
+
+def test_rank_genes_ttest_streams_all_datasets_and_writes_artifacts(tmp_path: Path) -> None:
+    corpus_root = tmp_path / "corpus"
+    _build_mock_federated_lance_corpus(corpus_root)
+    corpus = load_corpus(str(corpus_root))
+    output_dir = tmp_path / "pp-output"
+
+    first = rank_genes_ttest(
+        corpus,
+        batch_size=6,
+        control_label="CRISPR_control",
+        top_k=4,
+        output_dir=output_dir,
+    )
+    second = rank_genes_ttest(
+        corpus,
+        batch_size=6,
+        control_label="CRISPR_control",
+        top_k=4,
+        output_dir=output_dir,
+        overwrite=True,
+    )
+
+    assert first.to_dict(as_series=False) == second.to_dict(as_series=False)
+    assert first["dataset_id"].unique().sort().to_list() == ["mock_00", "mock_01"]
+    assert first.group_by(["dataset_id", "perturbation"]).len().sort(["dataset_id", "perturbation"])["len"].to_list() == [4, 4]
+
+    for dataset_id in ("mock_00", "mock_01"):
+        reference = _dense_reference_rank_genes_ttest(
+            corpus,
+            dataset_id,
+            control_label="CRISPR_control",
+            top_k=4,
+        )
+        subset = first.filter(pl.col("dataset_id") == dataset_id).sort(["perturbation", "rank"])
+        _assert_de_frame_matches_reference(subset, reference)
+
+        stats_path = output_dir / dataset_id / "ttest-degs.parquet"
+        provenance_path = output_dir / dataset_id / "ttest-degs.provenance.json"
+        assert stats_path.exists()
+        assert provenance_path.exists()
+        assert pl.read_parquet(stats_path).sort(["perturbation", "rank"]).to_dict(as_series=False) == subset.to_dict(
+            as_series=False
+        )
+
+        payload = json.loads(provenance_path.read_text(encoding="utf-8"))
+        assert payload["operation"] == "rank_genes_ttest"
+        assert payload["parameters"]["control_label"] == "CRISPR_control"
+        assert payload["parameters"]["top_k"] == 4
+        assert payload["parameters"]["test"] == "welch_t_test_two_sided"
+        assert payload["parameters"]["p_adjustment"] == "benjamini_hochberg"
+        assert payload["parameters"]["normalization"] == "log1p(count / size_factor)"
+        assert payload["extra"]["contrast_labels"] == ["CRISPR_geneX"]
