@@ -19,7 +19,7 @@ import torch
 from ..feature_registry import FeatureRegistry
 from ..gpu_pipeline import GPUSparsePipeline
 from ..index import MetadataIndex
-from ..loaders import _normalize_candidate_row_indices
+from ..loaders import DatasetRoutingTable, _normalize_candidate_row_indices
 
 if TYPE_CHECKING:
     from ..corpus_loader import Corpus
@@ -693,6 +693,180 @@ class PerturbationPairSampler:
             source_batch_labels=source_batch_labels,
             target_batch_labels=target_batch_labels,
         )
+
+
+@dataclass(frozen=True)
+class _PertTFPairReadRequest:
+    """Compact worker-facing request for one paired raw-expression read."""
+
+    pair_batch: PerturbationPairBatch
+    batch_index: int
+    seed: int
+    epoch: int
+
+
+class _PertTFPairReadBatchSampler:
+    """Wrap ``PerturbationPairSampler`` into pre-batched raw-read requests."""
+
+    def __init__(self, pair_sampler: PerturbationPairSampler) -> None:
+        self._pair_sampler = pair_sampler
+
+    def __len__(self) -> int:
+        return len(self._pair_sampler)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._pair_sampler.set_epoch(epoch)
+
+    def __iter__(self):
+        epoch = int(self._pair_sampler.epoch)
+        for batch_index, pair_batch in enumerate(self._pair_sampler):
+            yield [
+                _PertTFPairReadRequest(
+                    pair_batch=pair_batch,
+                    batch_index=batch_index,
+                    seed=self._pair_sampler.seed + epoch * 10000 + batch_index,
+                    epoch=epoch,
+                )
+            ]
+
+
+class _PertTFPairExpressionDataset:
+    """Worker-light dataset that reads paired source/target raw expression only."""
+
+    def __init__(
+        self,
+        expression_reader: Any,
+        *,
+        routing_table: DatasetRoutingTable,
+        topology: str = "aggregate",
+        backend: str = "lance",
+    ) -> None:
+        self._reader = expression_reader
+        self._routing_table = routing_table
+        self._topology = topology
+        self._backend = backend
+
+    @property
+    def routing_table(self) -> DatasetRoutingTable:
+        return self._routing_table
+
+    @property
+    def topology(self) -> str:
+        return self._topology
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    def __len__(self) -> int:
+        return self._routing_table.total_rows
+
+    def __getitems__(
+        self,
+        requests: Sequence[_PertTFPairReadRequest],
+    ) -> list[dict[str, Any]]:
+        request = _unwrap_single_pair_read_request(requests)
+        pair_batch = request.pair_batch
+        return [
+            {
+                "request": request,
+                "source_raw": self._read_raw_batch(pair_batch.source_indices),
+                "target_raw": self._read_raw_batch(pair_batch.target_indices),
+            }
+        ]
+
+    def _read_raw_batch(self, indices: np.ndarray) -> dict[str, Any]:
+        index_array = np.asarray(indices, dtype=np.int64)
+        expr = self._reader.read_expression_flat(index_array.tolist())
+        dataset_index = self._routing_table.resolve_dataset_indices(index_array)
+        batch: dict[str, Any] = {
+            "batch_size": expr.batch_size,
+            "global_row_index": expr.global_row_index,
+            "dataset_index": dataset_index,
+            "row_offsets": expr.row_offsets,
+            "expressed_gene_indices": expr.expressed_gene_indices,
+            "expression_counts": expr.expression_counts,
+        }
+        size_factor = self._routing_table.take_size_factor(index_array)
+        if size_factor is not None:
+            batch["size_factor"] = size_factor
+        return batch
+
+
+def _unwrap_single_pair_read_request(
+    requests: Sequence[_PertTFPairReadRequest],
+) -> _PertTFPairReadRequest:
+    if not requests:
+        raise ValueError("paired read dataset received empty request batch")
+    if len(requests) != 1:
+        raise ValueError(
+            "paired read dataset expected a single pre-batched request, "
+            f"got {len(requests)}"
+        )
+    request = requests[0]
+    if not isinstance(request, _PertTFPairReadRequest):
+        raise TypeError(
+            "paired read dataset expected _PertTFPairReadRequest items, "
+            f"got {type(request)!r}"
+        )
+    return request
+
+
+def _unwrap_single_prebatched_pair_item(
+    items: list[dict[str, Any]],
+    *,
+    collate_name: str,
+) -> dict[str, Any]:
+    if not items:
+        raise ValueError(f"{collate_name} received empty list")
+    if len(items) != 1:
+        raise ValueError(
+            f"{collate_name} expected a single pre-batched item, got {len(items)}"
+        )
+    return items[0]
+
+
+def _collate_expression_like_raw_batch(raw_batch: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "batch_size": raw_batch["batch_size"],
+        "global_row_index": torch.as_tensor(
+            raw_batch["global_row_index"],
+            dtype=torch.long,
+        ),
+        "dataset_index": torch.as_tensor(
+            raw_batch["dataset_index"],
+            dtype=torch.long,
+        ),
+        "row_offsets": torch.as_tensor(raw_batch["row_offsets"], dtype=torch.long),
+        "expressed_gene_indices": torch.as_tensor(
+            raw_batch["expressed_gene_indices"],
+            dtype=torch.long,
+        ),
+        "expression_counts": torch.as_tensor(
+            raw_batch["expression_counts"],
+            dtype=torch.float32,
+        ),
+    }
+    if "size_factor" in raw_batch:
+        result["size_factor"] = torch.as_tensor(
+            raw_batch["size_factor"],
+            dtype=torch.float32,
+        )
+    return result
+
+
+def _collate_perttf_raw_pair_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Unwrap one paired raw-read item for main-process pertTF assembly."""
+
+    batch = _unwrap_single_prebatched_pair_item(
+        items,
+        collate_name="_collate_perttf_raw_pair_batch",
+    )
+    return {
+        "request": batch["request"],
+        "source_raw": _collate_expression_like_raw_batch(batch["source_raw"]),
+        "target_raw": _collate_expression_like_raw_batch(batch["target_raw"]),
+    }
 
 
 class PertTFPairedBatchBuilder:

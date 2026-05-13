@@ -7,12 +7,18 @@ import pyarrow as pa
 import pytest
 import torch
 import yaml
+from torch.utils.data import DataLoader
 
 from perturb_data_lab.loaders import (
     PertTFAdapterConfig,
     PertTFPairedBatchBuilder,
     PerturbationPairSampler,
     load_corpus,
+)
+from perturb_data_lab.loaders.adapters.perttf import (
+    _collate_perttf_raw_pair_batch,
+    _PertTFPairExpressionDataset,
+    _PertTFPairReadBatchSampler,
 )
 
 
@@ -445,3 +451,205 @@ def test_build_from_raw_pair_batch_rejects_row_order_mismatch(
 
     with pytest.raises(ValueError, match="source_raw global_row_index"):
         builder.build_from_raw_pair_batch(pair_batch, source_raw, target_raw)
+
+
+def _build_pair_read_loader(
+    corpus,
+    *,
+    batch_size: int,
+    seed: int,
+    num_workers: int,
+    multiprocessing_context: str | None,
+):
+    pair_sampler = PerturbationPairSampler(
+        corpus.metadata_index,
+        batch_size=batch_size,
+        config=PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0),
+        seed=seed,
+        source_indices=[0, 1],
+    )
+    request_sampler = _PertTFPairReadBatchSampler(pair_sampler)
+    dataset = _PertTFPairExpressionDataset(
+        corpus.expression_reader,
+        routing_table=corpus.routing_table,
+        topology=corpus.topology,
+        backend=corpus.backend,
+    )
+    loader_kwargs = {
+        "batch_sampler": request_sampler,
+        "collate_fn": _collate_perttf_raw_pair_batch,
+        "num_workers": num_workers,
+    }
+    if multiprocessing_context is not None:
+        loader_kwargs["multiprocessing_context"] = multiprocessing_context
+    return DataLoader(dataset, **loader_kwargs)
+
+
+def _assert_pair_read_batch_matches_builder(
+    corpus,
+    batch: dict[str, object],
+) -> None:
+    config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
+    builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
+    request = batch["request"]
+    pair_batch = request.pair_batch
+    source_raw = batch["source_raw"]
+    target_raw = batch["target_raw"]
+
+    expected_source_raw = corpus.inspect_batch(pair_batch.source_indices)
+    expected_target_raw = corpus.inspect_batch(pair_batch.target_indices)
+
+    assert source_raw["batch_size"] == expected_source_raw["batch_size"]
+    assert target_raw["batch_size"] == expected_target_raw["batch_size"]
+    torch.testing.assert_close(
+        source_raw["global_row_index"],
+        torch.as_tensor(expected_source_raw["global_row_index"], dtype=torch.long),
+    )
+    torch.testing.assert_close(
+        source_raw["dataset_index"],
+        torch.as_tensor(expected_source_raw["dataset_index"], dtype=torch.long),
+    )
+    torch.testing.assert_close(
+        source_raw["row_offsets"],
+        torch.as_tensor(expected_source_raw["row_offsets"], dtype=torch.long),
+    )
+    torch.testing.assert_close(
+        source_raw["expressed_gene_indices"],
+        torch.as_tensor(expected_source_raw["expressed_gene_indices"], dtype=torch.long),
+    )
+    torch.testing.assert_close(
+        source_raw["expression_counts"],
+        torch.as_tensor(expected_source_raw["expression_counts"], dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        source_raw["size_factor"],
+        torch.as_tensor(expected_source_raw["size_factor"], dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        target_raw["global_row_index"],
+        torch.as_tensor(expected_target_raw["global_row_index"], dtype=torch.long),
+    )
+    torch.testing.assert_close(
+        target_raw["dataset_index"],
+        torch.as_tensor(expected_target_raw["dataset_index"], dtype=torch.long),
+    )
+    torch.testing.assert_close(
+        target_raw["row_offsets"],
+        torch.as_tensor(expected_target_raw["row_offsets"], dtype=torch.long),
+    )
+    torch.testing.assert_close(
+        target_raw["expressed_gene_indices"],
+        torch.as_tensor(expected_target_raw["expressed_gene_indices"], dtype=torch.long),
+    )
+    torch.testing.assert_close(
+        target_raw["expression_counts"],
+        torch.as_tensor(expected_target_raw["expression_counts"], dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        target_raw["size_factor"],
+        torch.as_tensor(expected_target_raw["size_factor"], dtype=torch.float32),
+    )
+
+    split_batch = builder.build_from_raw_pair_batch(
+        pair_batch,
+        source_raw,
+        target_raw,
+        seed=request.seed,
+        sampling_mode="hvg",
+        hvg_weight=4.0,
+        hvg_top_k=2,
+    )
+    reference_batch = builder.build_paired_batch(
+        pair_batch,
+        seed=request.seed,
+        sampling_mode="hvg",
+        hvg_weight=4.0,
+        hvg_top_k=2,
+    )
+    assert split_batch.keys() == reference_batch.keys()
+    for key in split_batch:
+        torch.testing.assert_close(split_batch[key], reference_batch[key])
+
+
+def test_pair_read_dataset_state_stays_worker_light(tmp_path: Path) -> None:
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    builder = PertTFPairedBatchBuilder(
+        corpus,
+        seq_len=3,
+        config=PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0),
+    )
+    dataset = _PertTFPairExpressionDataset(
+        corpus.expression_reader,
+        routing_table=corpus.routing_table,
+        topology=corpus.topology,
+        backend=corpus.backend,
+    )
+
+    assert set(dataset.__dict__) == {"_reader", "_routing_table", "_topology", "_backend"}
+    assert dataset.__dict__["_reader"] is corpus.expression_reader
+    assert dataset.__dict__["_routing_table"] is corpus.routing_table
+    assert all(value is not corpus.metadata_index for value in dataset.__dict__.values())
+    assert not any(torch.is_tensor(value) and value.is_cuda for value in dataset.__dict__.values())
+    assert not any(isinstance(value, torch.device) for value in dataset.__dict__.values())
+    assert not any(isinstance(value, torch.nn.Module) for value in dataset.__dict__.values())
+    assert not any(
+        isinstance(value, PertTFPairedBatchBuilder)
+        for value in dataset.__dict__.values()
+    )
+    assert all(value is not builder.adapter for value in dataset.__dict__.values())
+
+
+def test_pair_read_batch_sampler_tracks_epoch_and_batch_identity(
+    tmp_path: Path,
+) -> None:
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    sampler = PerturbationPairSampler(
+        corpus.metadata_index,
+        batch_size=1,
+        config=PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0),
+        seed=13,
+        source_indices=[0, 1],
+        drop_last=False,
+    )
+    request_sampler = _PertTFPairReadBatchSampler(sampler)
+
+    first_epoch_requests = [batch[0] for batch in request_sampler]
+    request_sampler.set_epoch(2)
+    second_epoch_requests = [batch[0] for batch in request_sampler]
+
+    assert [request.batch_index for request in first_epoch_requests] == [0, 1]
+    assert [request.seed for request in first_epoch_requests] == [13, 14]
+    assert [request.batch_index for request in second_epoch_requests] == [0, 1]
+    assert [request.seed for request in second_epoch_requests] == [20013, 20014]
+
+
+def test_pair_read_dataloader_supports_single_process(tmp_path: Path) -> None:
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    loader = _build_pair_read_loader(
+        corpus,
+        batch_size=2,
+        seed=7,
+        num_workers=0,
+        multiprocessing_context=None,
+    )
+
+    batches = list(loader)
+
+    assert len(batches) == 1
+    _assert_pair_read_batch_matches_builder(corpus, batches[0])
+
+
+def test_pair_read_dataloader_supports_spawn_workers(tmp_path: Path) -> None:
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    loader = _build_pair_read_loader(
+        corpus,
+        batch_size=2,
+        seed=7,
+        num_workers=2,
+        multiprocessing_context="spawn",
+    )
+
+    batches = list(loader)
+
+    assert len(batches) == 1
+    _assert_pair_read_batch_matches_builder(corpus, batches[0])
