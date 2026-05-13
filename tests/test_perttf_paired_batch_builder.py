@@ -598,10 +598,11 @@ def _build_public_pair_loader(
 
 
 def _assert_public_loader_matches_builder(loader: PertTFPairedBatchLoader) -> None:
-    expected_pair_batch = next(iter(loader.pair_sampler))
+    expected_request = next(iter(loader._request_sampler))[0]
+    expected_pair_batch = expected_request.pair_batch
     expected_batch = loader._builder.build_paired_batch(
         expected_pair_batch,
-        seed=loader.pair_sampler.seed + loader.epoch * 10000,
+        seed=expected_request.seed,
         sampling_mode="hvg",
         hvg_weight=4.0,
         hvg_top_k=2,
@@ -661,14 +662,38 @@ def test_pair_read_batch_sampler_tracks_epoch_and_batch_identity(
     )
     request_sampler = _PertTFPairReadBatchSampler(sampler)
 
+    request_sampler.set_epoch(0)
     first_epoch_requests = [batch[0] for batch in request_sampler]
+    request_sampler.set_epoch(0)
+    repeat_epoch_requests = [batch[0] for batch in request_sampler]
     request_sampler.set_epoch(2)
     second_epoch_requests = [batch[0] for batch in request_sampler]
 
     assert [request.batch_index for request in first_epoch_requests] == [0, 1]
-    assert [request.seed for request in first_epoch_requests] == [13, 14]
+    assert [request.request_index for request in first_epoch_requests] == [0, 1]
     assert [request.batch_index for request in second_epoch_requests] == [0, 1]
-    assert [request.seed for request in second_epoch_requests] == [20013, 20014]
+    assert [request.epoch for request in first_epoch_requests] == [0, 0]
+    assert [request.epoch for request in second_epoch_requests] == [2, 2]
+    assert [request.seed for request in first_epoch_requests] == [
+        request.seed for request in repeat_epoch_requests
+    ]
+    assert [request.seed for request in second_epoch_requests] != [
+        request.seed for request in first_epoch_requests
+    ]
+    assert [
+        tuple(request.pair_batch.source_indices.tolist())
+        for request in first_epoch_requests
+    ] == [
+        tuple(request.pair_batch.source_indices.tolist())
+        for request in repeat_epoch_requests
+    ]
+    assert [
+        tuple(request.pair_batch.target_indices.tolist())
+        for request in first_epoch_requests
+    ] == [
+        tuple(request.pair_batch.target_indices.tolist())
+        for request in repeat_epoch_requests
+    ]
 
 
 def test_pair_read_dataloader_supports_single_process(tmp_path: Path) -> None:
@@ -767,3 +792,31 @@ def test_public_paired_batch_loader_set_epoch_is_repeatable_and_reorders(
 
     assert epoch0_first == epoch0_second
     assert epoch1 != epoch0_first
+
+
+def test_pair_read_request_stream_supports_even_fake_two_rank_sharding(
+    tmp_path: Path,
+) -> None:
+    corpus = load_corpus(str(_build_mixed_union_pair_corpus(tmp_path)))
+    sampler = PerturbationPairSampler(
+        corpus.metadata_index,
+        batch_size=1,
+        config=PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0),
+        seed=5,
+        drop_last=True,
+    )
+    request_sampler = _PertTFPairReadBatchSampler(sampler)
+
+    request_sampler.set_epoch(0)
+    requests = [batch[0] for batch in request_sampler]
+    rank0_requests = [request for request in requests if request.request_index % 2 == 0]
+    rank1_requests = [request for request in requests if request.request_index % 2 == 1]
+
+    assert [request.request_index for request in requests] == [0, 1, 2, 3]
+    assert len(rank0_requests) == len(rank1_requests) == 2
+    assert {request.request_index for request in rank0_requests}.isdisjoint(
+        {request.request_index for request in rank1_requests}
+    )
+    assert sorted(
+        request.request_index for request in rank0_requests + rank1_requests
+    ) == [0, 1, 2, 3]

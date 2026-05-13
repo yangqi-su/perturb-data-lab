@@ -58,6 +58,24 @@ def _ordered_unique(labels: Iterable[str]) -> tuple[str, ...]:
     return tuple(ordered)
 
 
+def _derive_perttf_stream_seed(
+    base_seed: int,
+    *,
+    epoch: int,
+    batch_index: int,
+    stream_id: int,
+) -> int:
+    seed_sequence = np.random.SeedSequence(
+        [
+            int(base_seed),
+            int(epoch),
+            int(batch_index),
+            int(stream_id),
+        ]
+    )
+    return int(seed_sequence.generate_state(1, dtype=np.uint64)[0])
+
+
 @dataclass(frozen=True)
 class PertTFAdapterConfig:
     """Configuration for pertTF-local adapter surfaces."""
@@ -360,6 +378,21 @@ class PerturbationPairBatch:
     target_batch_labels: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _PertTFPairBatchPlan:
+    """Deterministic source-batch plan for one pertTF paired request.
+
+    Future distributed support can shard this plan stream by ``batch_index``
+    before worker reads without changing the worker dataset or tensor-builder
+    contracts.
+    """
+
+    source_indices: np.ndarray
+    batch_index: int
+    seed: int
+    epoch: int
+
+
 class PerturbationPairSampler:
     """Sample same-dataset/context source-target perturbation pairs.
 
@@ -496,19 +529,54 @@ class PerturbationPairSampler:
         self.epoch = int(epoch)
 
     def __iter__(self):
+        for _, pair_batch in self._iter_planned_batches():
+            yield pair_batch
+
+    def _iter_planned_batches(
+        self,
+    ) -> Iterator[tuple[_PertTFPairBatchPlan, PerturbationPairBatch]]:
+        for batch_plan in self._iter_batch_plans():
+            yield batch_plan, self.pair_source_indices(
+                batch_plan.source_indices,
+                seed=batch_plan.seed,
+            )
+
+    def _iter_batch_plans(self) -> Iterator[_PertTFPairBatchPlan]:
         if self._source_row_count == 0:
             return
-        rng = np.random.default_rng(self.seed + self.epoch)
+        epoch = int(self.epoch)
         source_order = self._source_indices.copy()
-        rng.shuffle(source_order)
-        for batch_idx, start in enumerate(
+        if self._source_row_count > 1:
+            rng = np.random.default_rng(self._shuffle_seed(epoch))
+            rng.shuffle(source_order)
+        for batch_index, start in enumerate(
             range(0, self._source_row_count, self.batch_size)
         ):
             source_indices = source_order[start : start + self.batch_size]
             if len(source_indices) < self.batch_size and self.drop_last:
                 continue
-            batch_seed = self.seed + self.epoch * 10000 + batch_idx
-            yield self.pair_source_indices(source_indices, seed=batch_seed)
+            yield _PertTFPairBatchPlan(
+                source_indices=source_indices.copy(),
+                batch_index=batch_index,
+                seed=self._batch_seed(epoch, batch_index),
+                epoch=epoch,
+            )
+
+    def _shuffle_seed(self, epoch: int) -> int:
+        return _derive_perttf_stream_seed(
+            self.seed,
+            epoch=epoch,
+            batch_index=0,
+            stream_id=0,
+        )
+
+    def _batch_seed(self, epoch: int, batch_index: int) -> int:
+        return _derive_perttf_stream_seed(
+            self.seed,
+            epoch=epoch,
+            batch_index=batch_index,
+            stream_id=1,
+        )
 
     def pair_source_indices(
         self,
@@ -706,6 +774,12 @@ class _PertTFPairReadRequest:
     seed: int
     epoch: int
 
+    @property
+    def request_index(self) -> int:
+        """Stable per-epoch request position for future sharding wrappers."""
+
+        return self.batch_index
+
 
 class _PertTFPairReadBatchSampler:
     """Wrap ``PerturbationPairSampler`` into pre-batched raw-read requests."""
@@ -720,14 +794,13 @@ class _PertTFPairReadBatchSampler:
         self._pair_sampler.set_epoch(epoch)
 
     def __iter__(self):
-        epoch = int(self._pair_sampler.epoch)
-        for batch_index, pair_batch in enumerate(self._pair_sampler):
+        for batch_plan, pair_batch in self._pair_sampler._iter_planned_batches():
             yield [
                 _PertTFPairReadRequest(
                     pair_batch=pair_batch,
-                    batch_index=batch_index,
-                    seed=self._pair_sampler.seed + epoch * 10000 + batch_index,
-                    epoch=epoch,
+                    batch_index=batch_plan.batch_index,
+                    seed=batch_plan.seed,
+                    epoch=batch_plan.epoch,
                 )
             ]
 
