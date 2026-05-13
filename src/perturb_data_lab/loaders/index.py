@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import polars as pl
@@ -22,6 +22,38 @@ _CANONICAL_OBS_TYPED_DTYPES: dict[str, pl.DataType] = {
     "local_row_index": pl.Int64,
     "size_factor": pl.Float64,
 }
+
+_CANONICAL_OBS_STRUCTURAL_COLUMNS: tuple[str, ...] = (
+    "global_row_index",
+    "cell_id",
+    "dataset_id",
+    "dataset_index",
+    "local_row_index",
+    "size_factor",
+)
+
+_CANONICAL_OBS_CONTENT_COLUMNS: tuple[str, ...] = (
+    "perturb_label",
+    "perturb_type",
+    "dose",
+    "dose_unit",
+    "timepoint",
+    "timepoint_unit",
+    "cell_context",
+    "cell_line_or_type",
+    "species",
+    "tissue",
+    "assay",
+    "condition",
+    "batch_id",
+    "donor_id",
+    "sex",
+    "disease_state",
+)
+
+_CANONICAL_OBS_CORE_COLUMNS: tuple[str, ...] = (
+    _CANONICAL_OBS_STRUCTURAL_COLUMNS + _CANONICAL_OBS_CONTENT_COLUMNS
+)
 
 _CANONICAL_SAFE_NULL_STRING_COLUMNS: frozenset[str] = frozenset(
     {"dose", "dose_unit", "timepoint", "timepoint_unit"}
@@ -146,6 +178,7 @@ class MetadataIndex:
         corpus_index_path: str | Path,
         *,
         use_canonical: bool = False,
+        extra_metadata_columns: Sequence[str] | None = None,
     ) -> "MetadataIndex":
         """Load from a corpus-index YAML and per-dataset parquet files.
 
@@ -201,11 +234,19 @@ class MetadataIndex:
             )
 
         if use_canonical:
-            return cls._from_canonical_dataset_entries(entries)
+            return cls._from_canonical_dataset_entries(
+                entries,
+                extra_metadata_columns=extra_metadata_columns,
+            )
         return cls._from_dataset_entries(entries)
 
     @classmethod
-    def from_dummy_data(cls, use_canonical: bool = False) -> "MetadataIndex":
+    def from_dummy_data(
+        cls,
+        use_canonical: bool = False,
+        *,
+        extra_metadata_columns: Sequence[str] | None = None,
+    ) -> "MetadataIndex":
         """Convenience factory for the synthetic dummy_00 + dummy_01 corpus.
 
         Reads from the known Stage 2 lance-federated output paths.
@@ -245,7 +286,10 @@ class MetadataIndex:
                         "n_obs": info["n_obs"],
                     }
                 )
-            return cls._from_canonical_dataset_entries(entries)
+            return cls._from_canonical_dataset_entries(
+                entries,
+                extra_metadata_columns=extra_metadata_columns,
+            )
 
         entries = []
         for ds_id, info in sorted(_DUMMY_DATASETS.items()):
@@ -382,7 +426,10 @@ class MetadataIndex:
 
     @classmethod
     def _from_canonical_dataset_entries(
-        cls, entries: list[dict[str, Any]]
+        cls,
+        entries: list[dict[str, Any]],
+        *,
+        extra_metadata_columns: Sequence[str] | None = None,
     ) -> "MetadataIndex":
         """Build a MetadataIndex from canonical obs parquets (already flat).
 
@@ -401,9 +448,14 @@ class MetadataIndex:
             obs_path = entry["obs_path"]
             dataset_id = entry["dataset_id"]
 
-            df = pl.read_parquet(obs_path)
+            df = _load_canonical_obs_frame(
+                obs_path,
+                extra_metadata_columns=extra_metadata_columns,
+                context=(
+                    f"canonical obs parquet for dataset '{dataset_id}' at {obs_path}"
+                ),
+            )
             n_obs = len(df)
-            df = _normalize_canonical_obs_dtypes(df)
 
             # Ensure dataset_index is correct
             if "dataset_index" in df.columns:
@@ -434,15 +486,7 @@ class MetadataIndex:
         combined = pl.concat(processed_dfs, how="diagonal_relaxed")
 
         # Ensure all must-have canonical obs columns exist
-        _canonical_cols = [
-            "global_row_index", "cell_id", "dataset_id",
-            "dataset_index", "local_row_index", "size_factor",
-            "perturb_label", "perturb_type", "dose", "dose_unit",
-            "timepoint", "timepoint_unit", "cell_context", "cell_line_or_type",
-            "species", "tissue", "assay", "condition", "batch_id",
-            "donor_id", "sex", "disease_state",
-        ]
-        for col in _canonical_cols:
+        for col in _CANONICAL_OBS_CORE_COLUMNS:
             if col not in combined.columns:
                 fill_dtype = _CANONICAL_OBS_TYPED_DTYPES.get(col, pl.Utf8)
                 combined = combined.with_columns(
@@ -455,24 +499,22 @@ class MetadataIndex:
         combined = combined.sort("global_row_index")
 
         # Reorder: structural columns first, then canonical content, then extensible
-        structural = [
-            "global_row_index", "cell_id", "dataset_id",
-            "dataset_index", "local_row_index", "size_factor",
-        ]
         content = [
-            c for c in _canonical_cols
-            if c not in structural and c in combined.columns
+            c for c in _CANONICAL_OBS_CONTENT_COLUMNS
+            if c in combined.columns
         ]
         # Keep raw_ columns that may have been carried forward as extensible
         extensible = sorted(
             c for c in combined.columns
-            if c not in structural and c not in content and not c.startswith("raw_")
+            if c not in _CANONICAL_OBS_STRUCTURAL_COLUMNS
+            and c not in content
+            and not c.startswith("raw_")
         )
         raw_cols = sorted(
             c for c in combined.columns
             if c.startswith("raw_")
         )
-        col_order = structural + content + extensible + raw_cols
+        col_order = list(_CANONICAL_OBS_STRUCTURAL_COLUMNS) + content + extensible + raw_cols
         combined = combined.select(col_order)
 
         # Validate contiguous
@@ -909,6 +951,75 @@ def _normalize_canonical_obs_dtypes(df: pl.DataFrame) -> pl.DataFrame:
     if not expressions:
         return df
     return df.with_columns(expressions)
+
+
+def _load_canonical_obs_frame(
+    obs_path: str | Path,
+    *,
+    extra_metadata_columns: Sequence[str] | None = None,
+    context: str | None = None,
+) -> pl.DataFrame:
+    """Read a canonical obs parquet with canonical-core projection by default."""
+    path_str = str(obs_path)
+    projection = _resolve_canonical_obs_projection(
+        pl.read_parquet_schema(path_str).keys(),
+        extra_metadata_columns=extra_metadata_columns,
+        context=context or f"canonical obs parquet at {path_str}",
+    )
+    return _normalize_canonical_obs_dtypes(
+        pl.read_parquet(path_str, columns=projection)
+    )
+
+
+def _resolve_canonical_obs_projection(
+    available_columns: Sequence[str],
+    *,
+    extra_metadata_columns: Sequence[str] | None = None,
+    context: str,
+) -> list[str]:
+    """Resolve the canonical-core parquet projection plus optional extras."""
+    extras = _normalize_extra_metadata_columns(extra_metadata_columns)
+    available = set(available_columns)
+    missing = [name for name in extras if name not in available]
+    if missing:
+        missing_str = ", ".join(repr(name) for name in missing)
+        raise ValueError(
+            f"{context} is missing requested extra metadata columns: {missing_str}"
+        )
+
+    projection = [
+        column_name
+        for column_name in _CANONICAL_OBS_CORE_COLUMNS
+        if column_name in available
+    ]
+    projection.extend(
+        column_name for column_name in extras if column_name not in projection
+    )
+    return projection
+
+
+def _normalize_extra_metadata_columns(
+    extra_metadata_columns: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """Validate and deduplicate requested extra metadata columns."""
+    if extra_metadata_columns is None:
+        return ()
+    if isinstance(extra_metadata_columns, (str, bytes)):
+        raise TypeError(
+            "extra_metadata_columns must be a sequence of column names"
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_name in extra_metadata_columns:
+        name = str(raw_name)
+        if not name:
+            raise ValueError("extra_metadata_columns cannot contain empty names")
+        if name in seen:
+            continue
+        seen.add(name)
+        normalized.append(name)
+    return tuple(normalized)
 
 
 def _null_if_legacy_missing(expr: pl.Expr) -> pl.Expr:

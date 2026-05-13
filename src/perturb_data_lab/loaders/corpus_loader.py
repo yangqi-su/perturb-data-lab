@@ -72,7 +72,14 @@ from .expression import (
 from .feature_registry import FeatureRegistry
 from .gene_tokenizer import GeneTokenizer
 from .gpu_pipeline import GPUSparsePipeline
-from .index import MetadataIndex, _CANONICAL_OBS_TYPED_DTYPES, _normalize_canonical_obs_dtypes
+from .index import (
+    MetadataIndex,
+    _CANONICAL_OBS_CONTENT_COLUMNS,
+    _CANONICAL_OBS_STRUCTURAL_COLUMNS,
+    _CANONICAL_OBS_TYPED_DTYPES,
+    _load_canonical_obs_frame,
+    _normalize_canonical_obs_dtypes,
+)
 from .loaders import (
     CorpusRandomBatchSampler,
     DatasetBatchSampler,
@@ -848,6 +855,7 @@ def load_corpus(
     corpus_root: str | Path,
     *,
     use_canonical: bool = True,
+    extra_metadata_columns: Sequence[str] | None = None,
 ) -> Corpus:
     """Load a training-ready ``Corpus`` from a corpus directory.
 
@@ -866,6 +874,9 @@ def load_corpus(
         Whether to use canonical obs/var parquets.  Default ``True``.
         When ``True``, reads ``canonical-obs.parquet`` and
         ``canonical-var.parquet`` from ``meta/{id}/canonical_meta/``.
+    extra_metadata_columns : sequence of str, optional
+        Additional canonical-obs parquet columns to load into
+        ``metadata_index`` beyond the default canonical/core projection.
 
     Returns
     -------
@@ -957,6 +968,7 @@ def load_corpus(
         datasets_info=global_ranges,
         obs_paths=canonical_obs_paths,
         use_canonical=use_canonical,
+        extra_metadata_columns=extra_metadata_columns,
     )
 
     # ------------------------------------------------------------------
@@ -1404,6 +1416,7 @@ def _build_metadata_index(
     datasets_info: list[tuple[str, int, int, int]],
     obs_paths: dict[str, Path],
     use_canonical: bool = True,
+    extra_metadata_columns: Sequence[str] | None = None,
 ) -> MetadataIndex:
     """Build a ``MetadataIndex`` from per-dataset canonical obs parquets.
 
@@ -1434,7 +1447,13 @@ def _build_metadata_index(
 
     for ds_id, ds_index, g_start, g_end in datasets_info:
         obs_path = obs_paths[ds_id]
-        df = _normalize_canonical_obs_dtypes(pl.read_parquet(str(obs_path)))
+        df = _load_canonical_obs_frame(
+            obs_path,
+            extra_metadata_columns=extra_metadata_columns,
+            context=(
+                f"canonical obs parquet for dataset '{ds_id}' at {obs_path}"
+            ),
+        )
         n_obs = len(df)
 
         # Override with corpus-global values
@@ -1456,10 +1475,7 @@ def _build_metadata_index(
     combined = pl.concat(processed, how="diagonal_relaxed")
 
     # Reorder: structural columns first, then canonical content, then the rest
-    structural = [
-        "global_row_index", "cell_id", "dataset_id",
-        "dataset_index", "local_row_index", "size_factor",
-    ]
+    structural = list(_CANONICAL_OBS_STRUCTURAL_COLUMNS)
     # Ensure all structural columns exist (fill missing with null)
     for col in structural:
         if col not in combined.columns:
@@ -1471,13 +1487,7 @@ def _build_metadata_index(
     combined = _normalize_canonical_obs_dtypes(combined)
 
     # Canonical content columns (may or may not all be present)
-    _canonical_content = [
-        "perturb_label", "perturb_type", "dose", "dose_unit",
-        "timepoint", "timepoint_unit", "cell_context", "cell_line_or_type",
-        "species", "tissue", "assay", "condition", "batch_id",
-        "donor_id", "sex", "disease_state",
-    ]
-    content_cols = [c for c in _canonical_content if c in combined.columns]
+    content_cols = [c for c in _CANONICAL_OBS_CONTENT_COLUMNS if c in combined.columns]
 
     # Everything else (extensible / raw_ columns)
     existing = set(combined.columns)

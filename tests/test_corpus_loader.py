@@ -178,6 +178,17 @@ def _make_obs_df(
     return pl.DataFrame(rows)
 
 
+def _rewrite_canonical_obs_columns(
+    corpus_root: Path,
+    dataset_id: str,
+    transform: Any,
+) -> None:
+    obs_path = corpus_root / "meta" / dataset_id / "canonical_meta" / "canonical-obs.parquet"
+    frame = pl.read_parquet(obs_path)
+    updated = transform(frame)
+    updated.write_parquet(obs_path)
+
+
 def _make_var_df(dataset_id: str, n_genes: int) -> pl.DataFrame:
     """Create a canonical-var DataFrame for testing."""
     rows = []
@@ -1059,6 +1070,85 @@ class TestLoadCorpusAggregate:
         assert np.issubdtype(taken["dataset_index"].dtype, np.integer)
         assert np.issubdtype(taken["size_factor"].dtype, np.floating)
         assert taken["dose"] == (None, None)
+
+    def test_load_corpus_projects_canonical_core_columns_only_by_default(
+        self, tmp_path: Path,
+    ) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        _rewrite_canonical_obs_columns(
+            tmp_path,
+            "mock_00",
+            lambda frame: frame.with_columns(
+                pl.Series("qc_bucket", ["pass"] * len(frame)),
+            ),
+        )
+        _rewrite_canonical_obs_columns(
+            tmp_path,
+            "mock_01",
+            lambda frame: frame.with_columns(
+                pl.Series("qc_bucket", ["review"] * len(frame)),
+            ),
+        )
+
+        corpus = load_corpus(str(tmp_path))
+
+        assert "qc_bucket" not in corpus.metadata_index.df.columns
+        assert "perturb_label" in corpus.metadata_index.df.columns
+
+    def test_load_corpus_can_load_explicit_extra_metadata_columns(
+        self, tmp_path: Path,
+    ) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        _rewrite_canonical_obs_columns(
+            tmp_path,
+            "mock_00",
+            lambda frame: frame.with_columns(
+                pl.Series("qc_bucket", [f"qc_{idx}" for idx in range(len(frame))]),
+            ),
+        )
+        _rewrite_canonical_obs_columns(
+            tmp_path,
+            "mock_01",
+            lambda frame: frame.with_columns(
+                pl.Series("qc_bucket", [f"qc_{idx}" for idx in range(len(frame))]),
+            ),
+        )
+
+        corpus = load_corpus(
+            str(tmp_path),
+            extra_metadata_columns=["qc_bucket"],
+        )
+
+        assert "qc_bucket" in corpus.metadata_index.df.columns
+        taken = corpus.take_metadata([0, 10], columns=["qc_bucket"])
+        assert taken["qc_bucket"] == ("qc_0", "qc_0")
+
+    def test_load_corpus_rejects_missing_requested_extra_metadata_column(
+        self, tmp_path: Path,
+    ) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+
+        with pytest.raises(
+            ValueError,
+            match="missing requested extra metadata columns: 'qc_bucket'",
+        ):
+            load_corpus(str(tmp_path), extra_metadata_columns=["qc_bucket"])
+
+    def test_load_corpus_keeps_old_corpora_missing_canonical_columns_loadable(
+        self, tmp_path: Path,
+    ) -> None:
+        _build_mock_aggregate_corpus(tmp_path)
+        _rewrite_canonical_obs_columns(
+            tmp_path,
+            "mock_00",
+            lambda frame: frame.drop("condition"),
+        )
+
+        corpus = load_corpus(str(tmp_path))
+
+        assert "condition" in corpus.metadata_index.df.columns
+        assert corpus.take_metadata([0], columns=["condition"])["condition"] == (None,)
+        assert corpus.take_metadata([10], columns=["condition"])["condition"] == ("NA",)
 
     def test_global_row_indices_contiguous(self, tmp_path: Path) -> None:
         """Global row indices are 0..N-1 contiguous."""
