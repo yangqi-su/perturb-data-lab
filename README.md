@@ -51,6 +51,7 @@ perturb-data-lab/
 - `docs/v0-onboarding-workflow.md`: current inspect → materialize → draft-schema → finalize-schema → canonicalize → load workflow
 - `docs/canonicalization_handbook.md`: canonical schema review rules, transform behavior, tokenizer notes, and common failure modes
 - `docs/perttf_marson_xorion_adapter_smoke.md`: user-facing handoff notes for the pertTF-local adapter smoke path
+- `docs/anndata_scanpy_handoff.md`: counts-only AnnData extraction, deterministic subsampling, Scanpy handoff, and IncrementalPCA examples
 - `docs/v0-default-backend-decision.md`: current backend policy and default/experimental guidance
 - `tests/`: focused regression and runtime smoke coverage
 
@@ -362,14 +363,85 @@ de = rank_genes_ttest(
   provenance sidecars.
 - `calculate_hvgs(...)` returns a ranked per-dataset HVG frame that can be fed
   into `run_pca(..., hvg_frame=...)`.
-- `run_pca(...)` currently exposes uncentered sparse `method="truncated_svd"`
-  semantics while keeping a PCA-like public API.
+- `run_pca(...)` supports default uncentered sparse `method="truncated_svd"`
+  plus centered `method="incremental_pca"` for bounded dense batches when
+  `scikit-learn` is installed (for example via `pip install ".[pca]"`).
 - `rank_genes_ttest(...)` runs streamed per-dataset Welch DE against an
   explicit control label and writes top-k `ttest-degs.parquet` artifacts when
   `output_dir` is set.
 - Write generated `pp` outputs only to repo-local real directories such as
   `./artifacts/pp`, never into the protected `data/`, `pertTF/`, or
   `perturb/` symlink roots.
+
+## Counts-only AnnData handoff and bounded PCA
+
+```python
+from perturb_data_lab.loaders import load_corpus, select_obs_indices
+from perturb_data_lab.pp import calculate_hvgs, run_pca
+
+corpus = load_corpus(
+    "/path/to/corpus",
+    extra_metadata_columns=["donor_id"],
+)
+
+estimate = corpus.to_anndata(
+    dataset_id="replogle_k562",
+    obs_columns=["perturb_label", "donor_id"],
+    dry_run=True,
+    max_memory_bytes=8_000_000_000,
+    on_exceed="warn",
+)
+
+fit_selection = select_obs_indices(
+    corpus,
+    dataset_id="replogle_k562",
+    strategy="balanced",
+    max_cells=20_000,
+    stratify_by=["perturb_label"],
+    max_per_group=500,
+    seed=7,
+)
+
+adata = corpus.to_anndata(
+    dataset_id="replogle_k562",
+    row_indices=fit_selection.row_indices,
+    obs_columns=["perturb_label", "donor_id"],
+)
+
+hvg_frame = calculate_hvgs(corpus, dataset_id="replogle_k562", batch_size=1024, n_hvg=2000)
+pca = run_pca(
+    corpus,
+    dataset_id="replogle_k562",
+    method="incremental_pca",
+    batch_size=1024,
+    n_components=50,
+    hvg_frame=hvg_frame,
+    fit_row_indices=fit_selection.row_indices,
+    max_dense_batch_bytes=2_000_000_000,
+    output_dir="./artifacts/pp/replogle-ipca",
+    overwrite=True,
+)
+```
+
+- `corpus.to_anndata(...)` is eager per-dataset in-memory extraction; run
+  `dry_run=True` first and set `max_memory_bytes` before materializing large
+  selections.
+- The exported `AnnData` is counts-only: `adata.X` is CSR raw counts and the
+  corpus runtime does not create normalized or log-transformed `.layers`.
+- Use `corpus.select_obs_indices(...)` or `select_obs_indices(corpus, ...)`
+  for deterministic `random`, `stratified`, or `balanced` row subsets that can
+  feed both `to_anndata(...)` and `run_pca(...)`.
+- `run_pca(method="incremental_pca")` is the bounded-memory centered PCA route;
+  use corpus-native streamed `pp` helpers when you want to stay on-disk rather
+  than handing a subset to Scanpy.
+- Scanpy remains user-managed rather than a core dependency; install and call it
+  after AnnData construction in your analysis environment.
+- Keep generated outputs in repo-local real directories such as
+  `./artifacts/pp/...`; never write them under `data/`, `pertTF/`, or
+  `perturb/`.
+
+See `docs/anndata_scanpy_handoff.md` for focused dry-run, subsampling, Scanpy,
+and IncrementalPCA examples.
 
 ## Migration note
 
