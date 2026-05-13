@@ -7,6 +7,7 @@ evolve without modifying the external ``pertTF`` repository.
 from .perttf import (
     CategoricalLabelMap,
     PertTFAdapterConfig,
+    PertTFNullLabelFilterStats,
     PertTFPairedBatchLoader,
     PertTFPairedBatchBuilder,
     PerturbationPairBatch,
@@ -19,6 +20,7 @@ from .perttf import (
 __all__ = [
     "CategoricalLabelMap",
     "PertTFAdapterConfig",
+    "PertTFNullLabelFilterStats",
     "PertTFPairedBatchLoader",
     "PertTFPairedBatchBuilder",
     "PerturbationPairBatch",

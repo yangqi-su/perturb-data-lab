@@ -633,6 +633,7 @@ def _build_public_pair_loader(
     drop_last: bool = True,
     config: PertTFAdapterConfig | None = None,
     adapter: PertTFCorpusAdapter | None = None,
+    row_indices=None,
     source_indices=None,
     target_candidate_indices=None,
 ):
@@ -643,6 +644,7 @@ def _build_public_pair_loader(
         seq_len=seq_len,
         config=resolved_config,
         adapter=adapter,
+        row_indices=row_indices,
         seed=seed,
         drop_last=drop_last,
         source_indices=source_indices,
@@ -813,7 +815,7 @@ def test_public_paired_batch_loader_omits_full_expression_fields_by_default(
     assert "full_expr_next_mask" not in batch
 
 
-def test_public_paired_batch_loader_supports_restricted_row_pool_with_null_labels(
+def test_public_paired_batch_loader_drops_null_rows_and_defaults_row_indices_pool(
     tmp_path: Path,
 ) -> None:
     corpus_path = _build_small_pair_corpus(tmp_path)
@@ -824,13 +826,42 @@ def test_public_paired_batch_loader_supports_restricted_row_pool_with_null_label
     frame.write_parquet(obs_path)
 
     corpus = load_corpus(str(corpus_path))
-    restricted_rows = np.asarray([1], dtype=np.int64)
     config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
-    adapter = PertTFCorpusAdapter.from_corpus(
-        corpus,
-        config,
-        row_indices=restricted_rows,
-    )
+    with pytest.warns(
+        RuntimeWarning,
+        match="PertTFPairedBatchLoader dropped 1 of 2 rows with null required pertTF labels",
+    ):
+        loader = _build_public_pair_loader(
+            corpus,
+            batch_size=1,
+            seq_len=3,
+            seed=7,
+            num_workers=0,
+            multiprocessing_context=None,
+            drop_last=False,
+            config=config,
+            row_indices=np.asarray([0, 1], dtype=np.int64),
+        )
+
+    batch = next(iter(loader))
+
+    assert batch["index"].tolist() == [1]
+    assert batch["next_index"].tolist() == [1]
+    assert loader.effective_label_row_indices.tolist() == [1]
+    assert loader.effective_source_indices.tolist() == [1]
+    assert loader.effective_target_candidate_indices.tolist() == [1]
+    assert loader.null_label_filter_stats.dropped_row_count == 1
+    assert loader.null_label_filter_stats.per_column_null_counts == {
+        "cell_context": 0,
+        "perturb_label": 1,
+        "batch_id": 0,
+    }
+
+
+def test_public_paired_batch_loader_explicit_pools_override_row_indices(
+    tmp_path: Path,
+) -> None:
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
     loader = _build_public_pair_loader(
         corpus,
         batch_size=1,
@@ -839,18 +870,18 @@ def test_public_paired_batch_loader_supports_restricted_row_pool_with_null_label
         num_workers=0,
         multiprocessing_context=None,
         drop_last=False,
-        config=config,
-        adapter=adapter,
-        source_indices=restricted_rows,
-        target_candidate_indices=restricted_rows,
+        row_indices=np.asarray([0], dtype=np.int64),
+        source_indices=np.asarray([1], dtype=np.int64),
+        target_candidate_indices=np.asarray([1], dtype=np.int64),
     )
 
     batch = next(iter(loader))
 
     assert batch["index"].tolist() == [1]
     assert batch["next_index"].tolist() == [1]
-    assert loader.pair_sampler._source_indices.tolist() == [1]
-    assert loader.pair_sampler._target_candidate_indices.tolist() == [1]
+    assert loader.row_indices.tolist() == [0]
+    assert loader.effective_source_indices.tolist() == [1]
+    assert loader.effective_target_candidate_indices.tolist() == [1]
 
 
 def test_pair_read_dataloader_supports_spawn_workers(tmp_path: Path) -> None:

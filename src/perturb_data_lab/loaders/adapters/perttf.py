@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CategoricalLabelMap",
     "PertTFAdapterConfig",
+    "PertTFNullLabelFilterStats",
     "PertTFPairedBatchLoader",
     "PertTFPairedBatchBuilder",
     "PerturbationPairBatch",
@@ -39,6 +40,27 @@ __all__ = [
 
 
 _DEFAULT_SPECIAL_TOKENS: tuple[str, ...] = ("<pad>", "<cls>", "<unk>", "<eos>")
+
+
+@dataclass(frozen=True)
+class PertTFNullLabelFilterStats:
+    """Compact summary of required-label null filtering."""
+
+    policy: str
+    required_columns: tuple[str, ...]
+    checked_row_count: int
+    kept_row_count: int
+    dropped_row_count: int
+    per_column_null_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class _PertTFNullLabelSelection:
+    """Resolved row subset after required-label null handling."""
+
+    candidate_row_indices: np.ndarray
+    effective_row_indices: np.ndarray
+    stats: PertTFNullLabelFilterStats
 
 
 def _normalize_label(value: Any, *, column: str) -> str:
@@ -98,8 +120,14 @@ class PertTFAdapterConfig:
     ps_width: int = 1
     include_full_expr: bool = False
     full_expr_mode: str = "union_padded"
+    null_label_policy: str = "drop"
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "null_label_policy",
+            _normalize_null_label_policy(self.null_label_policy),
+        )
         if len(set(self.special_tokens)) != len(self.special_tokens):
             raise ValueError("special_tokens must be unique")
         for token_name, token_value in (
@@ -118,6 +146,122 @@ class PertTFAdapterConfig:
             raise ValueError("ps_width must be positive")
         if self.full_expr_mode != "union_padded":
             raise ValueError("full_expr_mode must be 'union_padded'")
+
+
+def _normalize_null_label_policy(policy: str) -> str:
+    normalized = str(policy).strip().lower()
+    if normalized == "strict":
+        normalized = "error"
+    if normalized not in {"drop", "error"}:
+        raise ValueError("null_label_policy must be 'drop', 'error', or 'strict'")
+    return normalized
+
+
+def _required_label_columns(config: PertTFAdapterConfig) -> tuple[str, ...]:
+    return (
+        config.cell_context_column,
+        config.perturbation_column,
+        config.batch_column,
+    )
+
+
+def _format_null_label_counts(stats: PertTFNullLabelFilterStats) -> str:
+    nonzero_counts = [
+        f"{column}={count}"
+        for column, count in stats.per_column_null_counts.items()
+        if count > 0
+    ]
+    if not nonzero_counts:
+        return "none"
+    return ", ".join(nonzero_counts)
+
+
+def _format_null_label_policy_message(
+    warning_owner: str,
+    stats: PertTFNullLabelFilterStats,
+) -> str:
+    counts = _format_null_label_counts(stats)
+    if stats.policy == "drop":
+        return (
+            f"{warning_owner} dropped {stats.dropped_row_count} of "
+            f"{stats.checked_row_count} rows with null required pertTF labels "
+            f"({counts})"
+        )
+    return (
+        f"{warning_owner} found null required pertTF labels in "
+        f"{stats.dropped_row_count} of {stats.checked_row_count} rows while "
+        "null_label_policy='error' "
+        f"({counts})"
+    )
+
+
+def _select_non_null_label_rows(
+    metadata_index: MetadataIndex,
+    *,
+    config: PertTFAdapterConfig,
+    row_indices: Sequence[int] | np.ndarray | None,
+    warning_owner: str,
+    emit_warning: bool,
+    warning_stacklevel: int,
+) -> _PertTFNullLabelSelection:
+    candidate_row_indices = _normalize_candidate_row_indices(metadata_index, row_indices)
+    if candidate_row_indices is None:
+        candidate_row_indices = np.arange(len(metadata_index), dtype=np.int64)
+    else:
+        candidate_row_indices = candidate_row_indices.copy()
+
+    required_columns = _required_label_columns(config)
+    missing_columns = [
+        column for column in required_columns if column not in metadata_index.df.columns
+    ]
+    if missing_columns:
+        missing_list = ", ".join(repr(column) for column in missing_columns)
+        raise ValueError(f"metadata_index is missing required column(s): {missing_list}")
+
+    selected_metadata = metadata_index.take(
+        candidate_row_indices,
+        columns=list(required_columns),
+    )
+    null_mask = np.zeros(candidate_row_indices.size, dtype=bool)
+    per_column_null_counts: dict[str, int] = {}
+    for column in required_columns:
+        values = selected_metadata[column]
+        column_null_mask = np.fromiter(
+            (value is None for value in values),
+            dtype=bool,
+            count=candidate_row_indices.size,
+        )
+        per_column_null_counts[column] = int(np.count_nonzero(column_null_mask))
+        null_mask |= column_null_mask
+
+    dropped_row_count = int(np.count_nonzero(null_mask))
+    effective_row_indices = candidate_row_indices[~null_mask].copy()
+    stats = PertTFNullLabelFilterStats(
+        policy=config.null_label_policy,
+        required_columns=required_columns,
+        checked_row_count=int(candidate_row_indices.size),
+        kept_row_count=int(effective_row_indices.size),
+        dropped_row_count=dropped_row_count,
+        per_column_null_counts=per_column_null_counts,
+    )
+    if dropped_row_count > 0:
+        message = _format_null_label_policy_message(warning_owner, stats)
+        if config.null_label_policy == "error":
+            raise ValueError(message)
+        if emit_warning:
+            warnings.warn(message, RuntimeWarning, stacklevel=warning_stacklevel)
+    return _PertTFNullLabelSelection(
+        candidate_row_indices=candidate_row_indices,
+        effective_row_indices=effective_row_indices,
+        stats=stats,
+    )
+
+
+def _raise_empty_effective_rows(warning_owner: str, pool_name: str) -> None:
+    raise ValueError(
+        f"{warning_owner} resolved no usable {pool_name} after dropping rows with "
+        "null required pertTF labels"
+    )
 
 
 class CategoricalLabelMap:
@@ -316,6 +460,7 @@ class PertTFLabelAdapter:
     cell_context: CategoricalLabelMap
     perturbation: CategoricalLabelMap
     batch: CategoricalLabelMap
+    null_label_filter_stats: PertTFNullLabelFilterStats | None = None
 
     @classmethod
     def from_metadata_index(
@@ -323,10 +468,24 @@ class PertTFLabelAdapter:
         metadata_index: MetadataIndex,
         config: PertTFAdapterConfig | None = None,
         row_indices: Sequence[int] | np.ndarray | None = None,
+        *,
+        _emit_null_label_warning: bool = True,
+        _null_label_warning_owner: str = "PertTFLabelAdapter",
+        _null_label_warning_stacklevel: int = 3,
     ) -> "PertTFLabelAdapter":
         resolved = config or PertTFAdapterConfig()
         unknown_label = resolved.unknown_label
         append_unknown = (unknown_label,) if unknown_label is not None else ()
+        selection = _select_non_null_label_rows(
+            metadata_index,
+            config=resolved,
+            row_indices=row_indices,
+            warning_owner=_null_label_warning_owner,
+            emit_warning=_emit_null_label_warning,
+            warning_stacklevel=_null_label_warning_stacklevel,
+        )
+        if selection.effective_row_indices.size == 0:
+            _raise_empty_effective_rows(_null_label_warning_owner, "label row pool")
         return cls(
             config=resolved,
             cell_context=CategoricalLabelMap.from_metadata_column(
@@ -335,7 +494,7 @@ class PertTFLabelAdapter:
                 column=resolved.cell_context_column,
                 append_labels=append_unknown,
                 unknown_label=unknown_label,
-                row_indices=row_indices,
+                row_indices=selection.effective_row_indices,
             ),
             perturbation=CategoricalLabelMap.from_metadata_column(
                 metadata_index,
@@ -344,7 +503,7 @@ class PertTFLabelAdapter:
                 prepend_labels=resolved.control_labels,
                 append_labels=append_unknown,
                 unknown_label=unknown_label,
-                row_indices=row_indices,
+                row_indices=selection.effective_row_indices,
             ),
             batch=CategoricalLabelMap.from_metadata_column(
                 metadata_index,
@@ -352,8 +511,9 @@ class PertTFLabelAdapter:
                 column=resolved.batch_column,
                 append_labels=append_unknown,
                 unknown_label=unknown_label,
-                row_indices=row_indices,
+                row_indices=selection.effective_row_indices,
             ),
+            null_label_filter_stats=selection.stats,
         )
 
     @property
@@ -430,6 +590,8 @@ class PerturbationPairSampler:
         missing_target_policy: str = "error",
         source_indices: Sequence[int] | np.ndarray | None = None,
         target_candidate_indices: Sequence[int] | np.ndarray | None = None,
+        _null_label_warning_owner: str = "PerturbationPairSampler",
+        _null_label_warning_stacklevel: int = 3,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -451,13 +613,8 @@ class PerturbationPairSampler:
             )
 
         resolved_config = config or PertTFAdapterConfig()
-        resolved_labels = label_adapter or PertTFLabelAdapter.from_metadata_index(
-            metadata_index,
-            resolved_config,
-        )
         self._meta = metadata_index
         self.config = resolved_config
-        self.labels = resolved_labels
         self.batch_size = int(batch_size)
         self.seed = int(seed)
         self.drop_last = bool(drop_last)
@@ -475,6 +632,75 @@ class PerturbationPairSampler:
         normalized_target_candidate_indices = _normalize_candidate_row_indices(
             metadata_index,
             target_candidate_indices,
+        )
+
+        self.total_rows = len(metadata_index)
+        self._all_indices = np.arange(self.total_rows, dtype=np.int64)
+        if normalized_source_indices is None:
+            candidate_source_indices = self._all_indices.copy()
+        else:
+            candidate_source_indices = normalized_source_indices
+        if normalized_target_candidate_indices is None:
+            if normalized_source_indices is None:
+                candidate_target_candidate_indices = self._all_indices.copy()
+            else:
+                candidate_target_candidate_indices = candidate_source_indices.copy()
+        else:
+            candidate_target_candidate_indices = normalized_target_candidate_indices
+        candidate_label_row_indices = np.unique(
+            np.concatenate(
+                [candidate_source_indices, candidate_target_candidate_indices]
+            ).astype(np.int64, copy=False)
+        )
+        label_row_selection = _select_non_null_label_rows(
+            metadata_index,
+            config=resolved_config,
+            row_indices=candidate_label_row_indices,
+            warning_owner=_null_label_warning_owner,
+            emit_warning=True,
+            warning_stacklevel=_null_label_warning_stacklevel,
+        )
+        source_selection = _select_non_null_label_rows(
+            metadata_index,
+            config=resolved_config,
+            row_indices=candidate_source_indices,
+            warning_owner=_null_label_warning_owner,
+            emit_warning=False,
+            warning_stacklevel=_null_label_warning_stacklevel,
+        )
+        target_selection = _select_non_null_label_rows(
+            metadata_index,
+            config=resolved_config,
+            row_indices=candidate_target_candidate_indices,
+            warning_owner=_null_label_warning_owner,
+            emit_warning=False,
+            warning_stacklevel=_null_label_warning_stacklevel,
+        )
+        if source_selection.effective_row_indices.size == 0:
+            _raise_empty_effective_rows(_null_label_warning_owner, "source row pool")
+        if target_selection.effective_row_indices.size == 0:
+            _raise_empty_effective_rows(
+                _null_label_warning_owner,
+                "target candidate row pool",
+            )
+        if label_row_selection.effective_row_indices.size == 0:
+            _raise_empty_effective_rows(_null_label_warning_owner, "label row pool")
+        resolved_labels = label_adapter or PertTFLabelAdapter.from_metadata_index(
+            metadata_index,
+            resolved_config,
+            row_indices=label_row_selection.effective_row_indices,
+            _emit_null_label_warning=False,
+            _null_label_warning_owner=_null_label_warning_owner,
+            _null_label_warning_stacklevel=_null_label_warning_stacklevel,
+        )
+        self.labels = resolved_labels
+        self.null_label_filter_stats = label_row_selection.stats
+        self.source_null_label_filter_stats = source_selection.stats
+        self.target_candidate_null_label_filter_stats = target_selection.stats
+        self.effective_label_row_indices = label_row_selection.effective_row_indices.copy()
+        self.effective_source_indices = source_selection.effective_row_indices.copy()
+        self.effective_target_candidate_indices = (
+            target_selection.effective_row_indices.copy()
         )
 
         dataset_index = metadata_index.get_column("dataset_index")
@@ -496,34 +722,15 @@ class PerturbationPairSampler:
                 f"metadata_index is missing required column {self.config.batch_column!r}"
             )
 
-        self.total_rows = len(metadata_index)
-        self._all_indices = np.arange(self.total_rows, dtype=np.int64)
-        if normalized_source_indices is None:
-            self._source_indices = self._all_indices.copy()
-        else:
-            self._source_indices = normalized_source_indices
-        if normalized_target_candidate_indices is None:
-            if normalized_source_indices is None:
-                self._target_candidate_indices = self._all_indices.copy()
-            else:
-                self._target_candidate_indices = self._source_indices.copy()
-        else:
-            self._target_candidate_indices = normalized_target_candidate_indices
+        self._source_indices = self.effective_source_indices.copy()
+        self._target_candidate_indices = self.effective_target_candidate_indices.copy()
         self._source_index_mask = np.zeros(self.total_rows, dtype=bool)
         self._source_index_mask[self._source_indices] = True
         self._target_candidate_mask = np.zeros(self.total_rows, dtype=bool)
         self._target_candidate_mask[self._target_candidate_indices] = True
         self._source_row_count = int(self._source_indices.size)
         self._dataset_index = np.asarray(dataset_index, dtype=np.int32)
-        if normalized_source_indices is None and normalized_target_candidate_indices is None:
-            relevant_indices = self._all_indices
-        else:
-            relevant_indices = np.unique(
-                np.concatenate([self._source_indices, self._target_candidate_indices]).astype(
-                    np.int64,
-                    copy=False,
-                )
-            )
+        relevant_indices = self.effective_label_row_indices.copy()
         relevant_metadata = metadata_index.take(
             relevant_indices,
             columns=[
@@ -551,11 +758,19 @@ class PerturbationPairSampler:
             _normalize_label(value, column=self.config.batch_column)
             for value in relevant_metadata[self.config.batch_column]
         )
-        relevant_context_ids = self.labels.cell_context.encode_many(relevant_context_labels)
-        relevant_perturbation_ids = self.labels.perturbation.encode_many(
-            relevant_perturbation_labels
-        )
-        relevant_batch_ids = self.labels.batch.encode_many(relevant_batch_labels)
+        try:
+            relevant_context_ids = self.labels.cell_context.encode_many(
+                relevant_context_labels
+            )
+            relevant_perturbation_ids = self.labels.perturbation.encode_many(
+                relevant_perturbation_labels
+            )
+            relevant_batch_ids = self.labels.batch.encode_many(relevant_batch_labels)
+        except KeyError as exc:
+            raise ValueError(
+                "label_adapter is missing labels required by the effective "
+                "source/target row pools"
+            ) from exc
 
         for offset, row_idx in enumerate(relevant_indices.tolist()):
             context_labels_by_row[row_idx] = relevant_context_labels[offset]
@@ -1532,6 +1747,7 @@ class PertTFCorpusAdapter:
     config: PertTFAdapterConfig
     vocab: PertTFVocabAdapter
     labels: PertTFLabelAdapter
+    null_label_filter_stats: PertTFNullLabelFilterStats | None = None
 
     @classmethod
     def from_corpus(
@@ -1539,8 +1755,22 @@ class PertTFCorpusAdapter:
         corpus: Corpus,
         config: PertTFAdapterConfig | None = None,
         row_indices: Sequence[int] | np.ndarray | None = None,
+        *,
+        _emit_null_label_warning: bool = True,
+        _null_label_warning_owner: str = "PertTFCorpusAdapter",
+        _null_label_warning_stacklevel: int = 3,
     ) -> "PertTFCorpusAdapter":
         resolved = config or PertTFAdapterConfig()
+        selection = _select_non_null_label_rows(
+            corpus.metadata_index,
+            config=resolved,
+            row_indices=row_indices,
+            warning_owner=_null_label_warning_owner,
+            emit_warning=_emit_null_label_warning,
+            warning_stacklevel=_null_label_warning_stacklevel,
+        )
+        if selection.effective_row_indices.size == 0:
+            _raise_empty_effective_rows(_null_label_warning_owner, "label row pool")
         return cls(
             config=resolved,
             vocab=PertTFVocabAdapter.from_feature_registry(
@@ -1550,8 +1780,12 @@ class PertTFCorpusAdapter:
             labels=PertTFLabelAdapter.from_metadata_index(
                 corpus.metadata_index,
                 resolved,
-                row_indices=row_indices,
+                row_indices=selection.effective_row_indices,
+                _emit_null_label_warning=False,
+                _null_label_warning_owner=_null_label_warning_owner,
+                _null_label_warning_stacklevel=_null_label_warning_stacklevel,
             ),
+            null_label_filter_stats=selection.stats,
         )
 
     def to_reference_dict(self) -> dict[str, Any]:
@@ -1574,6 +1808,7 @@ class PertTFPairedBatchLoader:
         seq_len: int,
         config: PertTFAdapterConfig | None = None,
         adapter: PertTFCorpusAdapter | None = None,
+        row_indices: Sequence[int] | np.ndarray | None = None,
         seed: int = 0,
         drop_last: bool = True,
         perturbed_target_policy: str = "self_to_control_label",
@@ -1592,26 +1827,61 @@ class PertTFPairedBatchLoader:
         device: torch.device | str | None = "cpu",
     ) -> None:
         self.corpus = corpus
-        self._builder = PertTFPairedBatchBuilder(
-            corpus,
-            seq_len=seq_len,
-            config=config,
-            adapter=adapter,
-            device=device,
+        resolved_config = adapter.config if adapter is not None else (config or PertTFAdapterConfig())
+        normalized_row_indices = _normalize_candidate_row_indices(
+            corpus.metadata_index,
+            row_indices,
         )
-        self.adapter = self._builder.adapter
-        self.config = self._builder.config
+        resolved_source_indices = source_indices
+        if resolved_source_indices is None and normalized_row_indices is not None:
+            resolved_source_indices = normalized_row_indices.copy()
+        resolved_target_candidate_indices = target_candidate_indices
+        if resolved_target_candidate_indices is None:
+            resolved_target_candidate_indices = resolved_source_indices
         self.pair_sampler = PerturbationPairSampler(
             corpus.metadata_index,
             batch_size=batch_size,
-            config=self.config,
-            label_adapter=self.adapter.labels,
+            config=resolved_config,
+            label_adapter=None if adapter is None else adapter.labels,
             seed=seed,
             drop_last=drop_last,
             perturbed_target_policy=perturbed_target_policy,
             missing_target_policy=missing_target_policy,
-            source_indices=source_indices,
-            target_candidate_indices=target_candidate_indices,
+            source_indices=resolved_source_indices,
+            target_candidate_indices=resolved_target_candidate_indices,
+            _null_label_warning_owner="PertTFPairedBatchLoader",
+            _null_label_warning_stacklevel=4,
+        )
+        resolved_adapter = adapter
+        if resolved_adapter is None:
+            resolved_adapter = PertTFCorpusAdapter(
+                config=resolved_config,
+                vocab=PertTFVocabAdapter.from_feature_registry(
+                    corpus.feature_registry,
+                    special_tokens=resolved_config.special_tokens,
+                ),
+                labels=self.pair_sampler.labels,
+                null_label_filter_stats=self.pair_sampler.null_label_filter_stats,
+            )
+        self._builder = PertTFPairedBatchBuilder(
+            corpus,
+            seq_len=seq_len,
+            config=resolved_config,
+            adapter=resolved_adapter,
+            device=device,
+        )
+        self.adapter = self._builder.adapter
+        self.config = self._builder.config
+        self.row_indices = None if normalized_row_indices is None else normalized_row_indices.copy()
+        self.effective_label_row_indices = self.pair_sampler.effective_label_row_indices.copy()
+        self.effective_source_indices = self.pair_sampler.effective_source_indices.copy()
+        self.effective_target_candidate_indices = (
+            self.pair_sampler.effective_target_candidate_indices.copy()
+        )
+        self.null_label_filter_stats = self.pair_sampler.null_label_filter_stats
+        self.source_null_label_filter_stats = self.pair_sampler.source_null_label_filter_stats
+        self.target_candidate_null_label_filter_stats = (
+            self.pair_sampler.target_candidate_null_label_filter_stats
         )
         self._request_sampler = _PertTFPairReadBatchSampler(self.pair_sampler)
         self._dataset = _PertTFPairExpressionDataset(
