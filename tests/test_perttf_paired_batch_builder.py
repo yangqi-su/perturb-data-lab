@@ -4,6 +4,7 @@ import lance
 import numpy as np
 import polars as pl
 import pyarrow as pa
+import pytest
 import torch
 import yaml
 
@@ -362,3 +363,85 @@ def test_paired_batch_builder_emits_union_full_expression_masks_for_mixed_datase
     assert batch["full_expr_mask"][1].tolist() == [True, False, True, True]
     assert batch["full_expr_next"][1].tolist() == [float(config.cls_value), 0.0, 0.0, 7.0]
     assert batch["full_expr_next_mask"][1].tolist() == [True, False, True, True]
+
+
+def test_build_from_raw_pair_batch_matches_inspect_batch_path(
+    tmp_path: Path,
+) -> None:
+    config = PertTFAdapterConfig(
+        control_labels=("WT",),
+        mask_ratio=0.0,
+        include_full_expr=True,
+    )
+    corpus = load_corpus(str(_build_mixed_union_pair_corpus(tmp_path)))
+    pair_batch = PerturbationPairSampler(
+        corpus.metadata_index,
+        batch_size=2,
+        config=config,
+        seed=19,
+    ).pair_source_indices([0, 2], seed=23)
+    builder = PertTFPairedBatchBuilder(corpus, seq_len=2, config=config)
+
+    source_raw = corpus.inspect_batch(pair_batch.source_indices)
+    target_raw = corpus.inspect_batch(pair_batch.target_indices)
+
+    inspect_batch_output = builder.build_paired_batch(
+        pair_batch,
+        seed=29,
+        sampling_mode="hvg",
+        hvg_weight=4.0,
+        hvg_top_k=1,
+    )
+    raw_batch_output = builder.build_from_raw_pair_batch(
+        pair_batch,
+        source_raw,
+        target_raw,
+        seed=29,
+        sampling_mode="hvg",
+        hvg_weight=4.0,
+        hvg_top_k=1,
+    )
+
+    assert inspect_batch_output.keys() == raw_batch_output.keys()
+    for key in inspect_batch_output:
+        torch.testing.assert_close(inspect_batch_output[key], raw_batch_output[key])
+
+
+def test_build_from_raw_pair_batch_rejects_batch_size_mismatch(
+    tmp_path: Path,
+) -> None:
+    config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    pair_batch = PerturbationPairSampler(
+        corpus.metadata_index,
+        batch_size=2,
+        config=config,
+        seed=7,
+    ).pair_source_indices([0, 1], seed=11)
+    builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
+
+    source_raw = corpus.inspect_batch([int(pair_batch.source_indices[0])])
+    target_raw = corpus.inspect_batch(pair_batch.target_indices)
+
+    with pytest.raises(ValueError, match="source_raw batch_size"):
+        builder.build_from_raw_pair_batch(pair_batch, source_raw, target_raw)
+
+
+def test_build_from_raw_pair_batch_rejects_row_order_mismatch(
+    tmp_path: Path,
+) -> None:
+    config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    pair_batch = PerturbationPairSampler(
+        corpus.metadata_index,
+        batch_size=2,
+        config=config,
+        seed=7,
+    ).pair_source_indices([0, 1], seed=11)
+    builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
+
+    source_raw = corpus.inspect_batch(pair_batch.source_indices[::-1])
+    target_raw = corpus.inspect_batch(pair_batch.target_indices)
+
+    with pytest.raises(ValueError, match="source_raw global_row_index"):
+        builder.build_from_raw_pair_batch(pair_batch, source_raw, target_raw)

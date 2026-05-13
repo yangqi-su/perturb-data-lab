@@ -738,10 +738,47 @@ class PertTFPairedBatchBuilder:
         hvg_weight: float = 3.0,
         hvg_top_k: int | None = None,
     ) -> dict[str, torch.Tensor]:
-        self._validate_pair_batch(pair_batch)
-
         source_raw = self.corpus.inspect_batch(pair_batch.source_indices)
         target_raw = self.corpus.inspect_batch(pair_batch.target_indices)
+
+        return self.build_from_raw_pair_batch(
+            pair_batch,
+            source_raw,
+            target_raw,
+            seed=seed,
+            sampled_gene_ids=sampled_gene_ids,
+            sampling_mode=sampling_mode,
+            expressed_weight=expressed_weight,
+            hvg_weight=hvg_weight,
+            hvg_top_k=hvg_top_k,
+        )
+
+    def build_from_raw_pair_batch(
+        self,
+        pair_batch: PerturbationPairBatch,
+        source_raw: dict[str, Any],
+        target_raw: dict[str, Any],
+        *,
+        seed: int | None = None,
+        sampled_gene_ids: torch.Tensor | None = None,
+        sampling_mode: str = "hvg",
+        expressed_weight: float = 3.0,
+        hvg_weight: float = 3.0,
+        hvg_top_k: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        self._validate_pair_batch(pair_batch)
+        self._validate_raw_batch_alignment(
+            "source_raw",
+            source_raw,
+            expected_indices=pair_batch.source_indices,
+            expected_dataset_indices=pair_batch.source_dataset_indices,
+        )
+        self._validate_raw_batch_alignment(
+            "target_raw",
+            target_raw,
+            expected_indices=pair_batch.target_indices,
+            expected_dataset_indices=pair_batch.target_dataset_indices,
+        )
 
         source_processed = self._pipeline.process_batch(
             source_raw,
@@ -871,6 +908,58 @@ class PertTFPairedBatchBuilder:
             pair_batch.target_cell_context_ids,
         ):
             raise ValueError("pair_batch must preserve same-context pairing")
+
+    def _validate_raw_batch_alignment(
+        self,
+        name: str,
+        raw_batch: dict[str, Any],
+        *,
+        expected_indices: np.ndarray,
+        expected_dataset_indices: np.ndarray,
+    ) -> None:
+        batch_size = int(raw_batch.get("batch_size", -1))
+        expected_size = int(expected_indices.shape[0])
+        if batch_size != expected_size:
+            raise ValueError(
+                f"{name} batch_size {batch_size} does not match paired batch size {expected_size}"
+            )
+
+        raw_indices = self._raw_batch_numpy(raw_batch, "global_row_index", dtype=np.int64)
+        if raw_indices.shape != expected_indices.shape or not np.array_equal(
+            raw_indices,
+            expected_indices,
+        ):
+            raise ValueError(
+                f"{name} global_row_index does not match pair_batch ordering"
+            )
+
+        raw_dataset_indices = self._raw_batch_numpy(
+            raw_batch,
+            "dataset_index",
+            dtype=np.int64,
+        )
+        expected_dataset_indices64 = np.asarray(expected_dataset_indices, dtype=np.int64)
+        if (
+            raw_dataset_indices.shape != expected_dataset_indices64.shape
+            or not np.array_equal(raw_dataset_indices, expected_dataset_indices64)
+        ):
+            raise ValueError(
+                f"{name} dataset_index does not match pair_batch dataset routing"
+            )
+
+    def _raw_batch_numpy(
+        self,
+        raw_batch: dict[str, Any],
+        key: str,
+        *,
+        dtype: Any,
+    ) -> np.ndarray:
+        if key not in raw_batch:
+            raise KeyError(f"raw batch is missing required key {key!r}")
+        values = raw_batch[key]
+        if isinstance(values, torch.Tensor):
+            return values.detach().cpu().numpy().astype(dtype, copy=False)
+        return np.asarray(values, dtype=dtype)
 
     def _torch_generator(self, seed: int | None) -> torch.Generator | None:
         if seed is None:
