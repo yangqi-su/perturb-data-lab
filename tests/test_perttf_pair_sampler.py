@@ -109,6 +109,92 @@ def test_warn_skip_policy_drops_unpairable_sources_with_warning() -> None:
     np.testing.assert_array_equal(batch.target_indices, np.asarray([5], dtype=np.int64))
 
 
+def test_target_candidate_indices_require_source_indices() -> None:
+    with pytest.raises(ValueError, match="target_candidate_indices requires source_indices"):
+        PerturbationPairSampler(
+            _build_metadata_index(),
+            batch_size=2,
+            config=PertTFAdapterConfig(control_labels=("WT",)),
+            target_candidate_indices=[0, 1],
+        )
+
+
+def test_source_only_subset_restricts_iteration_and_targets() -> None:
+    source_pool = [0, 1, 5, 6]
+    sampler = PerturbationPairSampler(
+        _build_metadata_index(),
+        batch_size=2,
+        config=PertTFAdapterConfig(control_labels=("WT",)),
+        source_indices=source_pool,
+        seed=29,
+        drop_last=False,
+    )
+
+    batches = list(sampler)
+
+    sampled_sources = sorted(
+        int(index)
+        for batch in batches
+        for index in batch.source_indices.tolist()
+    )
+    assert sampled_sources == source_pool
+    for batch in batches:
+        assert set(batch.source_indices.tolist()).issubset(source_pool)
+        assert set(batch.target_indices.tolist()).issubset(source_pool)
+        assert batch.source_dataset_indices.tolist() == batch.target_dataset_indices.tolist()
+        assert batch.source_cell_context_labels == batch.target_cell_context_labels
+
+
+def test_pair_source_indices_rejects_rows_outside_configured_source_pool() -> None:
+    sampler = PerturbationPairSampler(
+        _build_metadata_index(),
+        batch_size=2,
+        config=PertTFAdapterConfig(control_labels=("WT",)),
+        source_indices=[0, 1, 5, 6],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="configured source_indices pool",
+    ):
+        sampler.pair_source_indices([2])
+
+
+def test_asymmetric_target_candidate_pool_preserves_pairing_invariants() -> None:
+    sampler = PerturbationPairSampler(
+        _build_metadata_index(),
+        batch_size=3,
+        config=PertTFAdapterConfig(control_labels=("WT",)),
+        source_indices=[0, 3, 6],
+        target_candidate_indices=[2, 4, 5],
+        perturbed_target_policy="matched_control_cell",
+        seed=13,
+    )
+
+    batch = sampler.pair_source_indices([0, 3, 6], seed=19)
+
+    np.testing.assert_array_equal(batch.target_indices, np.asarray([2, 4, 5], dtype=np.int64))
+    assert set(batch.target_indices.tolist()).issubset({2, 4, 5})
+    assert batch.source_dataset_indices.tolist() == batch.target_dataset_indices.tolist()
+    assert batch.source_cell_context_labels == batch.target_cell_context_labels
+
+
+def test_restricted_target_pool_can_make_source_unpairable() -> None:
+    sampler = PerturbationPairSampler(
+        _build_metadata_index(),
+        batch_size=1,
+        config=PertTFAdapterConfig(control_labels=("WT",)),
+        source_indices=[6],
+        target_candidate_indices=[5],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="configured target pool",
+    ):
+        sampler.pair_source_indices([6])
+
+
 def test_sampler_iteration_is_seed_deterministic_and_preserves_pairing_invariants() -> None:
     config = PertTFAdapterConfig(control_labels=("WT",))
     sampler_a = PerturbationPairSampler(

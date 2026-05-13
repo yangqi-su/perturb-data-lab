@@ -19,6 +19,7 @@ import torch
 from ..feature_registry import FeatureRegistry
 from ..gpu_pipeline import GPUSparsePipeline
 from ..index import MetadataIndex
+from ..loaders import _normalize_candidate_row_indices
 
 if TYPE_CHECKING:
     from ..corpus_loader import Corpus
@@ -358,7 +359,12 @@ class PerturbationPairBatch:
 
 
 class PerturbationPairSampler:
-    """Sample same-dataset/context source-target perturbation pairs."""
+    """Sample same-dataset/context source-target perturbation pairs.
+
+    Optional source and target candidate pools let callers restrict which
+    corpus-global rows can appear as sampled sources and paired targets while
+    preserving the existing same-dataset and same-context pairing invariants.
+    """
 
     def __init__(
         self,
@@ -371,6 +377,8 @@ class PerturbationPairSampler:
         drop_last: bool = True,
         perturbed_target_policy: str = "self_to_control_label",
         missing_target_policy: str = "error",
+        source_indices: Sequence[int] | np.ndarray | None = None,
+        target_candidate_indices: Sequence[int] | np.ndarray | None = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -385,6 +393,10 @@ class PerturbationPairSampler:
         if missing_target_policy not in {"error", "warn_skip"}:
             raise ValueError(
                 "missing_target_policy must be 'error' or 'warn_skip'"
+            )
+        if source_indices is None and target_candidate_indices is not None:
+            raise ValueError(
+                "target_candidate_indices requires source_indices"
             )
 
         resolved_config = config or PertTFAdapterConfig()
@@ -405,6 +417,14 @@ class PerturbationPairSampler:
         self._control_label_set = frozenset(self._control_labels)
         if not self._control_labels:
             raise ValueError("control_labels must contain at least one label")
+        normalized_source_indices = _normalize_candidate_row_indices(
+            metadata_index,
+            source_indices,
+        )
+        normalized_target_candidate_indices = _normalize_candidate_row_indices(
+            metadata_index,
+            target_candidate_indices,
+        )
 
         dataset_index = metadata_index.get_column("dataset_index")
         context_labels = metadata_index.get_column(self.config.cell_context_column)
@@ -427,6 +447,22 @@ class PerturbationPairSampler:
 
         self.total_rows = len(metadata_index)
         self._all_indices = np.arange(self.total_rows, dtype=np.int64)
+        if normalized_source_indices is None:
+            self._source_indices = self._all_indices.copy()
+        else:
+            self._source_indices = normalized_source_indices
+        if normalized_target_candidate_indices is None:
+            if normalized_source_indices is None:
+                self._target_candidate_indices = self._all_indices.copy()
+            else:
+                self._target_candidate_indices = self._source_indices.copy()
+        else:
+            self._target_candidate_indices = normalized_target_candidate_indices
+        self._source_index_mask = np.zeros(self.total_rows, dtype=bool)
+        self._source_index_mask[self._source_indices] = True
+        self._target_candidate_mask = np.zeros(self.total_rows, dtype=bool)
+        self._target_candidate_mask[self._target_candidate_indices] = True
+        self._source_row_count = int(self._source_indices.size)
         self._dataset_index = np.asarray(dataset_index, dtype=np.int32)
         self._context_labels = tuple(
             _normalize_label(value, column=self.config.cell_context_column)
@@ -451,19 +487,21 @@ class PerturbationPairSampler:
 
     def __len__(self) -> int:
         if self.drop_last:
-            return self.total_rows // self.batch_size
-        return (self.total_rows + self.batch_size - 1) // self.batch_size
+            return self._source_row_count // self.batch_size
+        return (self._source_row_count + self.batch_size - 1) // self.batch_size
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
     def __iter__(self):
-        if self.total_rows == 0:
+        if self._source_row_count == 0:
             return
         rng = np.random.default_rng(self.seed + self.epoch)
-        source_order = self._all_indices.copy()
+        source_order = self._source_indices.copy()
         rng.shuffle(source_order)
-        for batch_idx, start in enumerate(range(0, self.total_rows, self.batch_size)):
+        for batch_idx, start in enumerate(
+            range(0, self._source_row_count, self.batch_size)
+        ):
             source_indices = source_order[start : start + self.batch_size]
             if len(source_indices) < self.batch_size and self.drop_last:
                 continue
@@ -487,6 +525,10 @@ class PerturbationPairSampler:
             )
         if np.any(source_array < 0) or np.any(source_array >= self.total_rows):
             raise IndexError("source_indices contain out-of-range rows")
+        if not np.all(self._source_index_mask[source_array]):
+            raise ValueError(
+                "source_indices must come from the configured source_indices pool"
+            )
 
         rng = np.random.default_rng(self.seed if seed is None else int(seed))
         target_indices: list[int] = []
@@ -510,7 +552,7 @@ class PerturbationPairSampler:
 
     def _build_pool_by_key(self) -> dict[tuple[int, str, str], np.ndarray]:
         buckets: dict[tuple[int, str, str], list[int]] = {}
-        for row_idx in range(self.total_rows):
+        for row_idx in self._target_candidate_indices.tolist():
             key = (
                 int(self._dataset_index[row_idx]),
                 self._context_labels[row_idx],
@@ -576,6 +618,14 @@ class PerturbationPairSampler:
             return target_idx, target_perturbation
 
         if self.perturbed_target_policy == "self_to_control_label":
+            if not self._target_candidate_mask[source_idx]:
+                return self._handle_missing_target(
+                    source_idx,
+                    reason=(
+                        "self_to_control_label target row is not present in the "
+                        "configured target pool"
+                    ),
+                )
             return source_idx, self._control_labels[0]
 
         control_pool = self._control_pool_by_context.get(context_key)
