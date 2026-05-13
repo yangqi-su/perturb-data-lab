@@ -11,10 +11,11 @@ import json
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Sequence
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 from ..feature_registry import FeatureRegistry
 from ..gpu_pipeline import GPUSparsePipeline
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CategoricalLabelMap",
     "PertTFAdapterConfig",
+    "PertTFPairedBatchLoader",
     "PertTFPairedBatchBuilder",
     "PerturbationPairBatch",
     "PerturbationPairSampler",
@@ -869,6 +871,82 @@ def _collate_perttf_raw_pair_batch(items: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
+def _validate_perttf_loader_kwargs(
+    *,
+    num_workers: int,
+    multiprocessing_context: str | None,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int | None,
+) -> dict[str, Any]:
+    workers = int(num_workers)
+    if workers < 0:
+        raise ValueError("num_workers must be >= 0")
+    if not isinstance(pin_memory, bool):
+        raise TypeError("pin_memory must be a bool")
+    if not isinstance(persistent_workers, bool):
+        raise TypeError("persistent_workers must be a bool")
+
+    if workers == 0:
+        if multiprocessing_context is not None:
+            raise ValueError("multiprocessing_context requires num_workers > 0")
+        if persistent_workers:
+            raise ValueError("persistent_workers requires num_workers > 0")
+        if prefetch_factor is not None:
+            raise ValueError("prefetch_factor requires num_workers > 0")
+        normalized_context = None
+        normalized_prefetch = None
+    else:
+        if multiprocessing_context is None:
+            normalized_context = None
+        else:
+            normalized_context = str(multiprocessing_context).strip().lower()
+            if normalized_context not in {"fork", "spawn", "forkserver"}:
+                raise ValueError(
+                    "multiprocessing_context must be one of 'fork', 'spawn', "
+                    f"or 'forkserver', got {multiprocessing_context!r}"
+                )
+        if prefetch_factor is None:
+            normalized_prefetch = None
+        else:
+            normalized_prefetch = int(prefetch_factor)
+            if normalized_prefetch <= 0:
+                raise ValueError("prefetch_factor must be positive")
+
+    return {
+        "num_workers": workers,
+        "multiprocessing_context": normalized_context,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+        "prefetch_factor": normalized_prefetch,
+    }
+
+
+def _build_perttf_loader_kwargs(
+    *,
+    num_workers: int,
+    multiprocessing_context: str | None,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int | None,
+    backend: str,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers if num_workers > 0 else False,
+    }
+    if num_workers > 0:
+        kwargs["multiprocessing_context"] = (
+            multiprocessing_context
+            if multiprocessing_context is not None
+            else ("spawn" if backend == "lance" else None)
+        )
+        if prefetch_factor is not None:
+            kwargs["prefetch_factor"] = prefetch_factor
+    return kwargs
+
+
 class PertTFPairedBatchBuilder:
     """Build pertTF-compatible paired source/target batches from corpus rows.
 
@@ -1353,3 +1431,103 @@ class PertTFCorpusAdapter:
             "simple_vocab_stoi": self.vocab.to_simple_vocab_stoi(),
             **self.labels.to_reference_dict(),
         }
+
+
+class PertTFPairedBatchLoader:
+    """Slim public iterable that yields final pertTF paired batches."""
+
+    def __init__(
+        self,
+        corpus: Corpus,
+        *,
+        batch_size: int,
+        seq_len: int,
+        config: PertTFAdapterConfig | None = None,
+        adapter: PertTFCorpusAdapter | None = None,
+        seed: int = 0,
+        drop_last: bool = True,
+        perturbed_target_policy: str = "self_to_control_label",
+        missing_target_policy: str = "error",
+        sampling_mode: str = "hvg",
+        expressed_weight: float = 3.0,
+        hvg_weight: float = 3.0,
+        hvg_top_k: int | None = None,
+        num_workers: int = 0,
+        multiprocessing_context: str | None = None,
+        pin_memory: bool = False,
+        persistent_workers: bool = False,
+        prefetch_factor: int | None = None,
+        device: torch.device | str | None = "cpu",
+    ) -> None:
+        self.corpus = corpus
+        self._builder = PertTFPairedBatchBuilder(
+            corpus,
+            seq_len=seq_len,
+            config=config,
+            adapter=adapter,
+            device=device,
+        )
+        self.adapter = self._builder.adapter
+        self.config = self._builder.config
+        self.pair_sampler = PerturbationPairSampler(
+            corpus.metadata_index,
+            batch_size=batch_size,
+            config=self.config,
+            label_adapter=self.adapter.labels,
+            seed=seed,
+            drop_last=drop_last,
+            perturbed_target_policy=perturbed_target_policy,
+            missing_target_policy=missing_target_policy,
+        )
+        self._request_sampler = _PertTFPairReadBatchSampler(self.pair_sampler)
+        self._dataset = _PertTFPairExpressionDataset(
+            corpus.expression_reader,
+            routing_table=corpus.routing_table,
+            topology=corpus.topology,
+            backend=corpus.backend,
+        )
+        validated_loader = _validate_perttf_loader_kwargs(
+            num_workers=num_workers,
+            multiprocessing_context=multiprocessing_context,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        )
+        self._loader_kwargs = _build_perttf_loader_kwargs(
+            backend=corpus.backend,
+            **validated_loader,
+        )
+        self._sampling_mode = sampling_mode
+        self._expressed_weight = float(expressed_weight)
+        self._hvg_weight = float(hvg_weight)
+        self._hvg_top_k = hvg_top_k
+        self._data_loader = DataLoader(
+            self._dataset,
+            batch_sampler=self._request_sampler,
+            collate_fn=_collate_perttf_raw_pair_batch,
+            **self._loader_kwargs,
+        )
+
+    def __len__(self) -> int:
+        return len(self._request_sampler)
+
+    @property
+    def epoch(self) -> int:
+        return int(self.pair_sampler.epoch)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._request_sampler.set_epoch(epoch)
+
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        for raw_pair_batch in self._data_loader:
+            request = raw_pair_batch["request"]
+            yield self._builder.build_from_raw_pair_batch(
+                request.pair_batch,
+                raw_pair_batch["source_raw"],
+                raw_pair_batch["target_raw"],
+                seed=request.seed,
+                sampling_mode=self._sampling_mode,
+                expressed_weight=self._expressed_weight,
+                hvg_weight=self._hvg_weight,
+                hvg_top_k=self._hvg_top_k,
+            )

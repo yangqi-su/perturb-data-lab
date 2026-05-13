@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 
 from perturb_data_lab.loaders import (
     PertTFAdapterConfig,
+    PertTFPairedBatchLoader,
     PertTFPairedBatchBuilder,
     PerturbationPairSampler,
     load_corpus,
@@ -571,6 +572,53 @@ def _assert_pair_read_batch_matches_builder(
         torch.testing.assert_close(split_batch[key], reference_batch[key])
 
 
+def _build_public_pair_loader(
+    corpus,
+    *,
+    batch_size: int,
+    seq_len: int,
+    seed: int,
+    num_workers: int,
+    multiprocessing_context: str | None,
+    drop_last: bool = True,
+):
+    return PertTFPairedBatchLoader(
+        corpus,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        config=PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0),
+        seed=seed,
+        drop_last=drop_last,
+        sampling_mode="hvg",
+        hvg_weight=4.0,
+        hvg_top_k=2,
+        num_workers=num_workers,
+        multiprocessing_context=multiprocessing_context,
+    )
+
+
+def _assert_public_loader_matches_builder(loader: PertTFPairedBatchLoader) -> None:
+    expected_pair_batch = next(iter(loader.pair_sampler))
+    expected_batch = loader._builder.build_paired_batch(
+        expected_pair_batch,
+        seed=loader.pair_sampler.seed + loader.epoch * 10000,
+        sampling_mode="hvg",
+        hvg_weight=4.0,
+        hvg_top_k=2,
+    )
+
+    batches = list(loader)
+
+    assert len(batches) == 1
+    actual_batch = batches[0]
+    assert "request" not in actual_batch
+    assert "source_raw" not in actual_batch
+    assert "target_raw" not in actual_batch
+    assert actual_batch.keys() == expected_batch.keys()
+    for key in actual_batch:
+        torch.testing.assert_close(actual_batch[key], expected_batch[key])
+
+
 def test_pair_read_dataset_state_stays_worker_light(tmp_path: Path) -> None:
     corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
     builder = PertTFPairedBatchBuilder(
@@ -639,6 +687,27 @@ def test_pair_read_dataloader_supports_single_process(tmp_path: Path) -> None:
     _assert_pair_read_batch_matches_builder(corpus, batches[0])
 
 
+def test_public_paired_batch_loader_yields_final_batches_single_process(
+    tmp_path: Path,
+) -> None:
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    loader = _build_public_pair_loader(
+        corpus,
+        batch_size=2,
+        seq_len=3,
+        seed=7,
+        num_workers=0,
+        multiprocessing_context=None,
+    )
+
+    assert len(loader) == 1
+    assert loader.adapter is loader._builder.adapter
+    assert loader.config is loader._builder.config
+    assert loader.pair_sampler.batch_size == 2
+
+    _assert_public_loader_matches_builder(loader)
+
+
 def test_pair_read_dataloader_supports_spawn_workers(tmp_path: Path) -> None:
     corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
     loader = _build_pair_read_loader(
@@ -653,3 +722,48 @@ def test_pair_read_dataloader_supports_spawn_workers(tmp_path: Path) -> None:
 
     assert len(batches) == 1
     _assert_pair_read_batch_matches_builder(corpus, batches[0])
+
+
+def test_public_paired_batch_loader_uses_spawn_raw_pair_path(
+    tmp_path: Path,
+) -> None:
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    loader = _build_public_pair_loader(
+        corpus,
+        batch_size=2,
+        seq_len=3,
+        seed=7,
+        num_workers=2,
+        multiprocessing_context=None,
+    )
+
+    assert isinstance(loader._data_loader.dataset, _PertTFPairExpressionDataset)
+    assert isinstance(loader._data_loader.batch_sampler, _PertTFPairReadBatchSampler)
+    assert loader._loader_kwargs["multiprocessing_context"] == "spawn"
+
+    _assert_public_loader_matches_builder(loader)
+
+
+def test_public_paired_batch_loader_set_epoch_is_repeatable_and_reorders(
+    tmp_path: Path,
+) -> None:
+    corpus = load_corpus(str(_build_mixed_union_pair_corpus(tmp_path)))
+    loader = _build_public_pair_loader(
+        corpus,
+        batch_size=1,
+        seq_len=2,
+        seed=0,
+        num_workers=0,
+        multiprocessing_context=None,
+        drop_last=False,
+    )
+
+    loader.set_epoch(0)
+    epoch0_first = [int(batch["index"][0]) for batch in loader]
+    loader.set_epoch(0)
+    epoch0_second = [int(batch["index"][0]) for batch in loader]
+    loader.set_epoch(1)
+    epoch1 = [int(batch["index"][0]) for batch in loader]
+
+    assert epoch0_first == epoch0_second
+    assert epoch1 != epoch0_first
