@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import lance
@@ -454,6 +455,54 @@ def test_build_from_raw_pair_batch_rejects_row_order_mismatch(
         builder.build_from_raw_pair_batch(pair_batch, source_raw, target_raw)
 
 
+def test_build_from_raw_pair_batch_rejects_cross_dataset_pair_batch(
+    tmp_path: Path,
+) -> None:
+    config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    pair_batch = PerturbationPairSampler(
+        corpus.metadata_index,
+        batch_size=2,
+        config=config,
+        seed=7,
+    ).pair_source_indices([0, 1], seed=11)
+    builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
+
+    invalid_pair_batch = replace(
+        pair_batch,
+        target_dataset_indices=np.asarray([1, 0], dtype=np.int32),
+    )
+    source_raw = corpus.inspect_batch(pair_batch.source_indices)
+    target_raw = corpus.inspect_batch(pair_batch.target_indices)
+
+    with pytest.raises(ValueError, match="same-dataset pairing"):
+        builder.build_from_raw_pair_batch(invalid_pair_batch, source_raw, target_raw)
+
+
+def test_build_from_raw_pair_batch_rejects_cross_context_pair_batch(
+    tmp_path: Path,
+) -> None:
+    config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    pair_batch = PerturbationPairSampler(
+        corpus.metadata_index,
+        batch_size=2,
+        config=config,
+        seed=7,
+    ).pair_source_indices([0, 1], seed=11)
+    builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
+
+    invalid_pair_batch = replace(
+        pair_batch,
+        target_cell_context_ids=np.asarray([9, 9], dtype=np.int64),
+    )
+    source_raw = corpus.inspect_batch(pair_batch.source_indices)
+    target_raw = corpus.inspect_batch(pair_batch.target_indices)
+
+    with pytest.raises(ValueError, match="same-context pairing"):
+        builder.build_from_raw_pair_batch(invalid_pair_batch, source_raw, target_raw)
+
+
 def _build_pair_read_loader(
     corpus,
     *,
@@ -581,12 +630,14 @@ def _build_public_pair_loader(
     num_workers: int,
     multiprocessing_context: str | None,
     drop_last: bool = True,
+    config: PertTFAdapterConfig | None = None,
 ):
+    resolved_config = config or PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
     return PertTFPairedBatchLoader(
         corpus,
         batch_size=batch_size,
         seq_len=seq_len,
-        config=PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0),
+        config=resolved_config,
         seed=seed,
         drop_last=drop_last,
         sampling_mode="hvg",
@@ -731,6 +782,28 @@ def test_public_paired_batch_loader_yields_final_batches_single_process(
     assert loader.pair_sampler.batch_size == 2
 
     _assert_public_loader_matches_builder(loader)
+
+
+def test_public_paired_batch_loader_omits_full_expression_fields_by_default(
+    tmp_path: Path,
+) -> None:
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    loader = _build_public_pair_loader(
+        corpus,
+        batch_size=2,
+        seq_len=3,
+        seed=7,
+        num_workers=0,
+        multiprocessing_context=None,
+    )
+
+    batch = next(iter(loader))
+
+    assert "full_gene_ids" not in batch
+    assert "full_expr" not in batch
+    assert "full_expr_mask" not in batch
+    assert "full_expr_next" not in batch
+    assert "full_expr_next_mask" not in batch
 
 
 def test_pair_read_dataloader_supports_spawn_workers(tmp_path: Path) -> None:

@@ -104,6 +104,35 @@ for batch in corpus.loader(seq_len=1024, processing="gpu", num_workers=4):
 - If no sampler is stored and no loader-local sampler config is passed,
   `corpus.loader(...)` uses a default random sampler with `batch_size=128`.
 
+### pertTF paired loader
+
+```python
+from perturb_data_lab.loaders import (
+    PertTFAdapterConfig,
+    PertTFPairedBatchLoader,
+    load_corpus,
+)
+
+corpus = load_corpus("/path/to/corpus")
+perttf_loader = PertTFPairedBatchLoader(
+    corpus,
+    batch_size=8,
+    seq_len=1024,
+    config=PertTFAdapterConfig(control_labels=("WT",)),
+    num_workers=2,
+)
+
+for batch in perttf_loader:
+    train_step(batch)
+```
+
+- `PertTFPairedBatchLoader` yields final pertTF-ready batch dictionaries; normal
+  callers do not need to assemble raw pair requests or call
+  `build_from_raw_pair_batch(...)` directly.
+- `set_epoch(epoch)` is available for deterministic reshuffling between epochs.
+- When `num_workers > 0`, the loader keeps pair planning in the main process and
+  uses worker processes only for source/target expression reads.
+
 ### Metadata and inspection helpers
 
 ```python
