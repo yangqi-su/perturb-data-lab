@@ -65,7 +65,7 @@ class TestParserConstruction:
             "--dataset-id", "ds1",
             "--review-bundle", "/data/summary.yaml",
             "--output-corpus", "/corpus",
-            "--backend", "arrow-parquet",
+            "--backend", "zarr",
         ])
         assert ns.command == "materialize"
         assert ns.mode == "create"
@@ -73,7 +73,7 @@ class TestParserConstruction:
         assert ns.dataset_id == "ds1"
         assert ns.review_bundle == "/data/summary.yaml"
         assert ns.output_corpus == "/corpus"
-        assert ns.backend == "arrow-parquet"
+        assert ns.backend == "zarr"
         assert ns.topology is None
         assert ns.dry_run is False
 
@@ -117,7 +117,7 @@ class TestParserConstruction:
             "--input-dir", "/data/h5ad/",
             "--review-bundle-dir", "/data/reviews/",
             "--output-corpus", "/corpus",
-            "--backend", "arrow-ipc",
+            "--backend", "zarr",
             "--dry-run",
         ])
         assert ns.command == "materialize"
@@ -138,7 +138,7 @@ class TestParserConstruction:
             "--dataset-id", "ds1",
             "--review-bundle", "/data/summary.yaml",
             "--output-corpus", "/corpus",
-            "--backend", "arrow-parquet",
+            "--backend", "zarr",
         ])
         assert ns.source == "/data/test.h5ad"
         assert ns.input_list == "/data/list.csv"
@@ -153,18 +153,31 @@ class TestParserConstruction:
             "--dataset-id", "ds1",
             "--review-bundle", "/data/summary.yaml",
             "--output-corpus", "/corpus",
-            "--backend", "arrow-parquet",
+            "--backend", "zarr",
         ])
         assert ns.dataset_id == "ds1"
 
     def test_corpus_validate_subcommand(self):
         parser = build_parser()
         ns = parser.parse_args(
-            ["corpus-validate", "/c.yaml", "--backend", "webdataset"]
+            ["corpus-validate", "/c.yaml", "--backend", "zarr"]
         )
         assert ns.command == "corpus-validate"
         assert ns.corpus_index == "/c.yaml"
-        assert ns.backend == "webdataset"
+        assert ns.backend == "zarr"
+
+    def test_removed_backend_choice_is_rejected(self):
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args([
+                "materialize",
+                "--mode", "create",
+                "--source", "/data/test.h5ad",
+                "--dataset-id", "ds1",
+                "--review-bundle", "/data/summary.yaml",
+                "--output-corpus", "/corpus",
+                "--backend", "arrow-parquet",
+            ])
 
     def test_corpus_gc_subcommand(self):
         parser = build_parser()
@@ -220,8 +233,8 @@ class TestEffectiveTopologyResolution:
         assert _resolve_effective_topology("lance", "aggregate") == "aggregate"
 
     def test_non_lance_respects_requested_topology(self):
-        assert _resolve_effective_topology("arrow-parquet", "federated") == "federated"
-        assert _resolve_effective_topology("arrow-parquet", "aggregate") == "aggregate"
+        assert _resolve_effective_topology("zarr", "federated") == "federated"
+        assert _resolve_effective_topology("zarr", "aggregate") == "aggregate"
 
 
 class TestMaterializeDatasetRouting:
@@ -579,7 +592,7 @@ class TestCorpusValidateCmd:
             "contract_version": "0.3.0",
             "dataset_id": "ds1",
             "route": "create_new",
-            "backend": "arrow-parquet",
+            "backend": "zarr",
             "topology": "federated",
             "count_source": {"selected": ".X", "integer_only": True},
             "outputs": {

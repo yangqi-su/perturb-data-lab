@@ -17,7 +17,7 @@ from perturb_data_lab.inspectors.models import (
 )
 from perturb_data_lab.inspectors.workflow import run_batch
 from perturb_data_lab.materializers import Stage2Materializer
-from perturb_data_lab.materializers.backends.arrow_parquet import read_arrow_parquet_cell
+from perturb_data_lab.materializers.backends.zarr import read_zarr_cell
 from perturb_data_lab.materializers.models import OutputRoots
 from perturb_data_lab.materializers.obs_filter import ObsFilterError, filter_obs_rows
 
@@ -92,7 +92,7 @@ def test_stage2_materializer_applies_obs_filter_and_preserves_source_identity(
             matrix_root=str(matrix_root),
         ),
         dataset_id="tiny_filtered",
-        backend="arrow-parquet",
+        backend="zarr",
         topology="federated",
     ).materialize()
 
@@ -112,10 +112,11 @@ def test_stage2_materializer_applies_obs_filter_and_preserves_source_identity(
     assert sf_table.column("cell_id").to_pylist() == ["cell-3"]
     assert sf_table.num_rows == 1
 
-    cells_path = matrix_root / "tiny_filtered-cells.parquet"
-    indices, values, _ = read_arrow_parquet_cell(
-        cells_path,
+    indices, values, _ = read_zarr_cell(
+        matrix_root / "tiny_filtered-indices.zarr",
+        matrix_root / "tiny_filtered-counts.zarr",
         0,
+        row_offsets_path=matrix_root / "tiny_filtered-row-offsets.zarr",
         size_factor_path=meta_root / "size-factor.parquet",
     )
     assert indices == (1, 2)
@@ -151,7 +152,7 @@ def test_stage2_materializer_rejects_invalid_obs_filter_before_writing_outputs(
             matrix_root=str(matrix_root),
         ),
         dataset_id="invalid_filter",
-        backend="arrow-parquet",
+        backend="zarr",
         topology="federated",
     )
 
@@ -160,7 +161,7 @@ def test_stage2_materializer_rejects_invalid_obs_filter_before_writing_outputs(
 
     assert not (meta_root / "raw-obs.parquet").exists()
     assert not (meta_root / "size-factor.parquet").exists()
-    assert not (matrix_root / "invalid_filter-cells.parquet").exists()
+    assert not (matrix_root / "invalid_filter-row-offsets.zarr").exists()
 
 
 def _build_review_bundle(

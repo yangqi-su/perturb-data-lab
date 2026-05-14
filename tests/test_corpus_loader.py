@@ -24,7 +24,6 @@ from perturb_data_lab.loaders import (
     CPUPipeline,
     CorpusRandomBatchSampler,
     DatasetEntry,
-    DatasetRoutingTable,
     ExpressionBatch,
     ExpressionBatchDataset,
     GeneTokenizer,
@@ -527,89 +526,14 @@ def _build_mock_aggregate_zarr_corpus(
         )
 
 
-def _build_mock_aggregate_tiledb_corpus(
-    corpus_root: Path,
-    *,
-    include_size_factor: bool = True,
-    typed_structural: bool = False,
-    safe_nulls: bool = False,
-) -> None:
-    """Build a minimal aggregate TileDB corpus (2 datasets)."""
-    pytest.importorskip("tiledb")
-    corpus_root.mkdir(parents=True, exist_ok=True)
-
-    ds_configs = [
-        {"dataset_id": "mock_00", "cell_count": 10, "global_start": 0, "global_end": 10, "dataset_index": 0},
-        {"dataset_id": "mock_01", "cell_count": 15, "global_start": 10, "global_end": 25, "dataset_index": 1},
-    ]
-
-    index_doc = {
-        "kind": "corpus-index",
-        "contract_version": "0.3.0",
-        "global_metadata": {
-            "backend": "tiledb",
-            "topology": "aggregate",
-        },
-        "datasets": [
-            {
-                "dataset_id": ds["dataset_id"],
-                "join_mode": "create_new" if i == 0 else "append_routed",
-                "dataset_index": ds["dataset_index"],
-                "cell_count": ds["cell_count"],
-                "global_start": ds["global_start"],
-                "global_end": ds["global_end"],
-            }
-            for i, ds in enumerate(ds_configs)
-        ],
-    }
-    with open(corpus_root / "corpus-index.yaml", "w") as f:
-        yaml.safe_dump(index_doc, f)
-
-    writer = build_backend_fn("tiledb", "aggregate")
-    writer_state: dict[str, Any] | None = None
-    matrix_dir = corpus_root / "matrix"
-    matrix_dir.mkdir(parents=True, exist_ok=True)
-
-    for i, ds in enumerate(ds_configs):
-        ds_id = ds["dataset_id"]
-        meta_dir = corpus_root / "meta" / ds_id / "canonical_meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
-
-        obs_df = _make_obs_df(
-            ds_id,
-            ds["dataset_index"],
-            ds["cell_count"],
-            ds["global_start"],
-            include_size_factor=include_size_factor,
-            typed_structural=typed_structural,
-            safe_nulls=safe_nulls,
-        )
-        obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
-
-        var_df = _make_var_df(ds_id, N_GENES)
-        var_df.write_parquet(str(meta_dir / "canonical-var.parquet"))
-
-        _, writer_state = writer(
-            bundle=_bundle_for_rows(ds["global_start"], _make_lance_rows(ds["cell_count"])),
-            dataset_id=ds_id,
-            matrix_root=matrix_dir,
-            _writer_state=writer_state,
-            _is_last_chunk=i == len(ds_configs) - 1,
-            local_vocabulary_size=N_GENES,
-        )
-
-
 def _build_mock_aggregate_backend_corpus_from_configs(
     corpus_root: Path,
     *,
-    backend: str,
     ds_configs: Sequence[dict[str, Any]],
     include_size_factor: bool = True,
     typed_structural: bool = False,
     safe_nulls: bool = False,
 ) -> None:
-    if backend == "tiledb":
-        pytest.importorskip("tiledb")
     corpus_root.mkdir(parents=True, exist_ok=True)
 
     normalized_configs: list[dict[str, Any]] = []
@@ -627,7 +551,7 @@ def _build_mock_aggregate_backend_corpus_from_configs(
         "kind": "corpus-index",
         "contract_version": "0.3.0",
         "global_metadata": {
-            "backend": backend,
+            "backend": "lance",
             "topology": "aggregate",
         },
         "datasets": [
@@ -649,10 +573,8 @@ def _build_mock_aggregate_backend_corpus_from_configs(
     matrix_dir.mkdir(parents=True, exist_ok=True)
 
     lance_rows: list[dict[str, Any]] = []
-    writer_state: dict[str, Any] | None = None
-    writer = build_backend_fn("tiledb", "aggregate") if backend == "tiledb" else None
 
-    for i, ds in enumerate(normalized_configs):
+    for ds in normalized_configs:
         ds_id = str(ds["dataset_id"])
         global_start = int(ds["global_start"])
         dataset_index = int(ds["dataset_index"])
@@ -676,22 +598,7 @@ def _build_mock_aggregate_backend_corpus_from_configs(
         var_df = _make_var_df(ds_id, n_genes)
         var_df.write_parquet(str(meta_dir / "canonical-var.parquet"))
 
-        if backend == "lance":
-            lance_rows.extend(rows)
-            continue
-
-        assert writer is not None
-        _, writer_state = writer(
-            bundle=_bundle_for_rows(global_start, rows),
-            dataset_id=ds_id,
-            matrix_root=matrix_dir,
-            _writer_state=writer_state,
-            _is_last_chunk=i == len(normalized_configs) - 1,
-            local_vocabulary_size=n_genes,
-        )
-
-    if backend != "lance":
-        return
+        lance_rows.extend(rows)
 
     schema = pa.schema([
         ("expressed_gene_indices", pa.list_(pa.int32())),
@@ -799,90 +706,6 @@ def _build_mock_federated_corpus(
         lance.write_dataset(table, str(matrix_dir / f"{ds_id}.lance"), mode="overwrite")
 
 
-def _build_mock_federated_arrow_ipc_corpus(
-    corpus_root: Path,
-    *,
-    include_size_factor: bool = True,
-    typed_structural: bool = False,
-    safe_nulls: bool = False,
-) -> None:
-    """Build a minimal federated Arrow IPC corpus (2 datasets)."""
-    corpus_root.mkdir(parents=True, exist_ok=True)
-
-    ds_configs = [
-        {"dataset_id": "mock_00", "cell_count": 10, "global_start": 0, "global_end": 10, "dataset_index": 0},
-        {"dataset_id": "mock_01", "cell_count": 15, "global_start": 10, "global_end": 25, "dataset_index": 1},
-    ]
-
-    index_doc = {
-        "kind": "corpus-index",
-        "contract_version": "0.3.0",
-        "global_metadata": {
-            "backend": "arrow-ipc",
-            "topology": "federated",
-        },
-        "datasets": [
-            {
-                "dataset_id": ds["dataset_id"],
-                "join_mode": "create_new" if i == 0 else "append_routed",
-                "dataset_index": ds["dataset_index"],
-                "cell_count": ds["cell_count"],
-                "global_start": ds["global_start"],
-                "global_end": ds["global_end"],
-            }
-            for i, ds in enumerate(ds_configs)
-        ],
-    }
-    with open(corpus_root / "corpus-index.yaml", "w") as f:
-        yaml.safe_dump(index_doc, f)
-
-    schema = pa.schema([
-        ("expressed_gene_indices", pa.list_(pa.int32())),
-        ("expression_counts", pa.list_(pa.int32())),
-    ])
-    for ds in ds_configs:
-        ds_id = ds["dataset_id"]
-        ds_dir = corpus_root / ds_id
-        meta_dir = ds_dir / "meta" / "canonical_meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
-
-        obs_df = _make_obs_df(
-            ds_id,
-            ds["dataset_index"],
-            ds["cell_count"],
-            ds["global_start"],
-            include_size_factor=include_size_factor,
-            typed_structural=typed_structural,
-            safe_nulls=safe_nulls,
-        )
-        obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
-
-        var_df = _make_var_df(ds_id, N_GENES)
-        var_df.write_parquet(str(meta_dir / "canonical-var.parquet"))
-
-        matrix_dir = ds_dir / "matrix"
-        matrix_dir.mkdir(parents=True, exist_ok=True)
-        arrow_rows = _make_lance_rows(ds["cell_count"])
-        table = pa.table(
-            {
-                "expressed_gene_indices": pa.array(
-                    [row["expressed_gene_indices"] for row in arrow_rows],
-                    type=pa.list_(pa.int32()),
-                ),
-                "expression_counts": pa.array(
-                    [row["expression_counts"] for row in arrow_rows],
-                    type=pa.list_(pa.int32()),
-                ),
-            },
-            schema=schema,
-        )
-        with pa.ipc.new_file(
-            str(matrix_dir / f"{ds_id}-cells.arrow"),
-            table.schema,
-        ) as writer:
-            writer.write_table(table)
-
-
 def _build_mock_to_anndata_corpus(corpus_root: Path) -> None:
     ds_configs = [
         {
@@ -924,7 +747,6 @@ def _build_mock_to_anndata_corpus(corpus_root: Path) -> None:
     ]
     _build_mock_aggregate_backend_corpus_from_configs(
         corpus_root,
-        backend="lance",
         ds_configs=ds_configs,
         typed_structural=True,
     )
@@ -959,7 +781,6 @@ def _build_mock_selection_corpus(corpus_root: Path) -> None:
     ]
     _build_mock_aggregate_backend_corpus_from_configs(
         corpus_root,
-        backend="lance",
         ds_configs=ds_configs,
         typed_structural=True,
     )
@@ -1038,7 +859,6 @@ class TestLoadCorpusAggregate:
         ]
         _build_mock_aggregate_backend_corpus_from_configs(
             tmp_path,
-            backend="lance",
             ds_configs=ds_configs,
         )
 
@@ -1099,7 +919,6 @@ class TestLoadCorpusAggregate:
         ]
         _build_mock_aggregate_backend_corpus_from_configs(
             tmp_path,
-            backend="lance",
             ds_configs=ds_configs,
         )
 
@@ -1739,237 +1558,6 @@ class TestLoadCorpusAggregateZarrPhase2:
             load_corpus(str(tmp_path))
 
 
-class TestLoadCorpusAggregateTileDBPhase3:
-    """Phase 3 aggregate TileDB public API tests."""
-
-    @staticmethod
-    def _load_backend_pair(tmp_path: Path) -> tuple[Corpus, Corpus]:
-        pytest.importorskip("tiledb")
-        lance_root = tmp_path / "lance"
-        tiledb_root = tmp_path / "tiledb"
-        _build_mock_aggregate_corpus(lance_root)
-        _build_mock_aggregate_tiledb_corpus(tiledb_root)
-        return load_corpus(str(lance_root)), load_corpus(str(tiledb_root))
-
-    def test_load_corpus_builds_aggregate_tiledb_entries(self, tmp_path: Path) -> None:
-        pytest.importorskip("tiledb")
-        _build_mock_aggregate_tiledb_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        assert corpus.topology == "aggregate"
-        assert corpus.backend == "tiledb"
-        assert len(corpus.dataset_entries) == 2
-        assert [
-            (entry.dataset_id, entry.global_start, entry.global_end)
-            for entry in corpus.dataset_entries
-        ] == [
-            ("mock_00", 0, 10),
-            ("mock_01", 10, 25),
-        ]
-
-    @pytest.mark.parametrize(
-        "indices",
-        [
-            [0, 1, 2, 3],
-            [24, 10, 9, 0],
-            [8, 10, 24, 0],
-            [],
-        ],
-    )
-    def test_aggregate_tiledb_public_reads_match_aggregate_lance(
-        self,
-        tmp_path: Path,
-        indices: list[int],
-    ) -> None:
-        lance_corpus, tiledb_corpus = self._load_backend_pair(tmp_path)
-
-        _assert_public_api_matches_federated_lance(
-            tiledb_corpus,
-            lance_corpus,
-            indices,
-        )
-
-    def test_aggregate_tiledb_cpu_loader_matches_sampler_and_metadata_contract(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        lance_corpus, tiledb_corpus = self._load_backend_pair(tmp_path)
-        lance_corpus.set_sampler(batch_size=4, seed=11)
-        tiledb_corpus.set_sampler(batch_size=4, seed=11)
-
-        lance_batch = next(
-            lance_corpus.loader(
-                processing="cpu",
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-        tiledb_batch = next(
-            tiledb_corpus.loader(
-                processing="cpu",
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-
-        _assert_processed_loader_batch(tiledb_batch, batch_size=4)
-        np.testing.assert_array_equal(
-            tiledb_batch["global_row_index"],
-            lance_batch["global_row_index"],
-        )
-        np.testing.assert_array_equal(
-            tiledb_batch["dataset_index"],
-            lance_batch["dataset_index"],
-        )
-        assert tiledb_batch["meta_columns"] == lance_batch["meta_columns"]
-
-    @pytest.mark.parametrize(
-        ("artifact_path", "message"),
-        [
-            ("matrix/aggregated-cells.tiledb", "Aggregate TileDB array not found"),
-            ("matrix/aggregated-meta.json", "Aggregate TileDB metadata not found"),
-        ],
-    )
-    def test_missing_aggregate_tiledb_artifact_fails_with_clear_error(
-        self,
-        tmp_path: Path,
-        artifact_path: str,
-        message: str,
-    ) -> None:
-        pytest.importorskip("tiledb")
-        _build_mock_aggregate_tiledb_corpus(tmp_path)
-        path = tmp_path / artifact_path
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
-
-        with pytest.raises(FileNotFoundError, match=message):
-            load_corpus(str(tmp_path))
-
-
-class TestLoadCorpusAggregateTileDBPhase4:
-    """Phase 4 aggregate TileDB synthetic correctness tests."""
-
-    @staticmethod
-    def _mixed_local_vocab_configs() -> list[dict[str, Any]]:
-        return [
-            {
-                "dataset_id": "mock_00",
-                "dataset_index": 0,
-                "global_start": 0,
-                "n_genes": 5,
-                "rows": [
-                    {"expressed_gene_indices": [0, 2], "expression_counts": [5, 7]},
-                    {"expressed_gene_indices": [], "expression_counts": []},
-                    {"expressed_gene_indices": [1], "expression_counts": [3]},
-                ],
-            },
-            {
-                "dataset_id": "mock_01",
-                "dataset_index": 1,
-                "global_start": 3,
-                "n_genes": 9,
-                "rows": [
-                    {"expressed_gene_indices": [0, 4], "expression_counts": [1, 2]},
-                    {"expressed_gene_indices": [2, 5, 6], "expression_counts": [4, 5, 6]},
-                ],
-            },
-        ]
-
-    @classmethod
-    def _load_backend_pair(cls, tmp_path: Path) -> tuple[Corpus, Corpus]:
-        pytest.importorskip("tiledb")
-        configs = cls._mixed_local_vocab_configs()
-        lance_root = tmp_path / "lance"
-        tiledb_root = tmp_path / "tiledb"
-        _build_mock_aggregate_backend_corpus_from_configs(
-            lance_root,
-            backend="lance",
-            ds_configs=configs,
-        )
-        _build_mock_aggregate_backend_corpus_from_configs(
-            tiledb_root,
-            backend="tiledb",
-            ds_configs=configs,
-        )
-        return load_corpus(str(lance_root)), load_corpus(str(tiledb_root))
-
-    def test_load_corpus_handles_mixed_local_vocab_tiledb(self, tmp_path: Path) -> None:
-        pytest.importorskip("tiledb")
-        _build_mock_aggregate_backend_corpus_from_configs(
-            tmp_path,
-            backend="tiledb",
-            ds_configs=self._mixed_local_vocab_configs(),
-        )
-
-        corpus = load_corpus(str(tmp_path))
-
-        assert corpus.backend == "tiledb"
-        assert corpus.topology == "aggregate"
-        assert corpus.feature_registry.max_local_vocab == 9
-        assert corpus.feature_registry.global_vocab_size == 9
-
-    @pytest.mark.parametrize(
-        "indices",
-        [
-            [4, 1, 0, 3],
-            [2, 4],
-            [],
-        ],
-    )
-    def test_aggregate_tiledb_mixed_local_vocab_public_reads_match_lance(
-        self,
-        tmp_path: Path,
-        indices: list[int],
-    ) -> None:
-        lance_corpus, tiledb_corpus = self._load_backend_pair(tmp_path)
-
-        _assert_public_api_matches_federated_lance(
-            tiledb_corpus,
-            lance_corpus,
-            indices,
-        )
-
-    def test_aggregate_tiledb_cpu_loader_smoke_with_mixed_local_vocab_spawn(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        lance_corpus, tiledb_corpus = self._load_backend_pair(tmp_path)
-        lance_corpus.set_sampler(batch_size=4, seed=13)
-        tiledb_corpus.set_sampler(batch_size=4, seed=13)
-
-        lance_batch = next(
-            lance_corpus.loader(
-                processing="cpu",
-                seq_len=LOADER_SEQ_LEN,
-                num_workers=1,
-                multiprocessing_context="spawn",
-                metadata_columns=["perturb_label"],
-            )
-        )
-        tiledb_batch = next(
-            tiledb_corpus.loader(
-                processing="cpu",
-                seq_len=LOADER_SEQ_LEN,
-                num_workers=1,
-                multiprocessing_context="spawn",
-                metadata_columns=["perturb_label"],
-            )
-        )
-
-        _assert_processed_loader_batch(tiledb_batch, batch_size=4)
-        np.testing.assert_array_equal(
-            tiledb_batch["global_row_index"],
-            lance_batch["global_row_index"],
-        )
-        np.testing.assert_array_equal(
-            tiledb_batch["dataset_index"],
-            lance_batch["dataset_index"],
-        )
-        assert tiledb_batch["meta_columns"] == lance_batch["meta_columns"]
-
-
 class TestLoadCorpusFederated:
     """Test ``load_corpus()`` with federated Lance topology."""
 
@@ -2033,99 +1621,6 @@ class TestLoadCorpusFederated:
             assert isinstance(entry, LanceDatasetEntry)
             assert Path(str(entry.lance_path)).exists()
             assert str(entry.lance_path).endswith(f"{entry.dataset_id}.lance")
-
-
-class TestLoadCorpusFederatedArrowIpcPhase2:
-    """Phase 2 federated Arrow IPC public API tests."""
-
-    @staticmethod
-    def _load_backend_pair(tmp_path: Path) -> tuple[Corpus, Corpus]:
-        lance_root = tmp_path / "lance"
-        arrow_root = tmp_path / "arrow_ipc"
-        _build_mock_federated_corpus(lance_root)
-        _build_mock_federated_arrow_ipc_corpus(arrow_root)
-        return load_corpus(str(lance_root)), load_corpus(str(arrow_root))
-
-    def test_load_corpus_builds_arrow_ipc_dataset_entries(self, tmp_path: Path) -> None:
-        _build_mock_federated_arrow_ipc_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        from perturb_data_lab.loaders.expression import ArrowIpcDatasetEntry
-
-        assert corpus.topology == "federated"
-        assert corpus.backend == "arrow_ipc"
-        assert len(corpus.dataset_entries) == 2
-        for entry in corpus.dataset_entries:
-            assert isinstance(entry, ArrowIpcDatasetEntry)
-            assert Path(str(entry.arrow_path)).is_file()
-            assert str(entry.arrow_path).endswith(f"{entry.dataset_id}-cells.arrow")
-
-    @pytest.mark.parametrize(
-        "indices",
-        [
-            [0, 1, 2, 3],
-            [24, 10, 9, 0],
-            [8, 10, 24, 0],
-            [],
-        ],
-    )
-    def test_arrow_ipc_public_reads_match_federated_lance(
-        self,
-        tmp_path: Path,
-        indices: list[int],
-    ) -> None:
-        lance_corpus, arrow_corpus = self._load_backend_pair(tmp_path)
-
-        _assert_public_api_matches_federated_lance(arrow_corpus, lance_corpus, indices)
-
-    def test_arrow_ipc_cpu_loader_matches_sampler_and_metadata_contract(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        lance_corpus, arrow_corpus = self._load_backend_pair(tmp_path)
-        lance_corpus.set_sampler(batch_size=4, seed=11)
-        arrow_corpus.set_sampler(batch_size=4, seed=11)
-
-        lance_batch = next(
-            lance_corpus.loader(
-                processing="cpu",
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-        arrow_batch = next(
-            arrow_corpus.loader(
-                processing="cpu",
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-
-        _assert_processed_loader_batch(arrow_batch, batch_size=4)
-        np.testing.assert_array_equal(
-            arrow_batch["global_row_index"],
-            lance_batch["global_row_index"],
-        )
-        np.testing.assert_array_equal(
-            arrow_batch["dataset_index"],
-            lance_batch["dataset_index"],
-        )
-        assert arrow_batch["meta_columns"] == lance_batch["meta_columns"]
-
-    def test_missing_arrow_ipc_file_fails_with_clear_error(self, tmp_path: Path) -> None:
-        _build_mock_federated_arrow_ipc_corpus(tmp_path)
-        arrow_path = tmp_path / "mock_00" / "matrix" / "mock_00-cells.arrow"
-        arrow_path.unlink()
-
-        with pytest.raises(FileNotFoundError, match="Arrow IPC file not found"):
-            load_corpus(str(tmp_path))
-
-    def test_arrow_ipc_read_expression_rejects_out_of_range_index(self, tmp_path: Path) -> None:
-        _build_mock_federated_arrow_ipc_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        with pytest.raises(IndexError, match="out of range"):
-            corpus.read_expression([25])
 
 
 class TestLoadCorpusFederatedZarrPhase2:
@@ -2240,104 +1735,6 @@ class TestLoadCorpusFederatedZarrPhase2:
             load_corpus(str(tmp_path))
 
 
-class TestLoadCorpusFederatedParquetPhase2:
-    """Phase 2 federated Parquet public API tests."""
-
-    @staticmethod
-    def _load_backend_pair(tmp_path: Path) -> tuple[Corpus, Corpus]:
-        lance_root = tmp_path / "lance"
-        parquet_root = tmp_path / "parquet"
-        _build_mock_federated_corpus(lance_root)
-        _build_mock_federated_backend_corpus(
-            parquet_root,
-            index_backend="arrow-parquet",
-            writer_backend="arrow-parquet",
-        )
-        return load_corpus(str(lance_root)), load_corpus(str(parquet_root))
-
-    def test_load_corpus_builds_parquet_dataset_entries(self, tmp_path: Path) -> None:
-        _build_mock_federated_backend_corpus(
-            tmp_path,
-            index_backend="arrow-parquet",
-            writer_backend="arrow-parquet",
-        )
-        corpus = load_corpus(str(tmp_path))
-
-        from perturb_data_lab.loaders.expression import ParquetDatasetEntry
-
-        assert corpus.topology == "federated"
-        assert corpus.backend == "parquet"
-        assert len(corpus.dataset_entries) == 2
-        for entry in corpus.dataset_entries:
-            assert isinstance(entry, ParquetDatasetEntry)
-            assert Path(str(entry.parquet_path)).is_file()
-            assert str(entry.parquet_path).endswith(f"{entry.dataset_id}-cells.parquet")
-
-    @pytest.mark.parametrize(
-        "indices",
-        [
-            [0, 1, 2, 3],
-            [24, 10, 9, 0],
-            [8, 10, 24, 0],
-            [],
-        ],
-    )
-    def test_parquet_public_reads_match_federated_lance(
-        self,
-        tmp_path: Path,
-        indices: list[int],
-    ) -> None:
-        lance_corpus, parquet_corpus = self._load_backend_pair(tmp_path)
-
-        _assert_public_api_matches_federated_lance(parquet_corpus, lance_corpus, indices)
-
-    def test_parquet_cpu_loader_matches_sampler_and_metadata_contract(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        lance_corpus, parquet_corpus = self._load_backend_pair(tmp_path)
-        lance_corpus.set_sampler(batch_size=4, seed=11)
-        parquet_corpus.set_sampler(batch_size=4, seed=11)
-
-        lance_batch = next(
-            lance_corpus.loader(
-                processing="cpu",
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-        parquet_batch = next(
-            parquet_corpus.loader(
-                processing="cpu",
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-
-        _assert_processed_loader_batch(parquet_batch, batch_size=4)
-        np.testing.assert_array_equal(
-            parquet_batch["global_row_index"],
-            lance_batch["global_row_index"],
-        )
-        np.testing.assert_array_equal(
-            parquet_batch["dataset_index"],
-            lance_batch["dataset_index"],
-        )
-        assert parquet_batch["meta_columns"] == lance_batch["meta_columns"]
-
-    def test_missing_parquet_file_fails_with_clear_error(self, tmp_path: Path) -> None:
-        _build_mock_federated_backend_corpus(
-            tmp_path,
-            index_backend="arrow-parquet",
-            writer_backend="arrow-parquet",
-        )
-        parquet_path = tmp_path / "mock_00" / "matrix" / "mock_00-cells.parquet"
-        parquet_path.unlink()
-
-        with pytest.raises(FileNotFoundError, match="Parquet file not found"):
-            load_corpus(str(tmp_path))
-
-
 class TestCorpusApiPhase2:
     """Phase 2 corpus-level API scaffolding tests."""
 
@@ -2377,18 +1774,11 @@ class TestCorpusApiPhase2:
         with pytest.raises(ValueError, match="no longer accepts metadata_columns"):
             corpus.dataset(metadata_columns=["perturb_label"])
 
-    def test_expression_dataset_uses_explicit_routing_table(self, tmp_path: Path) -> None:
+    def test_dataset_returns_raw_expression_batches(self, tmp_path: Path) -> None:
         _build_mock_aggregate_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
         dataset = corpus.dataset()
-
-        assert type(dataset) is ExpressionBatchDataset
-        assert type(dataset.routing_table) is DatasetRoutingTable
-        np.testing.assert_array_equal(dataset.routing_table.dataset_starts, [0, 10])
-        np.testing.assert_array_equal(dataset.routing_table.dataset_stops, [10, 25])
-        np.testing.assert_array_equal(dataset.routing_table.dataset_indices, [0, 1])
-        assert dataset.routing_table.dataset_ids == ("mock_00", "mock_01")
 
         batch = dataset.__getitems__([0, 10, 24])[0]
         assert set(batch) == {

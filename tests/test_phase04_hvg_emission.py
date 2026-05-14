@@ -189,7 +189,7 @@ class TestMaterializationManifestHVGRoundTrip:
             contract_version=CONTRACT_VERSION,
             dataset_id="ds1",
             route="create_new",
-            backend="arrow-parquet",
+            backend="zarr",
             topology="federated",
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=OutputRoots(
@@ -209,149 +209,6 @@ class TestMaterializationManifestHVGRoundTrip:
         assert loaded.hvg_ranking_path is not None
         assert loaded.hvg_ranking_path.endswith("hvg.parquet")
         assert loaded.default_n_hvg == 2000
-
-
-# ---------------------------------------------------------------------------
-# Emission spec loader integration
-# ---------------------------------------------------------------------------
-
-
-class TestEmissionSpecLoaderIntegration:
-    """Test that loaders can read and apply emission spec."""
-
-    def _make_reader_components(self, tmp_path: Path):
-        """Create minimal Arrow/HF parquet + SQLite cell metadata for integration test."""
-        cells_path = tmp_path / "cells.parquet"
-        meta_path = tmp_path / "meta.parquet"
-        sqlite_path = tmp_path / "cell_meta.sqlite"
-        n_cells = 10
-        n_genes = 50
-
-        indices_list = []
-        counts_list = []
-        sf_list = []
-        for i in range(n_cells):
-            gene_indices = sorted(
-                np.random.default_rng(i).choice(n_genes, size=5, replace=False).tolist()
-            )
-            gene_counts = np.random.default_rng(i + 1000).integers(1, 10, size=5).tolist()
-            indices_list.append(gene_indices)
-            counts_list.append(gene_counts)
-            sf_list.append(float(np.random.default_rng(i).uniform(0.5, 2.0)))
-
-        table = pa.table(
-            {
-                "expressed_gene_indices": pa.array(indices_list, type=pa.list_(pa.int32())),
-                "expression_counts": pa.array(counts_list, type=pa.list_(pa.int32())),
-                "size_factor": pa.array(sf_list, type=pa.float64()),
-            }
-        )
-        pq.write_table(table, cells_path)
-
-        cell_ids = [f"syn_cell_{i}" for i in range(n_cells)]
-        meta_table = pa.table(
-            {
-                "cell_id": pa.array(cell_ids, type=pa.string()),
-                "size_factor": pa.array(sf_list, type=pa.float64()),
-                "raw_obs": pa.array([""] * n_cells, type=pa.string()),
-            }
-        )
-        pq.write_table(meta_table, meta_path)
-
-        # SQLite with canonical_perturbation/context
-        conn = sqlite3.connect(str(sqlite_path))
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS cell_meta "
-            "(cell_id TEXT, dataset_id TEXT, dataset_release TEXT, "
-            "size_factor REAL, canonical_perturbation TEXT, "
-            "canonical_context TEXT, raw_obs TEXT)"
-        )
-        for i in range(n_cells):
-            conn.execute(
-                "INSERT INTO cell_meta VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    f"syn_cell_{i}",
-                    "syn_ds",
-                    "v0",
-                    sf_list[i],
-                    json.dumps({"perturbation_label": f"gene_{i % 3}", "control_flag": "0"}),
-                    json.dumps({"dataset_id": "syn_ds", "cell_context": "treat"}),
-                    json.dumps({}),
-                ),
-            )
-        conn.commit()
-        conn.close()
-        return cells_path, meta_path, sqlite_path
-
-    @pytest.mark.skip(reason="ArrowHFCellReader removed in deprecated-loader-stack cleanup (Phase 1)")
-    def test_arrow_hf_cell_reader_emits_fields_via_spec(self, tmp_path: Path):
-        """ArrowHFCellReader returns CellState with canonical fields populated from SQLite."""
-        from perturb_data_lab.loaders import ArrowHFCellReader  # noqa: F401
-
-        cells_path, meta_path, sqlite_path = self._make_reader_components(tmp_path)
-        corpus_index = tmp_path / "corpus-index.yaml"
-        feature_reg = tmp_path / "feature-registry.yaml"
-        size_factor_path = tmp_path / "size-factor-manifest.yaml"
-
-        # Write minimal feature registry (50 genes)
-        from perturb_data_lab.materializers.models import (
-            FeatureRegistryEntry,
-            FeatureRegistryManifest,
-        )
-
-        reg = FeatureRegistryManifest(
-            kind="feature-registry",
-            contract_version=CONTRACT_VERSION,
-            registry_id="syn-reg",
-            append_only=True,
-            namespace="test",
-            feature_id_field="gene_id",
-            feature_label_field="gene_symbol",
-            default_missing_value=MISSING_VALUE_LITERAL,
-            entries=tuple(
-                FeatureRegistryEntry(
-                    token_id=j,
-                    feature_id=f"gene_{j}",
-                    feature_label=f"Gene {j}",
-                    namespace="test",
-                )
-                for j in range(50)
-            ),
-        )
-        reg.write_yaml(feature_reg)
-
-        from perturb_data_lab.materializers.models import (
-            SizeFactorEntry,
-            SizeFactorManifest,
-        )
-
-        sf_entries = [
-            SizeFactorEntry(cell_id=f"syn_cell_{i}", size_factor=1.0) for i in range(10)
-        ]
-        sf_manifest = SizeFactorManifest(
-            kind="size-factor-manifest",
-            contract_version=CONTRACT_VERSION,
-            method="sum",
-            entries=tuple(sf_entries),
-        )
-        sf_manifest.write_yaml(size_factor_path)
-
-        reader = ArrowHFCellReader(
-            dataset_id="syn_ds",
-            dataset_index=0,
-            corpus_index_path=corpus_index,
-            cells_parquet_path=cells_path,
-            meta_parquet_path=meta_path,
-            cell_meta_sqlite_path=sqlite_path,
-            feature_registry_path=feature_reg,
-            size_factor_manifest_path=size_factor_path,
-        )
-
-        cell = reader.read_cell(0)
-        # Verify emission fields are populated from SQLite
-        assert cell.canonical_perturbation.get("perturbation_label") is not None
-        assert cell.canonical_context.get("dataset_id") == "syn_ds"
-        assert cell.canonical_perturbation.get("control_flag") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +262,7 @@ class TestMaterializationManifestHVGRecord:
             contract_version=CONTRACT_VERSION,
             dataset_id="syn-ds",
             route="create_new",
-            backend="arrow-parquet",
+            backend="zarr",
             topology="federated",
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=output_roots,

@@ -454,7 +454,7 @@ class TestMaterializationManifestTokenizerPath:
             contract_version="0.2.0",
             dataset_id="test_ds",
             route="create_new",
-            backend="arrow-parquet",
+            backend="zarr",
             topology="federated",
             count_source=CountSourceSpec(selected=".X", integer_only=True),
             outputs=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
