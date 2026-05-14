@@ -48,6 +48,15 @@ class PpBatch:
         return int(self.global_row_index.shape[0])
 
 
+@dataclass(frozen=True)
+class _SparseFeatureSummary:
+    """Per-feature sparse batch sums shared across pp streaming reducers."""
+
+    sum: np.ndarray
+    sum_sq: np.ndarray
+    n_nonzero: np.ndarray
+
+
 def iter_dataset_batches(
     corpus: Corpus,
     *,
@@ -118,6 +127,35 @@ def log1p_size_factor_batch(
             batch.expression.indptr.copy(),
         ),
         shape=batch.expression.shape,
+    )
+
+
+def _summarize_sparse_features(
+    values: sparse.csr_matrix,
+    *,
+    n_features: int,
+) -> _SparseFeatureSummary:
+    """Return per-feature sums, squared sums, and nonzero counts for a CSR batch."""
+    data = np.asarray(values.data, dtype=np.float64)
+    if not data.size:
+        return _SparseFeatureSummary(
+            sum=np.zeros(n_features, dtype=np.float64),
+            sum_sq=np.zeros(n_features, dtype=np.float64),
+            n_nonzero=np.zeros(n_features, dtype=np.int64),
+        )
+
+    indices = np.asarray(values.indices, dtype=np.int64)
+    return _SparseFeatureSummary(
+        sum=np.bincount(indices, weights=data, minlength=n_features),
+        sum_sq=np.bincount(
+            indices,
+            weights=np.square(data),
+            minlength=n_features,
+        ),
+        n_nonzero=np.bincount(indices[data != 0.0], minlength=n_features).astype(
+            np.int64,
+            copy=False,
+        ),
     )
 
 

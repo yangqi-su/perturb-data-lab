@@ -11,7 +11,12 @@ from scipy.stats import t as student_t
 
 from ..loaders.corpus_loader import Corpus
 from .artifacts import prepare_pp_output, write_pp_provenance
-from .streaming import PpFeatureContext, iter_dataset_batches, log1p_size_factor_batch
+from .streaming import (
+    PpFeatureContext,
+    _summarize_sparse_features,
+    iter_dataset_batches,
+    log1p_size_factor_batch,
+)
 
 DEFAULT_TTEST_ARTIFACT_NAME = "ttest-degs"
 _LOGNORM_FORMULA = "log1p(count / size_factor)"
@@ -37,21 +42,10 @@ class _GroupAccumulator:
         if n_obs <= 0:
             raise ValueError("streamed DE groups must contain at least one row")
 
-        data = np.asarray(values.data, dtype=np.float64)
-        indices = np.asarray(values.indices, dtype=np.int64)
-        if data.size:
-            self.sum += np.bincount(indices, weights=data, minlength=self.n_features)
-            self.sum_sq += np.bincount(
-                indices,
-                weights=np.square(data),
-                minlength=self.n_features,
-            )
-            nonzero_indices = indices[data != 0.0]
-            if nonzero_indices.size:
-                self.n_nonzero += np.bincount(
-                    nonzero_indices,
-                    minlength=self.n_features,
-                ).astype(np.int64, copy=False)
+        summary = _summarize_sparse_features(values, n_features=self.n_features)
+        self.sum += summary.sum
+        self.sum_sq += summary.sum_sq
+        self.n_nonzero += summary.n_nonzero
         self.n_obs += n_obs
 
 
@@ -204,17 +198,17 @@ def _finalize_dataset_de(
             f"dataset {context.dataset_id!r} does not contain control label {control_label!r}"
         )
 
+    contrast_labels = sorted(label for label in accumulators if label != control_label)
     contrast_frames = [
         _build_ranked_contrast_frame(
             context,
             control_label=control_label,
             control=control,
             perturbation=label,
-            perturbed=accumulator,
+            perturbed=accumulators[label],
             top_k=top_k,
         )
-        for label, accumulator in sorted(accumulators.items())
-        if label != control_label
+        for label in contrast_labels
     ]
     frame = (
         _empty_deg_frame()
@@ -223,45 +217,78 @@ def _finalize_dataset_de(
     )
 
     if output_root is not None:
-        spec = prepare_pp_output(
-            output_root,
-            dataset_id=context.dataset_id,
-            artifact_name=artifact_name,
-            suffix="parquet",
-        )
-        if spec.artifact_path.exists() and not overwrite:
-            raise FileExistsError(f"output already exists: {spec.artifact_path}")
-        frame.write_parquet(spec.artifact_path)
-        write_pp_provenance(
-            spec,
+        _write_dataset_de_artifacts(
+            frame,
             corpus=corpus,
-            operation="rank_genes_ttest",
-            parameters={
-                "batch_size": batch_size,
-                "dataset_scope": "dataset",
-                "perturbation_column": perturbation_column,
-                "control_label": control_label,
-                "top_k": top_k,
-                "normalization": _LOGNORM_FORMULA,
-                "test": _P_VALUE_METHOD,
-                "p_adjustment": _P_ADJUST_METHOD,
-                "mean_semantics": "mean_lognorm_expression",
-                "logfoldchange_semantics": _LOGFOLDCHANGE_SEMANTICS,
-                "group_filtering": "all non-control labels in perturbation_column",
-            },
-            extra={
-                "contrast_labels": sorted(label for label in accumulators if label != control_label),
-                "n_contrasts": sum(1 for label in accumulators if label != control_label),
-                "n_obs_total": int(sum(accumulator.n_obs for accumulator in accumulators.values())),
-                "n_obs_reference": int(control.n_obs),
-                "n_features": int(context.n_features),
-                "global_row_start": int(context.global_start),
-                "global_row_end": int(context.global_end),
-                "gene_token_id_semantics": "shared global feature id without special-token offset",
-            },
+            context=context,
+            output_root=output_root,
+            artifact_name=artifact_name,
+            overwrite=overwrite,
+            batch_size=batch_size,
+            perturbation_column=perturbation_column,
+            control_label=control_label,
+            top_k=top_k,
+            control=control,
+            accumulators=accumulators,
+            contrast_labels=contrast_labels,
         )
 
     return frame
+
+
+def _write_dataset_de_artifacts(
+    frame: pl.DataFrame,
+    *,
+    corpus: Corpus,
+    context: PpFeatureContext,
+    output_root: Path,
+    artifact_name: str,
+    overwrite: bool,
+    batch_size: int,
+    perturbation_column: str,
+    control_label: str,
+    top_k: int,
+    control: _GroupAccumulator,
+    accumulators: dict[str, _GroupAccumulator],
+    contrast_labels: list[str],
+) -> None:
+    spec = prepare_pp_output(
+        output_root,
+        dataset_id=context.dataset_id,
+        artifact_name=artifact_name,
+        suffix="parquet",
+    )
+    if spec.artifact_path.exists() and not overwrite:
+        raise FileExistsError(f"output already exists: {spec.artifact_path}")
+    frame.write_parquet(spec.artifact_path)
+    write_pp_provenance(
+        spec,
+        corpus=corpus,
+        operation="rank_genes_ttest",
+        parameters={
+            "batch_size": batch_size,
+            "dataset_scope": "dataset",
+            "perturbation_column": perturbation_column,
+            "control_label": control_label,
+            "top_k": top_k,
+            "normalization": _LOGNORM_FORMULA,
+            "test": _P_VALUE_METHOD,
+            "p_adjustment": _P_ADJUST_METHOD,
+            "mean_semantics": "mean_lognorm_expression",
+            "logfoldchange_semantics": _LOGFOLDCHANGE_SEMANTICS,
+            "group_filtering": "all non-control labels in perturbation_column",
+        },
+        extra={
+            "contrast_labels": contrast_labels,
+            "n_contrasts": len(contrast_labels),
+            "n_obs_total": int(sum(accumulator.n_obs for accumulator in accumulators.values())),
+            "n_obs_reference": int(control.n_obs),
+            "n_features": int(context.n_features),
+            "global_row_start": int(context.global_start),
+            "global_row_end": int(context.global_end),
+            "gene_token_id_semantics": "shared global feature id without special-token offset",
+        },
+    )
 
 
 def _build_ranked_contrast_frame(
@@ -321,7 +348,7 @@ def _build_ranked_contrast_frame(
             "n_reference": np.full(len(top_indices), control.n_obs, dtype=np.int64),
             "n_perturbed": np.full(len(top_indices), perturbed.n_obs, dtype=np.int64),
         }
-    ).sort("rank")
+    )
 
 
 def _sample_variance(accumulator: _GroupAccumulator) -> np.ndarray:

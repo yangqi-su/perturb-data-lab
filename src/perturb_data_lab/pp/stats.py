@@ -11,7 +11,12 @@ import polars as pl
 
 from ..loaders.corpus_loader import Corpus
 from .artifacts import prepare_pp_output, write_pp_provenance
-from .streaming import PpFeatureContext, iter_dataset_batches, log1p_size_factor_batch
+from .streaming import (
+    PpFeatureContext,
+    _summarize_sparse_features,
+    iter_dataset_batches,
+    log1p_size_factor_batch,
+)
 
 DEFAULT_LOGNORM_STATS_ARTIFACT_NAME = "lognorm-stats"
 _LOGNORM_FORMULA = "log1p(count / size_factor)"
@@ -34,24 +39,10 @@ class _StreamingVarianceAccumulator:
         if n_obs <= 0:
             raise ValueError("streamed lognorm batches must contain at least one row")
 
-        data = np.asarray(values.data, dtype=np.float64)
-        indices = np.asarray(values.indices, dtype=np.int64)
-        if data.size:
-            batch_sum = np.bincount(indices, weights=data, minlength=self.n_features)
-            batch_sum_sq = np.bincount(
-                indices,
-                weights=np.square(data),
-                minlength=self.n_features,
-            )
-            nonzero_indices = indices[data != 0.0]
-            batch_n_nonzero = np.bincount(
-                nonzero_indices,
-                minlength=self.n_features,
-            ).astype(np.int64, copy=False)
-        else:
-            batch_sum = np.zeros(self.n_features, dtype=np.float64)
-            batch_sum_sq = np.zeros(self.n_features, dtype=np.float64)
-            batch_n_nonzero = np.zeros(self.n_features, dtype=np.int64)
+        summary = _summarize_sparse_features(values, n_features=self.n_features)
+        batch_sum = summary.sum
+        batch_sum_sq = summary.sum_sq
+        batch_n_nonzero = summary.n_nonzero
 
         batch_mean = batch_sum / float(n_obs)
         batch_m2 = np.maximum(batch_sum_sq - float(n_obs) * np.square(batch_mean), 0.0)
