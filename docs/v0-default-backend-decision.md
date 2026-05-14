@@ -13,7 +13,7 @@
 
 **Named operational alternate: Zarr for node-local staging**
 
-**Other backends: experimental but wired**
+**Other historical backends: preserved only on a local experimental snapshot branch**
 
 The current public workflow and docs should assume:
 
@@ -50,22 +50,23 @@ Do not describe Zarr as the default production choice in handbook or onboarding 
 
 ---
 
-## Experimental but wired backends
+## Other routes on slim main vs the experimental snapshot
 
-The package still contains additional backend routes. They remain useful for targeted experiments, compatibility work, or follow-up evaluation, but they are not the documented default path.
+Slim main now keeps exactly four supported corpus routes: aggregate Lance,
+federated Lance, aggregate Zarr, and federated Zarr.
+
+Removed backend code and the legacy truncated-SVD PCA path are preserved only on
+the local experimental snapshot branch
+`experimental/all-backends-pre-slim-20260514`. That branch is local-only unless
+someone explicitly pushes it.
 
 | Backend / route | Policy status | Notes |
 |---|---|---|
 | aggregate Lance | default | primary create/append/load path |
-| federated Lance | experimental | supported by loader, not the default operational recommendation |
+| federated Lance | supported secondary route | same slim-main runtime surface, not the default operational recommendation |
 | aggregate Zarr | optional alternate | use for node-local staging when justified |
-| federated Zarr | experimental | wired, not default |
-| aggregate TileDB | experimental | keep wired, but do not present as preferred path |
-| aggregate CSR memmap | experimental | useful for targeted investigations, not default policy |
-| federated Arrow IPC | experimental | wired reader path |
-| federated HuggingFace datasets | experimental | wired reader path |
-| federated Parquet | experimental | wired reader path |
-| WebDataset | dormant | not currently enabled by `load_corpus()` |
+| federated Zarr | supported secondary route | same slim-main runtime surface, not default |
+| removed experimental backends | experimental snapshot only | TileDB, CSR memmap/direct CSR, Arrow IPC, HuggingFace datasets, Parquet, and WebDataset live only on the local snapshot branch |
 
 ---
 
@@ -75,7 +76,8 @@ Docs should now state all of the following explicitly:
 
 - Lance is the default production backend.
 - Zarr is optional for node-local staging, not the default.
-- Other backends remain wired but experimental.
+- Federated Lance/Zarr remain supported through the same public runtime API.
+- Removed backends are not supported on slim main and should be described only as living on the local experimental snapshot branch.
 - Canonical schema review happens **after** materialization, not before it.
 - `load_corpus()` is the public runtime entrypoint after canonicalization.
 
@@ -83,7 +85,7 @@ Docs should now state all of the following explicitly:
 
 ## Caveats and follow-up notes
 
-- This policy does **not** mean every experimental backend is incorrect; it means the project should not steer new users to them first.
+- This policy does **not** mean every removed backend is incorrect; it means slim main no longer carries them as maintained routes.
 - Some public source-level rough edges remain, including a known `draft-schema` duplicate-canonical-name bug on at least one real dataset.
 - The policy is based on validated workflow fit and runtime readiness, not on a fresh full benchmark sweep across all backends.
 
@@ -95,5 +97,5 @@ Docs should now state all of the following explicitly:
 |---|---|---|
 | default production path | aggregate Lance | use for create, append, canonicalize, and runtime loading |
 | operational alternate | Zarr | use only when node-local staging or chunked-array handling is the main need |
-| experimental options | TileDB, CSR memmap, federated Lance/Zarr/Arrow IPC/HF datasets/Parquet | keep wired, but do not lead handbook examples with them |
-| dormant route | WebDataset | do not document as part of the current `load_corpus()` path |
+| supported secondary routes | federated Lance and federated Zarr | supported through the same slim-main `load_corpus()` API when topology requires it |
+| experimental snapshot only | TileDB, CSR memmap/direct CSR, Arrow IPC, HF datasets, Parquet, WebDataset, truncated-SVD PCA | use the local `experimental/all-backends-pre-slim-20260514` branch if you intentionally need the preserved pre-slim implementation |

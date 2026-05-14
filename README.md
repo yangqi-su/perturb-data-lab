@@ -11,7 +11,7 @@ Corpus-first preprocessing and runtime-loading system for large-scale perturb-se
 - backfill canonical `hvg.parquet` ranking tables for existing Lance corpora without reopening source h5ad files
 - expose a corpus-level `load_corpus()` / `Corpus` runtime API for unified access
 - expose a pertTF-local adapter path and Marson/Xorion smoke workflow without modifying `pertTF`
-- keep aggregate Lance as the production-default backend while leaving other backends wired for controlled experiments
+- keep Lance and Zarr as the maintained slim-main backends, with aggregate Lance as the production-default path
 
 ## Repo layout
 
@@ -46,7 +46,7 @@ perturb-data-lab/
 - `src/perturb_data_lab/materializers/`: create/append corpus writers, aggregate/federated backends, manifests, and emission-spec helpers
 - `src/perturb_data_lab/canonical/`: draft/final schema application and canonical obs/var generation
 - `src/perturb_data_lab/loaders/corpus_loader.py`: `load_corpus()` and `Corpus` for unified runtime access
-- `src/perturb_data_lab/pp/`: backend-agnostic streamed per-dataset stats, HVG, PCA/SVD, and Welch DE helpers
+- `src/perturb_data_lab/pp/`: backend-agnostic streamed per-dataset stats, HVG, IncrementalPCA, and Welch DE helpers
 - `scripts/perttf_marson_xorion_smoke.py`: bounded full-corpus public-loader smoke for Marson/Xorion
 - `docs/v0-onboarding-workflow.md`: current inspect → materialize → draft-schema → finalize-schema → canonicalize → load workflow
 - `docs/canonicalization_handbook.md`: canonical schema review rules, transform behavior, tokenizer notes, and common failure modes
@@ -100,11 +100,13 @@ obs_filter: "cell_line_or_type == 'T_cell' and donor_id in ['D1', 'D2'] and dise
 Recommended policy:
 
 - **Default production path:** aggregate Lance
-- **Optional node-local staging path:** Zarr when chunked array artifacts are operationally preferable
-- **Experimental but wired:** aggregate TileDB, aggregate CSR memmap, federated Lance, federated Zarr, federated Arrow IPC, federated HuggingFace datasets, federated Parquet
-- **Not currently enabled by `load_corpus(...)`:** WebDataset
+- **Optional node-local staging path:** aggregate Zarr when chunked array artifacts are operationally preferable
+- **Also supported on slim main:** federated Lance and federated Zarr through the same `load_corpus(...)` API
+- **Removed from slim main:** Arrow/Parquet/HF/WebDataset/TileDB/CSR runtime and materialization routes
 
 `load_corpus(path)` reconstructs a corpus from canonical metadata plus backend artifacts and exposes one backend-neutral runtime API across those supported routes.
+
+Removed backend code and the legacy truncated-SVD PCA route are preserved only on the local experimental snapshot branch `experimental/all-backends-pre-slim-20260514`; no remote branch is implied by this repository README.
 
 ```python
 from perturb_data_lab.loaders import load_corpus
@@ -173,6 +175,10 @@ for batch in perttf_loader:
 - `PertTFPairedBatchLoader` yields final pertTF-ready batch dictionaries; normal
   callers do not need to assemble raw pair requests or call
   `build_from_raw_pair_batch(...)` directly.
+- The retained slim-main pertTF public surface is `PertTFAdapterConfig`,
+  `PertTFCorpusAdapter`, `PerturbationPairBatch`, `PerturbationPairSampler`,
+  `PertTFPairedBatchBuilder`, and `PertTFPairedBatchLoader`, all re-exported
+  from `perturb_data_lab.loaders`.
 - Rows with null required pertTF labels (`cell_context`, `perturb_label`,
   `batch_id`) are dropped by default with a `RuntimeWarning`; the effective row
   counts remain visible via `perttf_loader.null_label_filter_stats` and the
@@ -214,7 +220,7 @@ for batch in corpus.loader(
 ### Custom row subsets and pertTF pairing pools
 
 ```python
-from perturb_data_lab.loaders.adapters.perttf import PerturbationPairSampler
+from perturb_data_lab.loaders import PerturbationPairSampler
 
 row_subset = [0, 3, 10, 22]
 
@@ -366,8 +372,8 @@ de = rank_genes_ttest(
 - `run_pca(...)` uses centered `method="incremental_pca"` as the slim-main
   streamed PCA route for bounded dense batches when `scikit-learn` is
   installed (for example via `pip install ".[pca]"`). The legacy
-  `method="truncated_svd"` path is preserved only on the experimental
-  pre-slim branch.
+  `method="truncated_svd"` path is preserved only on the local experimental
+  snapshot branch `experimental/all-backends-pre-slim-20260514`.
 - `rank_genes_ttest(...)` runs streamed per-dataset Welch DE against an
   explicit control label and writes top-k `ttest-degs.parquet` artifacts when
   `output_dir` is set.

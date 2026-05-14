@@ -158,4 +158,4 @@ result = run_pca(
 - `fit_row_indices` lets you fit on a bounded deterministic subset while `transform_row_indices` controls which rows receive embeddings.
 - Omit `transform_row_indices` to transform all rows in the requested dataset.
 - `max_dense_batch_bytes` guards the dense `batch_size × selected_features` working set before outputs are written.
-- `method="incremental_pca"` is the supported slim-main streamed PCA route; the legacy `method="truncated_svd"` path remains only on the experimental pre-slim branch.
+- `method="incremental_pca"` is the supported slim-main streamed PCA route; the legacy `method="truncated_svd"` path remains only on the local experimental snapshot branch `experimental/all-backends-pre-slim-20260514`.

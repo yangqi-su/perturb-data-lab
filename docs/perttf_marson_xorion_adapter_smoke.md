@@ -26,6 +26,13 @@ python scripts/perttf_marson_xorion_smoke.py \
   --output-dir /path/to/phase-07-artifacts
 ```
 
+The retained slim-main pertTF public import surface is re-exported from
+`perturb_data_lab.loaders`: `PertTFAdapterConfig`, `PertTFCorpusAdapter`,
+`PerturbationPairBatch`, `PerturbationPairSampler`,
+`PertTFPairedBatchBuilder`, and `PertTFPairedBatchLoader`. Legacy mapping helper
+names such as `PertTFVocabAdapter`, `PertTFLabelAdapter`, and
+`CategoricalLabelMap` are no longer part of the public import surface.
+
 ## Why the smoke scans bounded public-loader batches
 
 For the full 41.5M-cell corpus, this smoke keeps the validation bounded by using

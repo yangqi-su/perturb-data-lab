@@ -278,8 +278,8 @@ For multi-dataset corpora, include boundary checks across the dataset transition
 
 - **Default production backend:** aggregate Lance
 - **Optional node-local staging backend:** Zarr
-- **Experimental but still wired:** TileDB, CSR memmap, federated Lance/Zarr/Arrow IPC/HF datasets/Parquet
-- **Not part of the current default runtime path:** WebDataset
+- **Also supported on slim main:** federated Lance and federated Zarr
+- **Experimental snapshot only:** TileDB, CSR memmap/direct CSR, Arrow IPC, HF datasets, Parquet, WebDataset, and truncated-SVD PCA live only on local branch `experimental/all-backends-pre-slim-20260514`
 
 Use aggregate Lance unless there is a clear operational reason to stage a chunked array representation locally.
 
@@ -308,7 +308,7 @@ h5ad file
    │
    ▼
 [5] canonicalize
-   canonical-obs.parquet + canonical-var.parquet + corpus-vocab.yaml
+   canonical-obs.parquet + canonical-var.parquet + gene-tokenizer.json (when emitted)
    │
    ▼
 [6] load_corpus

@@ -1,12 +1,12 @@
-"""Model-specific loader adapters that live inside perturb-data-lab.
+"""Public slim-main model adapter exports.
 
-The pertTF adapter namespace is kept here so vocab and label preparation can
-evolve without modifying the external ``pertTF`` repository.
+The pertTF adapter namespace is kept here so the retained training-facing
+surface can evolve without modifying the external ``pertTF`` repository.
+Legacy mapping helpers remain internal to the implementation module.
 """
 
 from .perttf import (
     PertTFAdapterConfig,
-    PertTFNullLabelFilterStats,
     PertTFPairedBatchLoader,
     PertTFPairedBatchBuilder,
     PerturbationPairBatch,
@@ -16,7 +16,6 @@ from .perttf import (
 
 __all__ = [
     "PertTFAdapterConfig",
-    "PertTFNullLabelFilterStats",
     "PertTFPairedBatchLoader",
     "PertTFPairedBatchBuilder",
     "PerturbationPairBatch",

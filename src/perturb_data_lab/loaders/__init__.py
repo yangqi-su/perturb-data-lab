@@ -1,4 +1,4 @@
-"""Public composable corpus-loader API exports."""
+"""Public slim-main corpus loader and pertTF API exports."""
 
 from .expression import (
     AggregateLanceReader,
@@ -47,7 +47,6 @@ from .gpu_pipeline import (
 )
 from .adapters import (
     PertTFAdapterConfig,
-    PertTFNullLabelFilterStats,
     PertTFPairedBatchLoader,
     PertTFPairedBatchBuilder,
     PerturbationPairBatch,
@@ -91,7 +90,6 @@ __all__ = [
     "CPUPipeline",
     # Phase 4 — pertTF-local adapters
     "PertTFAdapterConfig",
-    "PertTFNullLabelFilterStats",
     "PertTFPairedBatchLoader",
     "PertTFPairedBatchBuilder",
     "PerturbationPairBatch",
