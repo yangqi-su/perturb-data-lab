@@ -11,17 +11,12 @@ import pytest
 from perturb_data_lab.loaders.expression import (
     AggregateLanceReader,
     AggregateZarrReader,
-    ArrowIpcDatasetEntry,
     DatasetEntry,
-    FederatedArrowIpcReader,
     FederatedLanceReader,
-    FederatedParquetReader,
-    FederatedWebDatasetReader,
     FederatedZarrReader,
     LanceDatasetEntry,
-    ParquetDatasetEntry,
-    WebDatasetEntry,
     ZarrDatasetEntry,
+    build_expression_reader,
 )
 from perturb_data_lab.loaders.loaders import ExpressionBatch
 
@@ -34,10 +29,6 @@ AGGREGATE_LANCE = _ARCHIVED_ROOT / "lance-aggregate/matrix/aggregated-cells.lanc
 AGGREGATE_ZARR_BASE = _ARCHIVED_ROOT / "zarr-aggregate/matrix"
 FEDERATED_ZARR_BASE = _ARCHIVED_ROOT / "zarr-federated"
 FEDERATED_BASE = _ARCHIVED_ROOT / "lance-federated"
-ARROW_IPC_BASE = _ARCHIVED_ROOT / "arrow-ipc-federated"
-PARQUET_BASE = _ARCHIVED_ROOT / "arrow-parquet-federated"
-WEBDATASET_BASE = _ARCHIVED_ROOT / "webdataset-federated"
-
 _DATASET_SIZES = {
     "dummy_00": 50_000,
     "dummy_01": 75_000,
@@ -152,66 +143,6 @@ def fed_zarr_reader() -> FederatedZarrReader:
     )
 
 
-@pytest.fixture(scope="module")
-def arrow_ipc_reader() -> FederatedArrowIpcReader:
-    return FederatedArrowIpcReader(
-        [
-            ArrowIpcDatasetEntry(
-                "dummy_00",
-                0,
-                50_000,
-                ARROW_IPC_BASE / "dummy_00/matrix/dummy_00-release-cells.arrow",
-            ),
-            ArrowIpcDatasetEntry(
-                "dummy_01",
-                50_000,
-                125_000,
-                ARROW_IPC_BASE / "dummy_01/matrix/dummy_01-release-cells.arrow",
-            ),
-        ]
-    )
-
-
-@pytest.fixture(scope="module")
-def parquet_reader() -> FederatedParquetReader:
-    return FederatedParquetReader(
-        [
-            ParquetDatasetEntry(
-                "dummy_00",
-                0,
-                50_000,
-                PARQUET_BASE / "dummy_00/matrix/dummy_00-release-cells.parquet",
-            ),
-            ParquetDatasetEntry(
-                "dummy_01",
-                50_000,
-                125_000,
-                PARQUET_BASE / "dummy_01/matrix/dummy_01-release-cells.parquet",
-            ),
-        ]
-    )
-
-
-@pytest.fixture(scope="module")
-def webdataset_reader() -> FederatedWebDatasetReader:
-    return FederatedWebDatasetReader(
-        [
-            WebDatasetEntry(
-                "dummy_00",
-                0,
-                50_000,
-                WEBDATASET_BASE / "dummy_00/matrix/dummy_00-release-cells.tar",
-            ),
-            WebDatasetEntry(
-                "dummy_01",
-                50_000,
-                125_000,
-                WEBDATASET_BASE / "dummy_01/matrix/dummy_01-release-cells.tar",
-            ),
-        ]
-    )
-
-
 class TestAggregateLanceReaderFlatOnly:
     def test_single_cell(self, agg_reader):
         batch = agg_reader.read_expression_flat([0])
@@ -305,15 +236,12 @@ class TestFederatedLanceReaderFlatOnly:
         _assert_batch_core(batch2, [1, 50_001])
 
 
-class TestDormantReaderFlatContract:
+class TestSlimReaderFlatContract:
     @pytest.mark.parametrize(
         ("fixture_name", "indices"),
         [
             ("agg_zarr_reader", [100, 5, 50_000, 99_999]),
             ("fed_zarr_reader", [0, 50_000, 1, 50_001]),
-            ("arrow_ipc_reader", [0, 50_000, 1, 50_001]),
-            ("parquet_reader", [0, 50_000, 1, 50_001]),
-            ("webdataset_reader", [0, 50_000, 1, 50_001]),
         ],
     )
     def test_flat_reader_smoke(self, request, fixture_name: str, indices: list[int]):
@@ -328,9 +256,6 @@ class TestDormantReaderFlatContract:
         [
             "agg_zarr_reader",
             "fed_zarr_reader",
-            "arrow_ipc_reader",
-            "parquet_reader",
-            "webdataset_reader",
         ],
     )
     def test_flat_reader_empty_input(self, request, fixture_name: str):
@@ -338,8 +263,10 @@ class TestDormantReaderFlatContract:
         batch = reader.read_expression_flat([])
         _assert_batch_core(batch, [])
 
-    def test_arrow_reader_out_of_range(self, arrow_ipc_reader):
-        with pytest.raises(IndexError):
-            arrow_ipc_reader.read_expression_flat([-1])
-        with pytest.raises(IndexError):
-            arrow_ipc_reader.read_expression_flat([125_000])
+    @pytest.mark.parametrize(
+        "backend",
+        ["arrow_ipc", "hf_datasets", "parquet", "webdataset", "tiledb", "csr_memmap"],
+    )
+    def test_removed_backends_raise_clear_error(self, backend: str) -> None:
+        with pytest.raises(ValueError, match="not supported in slim main"):
+            build_expression_reader(backend, "federated", [DatasetEntry("dummy", 0, 1)])

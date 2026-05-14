@@ -44,3 +44,24 @@ def test_removed_corpus_backends_fail_clearly(backend: str) -> None:
 def test_removed_expression_readers_raise_clear_error(backend: str) -> None:
     with pytest.raises(ValueError, match="not supported in slim main"):
         build_expression_reader(backend, "federated", [DatasetEntry("ds", 0, 1)])
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "AggregateTileDBReader",
+        "AggregateCsrMemmapReader",
+        "FederatedArrowIpcReader",
+        "FederatedHfDatasetsReader",
+        "FederatedParquetReader",
+        "FederatedWebDatasetReader",
+        "ArrowIpcDatasetEntry",
+        "HfDatasetsDatasetEntry",
+        "ParquetDatasetEntry",
+        "WebDatasetEntry",
+        "CsrMemmapShardEntry",
+    ],
+)
+def test_removed_expression_symbols_are_not_exported_from_loaders(symbol: str) -> None:
+    with pytest.raises(ImportError):
+        exec(f"from perturb_data_lab.loaders import {symbol}", {}, {})

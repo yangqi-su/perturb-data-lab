@@ -60,13 +60,9 @@ import yaml
 from torch.utils.data import DataLoader
 
 from .expression import (
-    ArrowIpcDatasetEntry,
-    CsrMemmapShardEntry,
     DatasetEntry,
     ExpressionReader,
-    HfDatasetsDatasetEntry,
     LanceDatasetEntry,
-    ParquetDatasetEntry,
     ZarrDatasetEntry,
     build_expression_reader,
 )
@@ -654,6 +650,142 @@ def _normalize_backend(raw: str) -> str:
     return norm
 
 
+def _build_range_entries(
+    global_ranges: Sequence[tuple[str, int, int, int]],
+) -> list[DatasetEntry]:
+    return [
+        DatasetEntry(
+            dataset_id=ds_id,
+            global_start=g_start,
+            global_end=g_end,
+        )
+        for ds_id, _dsi, g_start, g_end in global_ranges
+    ]
+
+
+def _build_aggregate_expression_components(
+    root: Path,
+    backend: str,
+    global_ranges: Sequence[tuple[str, int, int, int]],
+) -> tuple[list[DatasetEntry], ExpressionReader]:
+    entries = _build_range_entries(global_ranges)
+    if backend == "lance":
+        lance_path = root / "matrix" / "aggregated-cells.lance"
+        if not lance_path.exists():
+            raise FileNotFoundError(
+                f"Aggregate Lance file not found: {lance_path}"
+            )
+        return entries, build_expression_reader(
+            backend,
+            "aggregate",
+            entries,
+            lance_path=str(lance_path),
+        )
+
+    row_offsets_path = root / "matrix" / "aggregated-row-offsets.zarr"
+    indices_path = root / "matrix" / "aggregated-indices.zarr"
+    counts_path = root / "matrix" / "aggregated-counts.zarr"
+    if not row_offsets_path.is_dir():
+        raise FileNotFoundError(
+            "Aggregate Zarr row-offsets artifact not found: "
+            f"{row_offsets_path}"
+        )
+    if not indices_path.is_dir():
+        raise FileNotFoundError(
+            f"Aggregate Zarr indices artifact not found: {indices_path}"
+        )
+    if not counts_path.is_dir():
+        raise FileNotFoundError(
+            f"Aggregate Zarr counts artifact not found: {counts_path}"
+        )
+    return entries, build_expression_reader(
+        backend,
+        "aggregate",
+        entries,
+        offsets_path=str(row_offsets_path),
+        indices_path=str(indices_path),
+        counts_path=str(counts_path),
+    )
+
+
+def _build_federated_dataset_entry(
+    root: Path,
+    backend: str,
+    dataset_id: str,
+    global_start: int,
+    global_end: int,
+) -> LanceDatasetEntry | ZarrDatasetEntry:
+    matrix_root = resolve_corpus_paths("federated", root, dataset_id).matrix_root
+    if backend == "lance":
+        lance_path = matrix_root / f"{dataset_id}.lance"
+        if not lance_path.exists():
+            raise FileNotFoundError(
+                f"Lance file not found for dataset '{dataset_id}': "
+                f"{lance_path}"
+            )
+        return LanceDatasetEntry(
+            dataset_id=dataset_id,
+            global_start=global_start,
+            global_end=global_end,
+            lance_path=str(lance_path),
+        )
+
+    row_offsets_path = matrix_root / f"{dataset_id}-row-offsets.zarr"
+    indices_path = matrix_root / f"{dataset_id}-indices.zarr"
+    counts_path = matrix_root / f"{dataset_id}-counts.zarr"
+    if not row_offsets_path.is_dir():
+        raise FileNotFoundError(
+            f"Zarr row-offsets artifact not found for dataset '{dataset_id}': "
+            f"{row_offsets_path}"
+        )
+    if not indices_path.is_dir():
+        raise FileNotFoundError(
+            f"Zarr indices artifact not found for dataset '{dataset_id}': "
+            f"{indices_path}"
+        )
+    if not counts_path.is_dir():
+        raise FileNotFoundError(
+            f"Zarr counts artifact not found for dataset '{dataset_id}': "
+            f"{counts_path}"
+        )
+    return ZarrDatasetEntry(
+        dataset_id=dataset_id,
+        global_start=global_start,
+        global_end=global_end,
+        offsets_path=str(row_offsets_path),
+        indices_path=str(indices_path),
+        counts_path=str(counts_path),
+    )
+
+
+def _build_federated_expression_components(
+    root: Path,
+    backend: str,
+    global_ranges: Sequence[tuple[str, int, int, int]],
+) -> tuple[list[DatasetEntry], ExpressionReader]:
+    entries = [
+        _build_federated_dataset_entry(root, backend, ds_id, g_start, g_end)
+        for ds_id, _dsi, g_start, g_end in global_ranges
+    ]
+    return entries, build_expression_reader(backend, "federated", entries)
+
+
+def _build_expression_components(
+    root: Path,
+    topology: str,
+    backend: str,
+    global_ranges: Sequence[tuple[str, int, int, int]],
+) -> tuple[list[DatasetEntry], ExpressionReader]:
+    if topology == "aggregate":
+        return _build_aggregate_expression_components(root, backend, global_ranges)
+    if topology == "federated":
+        return _build_federated_expression_components(root, backend, global_ranges)
+    raise ValueError(
+        f"Unknown topology '{topology}'. "
+        f"Expected 'aggregate' or 'federated'."
+    )
+
+
 def _coerce_optional_float32(
     values: np.ndarray | tuple | None,
 ) -> np.ndarray | None:
@@ -1231,128 +1363,12 @@ def load_corpus(
     # ------------------------------------------------------------------
     # 4. Build dataset entries and ExpressionReader
     # ------------------------------------------------------------------
-    entries: list[DatasetEntry]
-    if topology == "aggregate":
-        if backend == "lance":
-            lance_path = str(root / "matrix" / "aggregated-cells.lance")
-            if not Path(lance_path).exists():
-                raise FileNotFoundError(
-                    f"Aggregate Lance file not found: {lance_path}"
-                )
-            entries = [
-                DatasetEntry(
-                    dataset_id=ds_id,
-                    global_start=g_start,
-                    global_end=g_end,
-                )
-                for ds_id, _dsi, g_start, g_end in global_ranges
-            ]
-            expression_reader = build_expression_reader(
-                backend, topology, entries, lance_path=lance_path,
-            )
-        elif backend == "zarr":
-            row_offsets_path = root / "matrix" / "aggregated-row-offsets.zarr"
-            indices_path = root / "matrix" / "aggregated-indices.zarr"
-            counts_path = root / "matrix" / "aggregated-counts.zarr"
-            if not row_offsets_path.is_dir():
-                raise FileNotFoundError(
-                    "Aggregate Zarr row-offsets artifact not found: "
-                    f"{row_offsets_path}"
-                )
-            if not indices_path.is_dir():
-                raise FileNotFoundError(
-                    f"Aggregate Zarr indices artifact not found: {indices_path}"
-                )
-            if not counts_path.is_dir():
-                raise FileNotFoundError(
-                    f"Aggregate Zarr counts artifact not found: {counts_path}"
-                )
-            entries = [
-                DatasetEntry(
-                    dataset_id=ds_id,
-                    global_start=g_start,
-                    global_end=g_end,
-                )
-                for ds_id, _dsi, g_start, g_end in global_ranges
-            ]
-            expression_reader = build_expression_reader(
-                backend,
-                topology,
-                entries,
-                offsets_path=str(row_offsets_path),
-                indices_path=str(indices_path),
-                counts_path=str(counts_path),
-            )
-        else:
-            raise ValueError(
-                f"Unsupported backend '{backend}' for aggregate topology. "
-                "Only 'lance' and 'zarr' are currently "
-                "supported for aggregate."
-            )
-    elif topology == "federated":
-        if backend in {"lance", "zarr"}:
-            entries = []
-            for ds_id, _dsi, g_start, g_end in global_ranges:
-                matrix_root = resolve_corpus_paths(topology, root, ds_id).matrix_root
-                if backend == "lance":
-                    lance_path = matrix_root / f"{ds_id}.lance"
-                    if not lance_path.exists():
-                        raise FileNotFoundError(
-                            f"Lance file not found for dataset '{ds_id}': "
-                            f"{lance_path}"
-                        )
-                    entries.append(
-                        LanceDatasetEntry(
-                            dataset_id=ds_id,
-                            global_start=g_start,
-                            global_end=g_end,
-                            lance_path=str(lance_path),
-                        )
-                    )
-                    continue
-
-                if backend == "zarr":
-                    row_offsets_path = matrix_root / f"{ds_id}-row-offsets.zarr"
-                    indices_path = matrix_root / f"{ds_id}-indices.zarr"
-                    counts_path = matrix_root / f"{ds_id}-counts.zarr"
-                    if not row_offsets_path.is_dir():
-                        raise FileNotFoundError(
-                            f"Zarr row-offsets artifact not found for dataset '{ds_id}': "
-                            f"{row_offsets_path}"
-                        )
-                    if not indices_path.is_dir():
-                        raise FileNotFoundError(
-                            f"Zarr indices artifact not found for dataset '{ds_id}': "
-                            f"{indices_path}"
-                        )
-                    if not counts_path.is_dir():
-                        raise FileNotFoundError(
-                            f"Zarr counts artifact not found for dataset '{ds_id}': "
-                            f"{counts_path}"
-                        )
-                    entries.append(
-                        ZarrDatasetEntry(
-                            dataset_id=ds_id,
-                            global_start=g_start,
-                            global_end=g_end,
-                            offsets_path=str(row_offsets_path),
-                            indices_path=str(indices_path),
-                            counts_path=str(counts_path),
-                        )
-                    )
-                    continue
-
-            expression_reader = build_expression_reader(backend, topology, entries)
-        else:
-            raise ValueError(
-                f"Unsupported backend '{backend}' for federated topology. "
-                f"Only 'lance' and 'zarr' are currently supported for federated."
-            )
-    else:
-        raise ValueError(
-            f"Unknown topology '{topology}'. "
-            f"Expected 'aggregate' or 'federated'."
-        )
+    entries, expression_reader = _build_expression_components(
+        root,
+        topology,
+        backend,
+        global_ranges,
+    )
 
     routing_table = _build_dataset_routing_table(metadata_index, entries)
 
@@ -2238,78 +2254,6 @@ def _resolve_dataset_hvg_inputs(
         if candidate.exists():
             return candidate, default_n_hvg
     return None, default_n_hvg
-
-
-def _build_csr_entries(
-    corpus_root: Path, manifest_path: Path
-) -> list[CsrMemmapShardEntry]:
-    """Build ``CsrMemmapShardEntry`` list from a ``csr-corpus-manifest.yaml``.
-
-    Parameters
-    ----------
-    corpus_root : Path
-        Root of the CSR corpus directory (for resolving relative shard paths).
-    manifest_path : Path
-        Path to ``csr-corpus-manifest.yaml``.
-
-    Returns
-    -------
-    list of CsrMemmapShardEntry
-        One entry per shard, sorted by ``global_start``.
-
-    Raises
-    ------
-    ValueError
-        If the manifest is missing required fields or the shards list is empty.
-    FileNotFoundError
-        If any required ``.npy`` file is missing.
-    """
-    doc = _read_yaml(manifest_path)
-    if doc.get("kind") != "csr-corpus-manifest":
-        raise ValueError(
-            f"Expected csr-corpus-manifest, got kind={doc.get('kind')!r}"
-        )
-    shards = doc.get("shards", [])
-    if not shards:
-        raise ValueError("CSR corpus manifest contains no shards")
-
-    entries: list[CsrMemmapShardEntry] = []
-    for s in shards:
-        shard_id = int(s["shard_id"])
-        shard_dir_name = s["path"]  # relative: "shard_000000"
-        shard_dir = corpus_root / shard_dir_name
-
-        ro_path = shard_dir / "row_offsets.npy"
-        gi_path = shard_dir / "gene_indices.npy"
-        cnt_path = shard_dir / "counts.npy"
-        if not ro_path.is_file():
-            raise FileNotFoundError(f"Missing: {ro_path}")
-        if not gi_path.is_file():
-            raise FileNotFoundError(f"Missing: {gi_path}")
-        if not cnt_path.is_file():
-            raise FileNotFoundError(f"Missing: {cnt_path}")
-
-        n_cells = int(s["n_cells"])
-        g_start = int(s["global_start"])
-        g_end = int(s["global_end"])
-
-        entries.append(
-            CsrMemmapShardEntry(
-                dataset_id=shard_dir_name,  # unique shard identifier
-                global_start=g_start,
-                global_end=g_end,
-                shard_id=shard_id,
-                shard_path=shard_dir,
-                row_offsets_path=ro_path,
-                gene_indices_path=gi_path,
-                counts_path=cnt_path,
-                n_cells=n_cells,
-            )
-        )
-
-    # Sort by global_start (defensive — manifest should already be sorted)
-    entries.sort(key=lambda e: e.global_start)
-    return entries
 
 
 def _build_dataset_routing_table(
