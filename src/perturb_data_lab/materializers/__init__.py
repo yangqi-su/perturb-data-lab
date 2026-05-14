@@ -57,13 +57,6 @@ _EXPORT_MAP = {
     "corpus_exists": (".registration", "corpus_exists"),
     "get_corpus_summary": (".registration", "get_corpus_summary"),
     "manifest_to_join_record": (".registration", "manifest_to_join_record"),
-    # Direct CSR builder
-    "H5adCsrChunk": (".direct_csr", "H5adCsrChunk"),
-    "DirectH5adCsrReader": (".direct_csr", "DirectH5adCsrReader"),
-    "DirectCsrDatasetManifest": (".direct_csr", "DirectCsrDatasetManifest"),
-    "convert_h5ad_to_csr_dataset": (".direct_csr", "convert_h5ad_to_csr_dataset"),
-    "merge_csr_dataset_manifests": (".direct_csr", "merge_csr_dataset_manifests"),
-    "package_csr_corpus": (".direct_csr", "package_csr_corpus"),
     # HVG backfill
     "backfill_hvg_rankings_for_corpus": (".hvg_backfill", "backfill_hvg_rankings_for_corpus"),
 }
@@ -119,13 +112,6 @@ __all__ = [
     "corpus_exists",
     "get_corpus_summary",
     "manifest_to_join_record",
-    # Direct CSR builder
-    "H5adCsrChunk",
-    "DirectH5adCsrReader",
-    "DirectCsrDatasetManifest",
-    "convert_h5ad_to_csr_dataset",
-    "merge_csr_dataset_manifests",
-    "package_csr_corpus",
     # HVG backfill
     "backfill_hvg_rankings_for_corpus",
 ]

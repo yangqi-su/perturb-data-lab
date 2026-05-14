@@ -156,11 +156,11 @@ def register_materialization(
         if backend is None:
             raise ValueError(
                 "backend is required for new corpus registration; "
-                "pass it explicitly (e.g., backend='arrow-hf')"
+                "pass it explicitly (e.g., backend='lance')"
             )
         if topology is None:
             # Infer from backend per contract backend-topology matrix
-            topology = "aggregate" if backend in {"lance", "tiledb"} else "federated"
+            topology = "aggregate" if backend == "lance" else "federated"
 
         # Build GlobalMetadataDocument for new corpus creation
         global_meta = GlobalMetadataDocument(

@@ -1,12 +1,8 @@
 """Corpus factory and modern composable corpus runtime API.
 
 ``load_corpus()`` reconstructs a training-ready ``Corpus`` from a corpus
-directory using canonical metadata as the source of truth. Supported
-artifact-backed routes are aggregate Lance, aggregate TileDB, aggregate Zarr,
-federated Lance, federated Zarr, federated Arrow IPC, federated HuggingFace
-Datasets, federated Parquet, and aggregate CSR memmap. WebDataset remains
-dormant in the package for future artifact work, but ``load_corpus(...)`` does
-not enable it yet.
+directory using canonical metadata as the source of truth. Slim main supports
+only Lance and Zarr corpora in aggregate or federated topology.
 
 The preferred runtime flow is::
 
@@ -613,24 +609,30 @@ class Corpus:
 # ---------------------------------------------------------------------------
 
 _BACKEND_NORMALIZE: dict[str, str] = {
-    "arrow-parquet": "parquet",
-    "arrow_parquet": "parquet",
-    "arrow-ipc": "arrow_ipc",
-    "hf-datasets": "hf_datasets",
-    "huggingface-datasets": "hf_datasets",
-    "datasets": "hf_datasets",
     "lance": "lance",
-    "parquet": "parquet",
-    "tiledb": "tiledb",
     "zarr": "zarr",
-    "webdataset": "webdataset",
-    "csr-memmap": "csr_memmap",
     # legacy / alternate names
-    "arrow_hf": "parquet",
-    "arrow_ipc": "arrow_ipc",
-    "hf_datasets": "hf_datasets",
     "lancedb": "lance",
 }
+
+_REMOVED_BACKEND_NAMES: frozenset[str] = frozenset(
+    {
+        "arrow-parquet",
+        "arrow_parquet",
+        "arrow-ipc",
+        "arrow_ipc",
+        "arrow_hf",
+        "hf-datasets",
+        "hf_datasets",
+        "huggingface-datasets",
+        "datasets",
+        "parquet",
+        "tiledb",
+        "webdataset",
+        "csr-memmap",
+        "csr_memmap",
+    }
+)
 
 
 def _normalize_backend(raw: str) -> str:
@@ -639,6 +641,12 @@ def _normalize_backend(raw: str) -> str:
         raise ValueError("corpus-index.yaml global_metadata.backend is empty")
     norm = _BACKEND_NORMALIZE.get(raw)
     if norm is None:
+        if raw in _REMOVED_BACKEND_NAMES:
+            raise ValueError(
+                f"Backend '{raw}' is not supported in slim main. Only 'lance' "
+                "and 'zarr' corpora can be loaded here; use the preserved "
+                "experimental snapshot branch for removed backends."
+            )
         raise ValueError(
             f"Unsupported corpus backend '{raw}'. "
             f"Supported: {sorted(_BACKEND_NORMALIZE.keys())}"
@@ -1242,32 +1250,6 @@ def load_corpus(
             expression_reader = build_expression_reader(
                 backend, topology, entries, lance_path=lance_path,
             )
-        elif backend == "tiledb":
-            tiledb_path = root / "matrix" / "aggregated-cells.tiledb"
-            tiledb_meta_path = root / "matrix" / "aggregated-meta.json"
-            if not tiledb_path.is_dir():
-                raise FileNotFoundError(
-                    f"Aggregate TileDB array not found: {tiledb_path}"
-                )
-            if not tiledb_meta_path.is_file():
-                raise FileNotFoundError(
-                    f"Aggregate TileDB metadata not found: {tiledb_meta_path}"
-                )
-            entries = [
-                DatasetEntry(
-                    dataset_id=ds_id,
-                    global_start=g_start,
-                    global_end=g_end,
-                )
-                for ds_id, _dsi, g_start, g_end in global_ranges
-            ]
-            expression_reader = build_expression_reader(
-                backend,
-                topology,
-                entries,
-                tiledb_path=str(tiledb_path),
-                tiledb_meta_path=str(tiledb_meta_path),
-            )
         elif backend == "zarr":
             row_offsets_path = root / "matrix" / "aggregated-row-offsets.zarr"
             indices_path = root / "matrix" / "aggregated-indices.zarr"
@@ -1301,25 +1283,14 @@ def load_corpus(
                 indices_path=str(indices_path),
                 counts_path=str(counts_path),
             )
-        elif backend == "csr_memmap":
-            # Read CSR manifest to build shard-level entries
-            manifest_path = root / "csr-corpus-manifest.yaml"
-            if not manifest_path.exists():
-                raise FileNotFoundError(
-                    f"CSR corpus manifest not found: {manifest_path}"
-                )
-            entries = _build_csr_entries(root, manifest_path)
-            expression_reader = build_expression_reader(
-                backend, topology, entries,
-            )
         else:
             raise ValueError(
                 f"Unsupported backend '{backend}' for aggregate topology. "
-                "Only 'lance', 'tiledb', 'zarr', and 'csr_memmap' are currently "
+                "Only 'lance' and 'zarr' are currently "
                 "supported for aggregate."
             )
     elif topology == "federated":
-        if backend in {"lance", "zarr", "arrow_ipc", "hf_datasets", "parquet"}:
+        if backend in {"lance", "zarr"}:
             entries = []
             for ds_id, _dsi, g_start, g_end in global_ranges:
                 matrix_root = resolve_corpus_paths(topology, root, ds_id).matrix_root
@@ -1371,59 +1342,11 @@ def load_corpus(
                     )
                     continue
 
-                if backend == "arrow_ipc":
-                    arrow_path = matrix_root / f"{ds_id}-cells.arrow"
-                    if not arrow_path.is_file():
-                        raise FileNotFoundError(
-                            f"Arrow IPC file not found for dataset '{ds_id}': "
-                            f"{arrow_path}"
-                        )
-                    entries.append(
-                        ArrowIpcDatasetEntry(
-                            dataset_id=ds_id,
-                            global_start=g_start,
-                            global_end=g_end,
-                            arrow_path=str(arrow_path),
-                        )
-                    )
-                    continue
-
-                if backend == "parquet":
-                    parquet_path = matrix_root / f"{ds_id}-cells.parquet"
-                    if not parquet_path.is_file():
-                        raise FileNotFoundError(
-                            f"Parquet file not found for dataset '{ds_id}': "
-                            f"{parquet_path}"
-                        )
-                    entries.append(
-                        ParquetDatasetEntry(
-                            dataset_id=ds_id,
-                            global_start=g_start,
-                            global_end=g_end,
-                            parquet_path=str(parquet_path),
-                        )
-                    )
-                    continue
-
-                hf_dataset_path = matrix_root / f"{ds_id}-hf-dataset"
-                if not hf_dataset_path.is_dir():
-                    raise FileNotFoundError(
-                        f"HF datasets directory not found for dataset '{ds_id}': "
-                        f"{hf_dataset_path}"
-                    )
-                entries.append(
-                    HfDatasetsDatasetEntry(
-                        dataset_id=ds_id,
-                        global_start=g_start,
-                        global_end=g_end,
-                        dataset_path=str(hf_dataset_path),
-                    )
-                )
             expression_reader = build_expression_reader(backend, topology, entries)
         else:
             raise ValueError(
                 f"Unsupported backend '{backend}' for federated topology. "
-                f"Only 'lance', 'zarr', 'arrow_ipc', 'hf_datasets', and 'parquet' are currently supported for federated."
+                f"Only 'lance' and 'zarr' are currently supported for federated."
             )
     else:
         raise ValueError(

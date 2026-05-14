@@ -2,11 +2,10 @@
 
 Defines the ``ExpressionReader`` protocol, a ``BaseExpressionReader`` abstract
 class that handles global→local routing and order-preserving reassembly, and
-backend-specific implementations for all supported backends.
+backend-specific implementations for the remaining slim-main readers.
 
-Supported backends: Lance, TileDB, Zarr, Arrow IPC, HuggingFace Datasets,
-Parquet, WebDataset.
-Supported topologies: aggregate, federated.
+Supported backends: Lance and Zarr.
+Supported topologies: aggregate and federated.
 
 Readers return **only expression data** via
 ``read_expression_flat(global_indices) -> ExpressionBatch``. Identity and
@@ -1415,8 +1414,7 @@ def build_expression_reader(
     Parameters
     ----------
     backend : str
-        One of ``"lance"``, ``"tiledb"``, ``"zarr"``, ``"arrow_ipc"``, ``"hf_datasets"``,
-        ``"parquet"``, ``"webdataset"``, ``"csr_memmap"``.
+        One of ``"lance"`` or ``"zarr"``.
     topology : str
         Either ``"aggregate"`` or ``"federated"``.
     entries : list of DatasetEntry
@@ -1447,21 +1445,6 @@ def build_expression_reader(
         else:
             return FederatedLanceReader(entries)  # type: ignore[arg-type]
 
-    elif backend == "tiledb":
-        if topology == "aggregate":
-            tiledb_path = kwargs.pop("tiledb_path")
-            tiledb_meta_path = kwargs.pop("tiledb_meta_path", None)
-            max_local_gene_index_exclusive = kwargs.pop(
-                "max_local_gene_index_exclusive", None
-            )
-            return AggregateTileDBReader(
-                tiledb_path,
-                entries,
-                tiledb_meta_path=tiledb_meta_path,
-                max_local_gene_index_exclusive=max_local_gene_index_exclusive,
-            )
-        raise ValueError("TileDB only supports aggregate topology.")
-
     elif backend == "zarr":
         if topology == "aggregate":
             offsets_path = kwargs.pop("offsets_path")
@@ -1471,45 +1454,25 @@ def build_expression_reader(
         else:
             return FederatedZarrReader(entries)  # type: ignore[arg-type]
 
-    elif backend == "arrow_ipc":
-        if topology == "aggregate":
-            raise ValueError("Arrow IPC aggregate topology is not supported.")
-        return FederatedArrowIpcReader(entries)  # type: ignore[arg-type]
-
-    elif backend == "hf_datasets":
-        if topology == "aggregate":
-            raise ValueError("HF datasets aggregate topology is not supported.")
-        return FederatedHfDatasetsReader(entries)  # type: ignore[arg-type]
-
-    elif backend == "parquet":
-        if topology == "aggregate":
-            raise ValueError("Parquet aggregate topology is not supported.")
-        return FederatedParquetReader(entries)  # type: ignore[arg-type]
-
-    elif backend == "webdataset":
-        if topology == "aggregate":
-            raise ValueError("WebDataset aggregate topology is not supported.")
-        return FederatedWebDatasetReader(entries)  # type: ignore[arg-type]
-
-    elif backend == "csr_memmap":
-        if topology == "aggregate":
-            cache_config = kwargs.pop("cache_config", None)
-            if kwargs:
-                raise TypeError(
-                    f"Unexpected keyword arguments for csr_memmap backend: "
-                    f"{sorted(kwargs.keys())}"
-                )
-            return AggregateCsrMemmapReader(entries, cache_config=cache_config)  # type: ignore[arg-type]
-        else:
-            raise ValueError(
-                "csr_memmap only supports aggregate topology "
-                "(sharding is internal to the backend)."
-            )
-
     else:
+        if backend in {
+            "tiledb",
+            "arrow_ipc",
+            "arrow-parquet",
+            "parquet",
+            "hf_datasets",
+            "hf-datasets",
+            "webdataset",
+            "csr_memmap",
+            "csr-memmap",
+        }:
+            raise ValueError(
+                f"Backend '{backend}' is not supported in slim main. Only "
+                "'lance' and 'zarr' readers remain available."
+            )
         raise ValueError(
             f"Unknown backend '{backend}'. "
-            f"Supported: lance, tiledb, zarr, arrow_ipc, hf_datasets, parquet, webdataset, csr_memmap."
+            f"Supported: lance, zarr."
         )
 
 

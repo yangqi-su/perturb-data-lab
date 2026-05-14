@@ -109,7 +109,7 @@ def _infer_backend_topology(
             f"cannot infer backend from {corpus_root / 'corpus-index.yaml'}"
         )
     if topology is None:
-        topology = "aggregate" if backend in {"lance", "tiledb"} else "federated"
+        topology = "aggregate" if backend == "lance" else "federated"
     return str(backend), str(topology)
 
 

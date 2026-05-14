@@ -36,7 +36,7 @@ from .materializers.paths import resolve_corpus_paths
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-BACKEND_CHOICES = ["arrow-parquet", "arrow-ipc", "hf-datasets", "webdataset", "zarr", "lance", "tiledb"]
+BACKEND_CHOICES = ["lance", "zarr"]
 TOPOLOGY_CHOICES = ["federated", "aggregate"]
 
 
@@ -534,7 +534,7 @@ def _infer_backend_topology_from_corpus(corpus_root: Path) -> tuple[str, str]:
             f"cannot auto-detect backend from {corpus_root / 'corpus-index.yaml'}"
         )
     if topology is None:
-        topology = "aggregate" if backend in {"lance", "tiledb"} else "federated"
+        topology = "aggregate" if backend == "lance" else "federated"
 
     return str(backend), str(topology)
 

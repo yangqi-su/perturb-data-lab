@@ -1,32 +1,8 @@
-"""Materialization route implementations using backend adapters.
+"""Materialization route implementations for the slim Lance/Zarr mainline.
 
-Phase 3 introduces the new ``AVAILABLE_WRITERS[backend][topology]`` dispatch table
-with explicit backend/topology separation. The legacy ``AVAILABLE_BACKENDS``
-registry and all fused-name aliases have been removed.
-
-New backend names (Phase 3):
-- ``arrow-parquet``: Arrow IPC over Parquet storage
-- ``arrow-ipc``: Arrow IPC file storage
-- ``hf-datasets``: HuggingFace datasets directory storage
-- ``webdataset``: WebDataset shard format
-- ``zarr``: Zarr 1D flat-buffer storage
-- ``lance``: Lance dataset storage
-- ``tiledb``: TileDB native sparse aggregate storage
-
-New topology names (Phase 3):
-- ``federated``: per-dataset output files
-- ``aggregate``: corpus-scoped single output files
-
-Removed (Phase 1 — backend-topology validation):
-- ``arrow-parquet × aggregate``: not supported (no true append in Parquet)
-- ``arrow-ipc × aggregate``: not supported (no true append in IPC files)
-
-Migration map (legacy → canonical):
-- ``arrow-hf`` → ``arrow-parquet × federated``
-- ``webdataset`` → ``webdataset × federated``
-- ``zarr-ts`` → ``zarr × federated``
-- ``lancedb-aggregated`` → ``lance × aggregate``
-- ``zarr-aggregated`` → ``zarr × aggregate``
+Only Lance and Zarr remain supported in slim main, and both continue to expose
+``federated`` and ``aggregate`` topology writers through the
+``AVAILABLE_WRITERS[backend][topology]`` dispatch table.
 """
 
 from __future__ import annotations
@@ -34,115 +10,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
-# ---- Phase 3 federated writers ----
-from .arrow_parquet import write_arrow_parquet_federated
-from .arrow_ipc import write_arrow_ipc_federated
-from .hf_datasets import write_hf_datasets_federated
-from .webdataset import write_webdataset_federated
 from .zarr import write_zarr_federated
 from .lance import write_lance_federated
 
-# ---- Phase 3 aggregate writers ----
-from .webdataset import write_webdataset_aggregate
+# ---- aggregate writers ----
 from .zarr import write_zarr_aggregate
 from .lance import write_lance_aggregate
-from .tiledb import write_tiledb_aggregate
-
-
-# ---------------------------------------------------------------------------
-# Thin federated writer wrappers — accept ChunkBundle + path/config kwargs
-# ---------------------------------------------------------------------------
-
-def materialize_arrow_parquet(
-    bundle: Any,
-    dataset_id: str,
-    matrix_root: Path,
-    *,
-    _writer_state: dict[str, Any] | None = None,
-    _is_last_chunk: bool = False,
-    **kwargs: Any,
-) -> tuple[dict[str, Path], dict | None]:
-    """Write using arrow-parquet × federated backend.
-
-    Thin serializer: accepts a single ``ChunkBundle`` and streams it to Parquet.
-    Returns ``({"cells": path}, writer_state_or_none)``.
-    """
-    return write_arrow_parquet_federated(
-        bundle=bundle,
-        dataset_id=dataset_id,
-        matrix_root=matrix_root,
-        _writer_state=_writer_state,
-        _is_last_chunk=_is_last_chunk,
-    )
-
-
-def materialize_arrow_ipc(
-    bundle: Any,
-    dataset_id: str,
-    matrix_root: Path,
-    *,
-    _writer_state: dict[str, Any] | None = None,
-    _is_last_chunk: bool = False,
-    **kwargs: Any,
-) -> tuple[dict[str, Path], dict | None]:
-    """Write using arrow-ipc × federated backend.
-
-    Thin serializer: accepts a single ``ChunkBundle`` and streams it to IPC.
-    Returns ``({"cells": path}, writer_state_or_none)``.
-    """
-    return write_arrow_ipc_federated(
-        bundle=bundle,
-        dataset_id=dataset_id,
-        matrix_root=matrix_root,
-        _writer_state=_writer_state,
-        _is_last_chunk=_is_last_chunk,
-    )
-
-
-def materialize_webdataset(
-    bundle: Any,
-    dataset_id: str,
-    matrix_root: Path,
-    *,
-    _writer_state: dict[str, Any] | None = None,
-    _is_last_chunk: bool = False,
-    cell_ids: tuple[str, ...] | None = None,
-    **kwargs: Any,
-) -> tuple[dict[str, Path], dict | None]:
-    """Write using webdataset × federated backend.
-
-    Thin serializer: streams each ``ChunkBundle`` directly to a tar shard.
-    Returns ``({"shard_path": ..., "meta": ...}, writer_state_or_none)``.
-    """
-    return write_webdataset_federated(
-        bundle=bundle,
-        dataset_id=dataset_id,
-        matrix_root=matrix_root,
-        cell_ids=cell_ids,
-        _writer_state=_writer_state,
-        _is_last_chunk=_is_last_chunk,
-    )
-
-
-def materialize_hf_datasets(
-    bundle: Any,
-    dataset_id: str,
-    matrix_root: Path,
-    *,
-    _writer_state: dict[str, Any] | None = None,
-    _is_last_chunk: bool = False,
-    **kwargs: Any,
-) -> tuple[dict[str, Path], dict | None]:
-    """Write using hf-datasets × federated backend."""
-    return write_hf_datasets_federated(
-        bundle=bundle,
-        dataset_id=dataset_id,
-        matrix_root=matrix_root,
-        _writer_state=_writer_state,
-        _is_last_chunk=_is_last_chunk,
-    )
 
 
 def materialize_zarr(
@@ -196,19 +69,6 @@ def materialize_lance(
 # ---------------------------------------------------------------------------
 
 AVAILABLE_WRITERS: dict[str, dict[str, Any]] = {
-    "arrow-parquet": {
-        "federated": materialize_arrow_parquet,
-    },
-    "arrow-ipc": {
-        "federated": materialize_arrow_ipc,
-    },
-    "hf-datasets": {
-        "federated": materialize_hf_datasets,
-    },
-    "webdataset": {
-        "federated": materialize_webdataset,
-        "aggregate": write_webdataset_aggregate,
-    },
     "zarr": {
         "federated": materialize_zarr,
         "aggregate": write_zarr_aggregate,
@@ -217,10 +77,21 @@ AVAILABLE_WRITERS: dict[str, dict[str, Any]] = {
         "federated": materialize_lance,
         "aggregate": write_lance_aggregate,
     },
-    "tiledb": {
-        "aggregate": write_tiledb_aggregate,
-    },
 }
+
+_REMOVED_BACKENDS: frozenset[str] = frozenset(
+    {
+        "arrow-hf",
+        "arrow-parquet",
+        "arrow-ipc",
+        "hf-datasets",
+        "webdataset",
+        "tiledb",
+        "csr-memmap",
+        "csr_memmap",
+        "parquet",
+    }
+)
 
 
 def build_backend_fn(backend: str, topology: str = "federated"):
@@ -229,8 +100,7 @@ def build_backend_fn(backend: str, topology: str = "federated"):
     Parameters
     ----------
     backend : str
-        Backend name: ``arrow-parquet``, ``arrow-ipc``, ``hf-datasets``, ``webdataset``,
-        ``zarr``, ``lance``, or ``tiledb``.
+        Backend name: ``lance`` or ``zarr``.
     topology : str, default "federated"
         Topology: ``federated`` (per-dataset files) or ``aggregate``
         (corpus-scoped).
@@ -246,6 +116,12 @@ def build_backend_fn(backend: str, topology: str = "federated"):
         If the backend/topology combination is not supported.
     """
     if backend not in AVAILABLE_WRITERS:
+        if backend in _REMOVED_BACKENDS:
+            raise KeyError(
+                f"backend '{backend}' is not supported in slim main; only "
+                "'lance' and 'zarr' remain available. Use the preserved "
+                "experimental snapshot branch for removed backends."
+            )
         raise KeyError(
             f"unknown backend: {backend}; "
             f"available backends: {list(AVAILABLE_WRITERS)}"
