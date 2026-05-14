@@ -869,6 +869,39 @@ def test_public_paired_batch_loader_omits_full_expression_fields_by_default(
 
 
 @pytest.mark.parametrize(
+    ("num_workers", "multiprocessing_context"),
+    [(0, None), (2, "spawn")],
+)
+def test_public_paired_batch_loader_preserves_full_expression_fields(
+    tmp_path: Path,
+    num_workers: int,
+    multiprocessing_context: str | None,
+) -> None:
+    corpus = load_corpus(str(_build_mixed_union_pair_corpus(tmp_path)))
+    loader = _build_public_pair_loader(
+        corpus,
+        batch_size=2,
+        seq_len=2,
+        seed=19,
+        num_workers=num_workers,
+        multiprocessing_context=multiprocessing_context,
+        source_indices=np.asarray([0, 2], dtype=np.int64),
+        target_candidate_indices=np.asarray([1, 3], dtype=np.int64),
+        config=PertTFAdapterConfig(
+            control_labels=("WT",),
+            mask_ratio=0.0,
+            include_full_expr=True,
+        ),
+    )
+
+    batch = next(iter(loader))
+
+    assert {"full_gene_ids", "full_expr", "full_expr_mask"}.issubset(batch)
+    assert {"full_expr_next", "full_expr_next_mask"}.issubset(batch)
+    _assert_public_loader_matches_builder(loader)
+
+
+@pytest.mark.parametrize(
     ("column", "expected_counts"),
     [
         (

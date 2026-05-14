@@ -60,6 +60,107 @@ class _PertTFNullLabelSelection:
     stats: PertTFNullLabelFilterStats
 
 
+@dataclass(frozen=True)
+class _PertTFRequiredLabelProfile:
+    """Profile null required-label state once for a fixed row universe."""
+
+    profiled_row_indices: np.ndarray
+    required_columns: tuple[str, ...]
+    policy: str
+    per_column_null_masks: dict[str, np.ndarray]
+    null_mask: np.ndarray
+
+    @classmethod
+    def from_metadata_index(
+        cls,
+        metadata_index: MetadataIndex,
+        *,
+        config: PertTFAdapterConfig,
+        row_indices: Sequence[int] | np.ndarray | None,
+    ) -> "_PertTFRequiredLabelProfile":
+        candidate_row_indices = _normalize_candidate_row_indices(
+            metadata_index,
+            row_indices,
+        )
+        if candidate_row_indices is None:
+            candidate_row_indices = np.arange(len(metadata_index), dtype=np.int64)
+        else:
+            candidate_row_indices = np.sort(candidate_row_indices.astype(np.int64, copy=False))
+
+        required_columns = _required_label_columns(config)
+        missing_columns = [
+            column for column in required_columns if column not in metadata_index.df.columns
+        ]
+        if missing_columns:
+            missing_list = ", ".join(repr(column) for column in missing_columns)
+            raise ValueError(f"metadata_index is missing required column(s): {missing_list}")
+
+        selected_metadata = metadata_index.take(
+            candidate_row_indices,
+            columns=list(required_columns),
+        )
+        null_mask = np.zeros(candidate_row_indices.size, dtype=bool)
+        per_column_null_masks: dict[str, np.ndarray] = {}
+        for column in required_columns:
+            column_null_mask = np.fromiter(
+                (value is None for value in selected_metadata[column]),
+                dtype=bool,
+                count=candidate_row_indices.size,
+            )
+            per_column_null_masks[column] = column_null_mask
+            null_mask |= column_null_mask
+
+        return cls(
+            profiled_row_indices=candidate_row_indices,
+            required_columns=required_columns,
+            policy=config.null_label_policy,
+            per_column_null_masks=per_column_null_masks,
+            null_mask=null_mask,
+        )
+
+    def select(
+        self,
+        candidate_row_indices: np.ndarray,
+        *,
+        warning_owner: str,
+        emit_warning: bool,
+        warning_stacklevel: int,
+    ) -> _PertTFNullLabelSelection:
+        positions = np.searchsorted(self.profiled_row_indices, candidate_row_indices)
+        if (
+            np.any(positions >= self.profiled_row_indices.size)
+            or not np.array_equal(self.profiled_row_indices[positions], candidate_row_indices)
+        ):
+            raise ValueError("row selection contains rows outside the profiled label pool")
+
+        subset_null_mask = self.null_mask[positions]
+        effective_row_indices = candidate_row_indices[~subset_null_mask].copy()
+        per_column_null_counts = {
+            column: int(np.count_nonzero(column_null_mask[positions]))
+            for column, column_null_mask in self.per_column_null_masks.items()
+        }
+        dropped_row_count = int(np.count_nonzero(subset_null_mask))
+        stats = PertTFNullLabelFilterStats(
+            policy=self.policy,
+            required_columns=self.required_columns,
+            checked_row_count=int(candidate_row_indices.size),
+            kept_row_count=int(effective_row_indices.size),
+            dropped_row_count=dropped_row_count,
+            per_column_null_counts=per_column_null_counts,
+        )
+        if dropped_row_count > 0:
+            message = _format_null_label_policy_message(warning_owner, stats)
+            if self.policy == "error":
+                raise ValueError(message)
+            if emit_warning:
+                warnings.warn(message, RuntimeWarning, stacklevel=warning_stacklevel)
+        return _PertTFNullLabelSelection(
+            candidate_row_indices=candidate_row_indices.copy(),
+            effective_row_indices=effective_row_indices,
+            stats=stats,
+        )
+
+
 def _normalize_label(value: Any, *, column: str) -> str:
     if value is None:
         raise ValueError(f"metadata column '{column}' contains null labels")
@@ -206,51 +307,16 @@ def _select_non_null_label_rows(
         candidate_row_indices = np.arange(len(metadata_index), dtype=np.int64)
     else:
         candidate_row_indices = candidate_row_indices.copy()
-
-    required_columns = _required_label_columns(config)
-    missing_columns = [
-        column for column in required_columns if column not in metadata_index.df.columns
-    ]
-    if missing_columns:
-        missing_list = ", ".join(repr(column) for column in missing_columns)
-        raise ValueError(f"metadata_index is missing required column(s): {missing_list}")
-
-    selected_metadata = metadata_index.take(
+    profile = _PertTFRequiredLabelProfile.from_metadata_index(
+        metadata_index,
+        config=config,
+        row_indices=candidate_row_indices,
+    )
+    return profile.select(
         candidate_row_indices,
-        columns=list(required_columns),
-    )
-    null_mask = np.zeros(candidate_row_indices.size, dtype=bool)
-    per_column_null_counts: dict[str, int] = {}
-    for column in required_columns:
-        values = selected_metadata[column]
-        column_null_mask = np.fromiter(
-            (value is None for value in values),
-            dtype=bool,
-            count=candidate_row_indices.size,
-        )
-        per_column_null_counts[column] = int(np.count_nonzero(column_null_mask))
-        null_mask |= column_null_mask
-
-    dropped_row_count = int(np.count_nonzero(null_mask))
-    effective_row_indices = candidate_row_indices[~null_mask].copy()
-    stats = PertTFNullLabelFilterStats(
-        policy=config.null_label_policy,
-        required_columns=required_columns,
-        checked_row_count=int(candidate_row_indices.size),
-        kept_row_count=int(effective_row_indices.size),
-        dropped_row_count=dropped_row_count,
-        per_column_null_counts=per_column_null_counts,
-    )
-    if dropped_row_count > 0:
-        message = _format_null_label_policy_message(warning_owner, stats)
-        if config.null_label_policy == "error":
-            raise ValueError(message)
-        if emit_warning:
-            warnings.warn(message, RuntimeWarning, stacklevel=warning_stacklevel)
-    return _PertTFNullLabelSelection(
-        candidate_row_indices=candidate_row_indices,
-        effective_row_indices=effective_row_indices,
-        stats=stats,
+        warning_owner=warning_owner,
+        emit_warning=emit_warning,
+        warning_stacklevel=warning_stacklevel,
     )
 
 
@@ -552,6 +618,19 @@ class PerturbationPairBatch:
 
 
 @dataclass(frozen=True)
+class _PertTFRowState:
+    """Compact per-row metadata used during paired source/target sampling."""
+
+    dataset_index: int
+    cell_context_label: str
+    perturbation_label: str
+    batch_label: str
+    cell_context_id: int
+    perturbation_id: int
+    batch_id: int
+
+
+@dataclass(frozen=True)
 class _PertTFPairBatchPlan:
     """Deterministic source-batch plan for one pertTF paired request.
 
@@ -564,6 +643,57 @@ class _PertTFPairBatchPlan:
     batch_index: int
     seed: int
     epoch: int
+
+
+@dataclass(frozen=True)
+class _PertTFPairSamplerSelections:
+    """Null-filtered row pools for paired source/target sampling."""
+
+    label_rows: _PertTFNullLabelSelection
+    source_rows: _PertTFNullLabelSelection
+    target_rows: _PertTFNullLabelSelection
+
+
+def _select_pair_sampler_rows(
+    metadata_index: MetadataIndex,
+    *,
+    config: PertTFAdapterConfig,
+    source_indices: np.ndarray,
+    target_candidate_indices: np.ndarray,
+    warning_owner: str,
+    warning_stacklevel: int,
+) -> _PertTFPairSamplerSelections:
+    label_row_indices = np.unique(
+        np.concatenate([source_indices, target_candidate_indices]).astype(
+            np.int64,
+            copy=False,
+        )
+    )
+    profile = _PertTFRequiredLabelProfile.from_metadata_index(
+        metadata_index,
+        config=config,
+        row_indices=label_row_indices,
+    )
+    return _PertTFPairSamplerSelections(
+        label_rows=profile.select(
+            label_row_indices,
+            warning_owner=warning_owner,
+            emit_warning=True,
+            warning_stacklevel=warning_stacklevel,
+        ),
+        source_rows=profile.select(
+            source_indices,
+            warning_owner=warning_owner,
+            emit_warning=False,
+            warning_stacklevel=warning_stacklevel,
+        ),
+        target_rows=profile.select(
+            target_candidate_indices,
+            warning_owner=warning_owner,
+            emit_warning=False,
+            warning_stacklevel=warning_stacklevel,
+        ),
+    )
 
 
 class PerturbationPairSampler:
@@ -632,47 +762,31 @@ class PerturbationPairSampler:
         )
 
         self.total_rows = len(metadata_index)
-        self._all_indices = np.arange(self.total_rows, dtype=np.int64)
         if normalized_source_indices is None:
-            candidate_source_indices = self._all_indices.copy()
+            candidate_source_indices = np.arange(self.total_rows, dtype=np.int64)
         else:
             candidate_source_indices = normalized_source_indices
         if normalized_target_candidate_indices is None:
             if normalized_source_indices is None:
-                candidate_target_candidate_indices = self._all_indices.copy()
+                candidate_target_candidate_indices = np.arange(
+                    self.total_rows,
+                    dtype=np.int64,
+                )
             else:
                 candidate_target_candidate_indices = candidate_source_indices.copy()
         else:
             candidate_target_candidate_indices = normalized_target_candidate_indices
-        candidate_label_row_indices = np.unique(
-            np.concatenate(
-                [candidate_source_indices, candidate_target_candidate_indices]
-            ).astype(np.int64, copy=False)
-        )
-        label_row_selection = _select_non_null_label_rows(
+        row_selections = _select_pair_sampler_rows(
             metadata_index,
             config=resolved_config,
-            row_indices=candidate_label_row_indices,
+            source_indices=candidate_source_indices,
+            target_candidate_indices=candidate_target_candidate_indices,
             warning_owner=_null_label_warning_owner,
-            emit_warning=True,
             warning_stacklevel=_null_label_warning_stacklevel,
         )
-        source_selection = _select_non_null_label_rows(
-            metadata_index,
-            config=resolved_config,
-            row_indices=candidate_source_indices,
-            warning_owner=_null_label_warning_owner,
-            emit_warning=False,
-            warning_stacklevel=_null_label_warning_stacklevel,
-        )
-        target_selection = _select_non_null_label_rows(
-            metadata_index,
-            config=resolved_config,
-            row_indices=candidate_target_candidate_indices,
-            warning_owner=_null_label_warning_owner,
-            emit_warning=False,
-            warning_stacklevel=_null_label_warning_stacklevel,
-        )
+        label_row_selection = row_selections.label_rows
+        source_selection = row_selections.source_rows
+        target_selection = row_selections.target_rows
         if source_selection.effective_row_indices.size == 0:
             _raise_empty_effective_rows(_null_label_warning_owner, "source row pool")
         if target_selection.effective_row_indices.size == 0:
@@ -700,89 +814,17 @@ class PerturbationPairSampler:
             target_selection.effective_row_indices.copy()
         )
 
-        dataset_index = metadata_index.get_column("dataset_index")
-        context_labels = metadata_index.get_column(self.config.cell_context_column)
-        perturbation_labels = metadata_index.get_column(self.config.perturbation_column)
-        batch_labels = metadata_index.get_column(self.config.batch_column)
-        if dataset_index is None:
+        if metadata_index.get_column("dataset_index") is None:
             raise ValueError("metadata_index is missing required column 'dataset_index'")
-        if context_labels is None:
-            raise ValueError(
-                f"metadata_index is missing required column {self.config.cell_context_column!r}"
-            )
-        if perturbation_labels is None:
-            raise ValueError(
-                f"metadata_index is missing required column {self.config.perturbation_column!r}"
-            )
-        if batch_labels is None:
-            raise ValueError(
-                f"metadata_index is missing required column {self.config.batch_column!r}"
-            )
 
         self._source_indices = self.effective_source_indices.copy()
         self._target_candidate_indices = self.effective_target_candidate_indices.copy()
-        self._source_index_mask = np.zeros(self.total_rows, dtype=bool)
-        self._source_index_mask[self._source_indices] = True
-        self._target_candidate_mask = np.zeros(self.total_rows, dtype=bool)
-        self._target_candidate_mask[self._target_candidate_indices] = True
+        self._source_lookup_indices = np.sort(self._source_indices.copy())
+        self._target_candidate_lookup_indices = np.sort(
+            self._target_candidate_indices.copy()
+        )
         self._source_row_count = int(self._source_indices.size)
-        self._dataset_index = np.asarray(dataset_index, dtype=np.int32)
-        relevant_indices = self.effective_label_row_indices.copy()
-        relevant_metadata = metadata_index.take(
-            relevant_indices,
-            columns=[
-                self.config.cell_context_column,
-                self.config.perturbation_column,
-                self.config.batch_column,
-            ],
-        )
-        context_labels_by_row = [""] * self.total_rows
-        perturbation_labels_by_row = [""] * self.total_rows
-        batch_labels_by_row = [""] * self.total_rows
-        cell_context_ids = np.full(self.total_rows, -1, dtype=np.int64)
-        perturbation_ids = np.full(self.total_rows, -1, dtype=np.int64)
-        batch_ids = np.full(self.total_rows, -1, dtype=np.int64)
-
-        relevant_context_labels = tuple(
-            _normalize_label(value, column=self.config.cell_context_column)
-            for value in relevant_metadata[self.config.cell_context_column]
-        )
-        relevant_perturbation_labels = tuple(
-            _normalize_label(value, column=self.config.perturbation_column)
-            for value in relevant_metadata[self.config.perturbation_column]
-        )
-        relevant_batch_labels = tuple(
-            _normalize_label(value, column=self.config.batch_column)
-            for value in relevant_metadata[self.config.batch_column]
-        )
-        try:
-            relevant_context_ids = self._label_mappings.cell_context.encode_many(
-                relevant_context_labels
-            )
-            relevant_perturbation_ids = self._label_mappings.perturbation.encode_many(
-                relevant_perturbation_labels
-            )
-            relevant_batch_ids = self._label_mappings.batch.encode_many(relevant_batch_labels)
-        except KeyError as exc:
-            raise ValueError(
-                "adapter mappings are missing labels required by the effective "
-                "source/target row pools"
-            ) from exc
-
-        for offset, row_idx in enumerate(relevant_indices.tolist()):
-            context_labels_by_row[row_idx] = relevant_context_labels[offset]
-            perturbation_labels_by_row[row_idx] = relevant_perturbation_labels[offset]
-            batch_labels_by_row[row_idx] = relevant_batch_labels[offset]
-            cell_context_ids[row_idx] = int(relevant_context_ids[offset])
-            perturbation_ids[row_idx] = int(relevant_perturbation_ids[offset])
-            batch_ids[row_idx] = int(relevant_batch_ids[offset])
-
-        self._context_labels = tuple(context_labels_by_row)
-        self._perturbation_labels = tuple(perturbation_labels_by_row)
-        self._batch_labels = tuple(batch_labels_by_row)
-        self._cell_context_ids = cell_context_ids
-        self._perturbation_ids = perturbation_ids
-        self._batch_ids = batch_ids
+        self._row_state_by_index = self._build_row_state_by_index(metadata_index)
         self._pool_by_key = self._build_pool_by_key()
         self._perturbations_by_context = self._build_perturbations_by_context()
         self._control_pool_by_context = self._build_control_pool_by_context()
@@ -862,7 +904,7 @@ class PerturbationPairSampler:
             )
         if np.any(source_array < 0) or np.any(source_array >= self.total_rows):
             raise IndexError("source_indices contain out-of-range rows")
-        if not np.all(self._source_index_mask[source_array]):
+        if not np.all(self._membership_mask(self._source_lookup_indices, source_array)):
             raise ValueError(
                 "source_indices must come from the configured source_indices pool"
             )
@@ -887,13 +929,100 @@ class PerturbationPairSampler:
             tuple(target_perturbation_labels),
         )
 
+    @staticmethod
+    def _membership_mask(
+        lookup_indices: np.ndarray,
+        query_indices: np.ndarray,
+    ) -> np.ndarray:
+        if query_indices.size == 0:
+            return np.ones(0, dtype=bool)
+        positions = np.searchsorted(lookup_indices, query_indices)
+        matches = np.zeros(query_indices.shape, dtype=bool)
+        in_range = positions < lookup_indices.size
+        if np.any(in_range):
+            matches[in_range] = (
+                lookup_indices[positions[in_range]] == query_indices[in_range]
+            )
+        return matches
+
+    def _contains_target_candidate(self, row_idx: int) -> bool:
+        return bool(
+            self._membership_mask(
+                self._target_candidate_lookup_indices,
+                np.asarray([row_idx], dtype=np.int64),
+            )[0]
+        )
+
+    def _row_state(self, row_idx: int) -> _PertTFRowState:
+        return self._row_state_by_index[int(row_idx)]
+
+    def _build_row_state_by_index(
+        self,
+        metadata_index: MetadataIndex,
+    ) -> dict[int, _PertTFRowState]:
+        relevant_indices = self.effective_label_row_indices.copy()
+        relevant_metadata = metadata_index.take(
+            relevant_indices,
+            columns=[
+                "dataset_index",
+                self.config.cell_context_column,
+                self.config.perturbation_column,
+                self.config.batch_column,
+            ],
+        )
+        relevant_dataset_indices = np.asarray(
+            relevant_metadata["dataset_index"],
+            dtype=np.int32,
+        )
+        relevant_context_labels = tuple(
+            _normalize_label(value, column=self.config.cell_context_column)
+            for value in relevant_metadata[self.config.cell_context_column]
+        )
+        relevant_perturbation_labels = tuple(
+            _normalize_label(value, column=self.config.perturbation_column)
+            for value in relevant_metadata[self.config.perturbation_column]
+        )
+        relevant_batch_labels = tuple(
+            _normalize_label(value, column=self.config.batch_column)
+            for value in relevant_metadata[self.config.batch_column]
+        )
+        try:
+            relevant_context_ids = self._label_mappings.cell_context.encode_many(
+                relevant_context_labels
+            )
+            relevant_perturbation_ids = self._label_mappings.perturbation.encode_many(
+                relevant_perturbation_labels
+            )
+            relevant_batch_ids = self._label_mappings.batch.encode_many(
+                relevant_batch_labels
+            )
+        except KeyError as exc:
+            raise ValueError(
+                "adapter mappings are missing labels required by the effective "
+                "source/target row pools"
+            ) from exc
+
+        row_state_by_index: dict[int, _PertTFRowState] = {}
+        for offset, row_idx in enumerate(relevant_indices.tolist()):
+            row_state_by_index[int(row_idx)] = _PertTFRowState(
+                dataset_index=int(relevant_dataset_indices[offset]),
+                cell_context_label=relevant_context_labels[offset],
+                perturbation_label=relevant_perturbation_labels[offset],
+                batch_label=relevant_batch_labels[offset],
+                cell_context_id=int(relevant_context_ids[offset]),
+                perturbation_id=int(relevant_perturbation_ids[offset]),
+                batch_id=int(relevant_batch_ids[offset]),
+            )
+        return row_state_by_index
+
     def _build_pool_by_key(self) -> dict[tuple[int, str, str], np.ndarray]:
         buckets: dict[tuple[int, str, str], list[int]] = {}
         for row_idx in self._target_candidate_indices.tolist():
+            row_state = self._row_state(row_idx)
             key = (
-                int(self._dataset_index[row_idx]),
-                self._context_labels[row_idx],
-                self._perturbation_labels[row_idx],
+                row_state.dataset_index,
+                row_state.cell_context_label,
+                row_state.perturbation_label,
             )
             buckets.setdefault(key, []).append(row_idx)
         return {
@@ -935,9 +1064,10 @@ class PerturbationPairSampler:
         source_idx: int,
         rng: np.random.Generator,
     ) -> tuple[int, str] | None:
-        dataset_index = int(self._dataset_index[source_idx])
-        context_label = self._context_labels[source_idx]
-        perturbation_label = self._perturbation_labels[source_idx]
+        source_state = self._row_state(source_idx)
+        dataset_index = source_state.dataset_index
+        context_label = source_state.cell_context_label
+        perturbation_label = source_state.perturbation_label
         context_key = (dataset_index, context_label)
         if perturbation_label in self._control_label_set:
             candidate_perturbations = self._perturbations_by_context.get(context_key, ())
@@ -955,7 +1085,7 @@ class PerturbationPairSampler:
             return target_idx, target_perturbation
 
         if self.perturbed_target_policy == "self_to_control_label":
-            if not self._target_candidate_mask[source_idx]:
+            if not self._contains_target_candidate(source_idx):
                 return self._handle_missing_target(
                     source_idx,
                     reason=(
@@ -975,7 +1105,7 @@ class PerturbationPairSampler:
                 ),
             )
         target_idx = int(rng.choice(control_pool))
-        return target_idx, self._perturbation_labels[target_idx]
+        return target_idx, self._row_state(target_idx).perturbation_label
 
     def _handle_missing_target(
         self,
@@ -995,23 +1125,50 @@ class PerturbationPairSampler:
         target_indices: np.ndarray,
         target_perturbation_labels: tuple[str, ...],
     ) -> PerturbationPairBatch:
-        source_dataset_indices = self._dataset_index[source_indices]
-        target_dataset_indices = self._dataset_index[target_indices]
-        source_context_ids = self._cell_context_ids[source_indices]
-        target_context_ids = self._cell_context_ids[target_indices]
-        source_perturbation_ids = self._perturbation_ids[source_indices]
+        source_states = [self._row_state(int(idx)) for idx in source_indices.tolist()]
+        target_states = [self._row_state(int(idx)) for idx in target_indices.tolist()]
+        source_dataset_indices = np.asarray(
+            [state.dataset_index for state in source_states],
+            dtype=np.int32,
+        )
+        target_dataset_indices = np.asarray(
+            [state.dataset_index for state in target_states],
+            dtype=np.int32,
+        )
+        source_context_ids = np.asarray(
+            [state.cell_context_id for state in source_states],
+            dtype=np.int64,
+        )
+        target_context_ids = np.asarray(
+            [state.cell_context_id for state in target_states],
+            dtype=np.int64,
+        )
+        source_perturbation_ids = np.asarray(
+            [state.perturbation_id for state in source_states],
+            dtype=np.int64,
+        )
         target_perturbation_ids = self._label_mappings.perturbation.encode_many(
             target_perturbation_labels
         )
-        source_batch_ids = self._batch_ids[source_indices]
-        target_batch_ids = self._batch_ids[target_indices]
-        source_context_labels = tuple(self._context_labels[int(idx)] for idx in source_indices)
-        target_context_labels = tuple(self._context_labels[int(idx)] for idx in target_indices)
-        source_perturbation_labels = tuple(
-            self._perturbation_labels[int(idx)] for idx in source_indices
+        source_batch_ids = np.asarray(
+            [state.batch_id for state in source_states],
+            dtype=np.int64,
         )
-        source_batch_labels = tuple(self._batch_labels[int(idx)] for idx in source_indices)
-        target_batch_labels = tuple(self._batch_labels[int(idx)] for idx in target_indices)
+        target_batch_ids = np.asarray(
+            [state.batch_id for state in target_states],
+            dtype=np.int64,
+        )
+        source_context_labels = tuple(
+            state.cell_context_label for state in source_states
+        )
+        target_context_labels = tuple(
+            state.cell_context_label for state in target_states
+        )
+        source_perturbation_labels = tuple(
+            state.perturbation_label for state in source_states
+        )
+        source_batch_labels = tuple(state.batch_label for state in source_states)
+        target_batch_labels = tuple(state.batch_label for state in target_states)
         return PerturbationPairBatch(
             source_indices=source_indices,
             target_indices=target_indices,
@@ -1287,6 +1444,27 @@ def _build_perttf_loader_kwargs(
     return kwargs
 
 
+def _resolve_perttf_loader_row_pools(
+    metadata_index: MetadataIndex,
+    *,
+    row_indices: Sequence[int] | np.ndarray | None,
+    source_indices: Sequence[int] | np.ndarray | None,
+    target_candidate_indices: Sequence[int] | np.ndarray | None,
+) -> tuple[np.ndarray | None, Sequence[int] | np.ndarray | None, Sequence[int] | np.ndarray | None]:
+    normalized_row_indices = _normalize_candidate_row_indices(metadata_index, row_indices)
+    resolved_source_indices = source_indices
+    if resolved_source_indices is None and normalized_row_indices is not None:
+        resolved_source_indices = normalized_row_indices.copy()
+    resolved_target_candidate_indices = target_candidate_indices
+    if resolved_target_candidate_indices is None:
+        resolved_target_candidate_indices = resolved_source_indices
+    return (
+        normalized_row_indices,
+        resolved_source_indices,
+        resolved_target_candidate_indices,
+    )
+
+
 class PertTFPairedBatchBuilder:
     """Build pertTF-compatible paired source/target batches from corpus rows.
 
@@ -1359,18 +1537,7 @@ class PertTFPairedBatchBuilder:
         hvg_top_k: int | None = None,
     ) -> dict[str, torch.Tensor]:
         self._validate_pair_batch(pair_batch)
-        self._validate_raw_batch_alignment(
-            "source_raw",
-            source_raw,
-            expected_indices=pair_batch.source_indices,
-            expected_dataset_indices=pair_batch.source_dataset_indices,
-        )
-        self._validate_raw_batch_alignment(
-            "target_raw",
-            target_raw,
-            expected_indices=pair_batch.target_indices,
-            expected_dataset_indices=pair_batch.target_dataset_indices,
-        )
+        self._validate_raw_pair_batches(pair_batch, source_raw, target_raw)
 
         source_processed = self._pipeline.process_batch(
             source_raw,
@@ -1537,6 +1704,33 @@ class PertTFPairedBatchBuilder:
         ):
             raise ValueError(
                 f"{name} dataset_index does not match pair_batch dataset routing"
+            )
+
+    def _validate_raw_pair_batches(
+        self,
+        pair_batch: PerturbationPairBatch,
+        source_raw: dict[str, Any],
+        target_raw: dict[str, Any],
+    ) -> None:
+        for name, raw_batch, expected_indices, expected_dataset_indices in (
+            (
+                "source_raw",
+                source_raw,
+                pair_batch.source_indices,
+                pair_batch.source_dataset_indices,
+            ),
+            (
+                "target_raw",
+                target_raw,
+                pair_batch.target_indices,
+                pair_batch.target_dataset_indices,
+            ),
+        ):
+            self._validate_raw_batch_alignment(
+                name,
+                raw_batch,
+                expected_indices=expected_indices,
+                expected_dataset_indices=expected_dataset_indices,
             )
 
     def _raw_batch_numpy(
@@ -1926,16 +2120,16 @@ class PertTFPairedBatchLoader:
     ) -> None:
         self.corpus = corpus
         resolved_config = adapter.config if adapter is not None else (config or PertTFAdapterConfig())
-        normalized_row_indices = _normalize_candidate_row_indices(
+        (
+            normalized_row_indices,
+            resolved_source_indices,
+            resolved_target_candidate_indices,
+        ) = _resolve_perttf_loader_row_pools(
             corpus.metadata_index,
-            row_indices,
+            row_indices=row_indices,
+            source_indices=source_indices,
+            target_candidate_indices=target_candidate_indices,
         )
-        resolved_source_indices = source_indices
-        if resolved_source_indices is None and normalized_row_indices is not None:
-            resolved_source_indices = normalized_row_indices.copy()
-        resolved_target_candidate_indices = target_candidate_indices
-        if resolved_target_candidate_indices is None:
-            resolved_target_candidate_indices = resolved_source_indices
         self.pair_sampler = PerturbationPairSampler(
             corpus.metadata_index,
             batch_size=batch_size,
