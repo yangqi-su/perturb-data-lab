@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from ..corpus_loader import Corpus
 
 __all__ = [
-    "CategoricalLabelMap",
     "PertTFAdapterConfig",
     "PertTFNullLabelFilterStats",
     "PertTFPairedBatchLoader",
@@ -34,8 +33,6 @@ __all__ = [
     "PerturbationPairBatch",
     "PerturbationPairSampler",
     "PertTFCorpusAdapter",
-    "PertTFLabelAdapter",
-    "PertTFVocabAdapter",
 ]
 
 
@@ -264,7 +261,7 @@ def _raise_empty_effective_rows(warning_owner: str, pool_name: str) -> None:
     )
 
 
-class CategoricalLabelMap:
+class _CategoricalLabelMap:
     """Deterministic string-label mapping for one metadata field."""
 
     def __init__(
@@ -299,7 +296,7 @@ class CategoricalLabelMap:
         append_labels: Sequence[str] = (),
         unknown_label: str | None = None,
         row_indices: Sequence[int] | np.ndarray | None = None,
-    ) -> "CategoricalLabelMap":
+    ) -> "_CategoricalLabelMap":
         if column not in metadata_index.df.columns:
             raise ValueError(f"metadata column '{column}' is not available")
         normalized_row_indices = _normalize_candidate_row_indices(
@@ -365,8 +362,8 @@ class CategoricalLabelMap:
 
 
 @dataclass(frozen=True)
-class PertTFVocabAdapter:
-    """SimpleVocab-compatible token ordering over the feature registry."""
+class _PertTFVocabMapping:
+    """Internal SimpleVocab-compatible token ordering over the feature registry."""
 
     special_tokens: tuple[str, ...]
     feature_ids_by_global_id: tuple[str, ...]
@@ -378,7 +375,7 @@ class PertTFVocabAdapter:
         feature_registry: FeatureRegistry,
         *,
         special_tokens: Sequence[str] = _DEFAULT_SPECIAL_TOKENS,
-    ) -> "PertTFVocabAdapter":
+    ) -> "_PertTFVocabMapping":
         normalized_specials = tuple(str(token) for token in special_tokens)
         if len(set(normalized_specials)) != len(normalized_specials):
             raise ValueError("special_tokens must be unique")
@@ -453,13 +450,13 @@ class PertTFVocabAdapter:
 
 
 @dataclass(frozen=True)
-class PertTFLabelAdapter:
-    """pertTF label mappings derived from corpus metadata."""
+class _PertTFLabelMappings:
+    """Internal pertTF label mappings derived from corpus metadata."""
 
     config: PertTFAdapterConfig
-    cell_context: CategoricalLabelMap
-    perturbation: CategoricalLabelMap
-    batch: CategoricalLabelMap
+    cell_context: _CategoricalLabelMap
+    perturbation: _CategoricalLabelMap
+    batch: _CategoricalLabelMap
     null_label_filter_stats: PertTFNullLabelFilterStats | None = None
 
     @classmethod
@@ -470,9 +467,9 @@ class PertTFLabelAdapter:
         row_indices: Sequence[int] | np.ndarray | None = None,
         *,
         _emit_null_label_warning: bool = True,
-        _null_label_warning_owner: str = "PertTFLabelAdapter",
+        _null_label_warning_owner: str = "PertTFCorpusAdapter",
         _null_label_warning_stacklevel: int = 3,
-    ) -> "PertTFLabelAdapter":
+    ) -> "_PertTFLabelMappings":
         resolved = config or PertTFAdapterConfig()
         unknown_label = resolved.unknown_label
         append_unknown = (unknown_label,) if unknown_label is not None else ()
@@ -488,7 +485,7 @@ class PertTFLabelAdapter:
             _raise_empty_effective_rows(_null_label_warning_owner, "label row pool")
         return cls(
             config=resolved,
-            cell_context=CategoricalLabelMap.from_metadata_column(
+            cell_context=_CategoricalLabelMap.from_metadata_column(
                 metadata_index,
                 name="cell_context",
                 column=resolved.cell_context_column,
@@ -496,7 +493,7 @@ class PertTFLabelAdapter:
                 unknown_label=unknown_label,
                 row_indices=selection.effective_row_indices,
             ),
-            perturbation=CategoricalLabelMap.from_metadata_column(
+            perturbation=_CategoricalLabelMap.from_metadata_column(
                 metadata_index,
                 name="perturbation",
                 column=resolved.perturbation_column,
@@ -505,7 +502,7 @@ class PertTFLabelAdapter:
                 unknown_label=unknown_label,
                 row_indices=selection.effective_row_indices,
             ),
-            batch=CategoricalLabelMap.from_metadata_column(
+            batch=_CategoricalLabelMap.from_metadata_column(
                 metadata_index,
                 name="batch",
                 column=resolved.batch_column,
@@ -583,7 +580,7 @@ class PerturbationPairSampler:
         *,
         batch_size: int,
         config: PertTFAdapterConfig | None = None,
-        label_adapter: PertTFLabelAdapter | None = None,
+        adapter: "PertTFCorpusAdapter" | None = None,
         seed: int = 0,
         drop_last: bool = True,
         perturbed_target_policy: str = "self_to_control_label",
@@ -612,7 +609,7 @@ class PerturbationPairSampler:
                 "target_candidate_indices requires source_indices"
             )
 
-        resolved_config = config or PertTFAdapterConfig()
+        resolved_config = adapter.config if adapter is not None else (config or PertTFAdapterConfig())
         self._meta = metadata_index
         self.config = resolved_config
         self.batch_size = int(batch_size)
@@ -685,7 +682,7 @@ class PerturbationPairSampler:
             )
         if label_row_selection.effective_row_indices.size == 0:
             _raise_empty_effective_rows(_null_label_warning_owner, "label row pool")
-        resolved_labels = label_adapter or PertTFLabelAdapter.from_metadata_index(
+        resolved_labels = adapter._labels if adapter is not None else _PertTFLabelMappings.from_metadata_index(
             metadata_index,
             resolved_config,
             row_indices=label_row_selection.effective_row_indices,
@@ -693,7 +690,7 @@ class PerturbationPairSampler:
             _null_label_warning_owner=_null_label_warning_owner,
             _null_label_warning_stacklevel=_null_label_warning_stacklevel,
         )
-        self.labels = resolved_labels
+        self._label_mappings = resolved_labels
         self.null_label_filter_stats = label_row_selection.stats
         self.source_null_label_filter_stats = source_selection.stats
         self.target_candidate_null_label_filter_stats = target_selection.stats
@@ -759,16 +756,16 @@ class PerturbationPairSampler:
             for value in relevant_metadata[self.config.batch_column]
         )
         try:
-            relevant_context_ids = self.labels.cell_context.encode_many(
+            relevant_context_ids = self._label_mappings.cell_context.encode_many(
                 relevant_context_labels
             )
-            relevant_perturbation_ids = self.labels.perturbation.encode_many(
+            relevant_perturbation_ids = self._label_mappings.perturbation.encode_many(
                 relevant_perturbation_labels
             )
-            relevant_batch_ids = self.labels.batch.encode_many(relevant_batch_labels)
+            relevant_batch_ids = self._label_mappings.batch.encode_many(relevant_batch_labels)
         except KeyError as exc:
             raise ValueError(
-                "label_adapter is missing labels required by the effective "
+                "adapter mappings are missing labels required by the effective "
                 "source/target row pools"
             ) from exc
 
@@ -1003,7 +1000,7 @@ class PerturbationPairSampler:
         source_context_ids = self._cell_context_ids[source_indices]
         target_context_ids = self._cell_context_ids[target_indices]
         source_perturbation_ids = self._perturbation_ids[source_indices]
-        target_perturbation_ids = self.labels.perturbation.encode_many(
+        target_perturbation_ids = self._label_mappings.perturbation.encode_many(
             target_perturbation_labels
         )
         source_batch_ids = self._batch_ids[source_indices]
@@ -1317,10 +1314,10 @@ class PertTFPairedBatchBuilder:
         self.seq_len = int(seq_len)
         self.device = torch.device("cpu" if device is None else device)
         self._pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=self.seq_len)
-        stoi = self.adapter.vocab.to_simple_vocab_stoi()
+        stoi = self.adapter.to_simple_vocab_stoi()
         self._pad_token_id = int(stoi[self.config.pad_token])
         self._cls_token_id = int(stoi[self.config.cls_token])
-        self._special_token_offset = self.adapter.vocab.special_token_offset
+        self._special_token_offset = self.adapter.special_token_offset
 
     def build_paired_batch(
         self,
@@ -1628,7 +1625,7 @@ class PertTFPairedBatchBuilder:
 
     def _full_gene_ids(self, batch_size: int) -> torch.Tensor:
         full_gene_ids = torch.as_tensor(
-            self.adapter.vocab.gene_token_ids,
+            self.adapter.gene_token_ids,
             dtype=torch.long,
             device=self.device,
         ).unsqueeze(0)
@@ -1745,9 +1742,32 @@ class PertTFCorpusAdapter:
     """Bundle pertTF-local vocab and label mappings for one loaded corpus."""
 
     config: PertTFAdapterConfig
-    vocab: PertTFVocabAdapter
-    labels: PertTFLabelAdapter
+    _vocab: _PertTFVocabMapping
+    _labels: _PertTFLabelMappings
     null_label_filter_stats: PertTFNullLabelFilterStats | None = None
+
+    @classmethod
+    def _from_parts(
+        cls,
+        *,
+        feature_registry: FeatureRegistry,
+        config: PertTFAdapterConfig,
+        label_mappings: _PertTFLabelMappings,
+        null_label_filter_stats: PertTFNullLabelFilterStats | None = None,
+    ) -> "PertTFCorpusAdapter":
+        return cls(
+            config=config,
+            _vocab=_PertTFVocabMapping.from_feature_registry(
+                feature_registry,
+                special_tokens=config.special_tokens,
+            ),
+            _labels=label_mappings,
+            null_label_filter_stats=(
+                label_mappings.null_label_filter_stats
+                if null_label_filter_stats is None
+                else null_label_filter_stats
+            ),
+        )
 
     @classmethod
     def from_corpus(
@@ -1771,13 +1791,10 @@ class PertTFCorpusAdapter:
         )
         if selection.effective_row_indices.size == 0:
             _raise_empty_effective_rows(_null_label_warning_owner, "label row pool")
-        return cls(
+        return cls._from_parts(
+            feature_registry=corpus.feature_registry,
             config=resolved,
-            vocab=PertTFVocabAdapter.from_feature_registry(
-                corpus.feature_registry,
-                special_tokens=resolved.special_tokens,
-            ),
-            labels=PertTFLabelAdapter.from_metadata_index(
+            label_mappings=_PertTFLabelMappings.from_metadata_index(
                 corpus.metadata_index,
                 resolved,
                 row_indices=selection.effective_row_indices,
@@ -1788,12 +1805,93 @@ class PertTFCorpusAdapter:
             null_label_filter_stats=selection.stats,
         )
 
+    @property
+    def special_tokens(self) -> tuple[str, ...]:
+        return self._vocab.special_tokens
+
+    @property
+    def feature_ids_by_global_id(self) -> tuple[str, ...]:
+        return self._vocab.feature_ids_by_global_id
+
+    @property
+    def special_token_offset(self) -> int:
+        return self._vocab.special_token_offset
+
+    @property
+    def gene_token_ids(self) -> np.ndarray:
+        return self._vocab.gene_token_ids
+
+    @property
+    def tokens_in_order(self) -> tuple[str, ...]:
+        return self._vocab.tokens_in_order
+
+    def token_id_for_global_id(self, global_id: int) -> int:
+        return self._vocab.token_id_for_global_id(global_id)
+
+    def global_id_for_token_id(self, token_id: int) -> int | None:
+        return self._vocab.global_id_for_token_id(token_id)
+
+    def feature_id_for_token_id(self, token_id: int) -> str:
+        return self._vocab.feature_id_for_token_id(token_id)
+
+    def to_simple_vocab_stoi(self) -> dict[str, int]:
+        return self._vocab.to_simple_vocab_stoi()
+
+    def to_simple_vocab_json(self, path: str | Path) -> None:
+        self._vocab.to_simple_vocab_json(path)
+
+    @property
+    def cell_context_labels(self) -> tuple[str, ...]:
+        return self._labels.cell_context.labels
+
+    @property
+    def perturbation_labels(self) -> tuple[str, ...]:
+        return self._labels.perturbation.labels
+
+    @property
+    def batch_labels(self) -> tuple[str, ...]:
+        return self._labels.batch.labels
+
+    @property
+    def cell_context_to_index(self) -> dict[str, int]:
+        return self._labels.cell_context.label_to_index
+
+    @property
+    def perturbation_to_index(self) -> dict[str, int]:
+        return self._labels.perturbation.label_to_index
+
+    @property
+    def batch_to_index(self) -> dict[str, int]:
+        return self._labels.batch.label_to_index
+
+    @property
+    def control_label_ids(self) -> tuple[int, ...]:
+        return self._labels.control_label_ids
+
+    def encode_cell_context(self, label: Any) -> int:
+        return self._labels.cell_context.encode(label)
+
+    def encode_cell_context_many(self, labels: Sequence[Any]) -> np.ndarray:
+        return self._labels.cell_context.encode_many(labels)
+
+    def encode_perturbation(self, label: Any) -> int:
+        return self._labels.perturbation.encode(label)
+
+    def encode_perturbation_many(self, labels: Sequence[Any]) -> np.ndarray:
+        return self._labels.perturbation.encode_many(labels)
+
+    def encode_batch(self, label: Any) -> int:
+        return self._labels.batch.encode(label)
+
+    def encode_batch_many(self, labels: Sequence[Any]) -> np.ndarray:
+        return self._labels.batch.encode_many(labels)
+
     def to_reference_dict(self) -> dict[str, Any]:
         return {
-            "genes": list(self.vocab.feature_ids_by_global_id),
-            "gene_token_ids": self.vocab.gene_token_ids.copy(),
-            "simple_vocab_stoi": self.vocab.to_simple_vocab_stoi(),
-            **self.labels.to_reference_dict(),
+            "genes": list(self.feature_ids_by_global_id),
+            "gene_token_ids": self.gene_token_ids.copy(),
+            "simple_vocab_stoi": self.to_simple_vocab_stoi(),
+            **self._labels.to_reference_dict(),
         }
 
 
@@ -1842,7 +1940,7 @@ class PertTFPairedBatchLoader:
             corpus.metadata_index,
             batch_size=batch_size,
             config=resolved_config,
-            label_adapter=None if adapter is None else adapter.labels,
+            adapter=adapter,
             seed=seed,
             drop_last=drop_last,
             perturbed_target_policy=perturbed_target_policy,
@@ -1854,13 +1952,10 @@ class PertTFPairedBatchLoader:
         )
         resolved_adapter = adapter
         if resolved_adapter is None:
-            resolved_adapter = PertTFCorpusAdapter(
+            resolved_adapter = PertTFCorpusAdapter._from_parts(
+                feature_registry=corpus.feature_registry,
                 config=resolved_config,
-                vocab=PertTFVocabAdapter.from_feature_registry(
-                    corpus.feature_registry,
-                    special_tokens=resolved_config.special_tokens,
-                ),
-                labels=self.pair_sampler.labels,
+                label_mappings=self.pair_sampler._label_mappings,
                 null_label_filter_stats=self.pair_sampler.null_label_filter_stats,
             )
         self._builder = PertTFPairedBatchBuilder(

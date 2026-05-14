@@ -6,13 +6,13 @@ import polars as pl
 import pyarrow as pa
 import yaml
 
+import perturb_data_lab.loaders as loader_exports
+import perturb_data_lab.loaders.adapters as adapter_exports
 from perturb_data_lab.loaders import (
     FeatureRegistry,
     MetadataIndex,
     PertTFAdapterConfig,
     PertTFCorpusAdapter,
-    PertTFLabelAdapter,
-    PertTFVocabAdapter,
     load_corpus,
 )
 
@@ -152,13 +152,15 @@ def _build_small_corpus(tmp_path: Path) -> Path:
     return corpus_root
 
 
-def test_vocab_adapter_preserves_feature_registry_order_with_reserved_offset() -> None:
-    registry = _build_feature_registry()
-    vocab = PertTFVocabAdapter.from_feature_registry(registry)
+def test_corpus_adapter_preserves_feature_registry_order_with_reserved_offset(
+    tmp_path: Path,
+) -> None:
+    corpus = load_corpus(str(_build_small_corpus(tmp_path)))
+    adapter = PertTFCorpusAdapter.from_corpus(corpus)
 
-    assert registry.global_feature_ids == ("GENE_B", "GENE_A", "GENE_C")
-    assert vocab.special_token_offset == 4
-    assert vocab.tokens_in_order == (
+    assert corpus.feature_registry.global_feature_ids == ("GENE_B", "GENE_A", "GENE_C")
+    assert adapter.special_token_offset == 4
+    assert adapter.tokens_in_order == (
         "<pad>",
         "<cls>",
         "<unk>",
@@ -167,36 +169,46 @@ def test_vocab_adapter_preserves_feature_registry_order_with_reserved_offset() -
         "GENE_A",
         "GENE_C",
     )
-    np.testing.assert_array_equal(vocab.gene_token_ids, np.asarray([4, 5, 6], dtype=np.int64))
-    assert vocab.token_id_for_global_id(0) == 4
-    assert vocab.token_id_for_global_id(1) == 5
-    assert vocab.feature_id_for_token_id(6) == "GENE_C"
+    np.testing.assert_array_equal(
+        adapter.gene_token_ids,
+        np.asarray([4, 5, 6], dtype=np.int64),
+    )
+    assert adapter.token_id_for_global_id(0) == 4
+    assert adapter.token_id_for_global_id(1) == 5
+    assert adapter.feature_id_for_token_id(6) == "GENE_C"
 
 
-def test_vocab_adapter_emits_simple_vocab_compatible_mapping() -> None:
-    vocab = PertTFVocabAdapter.from_feature_registry(_build_feature_registry())
-    stoi = vocab.to_simple_vocab_stoi()
+def test_corpus_adapter_emits_simple_vocab_compatible_mapping(tmp_path: Path) -> None:
+    corpus = load_corpus(str(_build_small_corpus(tmp_path)))
+    adapter = PertTFCorpusAdapter.from_corpus(corpus)
+    stoi = adapter.to_simple_vocab_stoi()
 
-    assert list(stoi.keys()) == list(vocab.tokens_in_order)
+    assert list(stoi.keys()) == list(adapter.tokens_in_order)
     assert list(stoi.values()) == list(range(len(stoi)))
 
 
-def test_label_adapter_builds_deterministic_maps_and_control_slots() -> None:
+def test_corpus_adapter_builds_deterministic_maps_and_control_slots(
+    tmp_path: Path,
+) -> None:
     config = PertTFAdapterConfig(control_labels=("WT", "CTRL"))
-    labels = PertTFLabelAdapter.from_metadata_index(_build_metadata_index(), config)
+    corpus = load_corpus(str(_build_small_corpus(tmp_path)))
+    adapter = PertTFCorpusAdapter.from_corpus(corpus, config)
 
-    assert labels.cell_context.labels == ("T_cell", "B_cell", "NK_cell")
-    assert labels.perturbation.labels == ("WT", "CTRL", "KO_TP53", "KO_GATA1")
-    assert labels.batch.labels == ("batch_b", "batch_a", "batch_c")
-    assert labels.control_label_ids == (0, 1)
+    assert adapter.cell_context_labels == ("T_cell", "B_cell")
+    assert adapter.perturbation_labels == ("WT", "CTRL", "KO_TP53", "KO_GATA1")
+    assert adapter.batch_labels == ("batch_0", "batch_1", "batch_2", "batch_3")
+    assert adapter.control_label_ids == (0, 1)
 
 
-def test_label_adapter_unknown_label_falls_back_when_configured() -> None:
+def test_corpus_adapter_unknown_label_falls_back_when_configured(
+    tmp_path: Path,
+) -> None:
     config = PertTFAdapterConfig(unknown_label="__unknown__")
-    labels = PertTFLabelAdapter.from_metadata_index(_build_metadata_index(), config)
+    corpus = load_corpus(str(_build_small_corpus(tmp_path)))
+    adapter = PertTFCorpusAdapter.from_corpus(corpus, config)
 
-    assert labels.cell_context.encode("missing_context") == labels.cell_context.encode("__unknown__")
-    assert labels.batch.encode("missing_batch") == labels.batch.encode("__unknown__")
+    assert adapter.encode_cell_context("missing_context") == adapter.encode_cell_context("__unknown__")
+    assert adapter.encode_batch("missing_batch") == adapter.encode_batch("__unknown__")
 
 
 def test_corpus_adapter_builds_from_loaded_small_corpus(tmp_path: Path) -> None:
@@ -215,3 +227,11 @@ def test_corpus_adapter_builds_from_loaded_small_corpus(tmp_path: Path) -> None:
     assert reference["simple_vocab_stoi"]["GENE_B"] == 4
     assert reference["cell_context_to_index"] == {"T_cell": 0, "B_cell": 1}
     assert reference["perturbation_to_index"] == {"WT": 0, "KO_TP53": 1, "KO_GATA1": 2}
+
+
+def test_removed_mapping_helpers_are_no_longer_public_exports() -> None:
+    for name in ("CategoricalLabelMap", "PertTFLabelAdapter", "PertTFVocabAdapter"):
+        assert name not in loader_exports.__all__
+        assert name not in adapter_exports.__all__
+        assert not hasattr(loader_exports, name)
+        assert not hasattr(adapter_exports, name)

@@ -314,9 +314,9 @@ def test_paired_batch_builder_reconstructs_target_values_at_source_sampled_genes
     assert torch.count_nonzero(batch["ps"]) == 0
     assert torch.count_nonzero(batch["ps_next"]) == 0
 
-    pad_token_id = builder.adapter.vocab.to_simple_vocab_stoi()[config.pad_token]
-    cls_token_id = builder.adapter.vocab.to_simple_vocab_stoi()[config.cls_token]
-    offset = builder.adapter.vocab.special_token_offset
+    pad_token_id = builder.adapter.to_simple_vocab_stoi()[config.pad_token]
+    cls_token_id = builder.adapter.to_simple_vocab_stoi()[config.cls_token]
+    offset = builder.adapter.special_token_offset
     assert torch.all(batch["gene_ids"][:, 0] == cls_token_id)
     assert torch.all(batch["target_values"][:, 0] == float(config.cls_value))
     assert torch.all(batch["target_values_next"][:, 0] == float(config.cls_value))
@@ -354,8 +354,8 @@ def test_paired_batch_builder_accepts_precomputed_sampled_gene_ids_and_preserves
         sampled_gene_ids=torch.tensor([[0, 3, -1]], dtype=torch.long),
     )
 
-    pad_token_id = builder.adapter.vocab.to_simple_vocab_stoi()[config.pad_token]
-    cls_token_id = builder.adapter.vocab.to_simple_vocab_stoi()[config.cls_token]
+    pad_token_id = builder.adapter.to_simple_vocab_stoi()[config.pad_token]
+    cls_token_id = builder.adapter.to_simple_vocab_stoi()[config.cls_token]
     assert batch["gene_ids"].shape == (1, 4)
     assert batch["gene_ids"][0].tolist() == [cls_token_id, 4, 7, pad_token_id]
     assert batch["values"][0].tolist() == [
@@ -403,7 +403,7 @@ def test_paired_batch_builder_emits_union_full_expression_masks_for_mixed_datase
         hvg_top_k=1,
     )
 
-    cls_token_id = builder.adapter.vocab.to_simple_vocab_stoi()[config.cls_token]
+    cls_token_id = builder.adapter.to_simple_vocab_stoi()[config.cls_token]
     assert batch["full_gene_ids"].shape == (2, 4)
     assert batch["full_gene_ids"][0].tolist() == [cls_token_id, 4, 5, 6]
     assert torch.equal(batch["full_gene_ids"][0], batch["full_gene_ids"][1])

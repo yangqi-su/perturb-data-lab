@@ -31,7 +31,7 @@ from perturb_data_lab.loaders import (
     GPUSparsePipeline,
     MetadataIndex,
     PertTFAdapterConfig,
-    PertTFLabelAdapter,
+    PertTFCorpusAdapter,
     select_obs_indices,
     collate_expression_batch,
     collate_expression_batch_cpu,
@@ -1570,9 +1570,9 @@ class TestLoadCorpusAggregate:
         assert corpus.take_metadata([0], columns=["perturb_label"])["perturb_label"] == (None,)
         with pytest.warns(
             RuntimeWarning,
-            match="PertTFLabelAdapter dropped 1 of 25 rows with null required pertTF labels",
+            match="PertTFCorpusAdapter dropped 1 of 25 rows with null required pertTF labels",
         ):
-            adapter = PertTFLabelAdapter.from_metadata_index(corpus.metadata_index)
+            adapter = PertTFCorpusAdapter.from_corpus(corpus)
         assert adapter.null_label_filter_stats is not None
         assert adapter.null_label_filter_stats.dropped_row_count == 1
         assert adapter.null_label_filter_stats.checked_row_count == 25
@@ -1586,8 +1586,8 @@ class TestLoadCorpusAggregate:
             ValueError,
             match="null_label_policy='error'",
         ):
-            PertTFLabelAdapter.from_metadata_index(
-                corpus.metadata_index,
+            PertTFCorpusAdapter.from_corpus(
+                corpus,
                 PertTFAdapterConfig(null_label_policy="error"),
             )
 

@@ -220,9 +220,9 @@ def _verify_sampled_alignment(
 ) -> dict[str, Any]:
     source_raw = corpus.inspect_batch(observed.source_indices.tolist())
     target_raw = corpus.inspect_batch(observed.target_indices.tolist())
-    pad_token_id = adapter.vocab.to_simple_vocab_stoi()[adapter.config.pad_token]
+    pad_token_id = adapter.to_simple_vocab_stoi()[adapter.config.pad_token]
     cls_offset = 1 if adapter.config.append_cls else 0
-    token_offset = adapter.vocab.special_token_offset
+    token_offset = adapter.special_token_offset
     local_to_global = corpus.feature_registry.local_to_global_map
     checked_positions = 0
     mismatches: list[str] = []

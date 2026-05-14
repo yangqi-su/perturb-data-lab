@@ -46,7 +46,6 @@ from .gpu_pipeline import (
     CPUPipeline,
 )
 from .adapters import (
-    CategoricalLabelMap,
     PertTFAdapterConfig,
     PertTFNullLabelFilterStats,
     PertTFPairedBatchLoader,
@@ -54,8 +53,6 @@ from .adapters import (
     PerturbationPairBatch,
     PerturbationPairSampler,
     PertTFCorpusAdapter,
-    PertTFLabelAdapter,
-    PertTFVocabAdapter,
 )
 
 __all__ = [
@@ -93,7 +90,6 @@ __all__ = [
     "GPUSparsePipeline",
     "CPUPipeline",
     # Phase 4 — pertTF-local adapters
-    "CategoricalLabelMap",
     "PertTFAdapterConfig",
     "PertTFNullLabelFilterStats",
     "PertTFPairedBatchLoader",
@@ -101,8 +97,6 @@ __all__ = [
     "PerturbationPairBatch",
     "PerturbationPairSampler",
     "PertTFCorpusAdapter",
-    "PertTFLabelAdapter",
-    "PertTFVocabAdapter",
     # Phase N — Corpus loader factory
     "Corpus",
     "ObsSelection",
