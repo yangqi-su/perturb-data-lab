@@ -242,7 +242,7 @@ class MaterializationManifest(YamlDocument):
     contract_version: str
     dataset_id: str
     route: str  # create_new | append_routed
-    backend: str  # arrow-hf | webdataset | zarr | lance (legacy names normalized on read)
+    backend: str  # lance | zarr (legacy lance/zarr aliases normalized on read)
     topology: str  # federated | aggregate (Stage 2 contract: backend and topology are separate)
     count_source: CountSourceSpec
     outputs: OutputRoots
@@ -275,26 +275,16 @@ class MaterializationManifest(YamlDocument):
             raise ValueError("materialization manifest contract version mismatch")
         if self.route not in {"create_new", "append_routed"}:
             raise ValueError(f"invalid route: {self.route}")
-        if self.backend not in {
-            "arrow-hf",
-            "arrow-parquet",
-            "arrow-ipc",
-            "hf-datasets",
-            "webdataset",
-            "zarr",
-            "lance",
-            "tiledb",
-        }:
+        if self.backend not in {"zarr", "lance"}:
             raise ValueError(f"invalid backend: {self.backend}")
         if self.topology not in {"federated", "aggregate"}:
             raise ValueError(f"invalid topology: {self.topology}")
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "MaterializationManifest":
-        backend_raw = data.get("backend", "arrow-hf")
-        # Normalize legacy backend names to the contract's clean names
+        backend_raw = data.get("backend", "lance")
+        # Normalize retained legacy backend aliases to the slim-main names.
         _LEGACY_BACKEND_MAP = {
-            "arrow-hf": "arrow-parquet",
             "zarr-ts": "zarr",
             "lancedb-aggregated": "lance",
             "zarr-aggregated": "zarr",
@@ -308,13 +298,11 @@ class MaterializationManifest(YamlDocument):
             route_normalized = "append_routed"
         else:
             route_normalized = route_raw
-        # Normalize topology: legacy routes had topology baked in
-        # "lancedb-aggregated" implies topology="aggregate"; others are federated
+        # Normalize topology: legacy retained aliases had topology baked in.
+        # "lancedb-aggregated" implies topology="aggregate"; others are federated.
         topo_raw = data.get("topology")
         if topo_raw is None:
-            topo_normalized = (
-                "aggregate" if backend_normalized in {"lance", "tiledb"} else "federated"
-            )
+            topo_normalized = "aggregate" if backend_normalized == "lance" else "federated"
         else:
             topo_normalized = str(topo_raw)
         document = cls(
@@ -685,23 +673,14 @@ class GlobalMetadataDocument(YamlDocument):
     feature_registry_id: str  # deprecated: replaced by tokenizer_path in contract 0.2.0
     missing_value_literal: str
     raw_field_policy: str
-    backend: str | None = None  # arrow-hf | arrow-parquet | arrow-ipc | hf-datasets | webdataset | zarr | lance | tiledb
+    backend: str | None = None  # lance | zarr
     topology: str | None = None  # federated | aggregate (Stage 2 contract: separate from backend)
     tokenizer_path: str | None = None  # relative path from corpus root to tokenizer.json
     emission_spec_path: str | None = None  # relative path from corpus root to corpus-emission-spec.yaml
     notes: tuple[str, ...] = ()
 
     def validate(self) -> None:
-        if self.backend is not None and self.backend not in {
-            "arrow-hf",
-            "arrow-parquet",
-            "arrow-ipc",
-            "hf-datasets",
-            "webdataset",
-            "zarr",
-            "lance",
-            "tiledb",
-        }:
+        if self.backend is not None and self.backend not in {"zarr", "lance"}:
             raise ValueError(f"invalid backend in global-metadata: {self.backend}")
         if self.topology is not None and self.topology not in {"federated", "aggregate"}:
             raise ValueError(f"invalid topology in global-metadata: {self.topology}")
@@ -752,7 +731,7 @@ class CorpusLedgerEntry:
     dataset_index: int
     join_mode: str  # create_new | append_routed
     manifest_path: str  # relative path from corpus root
-    backend: str  # arrow-hf | arrow-parquet | arrow-ipc | hf-datasets | webdataset | zarr | lance | tiledb
+    backend: str  # lance | zarr
     topology: str  # federated | aggregate
     cell_count: int
     feature_count: int
@@ -763,11 +742,7 @@ class CorpusLedgerEntry:
     def validate(self) -> None:
         if self.join_mode not in {"create_new", "append_routed"}:
             raise ValueError(f"invalid join_mode: {self.join_mode}")
-        if self.backend not in {
-            "arrow-hf", "arrow-parquet", "arrow-ipc",
-            "hf-datasets",
-            "webdataset", "zarr", "lance", "tiledb",
-        }:
+        if self.backend not in {"zarr", "lance"}:
             raise ValueError(f"invalid backend: {self.backend}")
         if self.topology not in {"federated", "aggregate"}:
             raise ValueError(f"invalid topology: {self.topology}")

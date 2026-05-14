@@ -171,7 +171,7 @@ class Stage2Materializer:
         Opaque writer state carried across datasets in aggregate topology.
         The corpus-level orchestrator reads this from the previous dataset's
         materializer and passes it to the next. None on the first dataset.
-        Only meaningful for aggregate topology backends (lance, zarr, webdataset).
+        Only meaningful for aggregate topology backends (lance, zarr).
     _is_last_dataset : bool, default False
         When True, signals to the aggregate backend that this is the final
         dataset in the series, triggering backend finalization.
@@ -891,17 +891,12 @@ class Stage2Materializer:
             # On first chunk: writer_state is None, writer opens/initializes.
             # On subsequent chunks: writer_state passed back, writer reuses/appends.
             # On last chunk: _is_last_chunk=True, writer closes/commits, returns None.
-            cell_ids_chunk: tuple[str, ...] | None = None
-            if self.backend == "webdataset":
-                cell_ids_chunk = tuple(cell_ids[chunk_start:chunk_end])
-
             paths, writer_state = backend_fn(
                 bundle=bundle,
                 dataset_id=self.dataset_id,
                 matrix_root=matrix_root,
                 _writer_state=writer_state,
                 _is_last_chunk=is_last,
-                cell_ids=cell_ids_chunk,
                 local_vocabulary_size=n_vars,
             )
 
@@ -1024,17 +1019,12 @@ class Stage2Materializer:
             n_cells_total += bundle.row_count
 
             # Call the aggregate backend writer with streaming state.
-            cell_ids_chunk: tuple[str, ...] | None = None
-            if self.backend == "webdataset":
-                cell_ids_chunk = tuple(cell_ids[chunk_start:chunk_end])
-
             paths, writer_state = backend_fn(
                 bundle=bundle,
                 dataset_id=self.dataset_id,
                 matrix_root=matrix_root,
                 _writer_state=writer_state,
                 _is_last_chunk=is_last_chunk,
-                cell_ids=cell_ids_chunk,
                 local_vocabulary_size=n_vars,
             )
 

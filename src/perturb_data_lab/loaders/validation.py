@@ -1,8 +1,7 @@
-"""Reusable cross-backend public-API validation helpers.
+"""Reusable slim-main public-API validation helpers.
 
 These helpers exercise the federated corpus public API through a single
-contract so backend parity checks can stay consistent across Lance, Zarr,
-Arrow IPC, HuggingFace datasets, and Parquet.
+contract so Lance and Zarr parity checks stay consistent.
 """
 
 from __future__ import annotations
@@ -37,8 +36,7 @@ def validate_cross_backend_contract(
     ----------
     corpus_roots:
         Mapping from backend label to corpus root. Backend labels may use dash
-        or underscore forms such as ``"arrow-ipc"`` / ``"arrow_ipc"`` and
-        ``"hf-datasets"`` / ``"hf_datasets"``.
+        or underscore forms such as ``"lance"`` and ``"zarr"``.
     sample_indices:
         Ordered global row indices used for deterministic cross-backend reads.
     metadata_columns:
@@ -410,50 +408,19 @@ def _matrix_artifact_report(backend: str, matrix_root: Path, dataset_id: str) ->
                 )
         return {"matrix_paths": {label: str(path) for label, path in artifacts.items()}}
 
-    if backend == "arrow_ipc":
-        matrix_path = matrix_root / f"{dataset_id}-cells.arrow"
-        if not matrix_path.is_file():
-            raise FileNotFoundError(
-                f"{backend} failed at artifact existence for dataset '{dataset_id}': "
-                f"missing matrix artifact at {matrix_path}"
-            )
-        return {"matrix_path": str(matrix_path)}
-
-    if backend == "hf_datasets":
-        matrix_path = matrix_root / f"{dataset_id}-hf-dataset"
-        if not matrix_path.is_dir():
-            raise FileNotFoundError(
-                f"{backend} failed at artifact existence for dataset '{dataset_id}': "
-                f"missing HF dataset directory at {matrix_path}"
-            )
-        return {"matrix_path": str(matrix_path)}
-
-    if backend == "parquet":
-        matrix_path = matrix_root / f"{dataset_id}-cells.parquet"
-        if not matrix_path.is_file():
-            raise FileNotFoundError(
-                f"{backend} failed at artifact existence for dataset '{dataset_id}': "
-                f"missing matrix artifact at {matrix_path}"
-            )
-        return {"matrix_path": str(matrix_path)}
-
     raise ValueError(f"Unsupported backend label '{backend}'")
 
 
 def _normalize_backend_label(label: str) -> str:
     normalized = str(label).strip().lower().replace("-", "_")
     aliases = {
-        "arrow_parquet": "parquet",
-        "parquet": "parquet",
-        "arrow_ipc": "arrow_ipc",
-        "hf_datasets": "hf_datasets",
         "zarr": "zarr",
         "lance": "lance",
     }
     resolved = aliases.get(normalized)
     if resolved is None:
         raise ValueError(
-            f"Unsupported backend label '{label}'. Expected 'lance', 'zarr', 'arrow-ipc', 'hf-datasets', or 'arrow-parquet'."
+            f"Unsupported backend label '{label}'. Expected 'lance' or 'zarr'."
         )
     return resolved
 

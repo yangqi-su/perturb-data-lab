@@ -1,10 +1,10 @@
 """Shared chunk translation layer for Stage 2 backend writers.
 
-This module introduces the shared benchmark-derived translation pattern used by all
-five backend writers (arrow-parquet, arrow-ipc, webdataset, zarr, lance). It provides
-a common ``ChunkBundle`` dataclass, shared PyArrow schemas, and the core
-``_translate_chunk()`` function that converts a CSR matrix batch into a form all
-backends can consume without backend-specific sparse re-encoding.
+This module introduces the shared benchmark-derived translation pattern used by the
+maintained Zarr and Lance writers. It provides a common ``ChunkBundle`` dataclass,
+shared PyArrow schemas, and the core ``_translate_chunk()`` function that converts a
+CSR matrix batch into a form both backends can consume without backend-specific
+sparse re-encoding.
 
 Architecture
 ------------
@@ -238,7 +238,7 @@ class ChunkBundle:
         receives or embeds them.
     indptr : np.ndarray
         CSR indptr array for this chunk. Int64, length ``n_rows + 1``. Raw buffer
-        available for backends that need flat-buffer access (Zarr, WebDataset).
+        available for backends that need flat-buffer access (Zarr).
     indices : np.ndarray
         **Dataset-local** gene indices (int32) for all non-zero entries in this chunk.
         Raw buffer for backends that need it. These indices are in the original
