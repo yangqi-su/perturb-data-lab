@@ -9,7 +9,6 @@ from typing import Any, Iterator, Sequence
 import numpy as np
 import polars as pl
 from scipy.sparse import csr_matrix
-from scipy.sparse.linalg import LinearOperator, svds
 
 from ..loaders.corpus_loader import Corpus
 from .artifacts import prepare_pp_output, write_pp_provenance
@@ -24,13 +23,16 @@ from .streaming import (
 
 DEFAULT_PCA_ARTIFACT_NAME = "pca"
 _LOGNORM_FORMULA = "log1p(count / size_factor)"
-_TRUNCATED_SVD_METHOD_SEMANTICS = "uncentered_truncated_svd_on_lognorm_expression"
 _INCREMENTAL_PCA_METHOD_SEMANTICS = "centered_incremental_pca_on_lognorm_expression"
+_TRUNCATED_SVD_UNSUPPORTED_MESSAGE = (
+    "method='truncated_svd' is unsupported in slim main. Use method='incremental_pca' "
+    "or switch to experimental/all-backends-pre-slim-20260514 for the legacy truncated SVD route."
+)
 
 
 @dataclass(frozen=True)
 class PpPcaResult:
-    """Collected outputs for one streamed PCA/SVD run."""
+    """Collected outputs for one streamed PCA run."""
 
     embeddings: pl.DataFrame
     components: pl.DataFrame
@@ -69,83 +71,13 @@ class _DatasetPcaPlan:
         return int(self.transform_row_indices.shape[0])
 
 
-class _SelectedLognormLinearOperator(LinearOperator):
-    """Linear operator exposing streamed selected lognorm rows for sparse SVD."""
-
-    def __init__(
-        self,
-        corpus: Corpus,
-        *,
-        context: PpFeatureContext,
-        selected_features: _SelectedFeatureSet,
-        batch_size: int,
-    ) -> None:
-        self._corpus = corpus
-        self._context = context
-        self._selected_features = selected_features
-        self._batch_size = int(batch_size)
-        super().__init__(
-            dtype=np.dtype(np.float64),
-            shape=(
-                int(context.global_end - context.global_start),
-                selected_features.n_features,
-            ),
-        )
-
-    def _matvec(self, vector: np.ndarray) -> np.ndarray:
-        return self._matmat(np.asarray(vector, dtype=np.float64)[:, None]).reshape(-1)
-
-    def _matmat(self, matrix: np.ndarray) -> np.ndarray:
-        weights = np.asarray(matrix, dtype=np.float64)
-        if weights.ndim != 2 or weights.shape[0] != self.shape[1]:
-            raise ValueError("right operand must have shape (n_selected_features, n_vectors)")
-
-        projected = np.empty((self.shape[0], weights.shape[1]), dtype=np.float64)
-        row_offset = 0
-        for _, selected in _iter_selected_lognorm_batches(
-            self._corpus,
-            context=self._context,
-            selected_features=self._selected_features,
-            batch_size=self._batch_size,
-        ):
-            batch_projection = selected @ weights
-            next_offset = row_offset + selected.shape[0]
-            projected[row_offset:next_offset] = np.asarray(batch_projection, dtype=np.float64)
-            row_offset = next_offset
-        return projected
-
-    def _rmatvec(self, vector: np.ndarray) -> np.ndarray:
-        return self._rmatmat(np.asarray(vector, dtype=np.float64)[:, None]).reshape(-1)
-
-    def _rmatmat(self, matrix: np.ndarray) -> np.ndarray:
-        left = np.asarray(matrix, dtype=np.float64)
-        if left.ndim != 2 or left.shape[0] != self.shape[0]:
-            raise ValueError("left operand must have shape (n_obs, n_vectors)")
-
-        projected = np.zeros((self.shape[1], left.shape[1]), dtype=np.float64)
-        row_offset = 0
-        for _, selected in _iter_selected_lognorm_batches(
-            self._corpus,
-            context=self._context,
-            selected_features=self._selected_features,
-            batch_size=self._batch_size,
-        ):
-            next_offset = row_offset + selected.shape[0]
-            projected += np.asarray(
-                selected.transpose() @ left[row_offset:next_offset],
-                dtype=np.float64,
-            )
-            row_offset = next_offset
-        return projected
-
-
 def run_pca(
     corpus: Corpus,
     *,
     dataset_id: str | None = None,
     batch_size: int = 1024,
     n_components: int = 50,
-    method: str = "truncated_svd",
+    method: str = "incremental_pca",
     fit_row_indices: Sequence[int] | np.ndarray | None = None,
     transform_row_indices: Sequence[int] | np.ndarray | None = None,
     hvg_frame: pl.DataFrame | None = None,
@@ -157,9 +89,9 @@ def run_pca(
 ) -> PpPcaResult:
     """Run streamed per-dataset dimensionality reduction on lognorm expression.
 
-    Phase 9 currently exposes an uncentered sparse truncated SVD route. The
-    public name stays ``run_pca`` because the plan calls for a PCA-like API, but
-    provenance and component statistics record the exact method semantics.
+    Slim main keeps IncrementalPCA as the streamed PCA route. The public name
+    stays ``run_pca`` because the outputs remain PCA-like, while provenance and
+    component statistics record the exact centered IncrementalPCA semantics.
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -168,17 +100,13 @@ def run_pca(
     if max_dense_batch_bytes is not None and int(max_dense_batch_bytes) <= 0:
         raise ValueError("max_dense_batch_bytes must be positive when provided")
 
-    if method not in {"truncated_svd", "incremental_pca"}:
+    if method == "truncated_svd":
+        raise NotImplementedError(_TRUNCATED_SVD_UNSUPPORTED_MESSAGE)
+    if method != "incremental_pca":
         raise NotImplementedError(
-            "run_pca supports only method='truncated_svd' or method='incremental_pca'"
+            "run_pca supports only method='incremental_pca' in slim main"
         )
-    if method == "truncated_svd" and (
-        fit_row_indices is not None or transform_row_indices is not None
-    ):
-        raise ValueError(
-            "fit_row_indices and transform_row_indices are supported only for method='incremental_pca'"
-        )
-    if method == "incremental_pca" and dataset_id is None and (
+    if dataset_id is None and (
         fit_row_indices is not None or transform_row_indices is not None
     ):
         raise ValueError(
@@ -195,7 +123,6 @@ def run_pca(
         _prepare_dataset_pca_plan(
             context,
             hvg_frame=hvg_frame,
-            method=method,
             batch_size=batch_size,
             n_components=n_components,
             fit_row_indices=fit_row_indices,
@@ -205,29 +132,17 @@ def run_pca(
         for context in _resolve_feature_contexts(corpus, dataset_id=dataset_id)
     ]
 
-    incremental_pca_cls = None
-    if method == "incremental_pca":
-        incremental_pca_cls = _load_incremental_pca_class()
+    incremental_pca_cls = _load_incremental_pca_class()
 
     for plan in plans:
         selected_frame = _build_selected_features_frame(plan.context, plan.selected_features)
-        if method == "truncated_svd":
-            embeddings_frame, components_frame, component_stats_frame = _run_truncated_svd_plan(
-                corpus,
-                plan=plan,
-                batch_size=batch_size,
-                n_components=n_components,
-                random_seed=random_seed,
-            )
-        else:
-            assert incremental_pca_cls is not None
-            embeddings_frame, components_frame, component_stats_frame = _run_incremental_pca_plan(
-                corpus,
-                plan=plan,
-                incremental_pca_cls=incremental_pca_cls,
-                batch_size=batch_size,
-                n_components=n_components,
-            )
+        embeddings_frame, components_frame, component_stats_frame = _run_incremental_pca_plan(
+            corpus,
+            plan=plan,
+            incremental_pca_cls=incremental_pca_cls,
+            batch_size=batch_size,
+            n_components=n_components,
+        )
 
         embedding_frames.append(embeddings_frame)
         component_frames.append(components_frame)
@@ -279,7 +194,6 @@ def _prepare_dataset_pca_plan(
     context: PpFeatureContext,
     *,
     hvg_frame: pl.DataFrame | None,
-    method: str,
     batch_size: int,
     n_components: int,
     fit_row_indices: Sequence[int] | np.ndarray | None,
@@ -287,26 +201,6 @@ def _prepare_dataset_pca_plan(
     max_dense_batch_bytes: int | None,
 ) -> _DatasetPcaPlan:
     selected_features = _resolve_selected_features(context, hvg_frame=hvg_frame)
-    full_dataset_rows = np.arange(context.global_start, context.global_end, dtype=np.int64)
-
-    if method == "truncated_svd":
-        min_dim = min(int(full_dataset_rows.size), selected_features.n_features)
-        if min_dim <= 1:
-            raise ValueError(
-                f"dataset {context.dataset_id!r} needs at least two rows/features for truncated SVD"
-            )
-        if n_components >= min_dim:
-            raise ValueError(
-                f"n_components={n_components} must be smaller than min(n_obs, n_selected_features)={min_dim}"
-            )
-        return _DatasetPcaPlan(
-            context=context,
-            selected_features=selected_features,
-            fit_row_indices=full_dataset_rows,
-            transform_row_indices=full_dataset_rows,
-            fit_chunks=(),
-            estimated_dense_batch_bytes=None,
-        )
 
     fit_rows = _normalize_context_row_indices(context, fit_row_indices)
     transform_rows = _normalize_context_row_indices(context, transform_row_indices)
@@ -480,26 +374,6 @@ def _estimate_dense_batch_bytes(*, n_rows: int, n_features: int) -> int:
     return int(n_rows) * int(n_features) * np.dtype(np.float64).itemsize
 
 
-def _iter_selected_lognorm_batches(
-    corpus: Corpus,
-    *,
-    context: PpFeatureContext,
-    selected_features: _SelectedFeatureSet,
-    batch_size: int,
-    row_indices: np.ndarray | None = None,
-):
-    row_offset = 0
-    for batch in _iter_context_batches(
-        corpus,
-        context=context,
-        batch_size=batch_size,
-        row_indices=row_indices,
-    ):
-        selected = _select_lognorm_features(batch, selected_features.local_feature_positions)
-        yield row_offset, selected
-        row_offset += batch.batch_size
-
-
 def _iter_context_batches(
     corpus: Corpus,
     *,
@@ -546,23 +420,6 @@ def _select_lognorm_features(
     return lognorm[:, local_feature_positions]
 
 
-def _canonicalize_svd(
-    singular_values: np.ndarray,
-    right_singular_vectors: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    order = np.argsort(np.asarray(singular_values, dtype=np.float64))[::-1]
-    sorted_values = np.asarray(singular_values, dtype=np.float64)[order]
-    sorted_vectors = np.asarray(right_singular_vectors, dtype=np.float64)[order].copy()
-    for component_index in range(sorted_vectors.shape[0]):
-        component = sorted_vectors[component_index]
-        if component.size == 0:
-            continue
-        pivot = int(np.argmax(np.abs(component)))
-        if component[pivot] < 0:
-            sorted_vectors[component_index] *= -1.0
-    return sorted_values, sorted_vectors
-
-
 def _canonicalize_component_signs(
     components: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -577,64 +434,6 @@ def _canonicalize_component_signs(
             canonical[component_index] *= -1.0
             signs[component_index] = -1.0
     return canonical, signs
-
-
-def _run_truncated_svd_plan(
-    corpus: Corpus,
-    *,
-    plan: _DatasetPcaPlan,
-    batch_size: int,
-    n_components: int,
-    random_seed: int,
-) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    operator = _SelectedLognormLinearOperator(
-        corpus,
-        context=plan.context,
-        selected_features=plan.selected_features,
-        batch_size=batch_size,
-    )
-    _, singular_values, right_singular_vectors = svds(
-        operator,
-        k=n_components,
-        solver="arpack",
-        rng=np.random.default_rng(random_seed),
-    )
-    singular_values, right_singular_vectors = _canonicalize_svd(
-        singular_values,
-        right_singular_vectors,
-    )
-
-    embeddings_frame, frobenius_norm_sq = _project_dataset_embeddings(
-        corpus,
-        context=plan.context,
-        selected_features=plan.selected_features,
-        components=right_singular_vectors,
-        batch_size=batch_size,
-        row_indices=None,
-    )
-    components_frame = _build_components_frame(
-        plan.context,
-        plan.selected_features,
-        components=right_singular_vectors,
-    )
-    singular_value_sq = np.square(np.asarray(singular_values, dtype=np.float64))
-    explained_variance = singular_value_sq / float(max(plan.fit_n_obs, 1))
-    if frobenius_norm_sq > 0.0:
-        explained_variance_ratio = singular_value_sq / frobenius_norm_sq
-    else:
-        explained_variance_ratio = np.zeros_like(singular_value_sq)
-    component_stats_frame = _build_component_stats_frame(
-        plan.context,
-        singular_values=singular_values,
-        explained_variance=explained_variance,
-        explained_variance_ratio=explained_variance_ratio,
-        n_selected_features=plan.selected_features.n_features,
-        n_obs=plan.fit_n_obs,
-        method="truncated_svd",
-        is_centered=False,
-        method_semantics=_TRUNCATED_SVD_METHOD_SEMANTICS,
-    )
-    return embeddings_frame, components_frame, component_stats_frame
 
 
 def _run_incremental_pca_plan(
@@ -735,47 +534,6 @@ def _transform_incremental_embeddings(
     for component_index in range(embeddings.shape[1]):
         payload[f"component_{component_index + 1}"] = embeddings[:, component_index]
     return pl.DataFrame(payload).sort("global_row_index")
-
-
-def _project_dataset_embeddings(
-    corpus: Corpus,
-    *,
-    context: PpFeatureContext,
-    selected_features: _SelectedFeatureSet,
-    components: np.ndarray,
-    batch_size: int,
-    row_indices: np.ndarray | None,
-) -> tuple[pl.DataFrame, float]:
-    global_rows: list[np.ndarray] = []
-    local_rows: list[np.ndarray] = []
-    embedding_chunks: list[np.ndarray] = []
-    frobenius_norm_sq = 0.0
-
-    for batch in _iter_context_batches(
-        corpus,
-        context=context,
-        batch_size=batch_size,
-        row_indices=row_indices,
-    ):
-        selected = _select_lognorm_features(batch, selected_features.local_feature_positions)
-        global_rows.append(np.asarray(batch.global_row_index, dtype=np.int64))
-        local_rows.append(np.asarray(batch.local_row_index, dtype=np.int64))
-        embedding_chunks.append(np.asarray(selected @ components.transpose(), dtype=np.float64))
-        frobenius_norm_sq += float(np.square(np.asarray(selected.data, dtype=np.float64)).sum())
-
-    if not embedding_chunks:
-        return _empty_embeddings_frame(components.shape[0]), 0.0
-
-    embeddings = np.vstack(embedding_chunks)
-    payload: dict[str, object] = {
-        "dataset_id": [context.dataset_id] * embeddings.shape[0],
-        "dataset_index": np.full(embeddings.shape[0], context.dataset_index, dtype=np.int32),
-        "global_row_index": np.concatenate(global_rows),
-        "local_row_index": np.concatenate(local_rows),
-    }
-    for component_index in range(embeddings.shape[1]):
-        payload[f"component_{component_index + 1}"] = embeddings[:, component_index]
-    return pl.DataFrame(payload).sort("global_row_index"), frobenius_norm_sq
 
 
 def _build_selected_features_frame(
@@ -942,10 +700,10 @@ def _write_dataset_outputs(
 
 
 def _method_semantics(method: str) -> str:
-    if method == "truncated_svd":
-        return _TRUNCATED_SVD_METHOD_SEMANTICS
     if method == "incremental_pca":
         return _INCREMENTAL_PCA_METHOD_SEMANTICS
+    if method == "truncated_svd":
+        raise NotImplementedError(_TRUNCATED_SVD_UNSUPPORTED_MESSAGE)
     raise NotImplementedError(f"Unknown PCA method semantics for {method!r}")
 
 

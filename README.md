@@ -363,9 +363,11 @@ de = rank_genes_ttest(
   provenance sidecars.
 - `calculate_hvgs(...)` returns a ranked per-dataset HVG frame that can be fed
   into `run_pca(..., hvg_frame=...)`.
-- `run_pca(...)` supports default uncentered sparse `method="truncated_svd"`
-  plus centered `method="incremental_pca"` for bounded dense batches when
-  `scikit-learn` is installed (for example via `pip install ".[pca]"`).
+- `run_pca(...)` uses centered `method="incremental_pca"` as the slim-main
+  streamed PCA route for bounded dense batches when `scikit-learn` is
+  installed (for example via `pip install ".[pca]"`). The legacy
+  `method="truncated_svd"` path is preserved only on the experimental
+  pre-slim branch.
 - `rank_genes_ttest(...)` runs streamed per-dataset Welch DE against an
   explicit control label and writes top-k `ttest-degs.parquet` artifacts when
   `output_dir` is set.

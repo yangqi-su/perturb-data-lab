@@ -309,54 +309,6 @@ def _dense_reference_hvgs(corpus, dataset_id: str) -> dict[str, np.ndarray | int
     }
 
 
-def _canonicalize_dense_svd(
-    singular_values: np.ndarray,
-    right_singular_vectors: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    order = np.argsort(singular_values)[::-1]
-    values = np.asarray(singular_values, dtype=np.float64)[order]
-    vectors = np.asarray(right_singular_vectors, dtype=np.float64)[order].copy()
-    signs = np.ones(values.shape[0], dtype=np.float64)
-    for component_index in range(vectors.shape[0]):
-        pivot = int(np.argmax(np.abs(vectors[component_index])))
-        if vectors[component_index, pivot] < 0:
-            vectors[component_index] *= -1.0
-            signs[component_index] = -1.0
-    return values, vectors, signs
-
-
-def _dense_reference_truncated_svd(
-    corpus,
-    dataset_id: str,
-    *,
-    n_components: int,
-    selected_global_feature_ids: np.ndarray | None = None,
-) -> dict[str, np.ndarray]:
-    matrices = []
-    for batch in iter_dataset_batches(corpus, dataset_id=dataset_id, batch_size=3):
-        dense = batch.expression.toarray().astype(np.float64, copy=False)
-        dense = np.log1p(dense / batch.size_factor[:, None].astype(np.float64, copy=False))
-        if selected_global_feature_ids is not None:
-            dense = dense[:, selected_global_feature_ids]
-        matrices.append(dense)
-
-    combined = np.vstack(matrices)
-    left, singular_values, right = np.linalg.svd(combined, full_matrices=False)
-    singular_values, right, signs = _canonicalize_dense_svd(
-        singular_values[:n_components],
-        right[:n_components],
-    )
-    left = left[:, :n_components] * signs[None, :]
-    embeddings = left * singular_values[None, :]
-    frobenius_norm_sq = float(np.square(combined).sum())
-    return {
-        "embeddings": embeddings,
-        "components": right,
-        "singular_values": singular_values,
-        "explained_variance_ratio": np.square(singular_values) / frobenius_norm_sq,
-    }
-
-
 def _dense_reference_incremental_pca(
     corpus,
     dataset_id: str,
@@ -721,13 +673,21 @@ def test_calculate_hvgs_matches_dense_reference_for_single_dataset(tmp_path: Pat
     assert hvgs["selected_at_default_n_hvg"].sum() == 7
 
 
-def test_run_pca_matches_dense_reference_and_is_deterministic(tmp_path: Path) -> None:
+def test_run_pca_defaults_to_incremental_pca_matches_dense_reference_and_is_deterministic(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("sklearn.decomposition")
     _build_mock_federated_lance_corpus(tmp_path)
     corpus = load_corpus(str(tmp_path))
 
     first = run_pca(corpus, dataset_id="mock_00", batch_size=4, n_components=3)
     second = run_pca(corpus, dataset_id="mock_00", batch_size=4, n_components=3)
-    reference = _dense_reference_truncated_svd(corpus, "mock_00", n_components=3)
+    reference = _dense_reference_incremental_pca(
+        corpus,
+        "mock_00",
+        n_components=3,
+        batch_size=4,
+    )
 
     assert first.embeddings.columns == [
         "dataset_id",
@@ -740,8 +700,10 @@ def test_run_pca_matches_dense_reference_and_is_deterministic(tmp_path: Path) ->
     ]
     assert first.embeddings.shape == (10, 7)
     assert first.components["component_index"].unique().sort().to_list() == [1, 2, 3]
+    assert first.component_stats["method"].unique().to_list() == ["incremental_pca"]
+    assert first.component_stats["is_centered"].unique().to_list() == [True]
     assert first.component_stats["method_semantics"].unique().to_list() == [
-        "uncentered_truncated_svd_on_lognorm_expression"
+        "centered_incremental_pca_on_lognorm_expression"
     ]
     assert first.selected_features["selection_source"].unique().to_list() == ["all_features"]
     np.testing.assert_array_equal(
@@ -772,6 +734,11 @@ def test_run_pca_matches_dense_reference_and_is_deterministic(tmp_path: Path) ->
         atol=1e-6,
     )
     np.testing.assert_allclose(
+        first.component_stats["explained_variance"].to_numpy(),
+        reference["explained_variance"],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
         first.component_stats["explained_variance_ratio"].to_numpy(),
         reference["explained_variance_ratio"],
         atol=1e-6,
@@ -782,7 +749,10 @@ def test_run_pca_matches_dense_reference_and_is_deterministic(tmp_path: Path) ->
     assert first.selected_features.to_dict(as_series=False) == second.selected_features.to_dict(as_series=False)
 
 
-def test_run_pca_streams_all_datasets_respects_hvgs_and_writes_artifacts(tmp_path: Path) -> None:
+def test_run_pca_incremental_pca_streams_all_datasets_respects_hvgs_and_writes_artifacts(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("sklearn.decomposition")
     corpus_root = tmp_path / "corpus"
     _build_mock_federated_lance_corpus(corpus_root)
     corpus = load_corpus(str(corpus_root))
@@ -837,10 +807,11 @@ def test_run_pca_streams_all_datasets_respects_hvgs_and_writes_artifacts(tmp_pat
             np.arange(global_start, global_stop, dtype=np.int64),
         )
 
-        reference = _dense_reference_truncated_svd(
+        reference = _dense_reference_incremental_pca(
             corpus,
             dataset_id,
             n_components=2,
+            batch_size=5,
             selected_global_feature_ids=selected["global_feature_id"].to_numpy(),
         )
         np.testing.assert_allclose(
@@ -862,9 +833,23 @@ def test_run_pca_streams_all_datasets_respects_hvgs_and_writes_artifacts(tmp_pat
             (output_dir / dataset_id / "pca-component-stats.provenance.json").read_text(encoding="utf-8")
         )
         assert provenance["operation"] == "run_pca"
-        assert provenance["parameters"]["method"] == "truncated_svd"
-        assert provenance["parameters"]["method_semantics"] == "uncentered_truncated_svd_on_lognorm_expression"
+        assert provenance["parameters"]["method"] == "incremental_pca"
+        assert provenance["parameters"]["method_semantics"] == "centered_incremental_pca_on_lognorm_expression"
         assert provenance["parameters"]["n_components"] == 2
+
+
+def test_run_pca_truncated_svd_errors_clearly_for_slim_main(tmp_path: Path) -> None:
+    _build_mock_federated_lance_corpus(tmp_path)
+    corpus = load_corpus(str(tmp_path))
+
+    with pytest.raises(NotImplementedError, match="unsupported in slim main"):
+        run_pca(
+            corpus,
+            dataset_id="mock_00",
+            method="truncated_svd",
+            batch_size=4,
+            n_components=2,
+        )
 
 
 def test_run_pca_incremental_pca_fit_subset_transforms_all_and_respects_hvgs(
