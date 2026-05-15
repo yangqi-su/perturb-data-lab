@@ -2,17 +2,31 @@
 
 This repository now contains a Phase 7 smoke path for validating the public
 `PertTFPairedBatchLoader` on the full Marson/Xorion aggregate corpus without
-editing the external `pertTF` repository.
+editing the external `pertTF` repository. The smoke now opts into explicit
+same-dataset + same-celltype pairing through the generic label config instead of
+relying on old built-in pertTF assumptions.
 
 ## What the smoke does
 
 - loads the existing aggregate Marson/Xorion Lance corpus with `load_corpus(...)`
 - verifies that all 14 datasets expose canonical `hvg.parquet` rankings at runtime
-- constructs a public `PertTFPairedBatchLoader`
+- constructs a public `PertTFPairedBatchLoader` with:
+  ```python
+  PertTFAdapterConfig(
+      label_fields={
+          "perturb_label": "perturbation",
+          "cell_context": "celltype",
+          "batch_id": "batch",
+          "dataset_index": "dataset",
+      },
+      perturbation_label="perturbation",
+      pairing_group_labels=("dataset", "celltype"),
+  )
+  ```
 - exercises the loader's default null-label drop behavior and records the effective row/drop stats
 - scans a bounded number of public-loader batches until it finds a small mixed-dataset batch with `sampling_mode="hvg"`
 - validates:
-  - same-dataset and same-context source/target invariants
+  - configured same-dataset and same-celltype source/target invariants
   - sampled source/target gene-ID alignment
   - union-vocabulary `full_expr_mask` / `full_expr_next_mask` semantics
   - worker-visible loader dataset state stays expression-only by design
@@ -44,6 +58,9 @@ normal callers use while still avoiding an unnecessarily broad full-corpus run
 just to prove the end-to-end tensor contract. Rows with null `cell_context`,
 `perturb_label`, or `batch_id` are now dropped by the public loader's default
 null-label policy, and the smoke records the resulting effective row counts.
+
+If you want default cross-dataset pertTF pairing instead, leave
+`pairing_group_labels=()` and omit the `dataset_index -> dataset` label field.
 
 ## Typical Slurm invocation
 
@@ -81,4 +98,6 @@ directory.
   loss consumption of those masks remains future work.
 - Control-label normalization is still configuration-driven. If a new corpus uses
   different control names, pass explicit `--control-label` overrides.
+- Dataset-constrained pairing is no longer implicit; this smoke requests it
+  explicitly through `pairing_group_labels=("dataset", "celltype")`.
 - The smoke is a contract/invariant check, not a training or throughput benchmark.

@@ -72,9 +72,9 @@ def test_perttf_config_defaults_expose_generic_label_fields() -> None:
     assert config.label_names == ("perturbation", "celltype", "batch")
     assert config.perturbation_label == "perturbation"
     assert config.pairing_group_labels == ()
-    assert config.perturbation_column == "perturb_label"
-    assert config.cell_context_column == "cell_context"
-    assert config.batch_column == "batch_id"
+    assert config.metadata_column_for_label("perturbation") == "perturb_label"
+    assert config.metadata_column_for_label("celltype") == "cell_context"
+    assert config.metadata_column_for_label("batch") == "batch_id"
     assert config.resolved_drop_null_labels == (
         "perturbation",
         "celltype",
@@ -82,6 +82,9 @@ def test_perttf_config_defaults_expose_generic_label_fields() -> None:
     )
     assert config.resolved_encode_null_labels == ()
     assert config.resolved_error_null_labels == ()
+    assert not hasattr(config, "perturbation_column")
+    assert not hasattr(config, "cell_context_column")
+    assert not hasattr(config, "batch_column")
 
 
 def test_perttf_config_accepts_explicit_dataset_pairing_and_null_policy() -> None:

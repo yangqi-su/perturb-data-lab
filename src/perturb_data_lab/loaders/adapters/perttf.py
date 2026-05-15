@@ -294,18 +294,6 @@ class PertTFAdapterConfig:
             raise ValueError(f"metadata column {normalized_column!r} is not configured") from exc
 
     @property
-    def perturbation_column(self) -> str:
-        return self.metadata_column_for_label(self.perturbation_label)
-
-    @property
-    def cell_context_column(self) -> str:
-        return self.metadata_column_for_label("celltype")
-
-    @property
-    def batch_column(self) -> str:
-        return self.metadata_column_for_label("batch")
-
-    @property
     def resolved_drop_null_labels(self) -> tuple[str, ...]:
         explicit_drop_labels = list(self.drop_null_labels or ())
         drop_label_set = set(explicit_drop_labels)

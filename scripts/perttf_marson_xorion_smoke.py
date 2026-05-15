@@ -70,8 +70,8 @@ class ObservedLoaderBatch:
     target_dataset_indices: np.ndarray
     source_dataset_ids: tuple[str, ...]
     target_dataset_ids: tuple[str, ...]
-    source_cell_context_labels: tuple[str, ...]
-    target_cell_context_labels: tuple[str, ...]
+    source_celltype_labels: tuple[str, ...]
+    target_celltype_labels: tuple[str, ...]
     source_perturbation_labels: tuple[str, ...]
     target_perturbation_labels: tuple[str, ...]
 
@@ -115,7 +115,9 @@ def _observe_loader_batch(
 ) -> ObservedLoaderBatch:
     source_indices = np.asarray(batch["index"].detach().cpu().tolist(), dtype=np.int64)
     target_indices = np.asarray(batch["next_index"].detach().cpu().tolist(), dtype=np.int64)
-    metadata_columns = ["dataset_index", config.cell_context_column, config.perturbation_column]
+    celltype_column = config.metadata_column_for_label("celltype")
+    perturbation_column = config.metadata_column_for_label(config.perturbation_label)
+    metadata_columns = ["dataset_index", celltype_column, perturbation_column]
     source_meta = corpus.take_metadata(source_indices.tolist(), columns=metadata_columns)
     target_meta = corpus.take_metadata(target_indices.tolist(), columns=metadata_columns)
     source_dataset_indices = np.asarray(source_meta["dataset_index"], dtype=np.int32)
@@ -129,17 +131,17 @@ def _observe_loader_batch(
         target_dataset_indices=target_dataset_indices,
         source_dataset_ids=_dataset_ids_from_indices(corpus, source_dataset_indices),
         target_dataset_ids=_dataset_ids_from_indices(corpus, target_dataset_indices),
-        source_cell_context_labels=tuple(
-            str(value) for value in source_meta[config.cell_context_column]
+        source_celltype_labels=tuple(
+            str(value) for value in source_meta[celltype_column]
         ),
-        target_cell_context_labels=tuple(
-            str(value) for value in target_meta[config.cell_context_column]
+        target_celltype_labels=tuple(
+            str(value) for value in target_meta[celltype_column]
         ),
         source_perturbation_labels=tuple(
-            str(value) for value in source_meta[config.perturbation_column]
+            str(value) for value in source_meta[perturbation_column]
         ),
         target_perturbation_labels=tuple(
-            str(value) for value in target_meta[config.perturbation_column]
+            str(value) for value in target_meta[perturbation_column]
         ),
     )
 
@@ -349,8 +351,8 @@ def _write_markdown_summary(path: Path, summary: dict[str, Any]) -> None:
                 "",
                 "## Checks",
                 "",
-                f"- Same-dataset invariant: `{summary['batch']['same_dataset_check']}`",
-                f"- Same-context invariant: `{summary['batch']['same_context_check']}`",
+                f"- Same-dataset check: `{summary['batch']['same_dataset_check']}` (required `{summary['batch']['same_dataset_check_required']}`)",
+                f"- Same-celltype check: `{summary['batch']['same_celltype_check']}` (required `{summary['batch']['same_celltype_check_required']}`)",
                 f"- Sampled source/target gene alignment: `{summary['alignment']['passed']}` ({summary['alignment']['checked_positions']} checked positions)",
                 f"- Union full-expression masks: `{summary['full_expression_masks']['passed']}`",
                 f"- Worker dataset stayed expression-only: `{summary['loader']['expression_only_state_passed']}`",
@@ -478,7 +480,14 @@ def main() -> None:
     config = PertTFAdapterConfig(
         control_labels=tuple(dict.fromkeys(str(value) for value in args.control_label)),
         include_full_expr=True,
+        label_fields={
+            "perturb_label": "perturbation",
+            "cell_context": "celltype",
+            "batch_id": "batch",
+            "dataset_index": "dataset",
+        },
         mask_ratio=0.0,
+        pairing_group_labels=("dataset", "celltype"),
     )
     multiprocessing_context = command_snapshot["multiprocessing_context"]
     loader = PertTFPairedBatchLoader(
@@ -506,7 +515,7 @@ def main() -> None:
 
     dataset_state = dict(loader._data_loader.dataset.__dict__)
     expression_only_state_passed = (
-        set(dataset_state) == {"_reader", "_routing_table", "_topology", "_backend"}
+        set(dataset_state) == {"_reader", "_total_rows"}
         and all(value is not corpus.metadata_index for value in dataset_state.values())
         and not any(isinstance(value, PertTFCorpusAdapter) for value in dataset_state.values())
     )
@@ -529,13 +538,15 @@ def main() -> None:
     same_dataset = bool(
         np.array_equal(observed.source_dataset_indices, observed.target_dataset_indices)
     )
-    same_context = bool(
+    same_celltype = bool(
         np.array_equal(
-            np.asarray(observed.source_cell_context_labels, dtype=object),
-            np.asarray(observed.target_cell_context_labels, dtype=object),
+            np.asarray(observed.source_celltype_labels, dtype=object),
+            np.asarray(observed.target_celltype_labels, dtype=object),
         )
     )
     mixed_dataset = bool(len(set(observed.source_dataset_ids)) > 1)
+    require_same_dataset = "dataset" in config.pairing_group_labels
+    require_same_celltype = "celltype" in config.pairing_group_labels
     alignment = _verify_sampled_alignment(corpus, loader.adapter, observed, batch)
     full_expr_masks = _verify_full_expression_masks(corpus, loader.adapter, observed, batch)
 
@@ -552,6 +563,7 @@ def main() -> None:
             ),
             "expression_only_state_passed": bool(expression_only_state_passed),
             "dataset_state_keys": sorted(dataset_state.keys()),
+            "pairing_group_labels": list(config.pairing_group_labels),
             "total_row_count": int(len(corpus.metadata_index)),
             "effective_label_row_count": int(len(loader.effective_label_row_indices)),
             "effective_source_row_count": int(len(loader.effective_source_indices)),
@@ -571,7 +583,9 @@ def main() -> None:
                 set(requested_dataset_ids).issubset(set(observed.source_dataset_ids))
             ),
             "same_dataset_check": same_dataset,
-            "same_context_check": same_context,
+            "same_dataset_check_required": require_same_dataset,
+            "same_celltype_check": same_celltype,
+            "same_celltype_check_required": require_same_celltype,
             "selected_sources": [
                 {
                     "dataset_id": dataset_id,
@@ -588,8 +602,8 @@ def main() -> None:
             "target_indices": [int(value) for value in observed.target_indices.tolist()],
             "source_dataset_ids": list(observed.source_dataset_ids),
             "target_dataset_ids": list(observed.target_dataset_ids),
-            "source_cell_context_labels": list(observed.source_cell_context_labels),
-            "target_cell_context_labels": list(observed.target_cell_context_labels),
+            "source_celltype_labels": list(observed.source_celltype_labels),
+            "target_celltype_labels": list(observed.target_celltype_labels),
             "source_perturbation_labels": list(observed.source_perturbation_labels),
             "target_perturbation_labels": list(observed.target_perturbation_labels),
             "batch_field_shapes": {
@@ -618,10 +632,10 @@ def main() -> None:
     _write_markdown_summary(output_dir / "phase-07-smoke-summary.md", summary)
     _log(f"Wrote smoke summaries to {summary_path}")
 
-    if not same_dataset:
+    if require_same_dataset and not same_dataset:
         raise RuntimeError("same-dataset pairing invariant failed")
-    if not same_context:
-        raise RuntimeError("same-context pairing invariant failed")
+    if require_same_celltype and not same_celltype:
+        raise RuntimeError("same-celltype pairing invariant failed")
     if not mixed_dataset:
         raise RuntimeError("mixed-dataset smoke batch was not achieved")
     if not alignment["passed"]:

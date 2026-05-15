@@ -164,7 +164,17 @@ perttf_loader = PertTFPairedBatchLoader(
     corpus,
     batch_size=8,
     seq_len=1024,
-    config=PertTFAdapterConfig(control_labels=("WT",)),
+    config=PertTFAdapterConfig(
+        control_labels=("WT",),
+        label_fields={
+            "perturb_label": "perturbation",
+            "cell_context": "celltype",
+            "batch_id": "batch",
+            "dataset_index": "dataset",
+        },
+        perturbation_label="perturbation",
+        pairing_group_labels=("dataset", "celltype"),
+    ),
     num_workers=2,
 )
 
@@ -175,14 +185,21 @@ for batch in perttf_loader:
 - `PertTFPairedBatchLoader` yields final pertTF-ready batch dictionaries; normal
   callers do not need to assemble raw pair requests or call
   `build_from_raw_pair_batch(...)` directly.
+- `label_fields` maps metadata columns to the final `{label_name}_labels` /
+  `{label_name}_labels_next` batch keys.
+- Default pairing only treats the configured perturbation label as semantic; it
+  does **not** automatically force same-dataset or same-celltype matches.
+- If you want same-dataset pairing, add `"dataset_index": "dataset"` to
+  `label_fields` and set `pairing_group_labels=("dataset",)`.
+- If you want same-dataset plus same-celltype pairing, set
+  `pairing_group_labels=("dataset", "celltype")` as in the example above.
 - The retained slim-main pertTF public surface is `PertTFAdapterConfig`,
   `PertTFCorpusAdapter`, `PerturbationPairBatch`, `PerturbationPairSampler`,
   `PertTFPairedBatchBuilder`, and `PertTFPairedBatchLoader`, all re-exported
   from `perturb_data_lab.loaders`.
-- Rows with null required pertTF labels (`cell_context`, `perturb_label`,
-  `batch_id`) now fail fast during adapter/loader construction; use
-  `row_indices`, `source_indices`, or `target_candidate_indices` to restrict the
-  loader to a valid subset when needed.
+- By default, rows with nulls in configured label fields are dropped once during
+  loader construction. Use `encode_null_labels=(...)` to keep a label as
+  `"<null>"`, or `error_null_labels=(...)` when you want nulls to raise.
 - `set_epoch(epoch)` is available for deterministic reshuffling between epochs.
 - When `num_workers > 0`, the loader keeps pair planning in the main process and
   uses worker processes only for source/target expression reads.
@@ -245,10 +262,11 @@ pair_sampler = PerturbationPairSampler(
   when explicit `source_indices` / `target_candidate_indices` are omitted, both
   source and target candidate pools default to that row subset.
 - `source_indices` restrict which rows can be sampled as pertTF sources.
-- `target_candidate_indices` further restrict valid paired targets and is
-  accepted only when `source_indices` is also provided.
-- Same-dataset and same-context pairing invariants are still enforced inside
-  the configured source/target pools.
+- `target_candidate_indices` restrict valid paired targets after the same label
+  filtering step and can be provided with or without explicit `source_indices`.
+- Pairing constraints come only from `pairing_group_labels`; leave it empty for
+  default cross-dataset pairing, or add labels such as `dataset` / `celltype`
+  when you want those groups matched.
 
 ### Stored sampler reuse and loader-local override warning
 
