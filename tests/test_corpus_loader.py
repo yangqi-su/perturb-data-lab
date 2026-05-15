@@ -1387,28 +1387,11 @@ class TestLoadCorpusAggregate:
         corpus = load_corpus(str(tmp_path))
 
         assert corpus.take_metadata([0], columns=["perturb_label"])["perturb_label"] == (None,)
-        with pytest.warns(
-            RuntimeWarning,
-            match="PertTFCorpusAdapter dropped 1 of 25 rows with null required pertTF labels",
-        ):
-            adapter = PertTFCorpusAdapter.from_corpus(corpus)
-        assert adapter.null_label_filter_stats is not None
-        assert adapter.null_label_filter_stats.dropped_row_count == 1
-        assert adapter.null_label_filter_stats.checked_row_count == 25
-        assert adapter.null_label_filter_stats.per_column_null_counts == {
-            "cell_context": 0,
-            "perturb_label": 1,
-            "batch_id": 0,
-        }
-
         with pytest.raises(
             ValueError,
-            match="null_label_policy='error'",
+            match="label row pool has null required pertTF labels",
         ):
-            PertTFCorpusAdapter.from_corpus(
-                corpus,
-                PertTFAdapterConfig(null_label_policy="error"),
-            )
+            PertTFCorpusAdapter.from_corpus(corpus)
 
     def test_global_row_indices_contiguous(self, tmp_path: Path) -> None:
         """Global row indices are 0..N-1 contiguous."""

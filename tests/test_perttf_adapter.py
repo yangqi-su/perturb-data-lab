@@ -4,6 +4,7 @@ import lance
 import numpy as np
 import polars as pl
 import pyarrow as pa
+import pytest
 import yaml
 
 import perturb_data_lab.loaders as loader_exports
@@ -183,6 +184,7 @@ def test_corpus_adapter_emits_simple_vocab_compatible_mapping(tmp_path: Path) ->
     adapter = PertTFCorpusAdapter.from_corpus(corpus)
     stoi = adapter.to_simple_vocab_stoi()
 
+    assert adapter.stoi == stoi
     assert list(stoi.keys()) == list(adapter.tokens_in_order)
     assert list(stoi.values()) == list(range(len(stoi)))
 
@@ -200,15 +202,14 @@ def test_corpus_adapter_builds_deterministic_maps_and_control_slots(
     assert adapter.control_label_ids == (0, 1)
 
 
-def test_corpus_adapter_unknown_label_falls_back_when_configured(
-    tmp_path: Path,
-) -> None:
-    config = PertTFAdapterConfig(unknown_label="__unknown__")
+def test_corpus_adapter_unknown_labels_raise_key_error(tmp_path: Path) -> None:
     corpus = load_corpus(str(_build_small_corpus(tmp_path)))
-    adapter = PertTFCorpusAdapter.from_corpus(corpus, config)
+    adapter = PertTFCorpusAdapter.from_corpus(corpus)
 
-    assert adapter.encode_cell_context("missing_context") == adapter.encode_cell_context("__unknown__")
-    assert adapter.encode_batch("missing_batch") == adapter.encode_batch("__unknown__")
+    with pytest.raises(KeyError, match="unknown label 'missing_context'"):
+        adapter.encode_cell_context("missing_context")
+    with pytest.raises(KeyError, match="unknown label 'missing_batch'"):
+        adapter.encode_batch("missing_batch")
 
 
 def test_corpus_adapter_builds_from_loaded_small_corpus(tmp_path: Path) -> None:

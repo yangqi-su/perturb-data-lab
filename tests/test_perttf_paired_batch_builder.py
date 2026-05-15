@@ -1,4 +1,3 @@
-import warnings
 from dataclasses import replace
 from pathlib import Path
 
@@ -902,26 +901,17 @@ def test_public_paired_batch_loader_preserves_full_expression_fields(
 
 
 @pytest.mark.parametrize(
-    ("column", "expected_counts"),
+    ("column", "match"),
     [
-        (
-            "cell_context",
-            {"cell_context": 1, "perturb_label": 0, "batch_id": 0},
-        ),
-        (
-            "perturb_label",
-            {"cell_context": 0, "perturb_label": 1, "batch_id": 0},
-        ),
-        (
-            "batch_id",
-            {"cell_context": 0, "perturb_label": 0, "batch_id": 1},
-        ),
+        ("cell_context", "'cell_context'"),
+        ("perturb_label", "'perturb_label'"),
+        ("batch_id", "'batch_id'"),
     ],
 )
-def test_public_paired_batch_loader_drops_null_required_label_rows_by_default(
+def test_public_paired_batch_loader_fails_fast_on_null_required_label_rows(
     tmp_path: Path,
     column: str,
-    expected_counts: dict[str, int],
+    match: str,
 ) -> None:
     corpus_path = _build_small_pair_corpus(tmp_path)
     obs_path = corpus_path / "meta" / "ds0" / "canonical_meta" / "canonical-obs.parquet"
@@ -933,11 +923,11 @@ def test_public_paired_batch_loader_drops_null_required_label_rows_by_default(
 
     corpus = load_corpus(str(corpus_path))
     config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
-    with pytest.warns(
-        RuntimeWarning,
-        match="PertTFPairedBatchLoader dropped 1 of 2 rows with null required pertTF labels",
+    with pytest.raises(
+        ValueError,
+        match=match,
     ):
-        loader = _build_public_pair_loader(
+        _build_public_pair_loader(
             corpus,
             batch_size=1,
             seq_len=3,
@@ -949,19 +939,7 @@ def test_public_paired_batch_loader_drops_null_required_label_rows_by_default(
             row_indices=np.asarray([0, 1], dtype=np.int64),
         )
 
-    batch = next(iter(loader))
-
-    assert loader.row_indices.tolist() == [0, 1]
-    assert batch["index"].tolist() == [1]
-    assert batch["next_index"].tolist() == [1]
-    assert loader.effective_label_row_indices.tolist() == [1]
-    assert loader.effective_source_indices.tolist() == [1]
-    assert loader.effective_target_candidate_indices.tolist() == [1]
-    assert loader.null_label_filter_stats.dropped_row_count == 1
-    assert loader.null_label_filter_stats.per_column_null_counts == expected_counts
-
-
-def test_public_paired_batch_loader_reports_warning_and_drop_counts(
+def test_public_paired_batch_loader_reports_all_null_columns_in_error(
     tmp_path: Path,
 ) -> None:
     corpus_path = _build_three_row_pair_corpus(tmp_path)
@@ -974,14 +952,11 @@ def test_public_paired_batch_loader_reports_warning_and_drop_counts(
     frame.write_parquet(obs_path)
 
     corpus = load_corpus(str(corpus_path))
-    with pytest.warns(
-        RuntimeWarning,
-        match=(
-            "PertTFPairedBatchLoader dropped 2 of 3 rows with null required pertTF labels "
-            "\\(cell_context=1, perturb_label=1, batch_id=1\\)"
-        ),
+    with pytest.raises(
+        ValueError,
+        match="'cell_context'.*'perturb_label'.*'batch_id'",
     ):
-        loader = _build_public_pair_loader(
+        _build_public_pair_loader(
             corpus,
             batch_size=1,
             seq_len=3,
@@ -990,20 +965,6 @@ def test_public_paired_batch_loader_reports_warning_and_drop_counts(
             multiprocessing_context=None,
             drop_last=False,
         )
-
-    batch = next(iter(loader))
-
-    assert batch["index"].tolist() == [2]
-    assert batch["next_index"].tolist() == [2]
-    assert loader.null_label_filter_stats.checked_row_count == 3
-    assert loader.null_label_filter_stats.kept_row_count == 1
-    assert loader.null_label_filter_stats.dropped_row_count == 2
-    assert loader.null_label_filter_stats.per_column_null_counts == {
-        "cell_context": 1,
-        "perturb_label": 1,
-        "batch_id": 1,
-    }
-
 
 def test_public_paired_batch_loader_selected_row_pool_ignores_null_rows_outside_subset(
     tmp_path: Path,
@@ -1016,59 +977,25 @@ def test_public_paired_batch_loader_selected_row_pool_ignores_null_rows_outside_
     frame.write_parquet(obs_path)
 
     corpus = load_corpus(str(corpus_path))
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        loader = _build_public_pair_loader(
-            corpus,
-            batch_size=1,
-            seq_len=3,
-            seed=7,
-            num_workers=0,
-            multiprocessing_context=None,
-            drop_last=False,
-            row_indices=np.asarray([1], dtype=np.int64),
-        )
+    loader = _build_public_pair_loader(
+        corpus,
+        batch_size=1,
+        seq_len=3,
+        seed=7,
+        num_workers=0,
+        multiprocessing_context=None,
+        drop_last=False,
+        row_indices=np.asarray([1], dtype=np.int64),
+    )
 
     batch = next(iter(loader))
 
-    assert len(caught) == 0
     assert batch["index"].tolist() == [1]
     assert batch["next_index"].tolist() == [1]
-    assert loader.null_label_filter_stats.checked_row_count == 1
-    assert loader.null_label_filter_stats.dropped_row_count == 0
+    assert loader.null_label_filter_stats is None
     assert loader.effective_label_row_indices.tolist() == [1]
     assert loader.effective_source_indices.tolist() == [1]
     assert loader.effective_target_candidate_indices.tolist() == [1]
-
-
-def test_public_paired_batch_loader_strict_mode_raises_on_null_required_labels(
-    tmp_path: Path,
-) -> None:
-    corpus_path = _build_small_pair_corpus(tmp_path)
-    obs_path = corpus_path / "meta" / "ds0" / "canonical_meta" / "canonical-obs.parquet"
-    frame = pl.read_parquet(obs_path).with_columns(
-        pl.Series("perturb_label", [None, "KO_TP53"]),
-    )
-    frame.write_parquet(obs_path)
-
-    corpus = load_corpus(str(corpus_path))
-
-    with pytest.raises(ValueError, match="null_label_policy='error'"):
-        _build_public_pair_loader(
-            corpus,
-            batch_size=1,
-            seq_len=3,
-            seed=7,
-            num_workers=0,
-            multiprocessing_context=None,
-            drop_last=False,
-            config=PertTFAdapterConfig(
-                control_labels=("WT",),
-                mask_ratio=0.0,
-                null_label_policy="strict",
-            ),
-            row_indices=np.asarray([0, 1], dtype=np.int64),
-        )
 
 
 def test_public_paired_batch_loader_explicit_pools_override_row_indices(
