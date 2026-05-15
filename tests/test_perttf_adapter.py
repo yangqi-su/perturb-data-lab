@@ -60,6 +60,111 @@ def _build_metadata_index() -> MetadataIndex:
     )
 
 
+def test_perttf_config_defaults_expose_generic_label_fields() -> None:
+    config = PertTFAdapterConfig()
+
+    assert config.label_fields == {
+        "perturb_label": "perturbation",
+        "cell_context": "celltype",
+        "batch_id": "batch",
+    }
+    assert config.metadata_columns == ("perturb_label", "cell_context", "batch_id")
+    assert config.label_names == ("perturbation", "celltype", "batch")
+    assert config.perturbation_label == "perturbation"
+    assert config.pairing_group_labels == ()
+    assert config.perturbation_column == "perturb_label"
+    assert config.cell_context_column == "cell_context"
+    assert config.batch_column == "batch_id"
+    assert config.resolved_drop_null_labels == (
+        "perturbation",
+        "celltype",
+        "batch",
+    )
+    assert config.resolved_encode_null_labels == ()
+    assert config.resolved_error_null_labels == ()
+
+
+def test_perttf_config_accepts_explicit_dataset_pairing_and_null_policy() -> None:
+    config = PertTFAdapterConfig(
+        label_fields={
+            "perturb_label": "perturbation",
+            "cell_context": "celltype",
+            "batch_id": "batch",
+            "dataset_index": "dataset",
+        },
+        pairing_group_labels=("dataset",),
+        encode_null_labels=("dataset",),
+    )
+
+    assert config.metadata_column_for_label("dataset") == "dataset_index"
+    assert config.label_name_for_column("dataset_index") == "dataset"
+    assert config.pairing_group_labels == ("dataset",)
+    assert config.resolved_encode_null_labels == ("dataset",)
+    assert config.resolved_drop_null_labels == (
+        "perturbation",
+        "celltype",
+        "batch",
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {
+                "label_fields": {
+                    1: "perturbation",
+                    "1": "celltype",
+                    "batch_id": "batch",
+                }
+            },
+            "label_fields metadata column names must be unique",
+        ),
+        (
+            {
+                "label_fields": {
+                    "perturb_label": 1,
+                    "cell_context": "1",
+                    "batch_id": "batch",
+                },
+                "perturbation_label": "1",
+            },
+            "label_fields label names must be unique",
+        ),
+        (
+            {
+                "label_fields": {
+                    "perturb_label": "perturbation",
+                    "cell_context": "celltype",
+                    "batch_id": "batch",
+                },
+                "perturbation_label": "dataset",
+            },
+            "perturbation_label must name one configured label field",
+        ),
+        (
+            {
+                "pairing_group_labels": ("dataset",),
+            },
+            "pairing_group_labels must name configured label fields",
+        ),
+        (
+            {
+                "encode_null_labels": ("celltype",),
+                "error_null_labels": ("celltype",),
+            },
+            "null label policy lists must not overlap",
+        ),
+    ],
+)
+def test_perttf_config_invalid_generic_label_settings_fail_early(
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        PertTFAdapterConfig(**kwargs)
+
+
 def _write_canonical_obs(path: Path, *, dataset_id: str, global_start: int) -> None:
     frame = pl.DataFrame(
         {
@@ -220,10 +325,20 @@ def test_corpus_adapter_builds_from_loaded_small_corpus(tmp_path: Path) -> None:
     corpus = load_corpus(str(_build_small_corpus(tmp_path)))
     adapter = PertTFCorpusAdapter.from_corpus(
         corpus,
-        PertTFAdapterConfig(control_labels=("WT",), cell_context_column="cell_context"),
+        PertTFAdapterConfig(
+            control_labels=("WT",),
+            label_fields={
+                "perturb_label": "perturbation",
+                "cell_context": "celltype",
+                "batch_id": "batch",
+                "dataset_index": "dataset",
+            },
+            pairing_group_labels=("dataset",),
+        ),
     )
 
     reference = adapter.to_reference_dict()
+    assert adapter.config.metadata_column_for_label("dataset") == "dataset_index"
     assert reference["genes"] == ["GENE_B", "GENE_A", "GENE_C"]
     np.testing.assert_array_equal(
         reference["gene_token_ids"],

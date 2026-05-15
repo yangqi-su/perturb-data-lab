@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Sequence
 
@@ -30,6 +30,38 @@ __all__ = [
 
 
 _DEFAULT_SPECIAL_TOKENS: tuple[str, ...] = ("<pad>", "<cls>", "<unk>", "<eos>")
+_DEFAULT_LABEL_FIELD_ITEMS: tuple[tuple[str, str], ...] = (
+    ("perturb_label", "perturbation"),
+    ("cell_context", "celltype"),
+    ("batch_id", "batch"),
+)
+
+
+def _normalize_nonempty_string(value: Any, *, field_name: str) -> str:
+    normalized = str(value)
+    if not normalized:
+        raise ValueError(f"{field_name} must not be empty")
+    return normalized
+
+
+def _normalize_unique_strings(values: Sequence[Any], *, field_name: str) -> tuple[str, ...]:
+    normalized = tuple(
+        _normalize_nonempty_string(value, field_name=field_name)
+        for value in values
+    )
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{field_name} must be unique")
+    return normalized
+
+
+def _format_duplicate_values(values: Sequence[str]) -> str:
+    duplicates: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen and value not in duplicates:
+            duplicates.append(value)
+        seen.add(value)
+    return ", ".join(repr(value) for value in duplicates)
 
 
 def _normalize_label(value: Any, *, column: str) -> str:
@@ -64,9 +96,15 @@ def _derive_perttf_stream_seed(
 class PertTFAdapterConfig:
     """Configuration for the retained pertTF wrapper surface."""
 
-    cell_context_column: str = "cell_context"
-    perturbation_column: str = "perturb_label"
-    batch_column: str = "batch_id"
+    label_fields: dict[str, str] = field(
+        default_factory=lambda: dict(_DEFAULT_LABEL_FIELD_ITEMS)
+    )
+    perturbation_label: str = "perturbation"
+    pairing_group_labels: tuple[str, ...] = ()
+    drop_null_labels: tuple[str, ...] | None = None
+    encode_null_labels: tuple[str, ...] | None = None
+    error_null_labels: tuple[str, ...] | None = None
+    null_label_value: str = "<null>"
     control_labels: tuple[str, ...] = ("WT",)
     special_tokens: tuple[str, ...] = _DEFAULT_SPECIAL_TOKENS
     pad_token: str = "<pad>"
@@ -82,6 +120,137 @@ class PertTFAdapterConfig:
     include_full_expr: bool = False
 
     def __post_init__(self) -> None:
+        if not self.label_fields:
+            raise ValueError("label_fields must contain at least one mapping")
+        normalized_label_items = [
+            (
+                _normalize_nonempty_string(column, field_name="label_fields metadata column"),
+                _normalize_nonempty_string(label_name, field_name="label_fields label name"),
+            )
+            for column, label_name in self.label_fields.items()
+        ]
+        normalized_columns = [column for column, _ in normalized_label_items]
+        normalized_labels = [label_name for _, label_name in normalized_label_items]
+        if len(set(normalized_columns)) != len(normalized_columns):
+            duplicate_list = _format_duplicate_values(normalized_columns)
+            raise ValueError(
+                "label_fields metadata column names must be unique"
+                + (f": {duplicate_list}" if duplicate_list else "")
+            )
+        if len(set(normalized_labels)) != len(normalized_labels):
+            duplicate_list = _format_duplicate_values(normalized_labels)
+            raise ValueError(
+                "label_fields label names must be unique"
+                + (f": {duplicate_list}" if duplicate_list else "")
+            )
+        normalized_label_fields = dict(normalized_label_items)
+        normalized_perturbation_label = _normalize_nonempty_string(
+            self.perturbation_label,
+            field_name="perturbation_label",
+        )
+        normalized_pairing_group_labels = _normalize_unique_strings(
+            self.pairing_group_labels,
+            field_name="pairing_group_labels",
+        )
+        normalized_drop_null_labels = (
+            None
+            if self.drop_null_labels is None
+            else _normalize_unique_strings(
+                self.drop_null_labels,
+                field_name="drop_null_labels",
+            )
+        )
+        normalized_encode_null_labels = (
+            None
+            if self.encode_null_labels is None
+            else _normalize_unique_strings(
+                self.encode_null_labels,
+                field_name="encode_null_labels",
+            )
+        )
+        normalized_error_null_labels = (
+            None
+            if self.error_null_labels is None
+            else _normalize_unique_strings(
+                self.error_null_labels,
+                field_name="error_null_labels",
+            )
+        )
+        configured_label_names = tuple(normalized_label_fields.values())
+        configured_label_name_set = set(configured_label_names)
+        if normalized_perturbation_label not in configured_label_name_set:
+            raise ValueError(
+                "perturbation_label must name one configured label field"
+            )
+        unknown_pairing_group_labels = [
+            label_name
+            for label_name in normalized_pairing_group_labels
+            if label_name not in configured_label_name_set
+        ]
+        if unknown_pairing_group_labels:
+            missing_list = ", ".join(
+                repr(label_name) for label_name in unknown_pairing_group_labels
+            )
+            raise ValueError(
+                "pairing_group_labels must name configured label fields: "
+                f"{missing_list}"
+            )
+        null_policy_lists = {
+            "drop_null_labels": normalized_drop_null_labels or (),
+            "encode_null_labels": normalized_encode_null_labels or (),
+            "error_null_labels": normalized_error_null_labels or (),
+        }
+        for policy_name, labels in null_policy_lists.items():
+            unknown_labels = [
+                label_name
+                for label_name in labels
+                if label_name not in configured_label_name_set
+            ]
+            if unknown_labels:
+                missing_list = ", ".join(repr(label_name) for label_name in unknown_labels)
+                raise ValueError(
+                    f"{policy_name} must name configured label fields: {missing_list}"
+                )
+        overlaps = []
+        null_policy_names = tuple(null_policy_lists)
+        for left_offset, left_name in enumerate(null_policy_names):
+            left_labels = set(null_policy_lists[left_name])
+            if not left_labels:
+                continue
+            for right_name in null_policy_names[left_offset + 1 :]:
+                overlap = tuple(sorted(left_labels.intersection(null_policy_lists[right_name])))
+                if overlap:
+                    overlap_list = ", ".join(repr(label_name) for label_name in overlap)
+                    overlaps.append(f"{left_name} and {right_name}: {overlap_list}")
+        if overlaps:
+            raise ValueError(
+                "null label policy lists must not overlap: " + "; ".join(overlaps)
+            )
+        object.__setattr__(self, "label_fields", normalized_label_fields)
+        object.__setattr__(self, "perturbation_label", normalized_perturbation_label)
+        object.__setattr__(
+            self,
+            "pairing_group_labels",
+            normalized_pairing_group_labels,
+        )
+        object.__setattr__(self, "drop_null_labels", normalized_drop_null_labels)
+        object.__setattr__(self, "encode_null_labels", normalized_encode_null_labels)
+        object.__setattr__(self, "error_null_labels", normalized_error_null_labels)
+        object.__setattr__(
+            self,
+            "null_label_value",
+            _normalize_nonempty_string(self.null_label_value, field_name="null_label_value"),
+        )
+        object.__setattr__(
+            self,
+            "control_labels",
+            tuple(str(label) for label in self.control_labels),
+        )
+        object.__setattr__(
+            self,
+            "special_tokens",
+            tuple(str(token) for token in self.special_tokens),
+        )
         if len(set(self.special_tokens)) != len(self.special_tokens):
             raise ValueError("special_tokens must be unique")
         for token_name, token_value in (
@@ -99,13 +268,68 @@ class PertTFAdapterConfig:
         if int(self.ps_width) <= 0:
             raise ValueError("ps_width must be positive")
 
+    @property
+    def metadata_columns(self) -> tuple[str, ...]:
+        return tuple(self.label_fields.keys())
+
+    @property
+    def label_names(self) -> tuple[str, ...]:
+        return tuple(self.label_fields.values())
+
+    def metadata_column_for_label(self, label_name: str) -> str:
+        normalized_label_name = _normalize_nonempty_string(
+            label_name,
+            field_name="label_name",
+        )
+        for column, configured_label_name in self.label_fields.items():
+            if configured_label_name == normalized_label_name:
+                return column
+        raise ValueError(f"label name {normalized_label_name!r} is not configured")
+
+    def label_name_for_column(self, column: str) -> str:
+        normalized_column = _normalize_nonempty_string(column, field_name="column")
+        try:
+            return self.label_fields[normalized_column]
+        except KeyError as exc:
+            raise ValueError(f"metadata column {normalized_column!r} is not configured") from exc
+
+    @property
+    def perturbation_column(self) -> str:
+        return self.metadata_column_for_label(self.perturbation_label)
+
+    @property
+    def cell_context_column(self) -> str:
+        return self.metadata_column_for_label("celltype")
+
+    @property
+    def batch_column(self) -> str:
+        return self.metadata_column_for_label("batch")
+
+    @property
+    def resolved_drop_null_labels(self) -> tuple[str, ...]:
+        explicit_drop_labels = list(self.drop_null_labels or ())
+        drop_label_set = set(explicit_drop_labels)
+        encode_label_set = set(self.resolved_encode_null_labels)
+        error_label_set = set(self.resolved_error_null_labels)
+        for label_name in self.label_names:
+            if label_name in encode_label_set or label_name in error_label_set:
+                continue
+            if label_name not in drop_label_set:
+                explicit_drop_labels.append(label_name)
+                drop_label_set.add(label_name)
+        return tuple(explicit_drop_labels)
+
+    @property
+    def resolved_encode_null_labels(self) -> tuple[str, ...]:
+        return tuple(self.encode_null_labels or ())
+
+    @property
+    def resolved_error_null_labels(self) -> tuple[str, ...]:
+        return tuple(self.error_null_labels or ())
+
 
 def _required_label_columns(config: PertTFAdapterConfig) -> tuple[str, ...]:
-    return (
-        config.cell_context_column,
-        config.perturbation_column,
-        config.batch_column,
-    )
+    return config.metadata_columns
 
 
 def _resolve_required_label_rows(
