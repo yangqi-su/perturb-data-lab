@@ -77,9 +77,7 @@ def test_perttf_config_defaults_expose_generic_label_fields() -> None:
         "celltype": "cell_context",
         "batch": "batch_id",
     }
-    assert config.resolved_drop_null_labels == ()
-    assert config.resolved_encode_null_labels == ()
-    assert config.resolved_error_null_labels == ()
+    assert config.resolved_drop_null_labels == ("perturbation",)
     assert not hasattr(config, "perturbation_column")
     assert not hasattr(config, "cell_context_column")
     assert not hasattr(config, "batch_column")
@@ -94,13 +92,11 @@ def test_perttf_config_accepts_explicit_dataset_pairing_and_null_policy() -> Non
             "dataset_id": "dataset",
         },
         pairing_group_labels=("dataset",),
-        encode_null_labels=("dataset",),
     )
 
     assert config.label_columns_by_name["dataset"] == "dataset_id"
     assert config.pairing_group_labels == ("dataset",)
-    assert config.resolved_encode_null_labels == ("dataset",)
-    assert config.resolved_drop_null_labels == ()
+    assert config.resolved_drop_null_labels == ("perturbation",)
 
 
 @pytest.mark.parametrize(
@@ -144,13 +140,7 @@ def test_perttf_config_accepts_explicit_dataset_pairing_and_null_policy() -> Non
             },
             "pairing_group_labels must name configured label fields",
         ),
-        (
-            {
-                "encode_null_labels": ("celltype",),
-                "error_null_labels": ("celltype",),
-            },
-            "encode_null_labels and error_null_labels must not overlap",
-        ),
+        ({"drop_null_labels": ("dataset",)}, "drop_null_labels must name configured label fields"),
     ],
 )
 def test_perttf_config_invalid_generic_label_settings_fail_early(
@@ -314,11 +304,11 @@ def test_corpus_adapter_unknown_labels_raise_key_error(tmp_path: Path) -> None:
     corpus = load_corpus(str(_build_small_corpus(tmp_path)))
     adapter = PertTFCorpusAdapter.from_corpus(corpus)
 
-    with pytest.raises(KeyError, match="unknown label 'missing_context'"):
+    with pytest.raises(KeyError, match="missing_context"):
         adapter.encode_label("celltype", "missing_context")
-    with pytest.raises(KeyError, match="unknown label 'missing_batch'"):
+    with pytest.raises(KeyError, match="missing_batch"):
         adapter.encode_label("batch", "missing_batch")
-    with pytest.raises(KeyError, match="unknown label field 'missing_field'"):
+    with pytest.raises(KeyError, match="missing_field"):
         adapter.encode_label("missing_field", "anything")
 
 

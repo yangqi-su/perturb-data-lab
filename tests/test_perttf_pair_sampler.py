@@ -8,8 +8,8 @@ from perturb_data_lab.loaders import (
     PerturbationPairSampler,
 )
 from perturb_data_lab.loaders.adapters.perttf import (
-    _build_encoded_metadata_table,
-    _resolve_perttf_row_selection,
+    _positions_for_global_rows,
+    _prepare_perttf_metadata,
 )
 
 
@@ -190,48 +190,51 @@ def test_missing_target_pool_raises_explicit_error() -> None:
 
 
 def test_row_selection_intersects_all_requested_pools_and_preserves_order() -> None:
-    selection = _resolve_perttf_row_selection(
+    selection = _prepare_perttf_metadata(
         _build_metadata_index(),
         config=_default_config(),
         row_indices=[3, 0, 1],
         source_indices=[1, 6, 0],
         target_candidate_indices=[0, 2, 3],
-    )
+    ).row_selection
 
     np.testing.assert_array_equal(selection.base_indices, np.asarray([3, 0, 1], dtype=np.int64))
     np.testing.assert_array_equal(selection.source_indices, np.asarray([1, 0], dtype=np.int64))
     np.testing.assert_array_equal(selection.target_candidate_indices, np.asarray([0, 3], dtype=np.int64))
 
 
-def test_encoded_metadata_table_compacts_rows_and_aligns_global_lookups() -> None:
-    table = _build_encoded_metadata_table(
+def test_prepared_metadata_compacts_rows_and_keeps_polars_frame() -> None:
+    prepared = _prepare_perttf_metadata(
         _build_metadata_index(),
         config=_default_config(),
-        base_indices=np.asarray([4, 0, 1], dtype=np.int64),
+        row_indices=np.asarray([4, 0, 1], dtype=np.int64),
+        source_indices=None,
+        target_candidate_indices=None,
     )
 
-    np.testing.assert_array_equal(table.global_row_indices, np.asarray([4, 0, 1], dtype=np.int64))
-    assert table.global_to_local == {4: 0, 0: 1, 1: 2}
+    np.testing.assert_array_equal(prepared.row_selection.base_indices, np.asarray([4, 0, 1], dtype=np.int64))
+    assert prepared.global_to_local == {4: 0, 0: 1, 1: 2}
+    assert prepared.frame.columns[:4] == ["global_row_index", "dataset_index", "perturbation", "perturbation_id"]
     np.testing.assert_array_equal(
-        table.positions_for_global_rows(np.asarray([1, 4], dtype=np.int64)),
+        _positions_for_global_rows(prepared, np.asarray([1, 4], dtype=np.int64)),
         np.asarray([2, 0], dtype=np.int64),
     )
     np.testing.assert_array_equal(
-        table.take_label_ids("celltype", np.asarray([1, 4], dtype=np.int64)),
+        prepared.label_ids_by_name["celltype"][_positions_for_global_rows(prepared, np.asarray([1, 4], dtype=np.int64))],
         np.asarray([1, 0], dtype=np.int64),
     )
-    assert table.take_labels("perturbation", np.asarray([4, 0, 1], dtype=np.int64)) == (
+    assert tuple(prepared.frame["perturbation"].to_list()) == (
         "KO_C",
         "WT",
         "KO_A",
     )
     np.testing.assert_allclose(
-        table.take_size_factor(np.asarray([1, 4], dtype=np.int64)),
+        prepared.size_factor[_positions_for_global_rows(prepared, np.asarray([1, 4], dtype=np.int64))],
         np.asarray([1.1, 1.0], dtype=np.float32),
     )
 
 
-def test_encoded_metadata_table_uses_filtered_base_pool_for_compaction() -> None:
+def test_prepared_metadata_uses_filtered_base_pool_for_compaction() -> None:
     sampler = PerturbationPairSampler(
         _build_metadata_index(),
         batch_size=1,
@@ -247,7 +250,7 @@ def test_encoded_metadata_table_uses_filtered_base_pool_for_compaction() -> None
         np.asarray([3, 0, 1], dtype=np.int64),
     )
     np.testing.assert_array_equal(
-        sampler._encoded_metadata_table.global_row_indices,
+        sampler._prepared_metadata.row_selection.base_indices,
         np.asarray([3, 0, 1], dtype=np.int64),
     )
 
@@ -291,11 +294,11 @@ def test_target_candidate_only_subset_is_allowed() -> None:
     np.testing.assert_array_equal(batch.target_indices, np.asarray([1, 1], dtype=np.int64))
 
 
-def test_encode_null_labels_keeps_rows_and_uses_null_token() -> None:
+def test_default_non_perturbation_null_labels_are_encoded() -> None:
     sampler = PerturbationPairSampler(
         _build_null_context_metadata_index(),
         batch_size=1,
-        config=_default_config(encode_null_labels=("celltype",)),
+        config=_default_config(),
         drop_last=False,
     )
 
@@ -325,24 +328,14 @@ def test_sampler_supports_perturbation_as_only_required_semantic_label() -> None
     assert batch.target_labels_by_name["perturbation"] == ("KO_A",)
 
 
-def test_error_null_labels_fail_on_selected_base_pool() -> None:
-    with pytest.raises(ValueError, match="configured error-null field"):
+def test_custom_drop_null_labels_removes_selected_base_pool() -> None:
+    with pytest.raises(ValueError, match="metadata row pool is empty"):
         PerturbationPairSampler(
             _build_null_context_metadata_index(),
             batch_size=1,
-            config=_default_config(error_null_labels=("celltype",)),
+            config=_default_config(drop_null_labels=("celltype",)),
+            drop_last=False,
         )
-
-
-def test_encoded_metadata_table_missing_global_rows_fail_clearly() -> None:
-    table = _build_encoded_metadata_table(
-        _build_null_context_metadata_index(),
-        config=_default_config(encode_null_labels=("celltype",)),
-        base_indices=np.asarray([0, 1], dtype=np.int64),
-    )
-
-    with pytest.raises(KeyError, match="missing global row 7"):
-        table.positions_for_global_rows(np.asarray([7], dtype=np.int64))
 
 
 def test_pair_source_indices_rejects_rows_outside_configured_source_pool() -> None:
