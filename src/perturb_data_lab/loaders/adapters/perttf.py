@@ -1442,31 +1442,6 @@ class PertTFPairedBatchBuilder:
             "values": masked_values,
             "target_values": source_values,
             "target_values_next": target_values_next,
-            "batch_labels": torch.as_tensor(
-                pair_batch.source_label_ids_by_name["batch"],
-                dtype=torch.long,
-                device=self.device,
-            ),
-            "celltype_labels": torch.as_tensor(
-                pair_batch.source_label_ids_by_name["celltype"],
-                dtype=torch.long,
-                device=self.device,
-            ),
-            "perturbation_labels": torch.as_tensor(
-                pair_batch.source_label_ids_by_name[self.config.perturbation_label],
-                dtype=torch.long,
-                device=self.device,
-            ),
-            "celltype_labels_next": torch.as_tensor(
-                pair_batch.target_label_ids_by_name["celltype"],
-                dtype=torch.long,
-                device=self.device,
-            ),
-            "perturbation_labels_next": torch.as_tensor(
-                pair_batch.target_label_ids_by_name[self.config.perturbation_label],
-                dtype=torch.long,
-                device=self.device,
-            ),
             "sf": self._size_factor_tensor(source_processed, batch_size),
             "sf_next": self._size_factor_tensor(target_processed, batch_size),
             "index": torch.as_tensor(
@@ -1490,6 +1465,17 @@ class PertTFPairedBatchBuilder:
                 device=self.device,
             ),
         }
+        for label_name in self.config.label_names:
+            batch[f"{label_name}_labels"] = torch.as_tensor(
+                pair_batch.source_label_ids_by_name[label_name],
+                dtype=torch.long,
+                device=self.device,
+            )
+            batch[f"{label_name}_labels_next"] = torch.as_tensor(
+                pair_batch.target_label_ids_by_name[label_name],
+                dtype=torch.long,
+                device=self.device,
+            )
         if self.config.include_full_expr:
             full_expr, full_expr_mask = self._build_full_expression_tensor(source_raw)
             full_expr_next, full_expr_next_mask = self._build_full_expression_tensor(

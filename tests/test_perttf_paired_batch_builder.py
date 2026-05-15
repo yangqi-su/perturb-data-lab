@@ -282,11 +282,6 @@ def test_paired_batch_builder_reconstructs_target_values_at_source_sampled_genes
         "values",
         "target_values",
         "target_values_next",
-        "batch_labels",
-        "celltype_labels",
-        "perturbation_labels",
-        "celltype_labels_next",
-        "perturbation_labels_next",
         "ps",
         "ps_next",
         "sf",
@@ -294,6 +289,8 @@ def test_paired_batch_builder_reconstructs_target_values_at_source_sampled_genes
         "index",
         "next_index",
     }
+    expected_keys.update({f"{label_name}_labels" for label_name in config.label_names})
+    expected_keys.update({f"{label_name}_labels_next" for label_name in config.label_names})
     assert expected_keys.issubset(batch.keys())
     assert batch["gene_ids"].shape == (2, 4)
     assert torch.equal(batch["gene_ids"], batch["next_gene_ids"])
@@ -309,6 +306,7 @@ def test_paired_batch_builder_reconstructs_target_values_at_source_sampled_genes
         torch.tensor([[1.2], [1.2]], dtype=torch.float32),
     )
     assert batch["perturbation_labels_next"].tolist() == [1, 0]
+    assert batch["batch_labels_next"].tolist() == [1, 1]
     assert batch["next_index"].tolist() == [1, 1]
     assert torch.count_nonzero(batch["ps"]) == 0
     assert torch.count_nonzero(batch["ps_next"]) == 0
@@ -332,6 +330,46 @@ def test_paired_batch_builder_reconstructs_target_values_at_source_sampled_genes
             global_id = token_id - offset
             assert batch["target_values"][batch_row, col].item() == source_dense[global_id]
             assert batch["target_values_next"][batch_row, col].item() == target_dense[global_id]
+
+
+def test_paired_batch_builder_emits_extra_configured_label_tensors(
+    tmp_path: Path,
+) -> None:
+    config = PertTFAdapterConfig(
+        control_labels=("WT",),
+        mask_ratio=0.0,
+        label_fields={
+            "perturb_label": "perturbation",
+            "cell_context": "celltype",
+            "batch_id": "batch",
+            "dataset_index": "dataset",
+        },
+    )
+    corpus = load_corpus(str(_build_mixed_union_pair_corpus(tmp_path)))
+    pair_batch = PerturbationPairSampler(
+        corpus.metadata_index,
+        batch_size=1,
+        config=config,
+        source_indices=[0],
+        target_candidate_indices=[3],
+        seed=7,
+        drop_last=False,
+    ).pair_source_indices([0], seed=11)
+    builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
+
+    batch = builder.build_paired_batch(
+        pair_batch,
+        seed=5,
+        sampling_mode="hvg",
+        hvg_weight=4.0,
+        hvg_top_k=2,
+    )
+
+    for label_name in config.label_names:
+        assert f"{label_name}_labels" in batch
+        assert f"{label_name}_labels_next" in batch
+    assert batch["dataset_labels"].tolist() == [0]
+    assert batch["dataset_labels_next"].tolist() == [1]
 
 
 def test_paired_batch_builder_accepts_precomputed_sampled_gene_ids_and_preserves_padding(
