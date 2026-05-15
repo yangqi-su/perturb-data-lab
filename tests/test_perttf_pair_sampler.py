@@ -7,6 +7,7 @@ from perturb_data_lab.loaders import (
     PertTFAdapterConfig,
     PerturbationPairSampler,
 )
+from perturb_data_lab.loaders.adapters.perttf import _resolve_perttf_row_selection
 
 
 def _build_metadata_index() -> MetadataIndex:
@@ -22,6 +23,42 @@ def _build_metadata_index() -> MetadataIndex:
                 "cell_context": ["T_cell", "T_cell", "T_cell", "B_cell", "B_cell", "T_cell", "T_cell", "B_cell"],
                 "perturb_label": ["WT", "KO_A", "KO_B", "WT", "KO_C", "WT", "KO_A", "KO_D"],
                 "batch_id": ["b0", "b1", "b1", "b2", "b2", "b3", "b4", "b5"],
+            }
+        )
+    )
+
+
+def _build_two_row_metadata_index() -> MetadataIndex:
+    return MetadataIndex(
+        pl.DataFrame(
+            {
+                "global_row_index": np.arange(2, dtype=np.int64),
+                "cell_id": ["cell_0", "cell_1"],
+                "dataset_id": ["ds0", "ds0"],
+                "dataset_index": np.asarray([0, 0], dtype=np.int32),
+                "local_row_index": np.arange(2, dtype=np.int64),
+                "size_factor": np.asarray([1.0, 1.1], dtype=np.float32),
+                "cell_context": ["T_cell", "T_cell"],
+                "perturb_label": ["WT", "KO_A"],
+                "batch_id": ["b0", "b1"],
+            }
+        )
+    )
+
+
+def _build_null_context_metadata_index() -> MetadataIndex:
+    return MetadataIndex(
+        pl.DataFrame(
+            {
+                "global_row_index": np.arange(2, dtype=np.int64),
+                "cell_id": ["cell_0", "cell_1"],
+                "dataset_id": ["ds0", "ds0"],
+                "dataset_index": np.asarray([0, 0], dtype=np.int32),
+                "local_row_index": np.arange(2, dtype=np.int64),
+                "size_factor": np.asarray([1.0, 1.1], dtype=np.float32),
+                "cell_context": [None, None],
+                "perturb_label": ["WT", "KO_A"],
+                "batch_id": ["b0", "b1"],
             }
         )
     )
@@ -93,40 +130,87 @@ def test_missing_target_pool_raises_explicit_error() -> None:
         sampler.pair_source_indices([7])
 
 
-def test_target_candidate_indices_require_source_indices() -> None:
-    with pytest.raises(ValueError, match="target_candidate_indices requires source_indices"):
-        PerturbationPairSampler(
-            _build_metadata_index(),
-            batch_size=2,
-            config=PertTFAdapterConfig(control_labels=("WT",)),
-            target_candidate_indices=[0, 1],
-        )
-
-
-def test_source_only_subset_restricts_iteration_and_targets() -> None:
-    source_pool = [0, 1, 5, 6]
-    sampler = PerturbationPairSampler(
+def test_row_selection_intersects_all_requested_pools_and_preserves_order() -> None:
+    selection = _resolve_perttf_row_selection(
         _build_metadata_index(),
-        batch_size=2,
         config=PertTFAdapterConfig(control_labels=("WT",)),
-        source_indices=source_pool,
-        seed=29,
+        row_indices=[3, 0, 1],
+        source_indices=[1, 6, 0],
+        target_candidate_indices=[0, 2, 3],
+    )
+
+    np.testing.assert_array_equal(selection.base_indices, np.asarray([3, 0, 1], dtype=np.int64))
+    np.testing.assert_array_equal(selection.source_indices, np.asarray([1, 0], dtype=np.int64))
+    np.testing.assert_array_equal(selection.target_candidate_indices, np.asarray([0, 3], dtype=np.int64))
+
+
+def test_source_only_subset_uses_filtered_base_pool_for_targets() -> None:
+    sampler = PerturbationPairSampler(
+        _build_two_row_metadata_index(),
+        batch_size=1,
+        config=PertTFAdapterConfig(control_labels=("WT",)),
+        source_indices=[0],
+        seed=11,
         drop_last=False,
     )
 
-    batches = list(sampler)
+    batch = sampler.pair_source_indices([0], seed=13)
 
-    sampled_sources = sorted(
-        int(index)
-        for batch in batches
-        for index in batch.source_indices.tolist()
+    np.testing.assert_array_equal(sampler.effective_source_indices, np.asarray([0], dtype=np.int64))
+    np.testing.assert_array_equal(
+        sampler.effective_target_candidate_indices,
+        np.asarray([0, 1], dtype=np.int64),
     )
-    assert sampled_sources == source_pool
-    for batch in batches:
-        assert set(batch.source_indices.tolist()).issubset(source_pool)
-        assert set(batch.target_indices.tolist()).issubset(source_pool)
-        assert batch.source_dataset_indices.tolist() == batch.target_dataset_indices.tolist()
-        assert batch.source_cell_context_labels == batch.target_cell_context_labels
+    np.testing.assert_array_equal(batch.target_indices, np.asarray([1], dtype=np.int64))
+
+
+def test_target_candidate_only_subset_is_allowed() -> None:
+    sampler = PerturbationPairSampler(
+        _build_two_row_metadata_index(),
+        batch_size=2,
+        config=PertTFAdapterConfig(control_labels=("WT",)),
+        target_candidate_indices=[1],
+        drop_last=False,
+    )
+
+    batch = sampler.pair_source_indices([0, 1], seed=17)
+
+    np.testing.assert_array_equal(sampler.effective_source_indices, np.asarray([0, 1], dtype=np.int64))
+    np.testing.assert_array_equal(
+        sampler.effective_target_candidate_indices,
+        np.asarray([1], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(batch.target_indices, np.asarray([1, 1], dtype=np.int64))
+
+
+def test_encode_null_labels_keeps_rows_and_uses_null_token() -> None:
+    sampler = PerturbationPairSampler(
+        _build_null_context_metadata_index(),
+        batch_size=1,
+        config=PertTFAdapterConfig(
+            control_labels=("WT",),
+            encode_null_labels=("celltype",),
+        ),
+        drop_last=False,
+    )
+
+    batch = sampler.pair_source_indices([0], seed=19)
+
+    np.testing.assert_array_equal(sampler.effective_source_indices, np.asarray([0, 1], dtype=np.int64))
+    assert batch.source_cell_context_labels == ("<null>",)
+    assert batch.target_cell_context_labels == ("<null>",)
+
+
+def test_error_null_labels_fail_on_selected_base_pool() -> None:
+    with pytest.raises(ValueError, match="configured error-null field"):
+        PerturbationPairSampler(
+            _build_null_context_metadata_index(),
+            batch_size=1,
+            config=PertTFAdapterConfig(
+                control_labels=("WT",),
+                error_null_labels=("celltype",),
+            ),
+        )
 
 
 def test_pair_source_indices_rejects_rows_outside_configured_source_pool() -> None:

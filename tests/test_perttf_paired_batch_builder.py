@@ -681,6 +681,7 @@ def _build_public_pair_loader(
     num_workers: int,
     multiprocessing_context: str | None,
     drop_last: bool = True,
+    perturbed_target_policy: str = "self_to_control_label",
     config: PertTFAdapterConfig | None = None,
     adapter: PertTFCorpusAdapter | None = None,
     row_indices=None,
@@ -697,6 +698,7 @@ def _build_public_pair_loader(
         row_indices=row_indices,
         seed=seed,
         drop_last=drop_last,
+        perturbed_target_policy=perturbed_target_policy,
         source_indices=source_indices,
         target_candidate_indices=target_candidate_indices,
         sampling_mode="hvg",
@@ -896,17 +898,16 @@ def test_public_paired_batch_loader_preserves_full_expression_fields(
 
 
 @pytest.mark.parametrize(
-    ("column", "match"),
+    "column",
     [
-        ("cell_context", "'cell_context'"),
-        ("perturb_label", "'perturb_label'"),
-        ("batch_id", "'batch_id'"),
+        "cell_context",
+        "perturb_label",
+        "batch_id",
     ],
 )
-def test_public_paired_batch_loader_fails_fast_on_null_required_label_rows(
+def test_public_paired_batch_loader_default_null_policy_drops_invalid_rows(
     tmp_path: Path,
     column: str,
-    match: str,
 ) -> None:
     corpus_path = _build_small_pair_corpus(tmp_path)
     obs_path = corpus_path / "meta" / "ds0" / "canonical_meta" / "canonical-obs.parquet"
@@ -917,40 +918,50 @@ def test_public_paired_batch_loader_fails_fast_on_null_required_label_rows(
     frame.write_parquet(obs_path)
 
     corpus = load_corpus(str(corpus_path))
-    config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
-    with pytest.raises(
-        ValueError,
-        match=match,
-    ):
-        _build_public_pair_loader(
-            corpus,
-            batch_size=1,
-            seq_len=3,
-            seed=7,
-            num_workers=0,
-            multiprocessing_context=None,
-            drop_last=False,
-            config=config,
-            row_indices=np.asarray([0, 1], dtype=np.int64),
-        )
-
-def test_public_paired_batch_loader_reports_all_null_columns_in_error(
-    tmp_path: Path,
-) -> None:
-    corpus_path = _build_three_row_pair_corpus(tmp_path)
-    obs_path = corpus_path / "meta" / "ds0" / "canonical_meta" / "canonical-obs.parquet"
-    frame = pl.read_parquet(obs_path).with_columns(
-        pl.Series("cell_context", [None, "T_cell", "T_cell"]),
-        pl.Series("perturb_label", ["WT", None, "KO_STAT1"]),
-        pl.Series("batch_id", ["batch_0", None, "batch_2"]),
+    loader = _build_public_pair_loader(
+        corpus,
+        batch_size=1,
+        seq_len=3,
+        seed=7,
+        num_workers=0,
+        multiprocessing_context=None,
+        drop_last=False,
+        config=PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0),
+        row_indices=np.asarray([0, 1], dtype=np.int64),
     )
+
+    batch = next(iter(loader))
+
+    assert batch["index"].tolist() == [1]
+    assert batch["next_index"].tolist() == [1]
+    assert loader.effective_label_row_indices.tolist() == [1]
+    assert loader.effective_source_indices.tolist() == [1]
+    assert loader.effective_target_candidate_indices.tolist() == [1]
+
+
+@pytest.mark.parametrize(
+    ("column", "label_name"),
+    [
+        ("cell_context", "celltype"),
+        ("perturb_label", "perturbation"),
+        ("batch_id", "batch"),
+    ],
+)
+def test_public_paired_batch_loader_error_null_policy_raises_for_selected_pool(
+    tmp_path: Path,
+    column: str,
+    label_name: str,
+) -> None:
+    corpus_path = _build_small_pair_corpus(tmp_path)
+    obs_path = corpus_path / "meta" / "ds0" / "canonical_meta" / "canonical-obs.parquet"
+    frame = pl.read_parquet(obs_path)
+    values = frame[column].to_list()
+    values[0] = None
+    frame = frame.with_columns(pl.Series(column, values))
     frame.write_parquet(obs_path)
 
     corpus = load_corpus(str(corpus_path))
-    with pytest.raises(
-        ValueError,
-        match="'cell_context'.*'perturb_label'.*'batch_id'",
-    ):
+    with pytest.raises(ValueError, match="configured error-null field"):
         _build_public_pair_loader(
             corpus,
             batch_size=1,
@@ -959,6 +970,12 @@ def test_public_paired_batch_loader_reports_all_null_columns_in_error(
             num_workers=0,
             multiprocessing_context=None,
             drop_last=False,
+            config=PertTFAdapterConfig(
+                control_labels=("WT",),
+                mask_ratio=0.0,
+                error_null_labels=(label_name,),
+            ),
+            row_indices=np.asarray([0, 1], dtype=np.int64),
         )
 
 def test_public_paired_batch_loader_selected_row_pool_ignores_null_rows_outside_subset(
@@ -1011,10 +1028,10 @@ def test_paired_batch_builder_requires_size_factor_metadata(tmp_path: Path) -> N
         builder.build_paired_batch(pair_batch, seed=5)
 
 
-def test_public_paired_batch_loader_explicit_pools_override_row_indices(
+def test_public_paired_batch_loader_explicit_pools_intersect_row_indices(
     tmp_path: Path,
 ) -> None:
-    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    corpus = load_corpus(str(_build_three_row_pair_corpus(tmp_path)))
     loader = _build_public_pair_loader(
         corpus,
         batch_size=1,
@@ -1023,18 +1040,20 @@ def test_public_paired_batch_loader_explicit_pools_override_row_indices(
         num_workers=0,
         multiprocessing_context=None,
         drop_last=False,
-        row_indices=np.asarray([0], dtype=np.int64),
-        source_indices=np.asarray([1], dtype=np.int64),
-        target_candidate_indices=np.asarray([1], dtype=np.int64),
+        perturbed_target_policy="matched_control_cell",
+        row_indices=np.asarray([0, 1], dtype=np.int64),
+        source_indices=np.asarray([1, 2], dtype=np.int64),
+        target_candidate_indices=np.asarray([0, 2], dtype=np.int64),
     )
 
     batch = next(iter(loader))
 
     assert batch["index"].tolist() == [1]
-    assert batch["next_index"].tolist() == [1]
-    assert loader.row_indices.tolist() == [0]
+    assert batch["next_index"].tolist() == [0]
+    assert loader.row_indices.tolist() == [0, 1]
+    assert loader.effective_label_row_indices.tolist() == [0, 1]
     assert loader.effective_source_indices.tolist() == [1]
-    assert loader.effective_target_candidate_indices.tolist() == [1]
+    assert loader.effective_target_candidate_indices.tolist() == [0]
 
 
 def test_pair_read_dataloader_supports_spawn_workers(tmp_path: Path) -> None:
