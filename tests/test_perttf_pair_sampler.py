@@ -241,7 +241,9 @@ def test_prepared_metadata_compacts_rows_and_keeps_polars_frame() -> None:
         np.asarray([2, 0], dtype=np.int64),
     )
     np.testing.assert_array_equal(
-        prepared.label_ids_by_name["celltype"][_positions_for_global_rows(prepared, np.asarray([1, 4], dtype=np.int64))],
+        np.asarray(prepared.frame["celltype_id"])[
+            _positions_for_global_rows(prepared, np.asarray([1, 4], dtype=np.int64))
+        ],
         np.asarray([1, 0], dtype=np.int64),
     )
     assert tuple(prepared.frame["perturbation"].to_list()) == (

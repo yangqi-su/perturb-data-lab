@@ -170,9 +170,7 @@ class _PertTFPreparedMetadata:
     global_to_local: dict[int, int]
     labels_by_name: dict[str, tuple[str, ...]]
     label_to_index_by_name: dict[str, dict[str, int]]
-    label_ids_by_name: dict[str, np.ndarray]
     control_label_ids: tuple[int, ...]
-    dataset_indices: np.ndarray
 
 
 def _intersect_preserving_order(
@@ -271,7 +269,6 @@ def _prepare_perttf_metadata(
 
     resolved_labels_by_name: dict[str, tuple[str, ...]] = {}
     resolved_label_to_index_by_name: dict[str, dict[str, int]] = {}
-    resolved_label_ids_by_name: dict[str, np.ndarray] = {}
     frame_columns: dict[str, Any] = {
         "global_row_index": row_selection.base_indices.copy(),
         "dataset_index": np.asarray(selected_metadata["dataset_index"], dtype=np.int32),
@@ -313,7 +310,6 @@ def _prepare_perttf_metadata(
         label_ids = np.asarray([label_to_index[value] for value in resolved_values], dtype=np.int64)
         resolved_labels_by_name[label_name] = label_vocab
         resolved_label_to_index_by_name[label_name] = label_to_index
-        resolved_label_ids_by_name[label_name] = label_ids
         frame_columns[label_name] = list(resolved_values)
         frame_columns[f"{label_name}_id"] = label_ids
 
@@ -333,9 +329,7 @@ def _prepare_perttf_metadata(
         global_to_local=global_to_local,
         labels_by_name=resolved_labels_by_name,
         label_to_index_by_name=resolved_label_to_index_by_name,
-        label_ids_by_name=resolved_label_ids_by_name,
         control_label_ids=control_label_ids,
-        dataset_indices=np.asarray(frame_columns["dataset_index"], dtype=np.int32),
     )
 
 
@@ -400,40 +394,6 @@ def _build_vocab_fields(
         stoi,
         special_token_offset,
         gene_token_ids,
-    )
-
-
-def _build_adapter_label_maps(
-    metadata_index: MetadataIndex,
-    *,
-    config: PertTFAdapterConfig,
-    row_indices: Sequence[int] | np.ndarray | None = None,
-    prepared_metadata: _PertTFPreparedMetadata | None = None,
-) -> tuple[
-    dict[str, tuple[str, ...]],
-    dict[str, dict[str, int]],
-    tuple[int, ...],
-]:
-    if prepared_metadata is None:
-        prepared_metadata = _prepare_perttf_metadata(
-            metadata_index,
-            config=config,
-            row_indices=row_indices,
-            source_indices=None,
-            target_candidate_indices=None,
-        )
-    labels_by_name = {
-        label_name: tuple(labels)
-        for label_name, labels in prepared_metadata.labels_by_name.items()
-    }
-    label_to_index_by_name = {
-        label_name: dict(label_to_index)
-        for label_name, label_to_index in prepared_metadata.label_to_index_by_name.items()
-    }
-    return (
-        labels_by_name,
-        label_to_index_by_name,
-        prepared_metadata.control_label_ids,
     )
 
 
@@ -926,10 +886,9 @@ class PertTFPairedBatchBuilder:
         hvg_weight: float = 3.0,
         hvg_top_k: int | None = None,
     ) -> dict[str, torch.Tensor]:
-        self._validate_pair_batch(pair_batch)
         source_raw = self._with_metadata_columns(source_raw)
         target_raw = self._with_metadata_columns(target_raw)
-        self._validate_raw_pair_batches(pair_batch, source_raw, target_raw)
+        self._check_raw_pair_batch(pair_batch, source_raw, target_raw)
 
         source_processed = self._pipeline.process_batch(
             source_raw,
@@ -1064,65 +1023,40 @@ class PertTFPairedBatchBuilder:
         return resolved
 
     def _label_ids_for_rows(self, label_name: str, global_indices: np.ndarray) -> np.ndarray:
-        positions = _positions_for_global_rows(self._prepared_metadata, global_indices)
-        return self._prepared_metadata.label_ids_by_name[label_name][positions].astype(
-            np.int64,
-            copy=False,
+        return _take_prepared_column(
+            self._prepared_metadata,
+            global_indices,
+            f"{label_name}_id",
+            dtype=np.int64,
         )
 
-    def _validate_pair_batch(self, pair_batch: PerturbationPairBatch) -> None:
-        if pair_batch.source_indices.shape != pair_batch.target_indices.shape:
-            raise ValueError("pair_batch source and target indices must have matching shapes")
-        target_perturbation_ids = np.asarray(pair_batch.target_perturbation_ids, dtype=np.int64)
-        if target_perturbation_ids.shape != pair_batch.source_indices.shape:
-            raise ValueError("pair_batch target_perturbation_ids must match source shape")
-
-    def _validate_raw_batch_alignment(
-        self,
-        name: str,
-        raw_batch: dict[str, Any],
-        *,
-        expected_indices: np.ndarray,
-    ) -> None:
-        batch_size = int(raw_batch.get("batch_size", -1))
-        expected_size = int(expected_indices.shape[0])
-        if batch_size != expected_size:
-            raise ValueError(
-                f"{name} batch_size {batch_size} does not match paired batch size {expected_size}"
-            )
-
-        raw_indices = self._raw_batch_numpy(raw_batch, "global_row_index", dtype=np.int64)
-        if raw_indices.shape != expected_indices.shape or not np.array_equal(
-            raw_indices,
-            expected_indices,
-        ):
-            raise ValueError(
-                f"{name} global_row_index does not match pair_batch ordering"
-            )
-
-    def _validate_raw_pair_batches(
+    def _check_raw_pair_batch(
         self,
         pair_batch: PerturbationPairBatch,
         source_raw: dict[str, Any],
         target_raw: dict[str, Any],
     ) -> None:
+        if pair_batch.source_indices.shape != pair_batch.target_indices.shape:
+            raise ValueError("pair_batch source and target indices must have matching shapes")
+        target_perturbation_ids = np.asarray(pair_batch.target_perturbation_ids, dtype=np.int64)
+        if target_perturbation_ids.shape != pair_batch.source_indices.shape:
+            raise ValueError("pair_batch target_perturbation_ids must match source shape")
         for name, raw_batch, expected_indices in (
-            (
-                "source_raw",
-                source_raw,
-                pair_batch.source_indices,
-            ),
-            (
-                "target_raw",
-                target_raw,
-                pair_batch.target_indices,
-            ),
+            ("source_raw", source_raw, pair_batch.source_indices),
+            ("target_raw", target_raw, pair_batch.target_indices),
         ):
-            self._validate_raw_batch_alignment(
-                name,
-                raw_batch,
-                expected_indices=expected_indices,
-            )
+            batch_size = int(raw_batch.get("batch_size", -1))
+            if batch_size != int(expected_indices.shape[0]):
+                raise ValueError(
+                    f"{name} batch_size {batch_size} does not match paired batch size "
+                    f"{int(expected_indices.shape[0])}"
+                )
+            raw_indices = self._raw_batch_numpy(raw_batch, "global_row_index", dtype=np.int64)
+            if raw_indices.shape != expected_indices.shape or not np.array_equal(
+                raw_indices,
+                expected_indices,
+            ):
+                raise ValueError(f"{name} global_row_index does not match pair_batch ordering")
 
     def _raw_batch_numpy(
         self,
@@ -1353,16 +1287,22 @@ class PertTFCorpusAdapter:
             corpus.feature_registry,
             special_tokens=resolved.special_tokens,
         )
-        (
-            labels_by_name,
-            label_to_index_by_name,
-            control_label_ids,
-        ) = _build_adapter_label_maps(
-            corpus.metadata_index,
-            config=resolved,
-            row_indices=row_indices,
-            prepared_metadata=prepared_metadata,
-        )
+        if prepared_metadata is None:
+            prepared_metadata = _prepare_perttf_metadata(
+                corpus.metadata_index,
+                config=resolved,
+                row_indices=row_indices,
+                source_indices=None,
+                target_candidate_indices=None,
+            )
+        labels_by_name = {
+            label_name: tuple(labels)
+            for label_name, labels in prepared_metadata.labels_by_name.items()
+        }
+        label_to_index_by_name = {
+            label_name: dict(label_to_index)
+            for label_name, label_to_index in prepared_metadata.label_to_index_by_name.items()
+        }
         return cls(
             config=resolved,
             special_tokens=special_tokens,
@@ -1373,7 +1313,7 @@ class PertTFCorpusAdapter:
             gene_token_ids=gene_token_ids,
             labels_by_name=labels_by_name,
             label_to_index_by_name=label_to_index_by_name,
-            control_label_ids=control_label_ids,
+            control_label_ids=prepared_metadata.control_label_ids,
         )
 
     def token_id_for_global_id(self, global_id: int) -> int:
@@ -1406,30 +1346,6 @@ class PertTFCorpusAdapter:
             encoding="utf-8",
         )
 
-    @property
-    def cell_context_labels(self) -> tuple[str, ...]:
-        return self.labels_by_name["celltype"]
-
-    @property
-    def perturbation_labels(self) -> tuple[str, ...]:
-        return self.labels_by_name[self.config.perturbation_label]
-
-    @property
-    def batch_labels(self) -> tuple[str, ...]:
-        return self.labels_by_name["batch"]
-
-    @property
-    def cell_context_to_index(self) -> dict[str, int]:
-        return self.label_to_index_by_name["celltype"]
-
-    @property
-    def perturbation_to_index(self) -> dict[str, int]:
-        return self.label_to_index_by_name[self.config.perturbation_label]
-
-    @property
-    def batch_to_index(self) -> dict[str, int]:
-        return self.label_to_index_by_name["batch"]
-
     def encode_label(self, name: str, label: Any) -> int:
         _check_nonempty_string(name, field_name="label_name")
         _check_nonempty_string(label, field_name=f"label field {name!r} value")
@@ -1441,24 +1357,6 @@ class PertTFCorpusAdapter:
         for label in labels:
             _check_nonempty_string(label, field_name=f"label field {name!r} value")
         return np.asarray([label_to_index[label] for label in labels], dtype=np.int64)
-
-    def encode_cell_context(self, label: Any) -> int:
-        return self.encode_label("celltype", label)
-
-    def encode_cell_context_many(self, labels: Sequence[Any]) -> np.ndarray:
-        return self.encode_labels("celltype", labels)
-
-    def encode_perturbation(self, label: Any) -> int:
-        return self.encode_label(self.config.perturbation_label, label)
-
-    def encode_perturbation_many(self, labels: Sequence[Any]) -> np.ndarray:
-        return self.encode_labels(self.config.perturbation_label, labels)
-
-    def encode_batch(self, label: Any) -> int:
-        return self.encode_label("batch", label)
-
-    def encode_batch_many(self, labels: Sequence[Any]) -> np.ndarray:
-        return self.encode_labels("batch", labels)
 
     def to_reference_dict(self) -> dict[str, Any]:
         return {
