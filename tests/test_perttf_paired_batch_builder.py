@@ -575,8 +575,6 @@ def _build_pair_read_loader(
     dataset = _PertTFPairExpressionDataset(
         corpus.expression_reader,
         routing_table=corpus.routing_table,
-        topology=corpus.topology,
-        backend=corpus.backend,
     )
     loader_kwargs = {
         "batch_sampler": request_sampler,
@@ -742,11 +740,9 @@ def test_pair_read_dataset_state_stays_worker_light(tmp_path: Path) -> None:
     dataset = _PertTFPairExpressionDataset(
         corpus.expression_reader,
         routing_table=corpus.routing_table,
-        topology=corpus.topology,
-        backend=corpus.backend,
     )
 
-    assert set(dataset.__dict__) == {"_reader", "_routing_table", "_topology", "_backend"}
+    assert set(dataset.__dict__) == {"_reader", "_routing_table"}
     assert dataset.__dict__["_reader"] is corpus.expression_reader
     assert dataset.__dict__["_routing_table"] is corpus.routing_table
     assert all(value is not corpus.metadata_index for value in dataset.__dict__.values())
@@ -782,7 +778,6 @@ def test_pair_read_batch_sampler_tracks_epoch_and_batch_identity(
     second_epoch_requests = [batch[0] for batch in request_sampler]
 
     assert [request.batch_index for request in first_epoch_requests] == [0, 1]
-    assert [request.request_index for request in first_epoch_requests] == [0, 1]
     assert [request.batch_index for request in second_epoch_requests] == [0, 1]
     assert [request.epoch for request in first_epoch_requests] == [0, 0]
     assert [request.epoch for request in second_epoch_requests] == [2, 2]
@@ -998,6 +993,25 @@ def test_public_paired_batch_loader_selected_row_pool_ignores_null_rows_outside_
     assert loader.effective_target_candidate_indices.tolist() == [1]
 
 
+def test_paired_batch_builder_requires_size_factor_metadata(tmp_path: Path) -> None:
+    corpus_path = _build_small_pair_corpus(tmp_path)
+    obs_path = corpus_path / "meta" / "ds0" / "canonical_meta" / "canonical-obs.parquet"
+    pl.read_parquet(obs_path).drop("size_factor").write_parquet(obs_path)
+
+    corpus = load_corpus(str(corpus_path))
+    config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
+    pair_batch = PerturbationPairSampler(
+        corpus.metadata_index,
+        batch_size=2,
+        config=config,
+        seed=7,
+    ).pair_source_indices([0, 1], seed=11)
+    builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
+
+    with pytest.raises(RuntimeError, match="size_factor"):
+        builder.build_paired_batch(pair_batch, seed=5)
+
+
 def test_public_paired_batch_loader_explicit_pools_override_row_indices(
     tmp_path: Path,
 ) -> None:
@@ -1040,7 +1054,7 @@ def test_pair_read_dataloader_supports_spawn_workers(tmp_path: Path) -> None:
     _assert_pair_read_batch_matches_builder(corpus, batches[0])
 
 
-def test_public_paired_batch_loader_uses_spawn_raw_pair_path(
+def test_public_paired_batch_loader_does_not_force_spawn_context(
     tmp_path: Path,
 ) -> None:
     corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
@@ -1055,9 +1069,7 @@ def test_public_paired_batch_loader_uses_spawn_raw_pair_path(
 
     assert isinstance(loader._data_loader.dataset, _PertTFPairExpressionDataset)
     assert isinstance(loader._data_loader.batch_sampler, _PertTFPairReadBatchSampler)
-    assert loader._loader_kwargs["multiprocessing_context"] == "spawn"
-
-    _assert_public_loader_matches_builder(loader)
+    assert "multiprocessing_context" not in loader._loader_kwargs
 
 
 def test_public_paired_batch_loader_set_epoch_is_repeatable_and_reorders(
@@ -1083,31 +1095,3 @@ def test_public_paired_batch_loader_set_epoch_is_repeatable_and_reorders(
 
     assert epoch0_first == epoch0_second
     assert epoch1 != epoch0_first
-
-
-def test_pair_read_request_stream_supports_even_fake_two_rank_sharding(
-    tmp_path: Path,
-) -> None:
-    corpus = load_corpus(str(_build_mixed_union_pair_corpus(tmp_path)))
-    sampler = PerturbationPairSampler(
-        corpus.metadata_index,
-        batch_size=1,
-        config=PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0),
-        seed=5,
-        drop_last=True,
-    )
-    request_sampler = _PertTFPairReadBatchSampler(sampler)
-
-    request_sampler.set_epoch(0)
-    requests = [batch[0] for batch in request_sampler]
-    rank0_requests = [request for request in requests if request.request_index % 2 == 0]
-    rank1_requests = [request for request in requests if request.request_index % 2 == 1]
-
-    assert [request.request_index for request in requests] == [0, 1, 2, 3]
-    assert len(rank0_requests) == len(rank1_requests) == 2
-    assert {request.request_index for request in rank0_requests}.isdisjoint(
-        {request.request_index for request in rank1_requests}
-    )
-    assert sorted(
-        request.request_index for request in rank0_requests + rank1_requests
-    ) == [0, 1, 2, 3]

@@ -85,7 +85,6 @@ class PertTFAdapterConfig:
     mask_ratio: float = 0.15
     ps_width: int = 1
     include_full_expr: bool = False
-    full_expr_mode: str = "union_padded"
 
     def __post_init__(self) -> None:
         if len(set(self.special_tokens)) != len(self.special_tokens):
@@ -104,8 +103,6 @@ class PertTFAdapterConfig:
             raise ValueError("mask_ratio must be between 0 and 1")
         if int(self.ps_width) <= 0:
             raise ValueError("ps_width must be positive")
-        if self.full_expr_mode != "union_padded":
-            raise ValueError("full_expr_mode must be 'union_padded'")
 
 
 def _required_label_columns(config: PertTFAdapterConfig) -> tuple[str, ...]:
@@ -857,18 +854,10 @@ class PerturbationPairSampler:
 
 @dataclass(frozen=True)
 class _PertTFPairReadRequest:
-    """Compact worker-facing request for one paired raw-expression read."""
-
     pair_batch: PerturbationPairBatch
     batch_index: int
     seed: int
     epoch: int
-
-    @property
-    def request_index(self) -> int:
-        """Stable per-epoch request position for future sharding wrappers."""
-
-        return self.batch_index
 
 
 class _PertTFPairReadBatchSampler:
@@ -903,25 +892,9 @@ class _PertTFPairExpressionDataset:
         expression_reader: Any,
         *,
         routing_table: DatasetRoutingTable,
-        topology: str = "aggregate",
-        backend: str = "lance",
     ) -> None:
         self._reader = expression_reader
         self._routing_table = routing_table
-        self._topology = topology
-        self._backend = backend
-
-    @property
-    def routing_table(self) -> DatasetRoutingTable:
-        return self._routing_table
-
-    @property
-    def topology(self) -> str:
-        return self._topology
-
-    @property
-    def backend(self) -> str:
-        return self._backend
 
     def __len__(self) -> int:
         return self._routing_table.total_rows
@@ -930,7 +903,11 @@ class _PertTFPairExpressionDataset:
         self,
         requests: Sequence[_PertTFPairReadRequest],
     ) -> list[dict[str, Any]]:
-        request = _unwrap_single_pair_read_request(requests)
+        if len(requests) != 1:
+            raise ValueError(
+                "paired read dataset expected exactly one pre-batched request"
+            )
+        request = requests[0]
         pair_batch = request.pair_batch
         return [
             {
@@ -956,39 +933,6 @@ class _PertTFPairExpressionDataset:
         if size_factor is not None:
             batch["size_factor"] = size_factor
         return batch
-
-
-def _unwrap_single_pair_read_request(
-    requests: Sequence[_PertTFPairReadRequest],
-) -> _PertTFPairReadRequest:
-    if not requests:
-        raise ValueError("paired read dataset received empty request batch")
-    if len(requests) != 1:
-        raise ValueError(
-            "paired read dataset expected a single pre-batched request, "
-            f"got {len(requests)}"
-        )
-    request = requests[0]
-    if not isinstance(request, _PertTFPairReadRequest):
-        raise TypeError(
-            "paired read dataset expected _PertTFPairReadRequest items, "
-            f"got {type(request)!r}"
-        )
-    return request
-
-
-def _unwrap_single_prebatched_pair_item(
-    items: list[dict[str, Any]],
-    *,
-    collate_name: str,
-) -> dict[str, Any]:
-    if not items:
-        raise ValueError(f"{collate_name} received empty list")
-    if len(items) != 1:
-        raise ValueError(
-            f"{collate_name} expected a single pre-batched item, got {len(items)}"
-        )
-    return items[0]
 
 
 def _collate_expression_like_raw_batch(raw_batch: dict[str, Any]) -> dict[str, Any]:
@@ -1023,10 +967,9 @@ def _collate_expression_like_raw_batch(raw_batch: dict[str, Any]) -> dict[str, A
 def _collate_perttf_raw_pair_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
     """Unwrap one paired raw-read item for main-process pertTF assembly."""
 
-    batch = _unwrap_single_prebatched_pair_item(
-        items,
-        collate_name="_collate_perttf_raw_pair_batch",
-    )
+    if len(items) != 1:
+        raise ValueError("paired raw pair collate expected exactly one item")
+    batch = items[0]
     return {
         "request": batch["request"],
         "source_raw": _collate_expression_like_raw_batch(batch["source_raw"]),
@@ -1034,7 +977,7 @@ def _collate_perttf_raw_pair_batch(items: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
-def _validate_perttf_loader_kwargs(
+def _perttf_loader_kwargs(
     *,
     num_workers: int,
     multiprocessing_context: str | None,
@@ -1045,11 +988,10 @@ def _validate_perttf_loader_kwargs(
     workers = int(num_workers)
     if workers < 0:
         raise ValueError("num_workers must be >= 0")
-    if not isinstance(pin_memory, bool):
-        raise TypeError("pin_memory must be a bool")
-    if not isinstance(persistent_workers, bool):
-        raise TypeError("persistent_workers must be a bool")
-
+    kwargs: dict[str, Any] = {
+        "num_workers": workers,
+        "pin_memory": pin_memory,
+    }
     if workers == 0:
         if multiprocessing_context is not None:
             raise ValueError("multiprocessing_context requires num_workers > 0")
@@ -1057,56 +999,13 @@ def _validate_perttf_loader_kwargs(
             raise ValueError("persistent_workers requires num_workers > 0")
         if prefetch_factor is not None:
             raise ValueError("prefetch_factor requires num_workers > 0")
-        normalized_context = None
-        normalized_prefetch = None
-    else:
-        if multiprocessing_context is None:
-            normalized_context = None
-        else:
-            normalized_context = str(multiprocessing_context).strip().lower()
-            if normalized_context not in {"fork", "spawn", "forkserver"}:
-                raise ValueError(
-                    "multiprocessing_context must be one of 'fork', 'spawn', "
-                    f"or 'forkserver', got {multiprocessing_context!r}"
-                )
-        if prefetch_factor is None:
-            normalized_prefetch = None
-        else:
-            normalized_prefetch = int(prefetch_factor)
-            if normalized_prefetch <= 0:
-                raise ValueError("prefetch_factor must be positive")
+        return kwargs
 
-    return {
-        "num_workers": workers,
-        "multiprocessing_context": normalized_context,
-        "pin_memory": pin_memory,
-        "persistent_workers": persistent_workers,
-        "prefetch_factor": normalized_prefetch,
-    }
-
-
-def _build_perttf_loader_kwargs(
-    *,
-    num_workers: int,
-    multiprocessing_context: str | None,
-    pin_memory: bool,
-    persistent_workers: bool,
-    prefetch_factor: int | None,
-    backend: str,
-) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {
-        "num_workers": num_workers,
-        "pin_memory": pin_memory,
-        "persistent_workers": persistent_workers if num_workers > 0 else False,
-    }
-    if num_workers > 0:
-        kwargs["multiprocessing_context"] = (
-            multiprocessing_context
-            if multiprocessing_context is not None
-            else ("spawn" if backend == "lance" else None)
-        )
-        if prefetch_factor is not None:
-            kwargs["prefetch_factor"] = prefetch_factor
+    kwargs["persistent_workers"] = persistent_workers
+    if multiprocessing_context is not None:
+        kwargs["multiprocessing_context"] = multiprocessing_context
+    if prefetch_factor is not None:
+        kwargs["prefetch_factor"] = int(prefetch_factor)
     return kwargs
 
 
@@ -1581,11 +1480,7 @@ class PertTFPairedBatchBuilder:
     ) -> torch.Tensor:
         raw_size_factor = processed_batch.get("size_factor")
         if raw_size_factor is None:
-            return torch.ones(
-                (batch_size, 1),
-                dtype=torch.float32,
-                device=self.device,
-            )
+            raise RuntimeError("pertTF batches require size_factor metadata")
         size_factor = torch.as_tensor(
             raw_size_factor,
             dtype=torch.float32,
@@ -1835,19 +1730,13 @@ class PertTFPairedBatchLoader:
         self._dataset = _PertTFPairExpressionDataset(
             corpus.expression_reader,
             routing_table=corpus.routing_table,
-            topology=corpus.topology,
-            backend=corpus.backend,
         )
-        validated_loader = _validate_perttf_loader_kwargs(
+        self._loader_kwargs = _perttf_loader_kwargs(
             num_workers=num_workers,
             multiprocessing_context=multiprocessing_context,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers,
             prefetch_factor=prefetch_factor,
-        )
-        self._loader_kwargs = _build_perttf_loader_kwargs(
-            backend=corpus.backend,
-            **validated_loader,
         )
         self._sampling_mode = sampling_mode
         self._expressed_weight = float(expressed_weight)
