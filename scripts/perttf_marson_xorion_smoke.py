@@ -115,8 +115,9 @@ def _observe_loader_batch(
 ) -> ObservedLoaderBatch:
     source_indices = np.asarray(batch["index"].detach().cpu().tolist(), dtype=np.int64)
     target_indices = np.asarray(batch["next_index"].detach().cpu().tolist(), dtype=np.int64)
-    celltype_column = config.metadata_column_for_label("celltype")
-    perturbation_column = config.metadata_column_for_label(config.perturbation_label)
+    label_columns = config.label_columns_by_name
+    celltype_column = label_columns["celltype"]
+    perturbation_column = label_columns[config.perturbation_label]
     metadata_columns = ["dataset_index", celltype_column, perturbation_column]
     source_meta = corpus.take_metadata(source_indices.tolist(), columns=metadata_columns)
     target_meta = corpus.take_metadata(target_indices.tolist(), columns=metadata_columns)

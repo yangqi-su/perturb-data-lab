@@ -72,14 +72,12 @@ def test_perttf_config_defaults_expose_generic_label_fields() -> None:
     assert config.label_names == ("perturbation", "celltype", "batch")
     assert config.perturbation_label == "perturbation"
     assert config.pairing_group_labels == ()
-    assert config.metadata_column_for_label("perturbation") == "perturb_label"
-    assert config.metadata_column_for_label("celltype") == "cell_context"
-    assert config.metadata_column_for_label("batch") == "batch_id"
-    assert config.resolved_drop_null_labels == (
-        "perturbation",
-        "celltype",
-        "batch",
-    )
+    assert config.label_columns_by_name == {
+        "perturbation": "perturb_label",
+        "celltype": "cell_context",
+        "batch": "batch_id",
+    }
+    assert config.resolved_drop_null_labels == ()
     assert config.resolved_encode_null_labels == ()
     assert config.resolved_error_null_labels == ()
     assert not hasattr(config, "perturbation_column")
@@ -93,21 +91,16 @@ def test_perttf_config_accepts_explicit_dataset_pairing_and_null_policy() -> Non
             "perturb_label": "perturbation",
             "cell_context": "celltype",
             "batch_id": "batch",
-            "dataset_index": "dataset",
+            "dataset_id": "dataset",
         },
         pairing_group_labels=("dataset",),
         encode_null_labels=("dataset",),
     )
 
-    assert config.metadata_column_for_label("dataset") == "dataset_index"
-    assert config.label_name_for_column("dataset_index") == "dataset"
+    assert config.label_columns_by_name["dataset"] == "dataset_id"
     assert config.pairing_group_labels == ("dataset",)
     assert config.resolved_encode_null_labels == ("dataset",)
-    assert config.resolved_drop_null_labels == (
-        "perturbation",
-        "celltype",
-        "batch",
-    )
+    assert config.resolved_drop_null_labels == ()
 
 
 @pytest.mark.parametrize(
@@ -121,7 +114,7 @@ def test_perttf_config_accepts_explicit_dataset_pairing_and_null_policy() -> Non
                     "batch_id": "batch",
                 }
             },
-            "label_fields metadata column names must be unique",
+            "label_fields metadata column must be a non-empty string",
         ),
         (
             {
@@ -132,7 +125,7 @@ def test_perttf_config_accepts_explicit_dataset_pairing_and_null_policy() -> Non
                 },
                 "perturbation_label": "1",
             },
-            "label_fields label names must be unique",
+            "label_fields label name must be a non-empty string",
         ),
         (
             {
@@ -156,7 +149,7 @@ def test_perttf_config_accepts_explicit_dataset_pairing_and_null_policy() -> Non
                 "encode_null_labels": ("celltype",),
                 "error_null_labels": ("celltype",),
             },
-            "null label policy lists must not overlap",
+            "encode_null_labels and error_null_labels must not overlap",
         ),
     ],
 )
@@ -339,21 +332,21 @@ def test_corpus_adapter_builds_from_loaded_small_corpus(tmp_path: Path) -> None:
                 "perturb_label": "perturbation",
                 "cell_context": "celltype",
                 "batch_id": "batch",
-                "dataset_index": "dataset",
+                "dataset_id": "dataset",
             },
             pairing_group_labels=("dataset",),
         ),
     )
 
     reference = adapter.to_reference_dict()
-    assert adapter.config.metadata_column_for_label("dataset") == "dataset_index"
+    assert adapter.config.label_columns_by_name["dataset"] == "dataset_id"
     assert reference["genes"] == ["GENE_B", "GENE_A", "GENE_C"]
     np.testing.assert_array_equal(
         reference["gene_token_ids"],
         np.asarray([4, 5, 6], dtype=np.int64),
     )
     assert reference["simple_vocab_stoi"]["GENE_B"] == 4
-    assert reference["labels_by_name"]["dataset"] == ("0", "1")
+    assert reference["labels_by_name"]["dataset"] == ("ds0", "ds1")
     assert reference["label_to_index_by_name"]["celltype"] == {
         "T_cell": 0,
         "B_cell": 1,
@@ -363,7 +356,7 @@ def test_corpus_adapter_builds_from_loaded_small_corpus(tmp_path: Path) -> None:
         "KO_TP53": 1,
         "KO_GATA1": 2,
     }
-    assert adapter.encode_label("dataset", "1") == 1
+    assert adapter.encode_label("dataset", "ds1") == 1
 
 
 def test_removed_mapping_helpers_are_no_longer_public_exports() -> None:

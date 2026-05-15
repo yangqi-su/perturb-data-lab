@@ -78,7 +78,7 @@ def _dataset_group_config(*group_labels: str, **kwargs) -> PertTFAdapterConfig:
             "perturb_label": "perturbation",
             "cell_context": "celltype",
             "batch_id": "batch",
-            "dataset_index": "dataset",
+            "dataset_id": "dataset",
         },
         pairing_group_labels=group_labels,
         **kwargs,

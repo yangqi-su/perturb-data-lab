@@ -342,7 +342,7 @@ def test_paired_batch_builder_emits_extra_configured_label_tensors(
             "perturb_label": "perturbation",
             "cell_context": "celltype",
             "batch_id": "batch",
-            "dataset_index": "dataset",
+            "dataset_id": "dataset",
         },
     )
     corpus = load_corpus(str(_build_mixed_union_pair_corpus(tmp_path)))
