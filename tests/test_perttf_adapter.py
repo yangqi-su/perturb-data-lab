@@ -305,9 +305,12 @@ def test_corpus_adapter_builds_deterministic_maps_and_control_slots(
     corpus = load_corpus(str(_build_small_corpus(tmp_path)))
     adapter = PertTFCorpusAdapter.from_corpus(corpus, config)
 
-    assert adapter.cell_context_labels == ("T_cell", "B_cell")
-    assert adapter.perturbation_labels == ("WT", "CTRL", "KO_TP53", "KO_GATA1")
-    assert adapter.batch_labels == ("batch_0", "batch_1", "batch_2", "batch_3")
+    assert adapter.labels_by_name == {
+        "perturbation": ("WT", "CTRL", "KO_TP53", "KO_GATA1"),
+        "celltype": ("T_cell", "B_cell"),
+        "batch": ("batch_0", "batch_1", "batch_2", "batch_3"),
+    }
+    assert adapter.label_to_index_by_name["celltype"] == {"T_cell": 0, "B_cell": 1}
     assert adapter.control_label_ids == (0, 1)
 
 
@@ -316,9 +319,11 @@ def test_corpus_adapter_unknown_labels_raise_key_error(tmp_path: Path) -> None:
     adapter = PertTFCorpusAdapter.from_corpus(corpus)
 
     with pytest.raises(KeyError, match="unknown label 'missing_context'"):
-        adapter.encode_cell_context("missing_context")
+        adapter.encode_label("celltype", "missing_context")
     with pytest.raises(KeyError, match="unknown label 'missing_batch'"):
-        adapter.encode_batch("missing_batch")
+        adapter.encode_label("batch", "missing_batch")
+    with pytest.raises(KeyError, match="unknown label field 'missing_field'"):
+        adapter.encode_label("missing_field", "anything")
 
 
 def test_corpus_adapter_builds_from_loaded_small_corpus(tmp_path: Path) -> None:
@@ -345,8 +350,17 @@ def test_corpus_adapter_builds_from_loaded_small_corpus(tmp_path: Path) -> None:
         np.asarray([4, 5, 6], dtype=np.int64),
     )
     assert reference["simple_vocab_stoi"]["GENE_B"] == 4
-    assert reference["cell_context_to_index"] == {"T_cell": 0, "B_cell": 1}
-    assert reference["perturbation_to_index"] == {"WT": 0, "KO_TP53": 1, "KO_GATA1": 2}
+    assert reference["labels_by_name"]["dataset"] == ("0", "1")
+    assert reference["label_to_index_by_name"]["celltype"] == {
+        "T_cell": 0,
+        "B_cell": 1,
+    }
+    assert reference["label_to_index_by_name"]["perturbation"] == {
+        "WT": 0,
+        "KO_TP53": 1,
+        "KO_GATA1": 2,
+    }
+    assert adapter.encode_label("dataset", "1") == 1
 
 
 def test_removed_mapping_helpers_are_no_longer_public_exports() -> None:

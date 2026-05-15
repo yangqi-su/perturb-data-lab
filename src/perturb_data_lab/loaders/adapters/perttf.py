@@ -598,44 +598,6 @@ def _build_encoded_metadata_table(
     )
 
 
-def _build_label_mapping(
-    metadata_index: MetadataIndex,
-    *,
-    map_name: str,
-    label_name: str,
-    column: str,
-    config: PertTFAdapterConfig,
-    row_indices: Sequence[int] | np.ndarray | None,
-    prepend_labels: Sequence[str] = (),
-) -> tuple[tuple[str, ...], dict[str, int]]:
-    if column not in metadata_index.df.columns:
-        raise ValueError(f"metadata column '{column}' is not available")
-    normalized_row_indices = _normalize_candidate_row_indices(metadata_index, row_indices)
-    if normalized_row_indices is None:
-        observed_values = metadata_index.df[column].unique(maintain_order=True).to_list()
-    else:
-        observed_values = metadata_index.take(
-            normalized_row_indices,
-            columns=[column],
-        )[column]
-    resolved_values = _resolve_loaded_label_values(
-        observed_values,
-        config=config,
-        label_name=label_name,
-        column=column,
-        pool_name=f"label map '{map_name}'",
-    )
-    labels = _ordered_unique(
-        [
-            *[str(label) for label in prepend_labels],
-            *resolved_values,
-        ]
-    )
-    if not labels:
-        raise ValueError(f"label map '{map_name}' must contain at least one label")
-    return labels, {label: idx for idx, label in enumerate(labels)}
-
-
 def _encode_label(
     label_to_index: dict[str, int],
     *,
@@ -711,18 +673,14 @@ def _build_vocab_fields(
     )
 
 
-def _build_label_fields(
+def _build_adapter_label_maps(
     metadata_index: MetadataIndex,
     *,
     config: PertTFAdapterConfig,
     row_indices: Sequence[int] | np.ndarray | None = None,
 ) -> tuple[
-    tuple[str, ...],
-    tuple[str, ...],
-    tuple[str, ...],
-    dict[str, int],
-    dict[str, int],
-    dict[str, int],
+    dict[str, tuple[str, ...]],
+    dict[str, dict[str, int]],
     tuple[int, ...],
 ]:
     effective_row_indices = _resolve_perttf_row_selection(
@@ -737,25 +695,21 @@ def _build_label_fields(
         config=config,
         base_indices=effective_row_indices,
     )
-    cell_context_labels = encoded_metadata.labels_by_name["celltype"]
-    perturbation_labels = encoded_metadata.labels_by_name[config.perturbation_label]
-    batch_labels = encoded_metadata.labels_by_name["batch"]
-    cell_context_to_index = encoded_metadata.label_to_index_by_name["celltype"]
-    perturbation_to_index = encoded_metadata.label_to_index_by_name[
-        config.perturbation_label
-    ]
-    batch_to_index = encoded_metadata.label_to_index_by_name["batch"]
+    labels_by_name = {
+        label_name: tuple(labels)
+        for label_name, labels in encoded_metadata.labels_by_name.items()
+    }
+    label_to_index_by_name = {
+        label_name: dict(label_to_index)
+        for label_name, label_to_index in encoded_metadata.label_to_index_by_name.items()
+    }
     control_label_ids = tuple(
-        perturbation_to_index[str(label)]
+        label_to_index_by_name[config.perturbation_label][str(label)]
         for label in config.control_labels
     )
     return (
-        cell_context_labels,
-        perturbation_labels,
-        batch_labels,
-        cell_context_to_index,
-        perturbation_to_index,
-        batch_to_index,
+        labels_by_name,
+        label_to_index_by_name,
         control_label_ids,
     )
 
@@ -849,17 +803,13 @@ class PerturbationPairSampler:
         preset_labels_by_name: dict[str, tuple[str, ...]] = {}
         preset_label_to_index_by_name: dict[str, dict[str, int]] = {}
         if adapter is not None:
-            for label_name, labels, label_to_index in (
-                ("celltype", adapter.cell_context_labels, adapter.cell_context_to_index),
-                (
-                    resolved_config.perturbation_label,
-                    adapter.perturbation_labels,
-                    adapter.perturbation_to_index,
-                ),
-                ("batch", adapter.batch_labels, adapter.batch_to_index),
-            ):
-                preset_labels_by_name[label_name] = tuple(labels)
-                preset_label_to_index_by_name[label_name] = dict(label_to_index)
+            for label_name in resolved_config.label_names:
+                preset_labels_by_name[label_name] = tuple(
+                    adapter.labels_by_name[label_name]
+                )
+                preset_label_to_index_by_name[label_name] = dict(
+                    adapter.label_to_index_by_name[label_name]
+                )
         self._encoded_metadata_table = _build_encoded_metadata_table(
             metadata_index,
             config=resolved_config,
@@ -1852,13 +1802,10 @@ class PertTFCorpusAdapter:
     stoi: dict[str, int]
     special_token_offset: int
     gene_token_ids: np.ndarray
-    cell_context_labels: tuple[str, ...]
-    perturbation_labels: tuple[str, ...]
-    batch_labels: tuple[str, ...]
-    cell_context_to_index: dict[str, int]
-    perturbation_to_index: dict[str, int]
-    batch_to_index: dict[str, int]
+    labels_by_name: dict[str, tuple[str, ...]]
+    label_to_index_by_name: dict[str, dict[str, int]]
     control_label_ids: tuple[int, ...]
+
     @classmethod
     def from_corpus(
         cls,
@@ -1879,14 +1826,10 @@ class PertTFCorpusAdapter:
             special_tokens=resolved.special_tokens,
         )
         (
-            cell_context_labels,
-            perturbation_labels,
-            batch_labels,
-            cell_context_to_index,
-            perturbation_to_index,
-            batch_to_index,
+            labels_by_name,
+            label_to_index_by_name,
             control_label_ids,
-        ) = _build_label_fields(
+        ) = _build_adapter_label_maps(
             corpus.metadata_index,
             config=resolved,
             row_indices=row_indices,
@@ -1899,12 +1842,8 @@ class PertTFCorpusAdapter:
             stoi=stoi,
             special_token_offset=special_token_offset,
             gene_token_ids=gene_token_ids,
-            cell_context_labels=cell_context_labels,
-            perturbation_labels=perturbation_labels,
-            batch_labels=batch_labels,
-            cell_context_to_index=cell_context_to_index,
-            perturbation_to_index=perturbation_to_index,
-            batch_to_index=batch_to_index,
+            labels_by_name=labels_by_name,
+            label_to_index_by_name=label_to_index_by_name,
             control_label_ids=control_label_ids,
         )
 
@@ -1938,62 +1877,87 @@ class PertTFCorpusAdapter:
             encoding="utf-8",
         )
 
-    def encode_cell_context(self, label: Any) -> int:
+    @property
+    def cell_context_labels(self) -> tuple[str, ...]:
+        return self.labels_by_name["celltype"]
+
+    @property
+    def perturbation_labels(self) -> tuple[str, ...]:
+        return self.labels_by_name[self.config.perturbation_label]
+
+    @property
+    def batch_labels(self) -> tuple[str, ...]:
+        return self.labels_by_name["batch"]
+
+    @property
+    def cell_context_to_index(self) -> dict[str, int]:
+        return self.label_to_index_by_name["celltype"]
+
+    @property
+    def perturbation_to_index(self) -> dict[str, int]:
+        return self.label_to_index_by_name[self.config.perturbation_label]
+
+    @property
+    def batch_to_index(self) -> dict[str, int]:
+        return self.label_to_index_by_name["batch"]
+
+    def encode_label(self, name: str, label: Any) -> int:
+        normalized_name = _normalize_nonempty_string(name, field_name="label_name")
+        try:
+            label_to_index = self.label_to_index_by_name[normalized_name]
+        except KeyError as exc:
+            raise KeyError(f"unknown label field {normalized_name!r}") from exc
         return _encode_label(
-            self.cell_context_to_index,
-            map_name="cell_context",
-            column=self.config.cell_context_column,
+            label_to_index,
+            map_name=normalized_name,
+            column=self.config.metadata_column_for_label(normalized_name),
             label=label,
         )
+
+    def encode_labels(self, name: str, labels: Sequence[Any]) -> np.ndarray:
+        normalized_name = _normalize_nonempty_string(name, field_name="label_name")
+        try:
+            label_to_index = self.label_to_index_by_name[normalized_name]
+        except KeyError as exc:
+            raise KeyError(f"unknown label field {normalized_name!r}") from exc
+        return _encode_labels(
+            label_to_index,
+            map_name=normalized_name,
+            column=self.config.metadata_column_for_label(normalized_name),
+            labels=labels,
+        )
+
+    def encode_cell_context(self, label: Any) -> int:
+        return self.encode_label("celltype", label)
 
     def encode_cell_context_many(self, labels: Sequence[Any]) -> np.ndarray:
-        return _encode_labels(
-            self.cell_context_to_index,
-            map_name="cell_context",
-            column=self.config.cell_context_column,
-            labels=labels,
-        )
+        return self.encode_labels("celltype", labels)
 
     def encode_perturbation(self, label: Any) -> int:
-        return _encode_label(
-            self.perturbation_to_index,
-            map_name="perturbation",
-            column=self.config.perturbation_column,
-            label=label,
-        )
+        return self.encode_label(self.config.perturbation_label, label)
 
     def encode_perturbation_many(self, labels: Sequence[Any]) -> np.ndarray:
-        return _encode_labels(
-            self.perturbation_to_index,
-            map_name="perturbation",
-            column=self.config.perturbation_column,
-            labels=labels,
-        )
+        return self.encode_labels(self.config.perturbation_label, labels)
 
     def encode_batch(self, label: Any) -> int:
-        return _encode_label(
-            self.batch_to_index,
-            map_name="batch",
-            column=self.config.batch_column,
-            label=label,
-        )
+        return self.encode_label("batch", label)
 
     def encode_batch_many(self, labels: Sequence[Any]) -> np.ndarray:
-        return _encode_labels(
-            self.batch_to_index,
-            map_name="batch",
-            column=self.config.batch_column,
-            labels=labels,
-        )
+        return self.encode_labels("batch", labels)
 
     def to_reference_dict(self) -> dict[str, Any]:
         return {
             "genes": list(self.feature_ids_by_global_id),
             "gene_token_ids": self.gene_token_ids.copy(),
             "simple_vocab_stoi": self.to_simple_vocab_stoi(),
-            "cell_context_to_index": dict(self.cell_context_to_index),
-            "perturbation_to_index": dict(self.perturbation_to_index),
-            "batch_to_index": dict(self.batch_to_index),
+            "labels_by_name": {
+                label_name: tuple(labels)
+                for label_name, labels in self.labels_by_name.items()
+            },
+            "label_to_index_by_name": {
+                label_name: dict(label_to_index)
+                for label_name, label_to_index in self.label_to_index_by_name.items()
+            },
             "control_label_ids": self.control_label_ids,
         }
 
