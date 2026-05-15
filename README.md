@@ -180,9 +180,9 @@ for batch in perttf_loader:
   `PertTFPairedBatchBuilder`, and `PertTFPairedBatchLoader`, all re-exported
   from `perturb_data_lab.loaders`.
 - Rows with null required pertTF labels (`cell_context`, `perturb_label`,
-  `batch_id`) are dropped by default with a `RuntimeWarning`; the effective row
-  counts remain visible via `perttf_loader.null_label_filter_stats` and the
-  `effective_*_indices` attributes.
+  `batch_id`) now fail fast during adapter/loader construction; use
+  `row_indices`, `source_indices`, or `target_candidate_indices` to restrict the
+  loader to a valid subset when needed.
 - `set_epoch(epoch)` is available for deterministic reshuffling between epochs.
 - When `num_workers > 0`, the loader keeps pair planning in the main process and
   uses worker processes only for source/target expression reads.

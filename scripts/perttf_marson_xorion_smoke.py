@@ -51,27 +51,6 @@ def _max_rss_mib() -> float:
     return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
 
 
-def _null_label_filter_stats_summary(stats) -> dict[str, Any]:
-    if stats is None:
-        return {
-            "policy": "none",
-            "checked_row_count": 0,
-            "kept_row_count": 0,
-            "dropped_row_count": 0,
-            "per_column_null_counts": {},
-        }
-    return {
-        "policy": str(stats.policy),
-        "checked_row_count": int(stats.checked_row_count),
-        "kept_row_count": int(stats.kept_row_count),
-        "dropped_row_count": int(stats.dropped_row_count),
-        "per_column_null_counts": {
-            str(column): int(count)
-            for column, count in stats.per_column_null_counts.items()
-        },
-    }
-
-
 @dataclass(frozen=True)
 class DatasetEntry:
     dataset_id: str
@@ -359,7 +338,6 @@ def _write_markdown_summary(path: Path, summary: dict[str, Any]) -> None:
                 f"- `Effective Label Rows`: `{summary['loader']['effective_label_row_count']}` / `{summary['loader']['total_row_count']}`",
                 f"- `Effective Source Rows`: `{summary['loader']['effective_source_row_count']}`",
                 f"- `Effective Target Candidate Rows`: `{summary['loader']['effective_target_candidate_row_count']}`",
-                f"- `Dropped Null-Label Rows`: `{summary['loader']['null_label_filter_stats']['dropped_row_count']}` ({summary['loader']['null_label_filter_stats']['per_column_null_counts']})",
                 "",
                 "## HVG Discovery",
                 "",
@@ -515,18 +493,15 @@ def main() -> None:
         num_workers=int(args.num_workers),
         multiprocessing_context=multiprocessing_context,
     )
-    null_label_filter_stats = _null_label_filter_stats_summary(loader.null_label_filter_stats)
     if not loader.effective_label_row_indices.size:
-        raise RuntimeError("public pertTF loader resolved no usable rows after null-label dropping")
+        raise RuntimeError("public pertTF loader resolved no usable rows")
     loader_seconds = time.monotonic() - loader_start
     _log(
         "Built public pertTF loader in "
         f"{loader_seconds:.2f}s with "
         f"{len(loader.effective_label_row_indices)} effective label rows, "
         f"{len(loader.effective_source_indices)} effective source rows, "
-        f"{len(loader.effective_target_candidate_indices)} effective target rows, "
-        f"dropped {null_label_filter_stats['dropped_row_count']} rows "
-        f"{null_label_filter_stats['per_column_null_counts']}"
+        f"{len(loader.effective_target_candidate_indices)} effective target rows"
     )
 
     dataset_state = dict(loader._data_loader.dataset.__dict__)
@@ -583,7 +558,6 @@ def main() -> None:
             "effective_target_candidate_row_count": int(
                 len(loader.effective_target_candidate_indices)
             ),
-            "null_label_filter_stats": null_label_filter_stats,
         },
         "batch": {
             "hvg_top_k": int(args.hvg_top_k),

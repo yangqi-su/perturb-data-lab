@@ -987,7 +987,6 @@ def test_public_paired_batch_loader_selected_row_pool_ignores_null_rows_outside_
 
     assert batch["index"].tolist() == [1]
     assert batch["next_index"].tolist() == [1]
-    assert loader.null_label_filter_stats is None
     assert loader.effective_label_row_indices.tolist() == [1]
     assert loader.effective_source_indices.tolist() == [1]
     assert loader.effective_target_candidate_indices.tolist() == [1]

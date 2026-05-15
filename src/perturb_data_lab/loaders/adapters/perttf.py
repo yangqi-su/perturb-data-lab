@@ -1,9 +1,4 @@
-"""pertTF-specific vocab and label adapters built inside perturb-data-lab.
-
-This module prepares pertTF-compatible mapping objects from a loaded
-``perturb-data-lab`` corpus without importing or modifying the external
-``pertTF`` repository.
-"""
+"""Slim pertTF adapter, sampler, and batch builder wrappers."""
 
 from __future__ import annotations
 
@@ -67,7 +62,7 @@ def _derive_perttf_stream_seed(
 
 @dataclass(frozen=True)
 class PertTFAdapterConfig:
-    """Configuration for pertTF-local adapter surfaces."""
+    """Configuration for the retained pertTF wrapper surface."""
 
     cell_context_column: str = "cell_context"
     perturbation_column: str = "perturb_label"
@@ -313,7 +308,7 @@ def _build_label_fields(
 
 @dataclass(frozen=True)
 class PerturbationPairBatch:
-    """Paired source/target metadata spec for pertTF-style perturbation batches."""
+    """Paired source and target metadata for one pertTF batch."""
 
     source_indices: np.ndarray
     target_indices: np.ndarray
@@ -335,8 +330,6 @@ class PerturbationPairBatch:
 
 @dataclass(frozen=True)
 class _PertTFPairBatchPlan:
-    """Deterministic source-batch plan for one pertTF paired request."""
-
     source_indices: np.ndarray
     batch_index: int
     seed: int
@@ -344,12 +337,7 @@ class _PertTFPairBatchPlan:
 
 
 class PerturbationPairSampler:
-    """Sample same-dataset/context source-target perturbation pairs.
-
-    Optional source and target candidate pools let callers restrict which
-    corpus-global rows can appear as sampled sources and paired targets while
-    preserving the existing same-dataset and same-context pairing invariants.
-    """
+    """Sample same-dataset, same-context source/target perturbation pairs."""
 
     def __init__(
         self,
@@ -455,10 +443,6 @@ class PerturbationPairSampler:
                 config=resolved_config,
                 row_indices=self.effective_label_row_indices,
             )
-        self.null_label_filter_stats = None
-        self.source_null_label_filter_stats = None
-        self.target_candidate_null_label_filter_stats = None
-
         if metadata_index.get_column("dataset_index") is None:
             raise ValueError("metadata_index is missing required column 'dataset_index'")
 
@@ -861,8 +845,6 @@ class _PertTFPairReadRequest:
 
 
 class _PertTFPairReadBatchSampler:
-    """Wrap ``PerturbationPairSampler`` into pre-batched raw-read requests."""
-
     def __init__(self, pair_sampler: PerturbationPairSampler) -> None:
         self._pair_sampler = pair_sampler
 
@@ -885,8 +867,6 @@ class _PertTFPairReadBatchSampler:
 
 
 class _PertTFPairExpressionDataset:
-    """Worker-light dataset that reads paired source/target raw expression only."""
-
     def __init__(
         self,
         expression_reader: Any,
@@ -965,8 +945,6 @@ def _collate_expression_like_raw_batch(raw_batch: dict[str, Any]) -> dict[str, A
 
 
 def _collate_perttf_raw_pair_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
-    """Unwrap one paired raw-read item for main-process pertTF assembly."""
-
     if len(items) != 1:
         raise ValueError("paired raw pair collate expected exactly one item")
     batch = items[0]
@@ -1031,13 +1009,7 @@ def _resolve_perttf_loader_row_pools(
 
 
 class PertTFPairedBatchBuilder:
-    """Build pertTF-compatible paired source/target batches from corpus rows.
-
-    When ``include_full_expr=True``, this also emits union-vocabulary dense
-    expression tensors plus per-row presence masks. Those masks are intended
-    for future pertTF-side loss changes and are emitted here without modifying
-    the external ``pertTF`` repository.
-    """
+    """Build pertTF-style paired source/target batches from corpus rows."""
 
     def __init__(
         self,
@@ -1493,7 +1465,7 @@ class PertTFPairedBatchBuilder:
 
 @dataclass(frozen=True)
 class PertTFCorpusAdapter:
-    """Bundle pertTF-local vocab and label mappings for one loaded corpus."""
+    """Bundle pertTF vocab and label mappings for one loaded corpus."""
 
     config: PertTFAdapterConfig
     special_tokens: tuple[str, ...]
@@ -1509,8 +1481,6 @@ class PertTFCorpusAdapter:
     perturbation_to_index: dict[str, int]
     batch_to_index: dict[str, int]
     control_label_ids: tuple[int, ...]
-    null_label_filter_stats: Any | None = None
-
     @classmethod
     def from_corpus(
         cls,
@@ -1723,9 +1693,6 @@ class PertTFPairedBatchLoader:
         self.effective_target_candidate_indices = (
             self.pair_sampler.effective_target_candidate_indices.copy()
         )
-        self.null_label_filter_stats = None
-        self.source_null_label_filter_stats = None
-        self.target_candidate_null_label_filter_stats = None
         self._request_sampler = _PertTFPairReadBatchSampler(self.pair_sampler)
         self._dataset = _PertTFPairExpressionDataset(
             corpus.expression_reader,

@@ -13,7 +13,11 @@ from perturb_data_lab.loaders import (
     FeatureRegistry,
     MetadataIndex,
     PertTFAdapterConfig,
+    PertTFPairedBatchBuilder,
+    PertTFPairedBatchLoader,
     PertTFCorpusAdapter,
+    PerturbationPairBatch,
+    PerturbationPairSampler,
     load_corpus,
 )
 
@@ -236,3 +240,20 @@ def test_removed_mapping_helpers_are_no_longer_public_exports() -> None:
         assert name not in adapter_exports.__all__
         assert not hasattr(loader_exports, name)
         assert not hasattr(adapter_exports, name)
+
+
+def test_retained_perttf_classes_still_import_from_public_modules() -> None:
+    expected = {
+        "PertTFAdapterConfig": PertTFAdapterConfig,
+        "PertTFCorpusAdapter": PertTFCorpusAdapter,
+        "PerturbationPairBatch": PerturbationPairBatch,
+        "PerturbationPairSampler": PerturbationPairSampler,
+        "PertTFPairedBatchBuilder": PertTFPairedBatchBuilder,
+        "PertTFPairedBatchLoader": PertTFPairedBatchLoader,
+    }
+
+    for name, expected_object in expected.items():
+        assert name in loader_exports.__all__
+        assert name in adapter_exports.__all__
+        assert getattr(loader_exports, name) is expected_object
+        assert getattr(adapter_exports, name) is expected_object
