@@ -339,6 +339,57 @@ class _PertTFRowSelection:
     target_candidate_indices: np.ndarray
 
 
+@dataclass(frozen=True)
+class _PertTFEncodedMetadataTable:
+    """Compact label/size-factor state keyed by corpus-global row indices.
+
+    Public sampler and loader paths continue to use corpus-global row indices.
+    The local compact positions here are private implementation details used only
+    for fast metadata lookup after filtering.
+    """
+
+    global_row_indices: np.ndarray
+    global_to_local: dict[int, int]
+    labels_by_name: dict[str, tuple[str, ...]]
+    label_to_index_by_name: dict[str, dict[str, int]]
+    label_ids_by_name: dict[str, np.ndarray]
+    size_factor: np.ndarray | None
+
+    def positions_for_global_rows(self, global_indices: np.ndarray) -> np.ndarray:
+        normalized = np.asarray(global_indices, dtype=np.int64)
+        positions = np.empty(normalized.shape, dtype=np.int64)
+        for offset, global_idx in enumerate(normalized.tolist()):
+            try:
+                positions[offset] = self.global_to_local[int(global_idx)]
+            except KeyError as exc:
+                raise KeyError(
+                    f"encoded metadata table is missing global row {int(global_idx)}"
+                ) from exc
+        return positions
+
+    def take_label_ids(self, name: str, global_indices: np.ndarray) -> np.ndarray:
+        try:
+            label_ids = self.label_ids_by_name[name]
+        except KeyError as exc:
+            raise KeyError(f"encoded metadata table is missing label field {name!r}") from exc
+        return label_ids[self.positions_for_global_rows(global_indices)]
+
+    def take_labels(self, name: str, global_indices: np.ndarray) -> tuple[str, ...]:
+        try:
+            labels = self.labels_by_name[name]
+        except KeyError as exc:
+            raise KeyError(f"encoded metadata table is missing label field {name!r}") from exc
+        return tuple(
+            labels[int(label_id)]
+            for label_id in self.take_label_ids(name, global_indices).tolist()
+        )
+
+    def take_size_factor(self, global_indices: np.ndarray) -> np.ndarray | None:
+        if self.size_factor is None:
+            return None
+        return self.size_factor[self.positions_for_global_rows(global_indices)]
+
+
 def _null_mask(values: Sequence[Any]) -> np.ndarray:
     return np.asarray([value is None for value in values], dtype=bool)
 
@@ -452,6 +503,98 @@ def _resolve_perttf_row_selection(
         base_indices=candidate_row_indices,
         source_indices=resolved_source_indices,
         target_candidate_indices=resolved_target_candidate_indices,
+    )
+
+
+def _build_encoded_metadata_table(
+    metadata_index: MetadataIndex,
+    *,
+    config: PertTFAdapterConfig,
+    base_indices: Sequence[int] | np.ndarray,
+    labels_by_name: dict[str, tuple[str, ...]] | None = None,
+    label_to_index_by_name: dict[str, dict[str, int]] | None = None,
+) -> _PertTFEncodedMetadataTable:
+    global_row_indices = np.asarray(base_indices, dtype=np.int64)
+    if global_row_indices.ndim != 1:
+        raise ValueError("base_indices must be a 1-D sequence of corpus-global row indices")
+    if global_row_indices.size == 0:
+        raise ValueError("encoded metadata row pool is empty")
+
+    requested_columns = list(config.metadata_columns)
+    if "size_factor" in metadata_index.df.columns:
+        requested_columns.append("size_factor")
+    loaded_metadata = metadata_index.take(global_row_indices, columns=requested_columns)
+
+    resolved_labels_by_name: dict[str, tuple[str, ...]] = {}
+    resolved_label_to_index_by_name: dict[str, dict[str, int]] = {}
+    resolved_label_ids_by_name: dict[str, np.ndarray] = {}
+
+    preset_labels_by_name = labels_by_name or {}
+    preset_label_to_index_by_name = label_to_index_by_name or {}
+
+    for column, label_name in config.label_fields.items():
+        resolved_values = _resolve_loaded_label_values(
+            loaded_metadata[column],
+            config=config,
+            label_name=label_name,
+            column=column,
+            pool_name="encoded metadata row pool",
+        )
+        label_vocab = preset_labels_by_name.get(label_name)
+        label_to_index = preset_label_to_index_by_name.get(label_name)
+        if label_vocab is None:
+            prepend_labels = (
+                config.control_labels if label_name == config.perturbation_label else ()
+            )
+            label_vocab = _ordered_unique(
+                [
+                    *[str(label) for label in prepend_labels],
+                    *resolved_values,
+                ]
+            )
+        else:
+            label_vocab = tuple(str(label) for label in label_vocab)
+        if not label_vocab:
+            raise ValueError(f"label field {label_name!r} must contain at least one label")
+        if label_to_index is None:
+            label_to_index = {label: idx for idx, label in enumerate(label_vocab)}
+        else:
+            label_to_index = {
+                str(label): int(index)
+                for label, index in label_to_index.items()
+            }
+        try:
+            label_ids = _encode_labels(
+                label_to_index,
+                map_name=label_name,
+                column=column,
+                labels=resolved_values,
+            )
+        except KeyError as exc:
+            raise ValueError(
+                "encoded metadata table mappings are missing labels required by "
+                "the filtered row pool"
+            ) from exc
+        resolved_labels_by_name[label_name] = label_vocab
+        resolved_label_to_index_by_name[label_name] = label_to_index
+        resolved_label_ids_by_name[label_name] = label_ids
+
+    size_factor: np.ndarray | None = None
+    if "size_factor" in loaded_metadata:
+        size_factor_values = np.asarray(loaded_metadata["size_factor"], dtype=np.float32)
+        if size_factor_values.size != 0 and not np.isnan(size_factor_values).all():
+            size_factor = size_factor_values
+
+    return _PertTFEncodedMetadataTable(
+        global_row_indices=global_row_indices.copy(),
+        global_to_local={
+            int(global_row_index): local_position
+            for local_position, global_row_index in enumerate(global_row_indices.tolist())
+        },
+        labels_by_name=resolved_labels_by_name,
+        label_to_index_by_name=resolved_label_to_index_by_name,
+        label_ids_by_name=resolved_label_ids_by_name,
+        size_factor=size_factor,
     )
 
 
@@ -589,33 +732,19 @@ def _build_label_fields(
         source_indices=None,
         target_candidate_indices=None,
     ).base_indices
-    if effective_row_indices.size == 0:
-        raise ValueError("label row pool is empty")
-    cell_context_labels, cell_context_to_index = _build_label_mapping(
+    encoded_metadata = _build_encoded_metadata_table(
         metadata_index,
-        map_name="cell_context",
-        label_name="celltype",
-        column=config.cell_context_column,
         config=config,
-        row_indices=effective_row_indices,
+        base_indices=effective_row_indices,
     )
-    perturbation_labels, perturbation_to_index = _build_label_mapping(
-        metadata_index,
-        map_name="perturbation",
-        label_name=config.perturbation_label,
-        column=config.perturbation_column,
-        config=config,
-        row_indices=effective_row_indices,
-        prepend_labels=config.control_labels,
-    )
-    batch_labels, batch_to_index = _build_label_mapping(
-        metadata_index,
-        map_name="batch",
-        label_name="batch",
-        column=config.batch_column,
-        config=config,
-        row_indices=effective_row_indices,
-    )
+    cell_context_labels = encoded_metadata.labels_by_name["celltype"]
+    perturbation_labels = encoded_metadata.labels_by_name[config.perturbation_label]
+    batch_labels = encoded_metadata.labels_by_name["batch"]
+    cell_context_to_index = encoded_metadata.label_to_index_by_name["celltype"]
+    perturbation_to_index = encoded_metadata.label_to_index_by_name[
+        config.perturbation_label
+    ]
+    batch_to_index = encoded_metadata.label_to_index_by_name["batch"]
     control_label_ids = tuple(
         perturbation_to_index[str(label)]
         for label in config.control_labels
@@ -714,34 +843,35 @@ class PerturbationPairSampler:
         self.effective_target_candidate_indices = (
             row_selection.target_candidate_indices.copy()
         )
-        self.effective_label_row_indices = np.unique(
-            np.concatenate(
-                [
-                    self.effective_source_indices,
-                    self.effective_target_candidate_indices,
-                ]
-            ).astype(np.int64, copy=False)
-        )
+        self.effective_label_row_indices = row_selection.base_indices.copy()
         if self.effective_label_row_indices.size == 0:
             raise ValueError("label row pool is empty")
+        preset_labels_by_name: dict[str, tuple[str, ...]] = {}
+        preset_label_to_index_by_name: dict[str, dict[str, int]] = {}
         if adapter is not None:
-            self._cell_context_to_index = dict(adapter.cell_context_to_index)
-            self._perturbation_to_index = dict(adapter.perturbation_to_index)
-            self._batch_to_index = dict(adapter.batch_to_index)
-        else:
-            (
-                _,
-                _,
-                _,
-                self._cell_context_to_index,
-                self._perturbation_to_index,
-                self._batch_to_index,
-                _,
-            ) = _build_label_fields(
-                metadata_index,
-                config=resolved_config,
-                row_indices=self.effective_label_row_indices,
-            )
+            for label_name, labels, label_to_index in (
+                ("celltype", adapter.cell_context_labels, adapter.cell_context_to_index),
+                (
+                    resolved_config.perturbation_label,
+                    adapter.perturbation_labels,
+                    adapter.perturbation_to_index,
+                ),
+                ("batch", adapter.batch_labels, adapter.batch_to_index),
+            ):
+                preset_labels_by_name[label_name] = tuple(labels)
+                preset_label_to_index_by_name[label_name] = dict(label_to_index)
+        self._encoded_metadata_table = _build_encoded_metadata_table(
+            metadata_index,
+            config=resolved_config,
+            base_indices=self.effective_label_row_indices,
+            labels_by_name=preset_labels_by_name or None,
+            label_to_index_by_name=preset_label_to_index_by_name or None,
+        )
+        self._perturbation_to_index = dict(
+            self._encoded_metadata_table.label_to_index_by_name[
+                self.config.perturbation_label
+            ]
+        )
         if metadata_index.get_column("dataset_index") is None:
             raise ValueError("metadata_index is missing required column 'dataset_index'")
 
@@ -874,13 +1004,10 @@ class PerturbationPairSampler:
         )
 
     def _row_position(self, row_idx: int) -> int:
-        return self._row_position_by_index[int(row_idx)]
+        return self._encoded_metadata_table.global_to_local[int(row_idx)]
 
     def _row_positions(self, row_indices: np.ndarray) -> np.ndarray:
-        return np.asarray(
-            [self._row_position(int(row_idx)) for row_idx in row_indices.tolist()],
-            dtype=np.int64,
-        )
+        return self._encoded_metadata_table.positions_for_global_rows(row_indices)
 
     def _load_row_metadata(
         self,
@@ -889,67 +1016,31 @@ class PerturbationPairSampler:
         relevant_indices = self.effective_label_row_indices.copy()
         relevant_metadata = metadata_index.take(
             relevant_indices,
-            columns=[
-                "dataset_index",
-                self.config.cell_context_column,
-                self.config.perturbation_column,
-                self.config.batch_column,
-            ],
+            columns=["dataset_index"],
         )
         relevant_dataset_indices = np.asarray(
             relevant_metadata["dataset_index"],
             dtype=np.int32,
         )
-        relevant_context_labels = _resolve_loaded_label_values(
-            relevant_metadata[self.config.cell_context_column],
-            config=self.config,
-            label_name="celltype",
-            column=self.config.cell_context_column,
-            pool_name="effective label row pool",
+        relevant_context_ids = self._encoded_metadata_table.label_ids_by_name["celltype"]
+        relevant_perturbation_ids = self._encoded_metadata_table.label_ids_by_name[
+            self.config.perturbation_label
+        ]
+        relevant_batch_ids = self._encoded_metadata_table.label_ids_by_name["batch"]
+        relevant_context_labels = tuple(
+            self._encoded_metadata_table.labels_by_name["celltype"][int(label_id)]
+            for label_id in relevant_context_ids.tolist()
         )
-        relevant_perturbation_labels = _resolve_loaded_label_values(
-            relevant_metadata[self.config.perturbation_column],
-            config=self.config,
-            label_name=self.config.perturbation_label,
-            column=self.config.perturbation_column,
-            pool_name="effective label row pool",
+        relevant_perturbation_labels = tuple(
+            self._encoded_metadata_table.labels_by_name[self.config.perturbation_label][
+                int(label_id)
+            ]
+            for label_id in relevant_perturbation_ids.tolist()
         )
-        relevant_batch_labels = _resolve_loaded_label_values(
-            relevant_metadata[self.config.batch_column],
-            config=self.config,
-            label_name="batch",
-            column=self.config.batch_column,
-            pool_name="effective label row pool",
+        relevant_batch_labels = tuple(
+            self._encoded_metadata_table.labels_by_name["batch"][int(label_id)]
+            for label_id in relevant_batch_ids.tolist()
         )
-        try:
-            relevant_context_ids = _encode_labels(
-                self._cell_context_to_index,
-                map_name="cell_context",
-                column=self.config.cell_context_column,
-                labels=relevant_context_labels,
-            )
-            relevant_perturbation_ids = _encode_labels(
-                self._perturbation_to_index,
-                map_name="perturbation",
-                column=self.config.perturbation_column,
-                labels=relevant_perturbation_labels,
-            )
-            relevant_batch_ids = _encode_labels(
-                self._batch_to_index,
-                map_name="batch",
-                column=self.config.batch_column,
-                labels=relevant_batch_labels,
-            )
-        except KeyError as exc:
-            raise ValueError(
-                "adapter mappings are missing labels required by the effective "
-                "source/target row pools"
-            ) from exc
-
-        self._row_position_by_index = {
-            int(row_idx): offset
-            for offset, row_idx in enumerate(relevant_indices.tolist())
-        }
         self._row_dataset_indices = relevant_dataset_indices
         self._row_context_labels = relevant_context_labels
         self._row_perturbation_labels = relevant_perturbation_labels
