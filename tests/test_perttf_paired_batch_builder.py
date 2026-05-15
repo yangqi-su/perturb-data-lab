@@ -546,7 +546,7 @@ def test_build_from_raw_pair_batch_rejects_row_order_mismatch(
         builder.build_from_raw_pair_batch(pair_batch, source_raw, target_raw)
 
 
-def test_build_from_raw_pair_batch_rejects_missing_required_label_ids(
+def test_build_from_raw_pair_batch_rejects_target_perturbation_shape_mismatch(
     tmp_path: Path,
 ) -> None:
     config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
@@ -561,43 +561,12 @@ def test_build_from_raw_pair_batch_rejects_missing_required_label_ids(
 
     invalid_pair_batch = replace(
         pair_batch,
-        target_label_ids_by_name={
-            label_name: label_ids
-            for label_name, label_ids in pair_batch.target_label_ids_by_name.items()
-            if label_name != "celltype"
-        },
+        target_perturbation_ids=np.asarray([0], dtype=np.int64),
     )
     source_raw = corpus.inspect_batch(pair_batch.source_indices)
     target_raw = corpus.inspect_batch(pair_batch.target_indices)
 
-    with pytest.raises(ValueError, match="missing label field 'celltype'"):
-        builder.build_from_raw_pair_batch(invalid_pair_batch, source_raw, target_raw)
-
-
-def test_build_from_raw_pair_batch_rejects_label_id_shape_mismatch(
-    tmp_path: Path,
-) -> None:
-    config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
-    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
-    pair_batch = PerturbationPairSampler(
-        corpus.metadata_index,
-        batch_size=2,
-        config=config,
-        seed=7,
-    ).pair_source_indices([0, 1], seed=11)
-    builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
-
-    invalid_pair_batch = replace(
-        pair_batch,
-        target_label_ids_by_name={
-            **pair_batch.target_label_ids_by_name,
-            "celltype": np.asarray([9], dtype=np.int64),
-        },
-    )
-    source_raw = corpus.inspect_batch(pair_batch.source_indices)
-    target_raw = corpus.inspect_batch(pair_batch.target_indices)
-
-    with pytest.raises(ValueError, match=r"label field 'celltype'.*expected \(2,\)"):
+    with pytest.raises(ValueError, match="target_perturbation_ids"):
         builder.build_from_raw_pair_batch(invalid_pair_batch, source_raw, target_raw)
 
 
@@ -651,10 +620,7 @@ def _assert_pair_read_batch_matches_builder(
         source_raw["global_row_index"],
         torch.as_tensor(expected_source_raw["global_row_index"], dtype=torch.long),
     )
-    torch.testing.assert_close(
-        source_raw["dataset_index"],
-        torch.as_tensor(expected_source_raw["dataset_index"], dtype=torch.long),
-    )
+    assert "dataset_index" not in source_raw
     torch.testing.assert_close(
         source_raw["row_offsets"],
         torch.as_tensor(expected_source_raw["row_offsets"], dtype=torch.long),
@@ -672,10 +638,7 @@ def _assert_pair_read_batch_matches_builder(
         target_raw["global_row_index"],
         torch.as_tensor(expected_target_raw["global_row_index"], dtype=torch.long),
     )
-    torch.testing.assert_close(
-        target_raw["dataset_index"],
-        torch.as_tensor(expected_target_raw["dataset_index"], dtype=torch.long),
-    )
+    assert "dataset_index" not in target_raw
     torch.testing.assert_close(
         target_raw["row_offsets"],
         torch.as_tensor(expected_target_raw["row_offsets"], dtype=torch.long),

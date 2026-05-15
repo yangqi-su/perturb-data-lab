@@ -100,11 +100,7 @@ def test_default_pairing_can_cross_dataset_and_context_when_unconstrained() -> N
 
     np.testing.assert_array_equal(batch.source_indices, np.asarray([0], dtype=np.int64))
     np.testing.assert_array_equal(batch.target_indices, np.asarray([7], dtype=np.int64))
-    assert batch.source_dataset_indices.tolist() == [0]
-    assert batch.target_dataset_indices.tolist() == [1]
-    assert batch.source_labels_by_name["celltype"] == ("T_cell",)
-    assert batch.target_labels_by_name["celltype"] == ("B_cell",)
-    assert batch.target_labels_by_name["perturbation"] == ("KO_D",)
+    np.testing.assert_array_equal(batch.target_perturbation_ids, np.asarray([4], dtype=np.int64))
 
 
 def test_explicit_dataset_pairing_uses_configured_dataset_label() -> None:
@@ -121,7 +117,6 @@ def test_explicit_dataset_pairing_uses_configured_dataset_label() -> None:
     batch = sampler.pair_source_indices([0], seed=11)
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([1], dtype=np.int64))
-    assert batch.source_labels_by_name["dataset"] == batch.target_labels_by_name["dataset"]
 
 
 def test_explicit_dataset_and_celltype_pairing_uses_both_group_labels() -> None:
@@ -138,8 +133,6 @@ def test_explicit_dataset_and_celltype_pairing_uses_both_group_labels() -> None:
     batch = sampler.pair_source_indices([3], seed=11)
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([4], dtype=np.int64))
-    assert batch.source_labels_by_name["dataset"] == batch.target_labels_by_name["dataset"]
-    assert batch.source_labels_by_name["celltype"] == batch.target_labels_by_name["celltype"]
 
 
 def test_perturbed_sources_default_to_self_with_control_label_override() -> None:
@@ -153,11 +146,7 @@ def test_perturbed_sources_default_to_self_with_control_label_override() -> None
     batch = sampler.pair_source_indices([1, 6])
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([1, 6], dtype=np.int64))
-    assert batch.target_labels_by_name["perturbation"] == ("WT", "WT")
-    np.testing.assert_array_equal(
-        batch.target_label_ids_by_name["perturbation"],
-        np.asarray([0, 0], dtype=np.int64),
-    )
+    np.testing.assert_array_equal(batch.target_perturbation_ids, np.asarray([0, 0], dtype=np.int64))
 
 
 def test_matched_control_policy_respects_explicit_pairing_groups() -> None:
@@ -172,9 +161,7 @@ def test_matched_control_policy_respects_explicit_pairing_groups() -> None:
     batch = sampler.pair_source_indices([1, 2, 6], seed=19)
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([0, 0, 5], dtype=np.int64))
-    assert batch.target_labels_by_name["perturbation"] == ("WT", "WT", "WT")
-    assert batch.source_labels_by_name["dataset"] == batch.target_labels_by_name["dataset"]
-    assert batch.source_labels_by_name["celltype"] == batch.target_labels_by_name["celltype"]
+    np.testing.assert_array_equal(batch.target_perturbation_ids, np.asarray([0, 0, 0], dtype=np.int64))
 
 
 def test_missing_target_pool_raises_explicit_error() -> None:
@@ -229,7 +216,7 @@ def test_prepared_metadata_compacts_rows_and_keeps_polars_frame() -> None:
         "KO_A",
     )
     np.testing.assert_allclose(
-        prepared.size_factor[_positions_for_global_rows(prepared, np.asarray([1, 4], dtype=np.int64))],
+        np.asarray(prepared.frame["size_factor"])[_positions_for_global_rows(prepared, np.asarray([1, 4], dtype=np.int64))],
         np.asarray([1.1, 1.0], dtype=np.float32),
     )
 
@@ -305,8 +292,7 @@ def test_default_non_perturbation_null_labels_are_encoded() -> None:
     batch = sampler.pair_source_indices([0], seed=19)
 
     np.testing.assert_array_equal(sampler.effective_source_indices, np.asarray([0, 1], dtype=np.int64))
-    assert batch.source_labels_by_name["celltype"] == ("<null>",)
-    assert batch.target_labels_by_name["celltype"] == ("<null>",)
+    np.testing.assert_array_equal(batch.source_indices, np.asarray([0], dtype=np.int64))
 
 
 def test_sampler_supports_perturbation_as_only_required_semantic_label() -> None:
@@ -322,10 +308,8 @@ def test_sampler_supports_perturbation_as_only_required_semantic_label() -> None
 
     batch = sampler.pair_source_indices([0], seed=29)
 
-    assert tuple(batch.source_label_ids_by_name) == ("perturbation",)
-    assert tuple(batch.target_label_ids_by_name) == ("perturbation",)
     np.testing.assert_array_equal(batch.target_indices, np.asarray([6], dtype=np.int64))
-    assert batch.target_labels_by_name["perturbation"] == ("KO_A",)
+    np.testing.assert_array_equal(batch.target_perturbation_ids, np.asarray([1], dtype=np.int64))
 
 
 def test_custom_drop_null_labels_removes_selected_base_pool() -> None:
@@ -368,8 +352,6 @@ def test_asymmetric_target_candidate_pool_preserves_pairing_invariants() -> None
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([2, 4, 5], dtype=np.int64))
     assert set(batch.target_indices.tolist()).issubset({2, 4, 5})
-    assert batch.source_labels_by_name["dataset"] == batch.target_labels_by_name["dataset"]
-    assert batch.source_labels_by_name["celltype"] == batch.target_labels_by_name["celltype"]
 
 
 def test_restricted_target_pool_can_make_source_unpairable() -> None:
@@ -416,8 +398,7 @@ def test_sampler_iteration_is_seed_deterministic_and_preserves_pairing_invariant
     for batch_a, batch_b in zip(batches_a, batches_b, strict=True):
         np.testing.assert_array_equal(batch_a.source_indices, batch_b.source_indices)
         np.testing.assert_array_equal(batch_a.target_indices, batch_b.target_indices)
-        assert batch_a.source_labels_by_name["dataset"] == batch_a.target_labels_by_name["dataset"]
-        assert batch_a.source_labels_by_name["celltype"] == batch_a.target_labels_by_name["celltype"]
+        np.testing.assert_array_equal(batch_a.target_perturbation_ids, batch_b.target_perturbation_ids)
 
 
 def test_sampler_set_epoch_is_repeatable_and_changes_pair_sequence() -> None:

@@ -173,7 +173,6 @@ class _PertTFPreparedMetadata:
     label_ids_by_name: dict[str, np.ndarray]
     control_label_ids: tuple[int, ...]
     dataset_indices: np.ndarray
-    size_factor: np.ndarray | None
 
 
 def _intersect_preserving_order(
@@ -310,11 +309,9 @@ def _prepare_perttf_metadata(
         frame_columns[label_name] = list(resolved_values)
         frame_columns[f"{label_name}_id"] = label_ids
 
-    size_factor: np.ndarray | None = None
     if "size_factor" in selected_metadata:
         size_factor_values = np.asarray(selected_metadata["size_factor"], dtype=np.float32)
         if size_factor_values.size != 0 and not np.isnan(size_factor_values).all():
-            size_factor = size_factor_values
             frame_columns["size_factor"] = size_factor_values
 
     control_label_ids = tuple(
@@ -334,7 +331,6 @@ def _prepare_perttf_metadata(
         label_ids_by_name=resolved_label_ids_by_name,
         control_label_ids=control_label_ids,
         dataset_indices=np.asarray(frame_columns["dataset_index"], dtype=np.int32),
-        size_factor=size_factor,
     )
 
 
@@ -349,13 +345,15 @@ def _positions_for_global_rows(
     )
 
 
-def _take_prepared_size_factor(
+def _take_prepared_column(
     prepared_metadata: _PertTFPreparedMetadata,
     global_indices: np.ndarray,
-) -> np.ndarray | None:
-    if prepared_metadata.size_factor is None:
-        return None
-    return prepared_metadata.size_factor[_positions_for_global_rows(prepared_metadata, global_indices)]
+    column: str,
+    *,
+    dtype: Any,
+) -> np.ndarray:
+    positions = _positions_for_global_rows(prepared_metadata, global_indices)
+    return np.asarray(prepared_metadata.frame[column], dtype=dtype)[positions]
 
 
 def _build_vocab_fields(
@@ -440,12 +438,7 @@ class PerturbationPairBatch:
 
     source_indices: np.ndarray
     target_indices: np.ndarray
-    source_dataset_indices: np.ndarray
-    target_dataset_indices: np.ndarray
-    source_label_ids_by_name: dict[str, np.ndarray]
-    target_label_ids_by_name: dict[str, np.ndarray]
-    source_labels_by_name: dict[str, tuple[str, ...]]
-    target_labels_by_name: dict[str, tuple[str, ...]]
+    target_perturbation_ids: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -486,7 +479,6 @@ class PerturbationPairSampler:
             )
 
         resolved_config = adapter.config if adapter is not None else (config or PertTFAdapterConfig())
-        self._meta = metadata_index
         self.config = resolved_config
         self.batch_size = int(batch_size)
         self.seed = int(seed)
@@ -527,11 +519,6 @@ class PerturbationPairSampler:
         if self.effective_label_row_indices.size == 0:
             raise ValueError("label row pool is empty")
         self._prepared_metadata = prepared_metadata
-        self._perturbation_to_index = dict(
-            self._prepared_metadata.label_to_index_by_name[
-                self.config.perturbation_label
-            ]
-        )
         self._control_label_ids = tuple(int(label_id) for label_id in prepared_metadata.control_label_ids)
         self._control_label_id_set = frozenset(self._control_label_ids)
         if metadata_index.get_column("dataset_index") is None:
@@ -544,7 +531,6 @@ class PerturbationPairSampler:
             self._target_candidate_indices.copy()
         )
         self._source_row_count = int(self._source_indices.size)
-        self._row_dataset_indices = prepared_metadata.dataset_indices
         self._row_label_ids_by_name = {
             label_name: label_ids.copy()
             for label_name, label_ids in prepared_metadata.label_ids_by_name.items()
@@ -564,14 +550,8 @@ class PerturbationPairSampler:
         self.epoch = int(epoch)
 
     def __iter__(self):
-        for _, pair_batch in self._iter_planned_batches():
-            yield pair_batch
-
-    def _iter_planned_batches(
-        self,
-    ) -> Iterator[tuple[_PertTFPairBatchPlan, PerturbationPairBatch]]:
         for batch_plan in self._iter_batch_plans():
-            yield batch_plan, self.pair_source_indices(
+            yield self.pair_source_indices(
                 batch_plan.source_indices,
                 seed=batch_plan.seed,
             )
@@ -582,7 +562,7 @@ class PerturbationPairSampler:
         epoch = int(self.epoch)
         source_order = self._source_indices.copy()
         if self._source_row_count > 1:
-            rng = np.random.default_rng(self._shuffle_seed(epoch))
+            rng = np.random.default_rng(self._stream_seed(epoch, 0, 0))
             rng.shuffle(source_order)
         for batch_index, start in enumerate(
             range(0, self._source_row_count, self.batch_size)
@@ -593,24 +573,16 @@ class PerturbationPairSampler:
             yield _PertTFPairBatchPlan(
                 source_indices=source_indices.copy(),
                 batch_index=batch_index,
-                seed=self._batch_seed(epoch, batch_index),
+                seed=self._stream_seed(epoch, batch_index, 1),
                 epoch=epoch,
             )
 
-    def _shuffle_seed(self, epoch: int) -> int:
-        return _derive_perttf_stream_seed(
-            self.seed,
-            epoch=epoch,
-            batch_index=0,
-            stream_id=0,
-        )
-
-    def _batch_seed(self, epoch: int, batch_index: int) -> int:
+    def _stream_seed(self, epoch: int, batch_index: int, stream_id: int) -> int:
         return _derive_perttf_stream_seed(
             self.seed,
             epoch=epoch,
             batch_index=batch_index,
-            stream_id=1,
+            stream_id=stream_id,
         )
 
     def pair_source_indices(
@@ -674,28 +646,10 @@ class PerturbationPairSampler:
     def _row_position(self, row_idx: int) -> int:
         return self._prepared_metadata.global_to_local[int(row_idx)]
 
-    def _row_positions(self, row_indices: np.ndarray) -> np.ndarray:
-        return _positions_for_global_rows(self._prepared_metadata, row_indices)
-
     def _group_key_for_position(self, row_position: int) -> tuple[int, ...]:
         return tuple(
             int(self._row_label_ids_by_name[label_name][row_position])
             for label_name in self.config.pairing_group_labels
-        )
-
-    def _group_description(self, group_key: tuple[int, ...]) -> str:
-        if not self.config.pairing_group_labels:
-            return "the unconstrained pairing pool"
-        return ", ".join(
-            (
-                f"{label_name}="
-                f"{self._prepared_metadata.labels_by_name[label_name][int(label_id)]!r}"
-            )
-            for label_name, label_id in zip(
-                self.config.pairing_group_labels,
-                group_key,
-                strict=True,
-            )
         )
 
     def _build_target_pool_by_key(self) -> dict[tuple[int, ...], np.ndarray]:
@@ -766,8 +720,7 @@ class PerturbationPairSampler:
                 self._raise_missing_target(
                     source_idx,
                     reason=(
-                        "no treated target pool exists for control source within "
-                        f"{self._group_description(group_key)}"
+                        "no treated target pool exists for control source"
                     ),
                 )
             target_perturbation_id = int(rng.choice(candidate_perturbation_ids))
@@ -790,10 +743,7 @@ class PerturbationPairSampler:
         if control_pool is None or len(control_pool) == 0:
             self._raise_missing_target(
                 source_idx,
-                reason=(
-                    "no matched control pool exists for perturbed source within "
-                    f"{self._group_description(group_key)}"
-                ),
+                reason="no matched control pool exists for perturbed source",
             )
         target_idx = int(rng.choice(control_pool))
         target_position = self._row_position(target_idx)
@@ -820,53 +770,14 @@ class PerturbationPairSampler:
         target_indices: np.ndarray,
         target_perturbation_ids: np.ndarray,
     ) -> PerturbationPairBatch:
-        source_positions = self._row_positions(source_indices)
-        target_positions = self._row_positions(target_indices)
-        source_dataset_indices = self._row_dataset_indices[source_positions].astype(
-            np.int32,
-            copy=False,
-        )
-        target_dataset_indices = self._row_dataset_indices[target_positions].astype(
-            np.int32,
-            copy=False,
-        )
         resolved_target_perturbation_ids = np.asarray(
             target_perturbation_ids,
             dtype=np.int64,
         )
-        source_label_ids_by_name: dict[str, np.ndarray] = {}
-        target_label_ids_by_name: dict[str, np.ndarray] = {}
-        source_labels_by_name: dict[str, tuple[str, ...]] = {}
-        target_labels_by_name: dict[str, tuple[str, ...]] = {}
-        for label_name in self.config.label_names:
-            label_vocab = self._prepared_metadata.labels_by_name[label_name]
-            source_label_ids = self._row_label_ids_by_name[label_name][source_positions].astype(
-                np.int64,
-                copy=False,
-            )
-            target_label_ids = self._row_label_ids_by_name[label_name][target_positions].astype(
-                np.int64,
-                copy=False,
-            )
-            if label_name == self.config.perturbation_label:
-                target_label_ids = resolved_target_perturbation_ids.copy()
-            source_label_ids_by_name[label_name] = source_label_ids
-            target_label_ids_by_name[label_name] = target_label_ids
-            source_labels_by_name[label_name] = tuple(
-                label_vocab[int(label_id)] for label_id in source_label_ids.tolist()
-            )
-            target_labels_by_name[label_name] = tuple(
-                label_vocab[int(label_id)] for label_id in target_label_ids.tolist()
-            )
         return PerturbationPairBatch(
             source_indices=source_indices,
             target_indices=target_indices,
-            source_dataset_indices=source_dataset_indices,
-            target_dataset_indices=target_dataset_indices,
-            source_label_ids_by_name=source_label_ids_by_name,
-            target_label_ids_by_name=target_label_ids_by_name,
-            source_labels_by_name=source_labels_by_name,
-            target_labels_by_name=target_labels_by_name,
+            target_perturbation_ids=resolved_target_perturbation_ids,
         )
 
 
@@ -889,7 +800,11 @@ class _PertTFPairReadBatchSampler:
         self._pair_sampler.set_epoch(epoch)
 
     def __iter__(self):
-        for batch_plan, pair_batch in self._pair_sampler._iter_planned_batches():
+        for batch_plan in self._pair_sampler._iter_batch_plans():
+            pair_batch = self._pair_sampler.pair_source_indices(
+                batch_plan.source_indices,
+                seed=batch_plan.seed,
+            )
             yield [
                 _PertTFPairReadRequest(
                     pair_batch=pair_batch,
@@ -928,11 +843,9 @@ class _PertTFPairExpressionDataset:
                 "request": request,
                 "source_raw": self._read_raw_batch(
                     pair_batch.source_indices,
-                    dataset_indices=pair_batch.source_dataset_indices,
                 ),
                 "target_raw": self._read_raw_batch(
                     pair_batch.target_indices,
-                    dataset_indices=pair_batch.target_dataset_indices,
                 ),
             }
         ]
@@ -940,15 +853,12 @@ class _PertTFPairExpressionDataset:
     def _read_raw_batch(
         self,
         indices: np.ndarray,
-        *,
-        dataset_indices: np.ndarray,
     ) -> dict[str, Any]:
         index_array = np.asarray(indices, dtype=np.int64)
         expr = self._reader.read_expression_flat(index_array.tolist())
         batch: dict[str, Any] = {
             "batch_size": expr.batch_size,
             "global_row_index": expr.global_row_index,
-            "dataset_index": np.asarray(dataset_indices, dtype=np.int32),
             "row_offsets": expr.row_offsets,
             "expressed_gene_indices": expr.expressed_gene_indices,
             "expression_counts": expr.expression_counts,
@@ -963,10 +873,6 @@ def _collate_expression_like_raw_batch(raw_batch: dict[str, Any]) -> dict[str, A
             raw_batch["global_row_index"],
             dtype=torch.long,
         ),
-        "dataset_index": torch.as_tensor(
-            raw_batch["dataset_index"],
-            dtype=torch.long,
-        ),
         "row_offsets": torch.as_tensor(raw_batch["row_offsets"], dtype=torch.long),
         "expressed_gene_indices": torch.as_tensor(
             raw_batch["expressed_gene_indices"],
@@ -977,6 +883,11 @@ def _collate_expression_like_raw_batch(raw_batch: dict[str, Any]) -> dict[str, A
             dtype=torch.float32,
         ),
     }
+    if "dataset_index" in raw_batch:
+        result["dataset_index"] = torch.as_tensor(
+            raw_batch["dataset_index"],
+            dtype=torch.long,
+        )
     if "size_factor" in raw_batch:
         result["size_factor"] = torch.as_tensor(
             raw_batch["size_factor"],
@@ -1053,7 +964,15 @@ class PertTFPairedBatchBuilder:
         self._pad_token_id = int(self.adapter.stoi[self.config.pad_token])
         self._cls_token_id = int(self.adapter.stoi[self.config.cls_token])
         self._special_token_offset = self.adapter.special_token_offset
-        self._prepared_metadata = prepared_metadata
+        self._prepared_metadata = prepared_metadata or _prepare_perttf_metadata(
+            corpus.metadata_index,
+            config=self.config,
+            row_indices=None,
+            source_indices=None,
+            target_candidate_indices=None,
+            labels_by_name=self.adapter.labels_by_name,
+            label_to_index_by_name=self.adapter.label_to_index_by_name,
+        )
 
     def build_paired_batch(
         self,
@@ -1095,9 +1014,9 @@ class PertTFPairedBatchBuilder:
         hvg_top_k: int | None = None,
     ) -> dict[str, torch.Tensor]:
         self._validate_pair_batch(pair_batch)
+        source_raw = self._with_metadata_columns(source_raw)
+        target_raw = self._with_metadata_columns(target_raw)
         self._validate_raw_pair_batches(pair_batch, source_raw, target_raw)
-        source_raw = self._with_resolved_size_factor(source_raw)
-        target_raw = self._with_resolved_size_factor(target_raw)
 
         source_processed = self._pipeline.process_batch(
             source_raw,
@@ -1179,13 +1098,23 @@ class PertTFPairedBatchBuilder:
             ),
         }
         for label_name in self.config.label_names:
+            source_label_ids = self._label_ids_for_rows(
+                label_name,
+                pair_batch.source_indices,
+            )
+            target_label_ids = self._label_ids_for_rows(
+                label_name,
+                pair_batch.target_indices,
+            )
+            if label_name == self.config.perturbation_label:
+                target_label_ids = np.asarray(pair_batch.target_perturbation_ids, dtype=np.int64)
             batch[f"{label_name}_labels"] = torch.as_tensor(
-                pair_batch.source_label_ids_by_name[label_name],
+                source_label_ids,
                 dtype=torch.long,
                 device=self.device,
             )
             batch[f"{label_name}_labels_next"] = torch.as_tensor(
-                pair_batch.target_label_ids_by_name[label_name],
+                target_label_ids,
                 dtype=torch.long,
                 device=self.device,
             )
@@ -1203,62 +1132,37 @@ class PertTFPairedBatchBuilder:
 
     __call__ = build_paired_batch
 
-    def _with_resolved_size_factor(self, raw_batch: dict[str, Any]) -> dict[str, Any]:
-        if raw_batch.get("size_factor") is not None:
-            return raw_batch
+    def _with_metadata_columns(self, raw_batch: dict[str, Any]) -> dict[str, Any]:
         global_indices = self._raw_batch_numpy(raw_batch, "global_row_index", dtype=np.int64)
-        size_factor = self._take_compact_size_factor(global_indices)
-        if size_factor is None:
-            size_factor = self._take_metadata_size_factor(global_indices)
-        if size_factor is None:
-            return raw_batch
         resolved = dict(raw_batch)
-        resolved["size_factor"] = size_factor
+        resolved["dataset_index"] = _take_prepared_column(
+            self._prepared_metadata,
+            global_indices,
+            "dataset_index",
+            dtype=np.int32,
+        )
+        if "size_factor" in self._prepared_metadata.frame.columns:
+            resolved["size_factor"] = _take_prepared_column(
+                self._prepared_metadata,
+                global_indices,
+                "size_factor",
+                dtype=np.float32,
+            )
         return resolved
 
-    def _take_compact_size_factor(self, global_indices: np.ndarray) -> np.ndarray | None:
-        if self._prepared_metadata is None:
-            return None
-        try:
-            return _take_prepared_size_factor(self._prepared_metadata, global_indices)
-        except KeyError:
-            return None
-
-    def _take_metadata_size_factor(self, global_indices: np.ndarray) -> np.ndarray | None:
-        if "size_factor" not in self.corpus.metadata_index.df.columns:
-            return None
-        gathered = self.corpus.metadata_index.take(global_indices, columns=["size_factor"])
-        size_factor_values = np.asarray(gathered["size_factor"], dtype=np.float32)
-        if size_factor_values.size == 0 or np.isnan(size_factor_values).all():
-            return None
-        return size_factor_values
+    def _label_ids_for_rows(self, label_name: str, global_indices: np.ndarray) -> np.ndarray:
+        positions = _positions_for_global_rows(self._prepared_metadata, global_indices)
+        return self._prepared_metadata.label_ids_by_name[label_name][positions].astype(
+            np.int64,
+            copy=False,
+        )
 
     def _validate_pair_batch(self, pair_batch: PerturbationPairBatch) -> None:
         if pair_batch.source_indices.shape != pair_batch.target_indices.shape:
             raise ValueError("pair_batch source and target indices must have matching shapes")
-        for dict_name, label_ids_by_name, expected_shape in (
-            (
-                "source_label_ids_by_name",
-                pair_batch.source_label_ids_by_name,
-                pair_batch.source_indices.shape,
-            ),
-            (
-                "target_label_ids_by_name",
-                pair_batch.target_label_ids_by_name,
-                pair_batch.target_indices.shape,
-            ),
-        ):
-            for label_name in self.config.label_names:
-                if label_name not in label_ids_by_name:
-                    raise ValueError(
-                        f"pair_batch is missing label field {label_name!r} in {dict_name}"
-                    )
-                label_ids = np.asarray(label_ids_by_name[label_name], dtype=np.int64)
-                if label_ids.shape != expected_shape:
-                    raise ValueError(
-                        f"pair_batch label field {label_name!r} in {dict_name} "
-                        f"has shape {label_ids.shape}, expected {expected_shape}"
-                    )
+        target_perturbation_ids = np.asarray(pair_batch.target_perturbation_ids, dtype=np.int64)
+        if target_perturbation_ids.shape != pair_batch.source_indices.shape:
+            raise ValueError("pair_batch target_perturbation_ids must match source shape")
 
     def _validate_raw_batch_alignment(
         self,
@@ -1266,7 +1170,6 @@ class PertTFPairedBatchBuilder:
         raw_batch: dict[str, Any],
         *,
         expected_indices: np.ndarray,
-        expected_dataset_indices: np.ndarray,
     ) -> None:
         batch_size = int(raw_batch.get("batch_size", -1))
         expected_size = int(expected_indices.shape[0])
@@ -1284,45 +1187,28 @@ class PertTFPairedBatchBuilder:
                 f"{name} global_row_index does not match pair_batch ordering"
             )
 
-        raw_dataset_indices = self._raw_batch_numpy(
-            raw_batch,
-            "dataset_index",
-            dtype=np.int64,
-        )
-        expected_dataset_indices64 = np.asarray(expected_dataset_indices, dtype=np.int64)
-        if (
-            raw_dataset_indices.shape != expected_dataset_indices64.shape
-            or not np.array_equal(raw_dataset_indices, expected_dataset_indices64)
-        ):
-            raise ValueError(
-                f"{name} dataset_index does not match pair_batch dataset routing"
-            )
-
     def _validate_raw_pair_batches(
         self,
         pair_batch: PerturbationPairBatch,
         source_raw: dict[str, Any],
         target_raw: dict[str, Any],
     ) -> None:
-        for name, raw_batch, expected_indices, expected_dataset_indices in (
+        for name, raw_batch, expected_indices in (
             (
                 "source_raw",
                 source_raw,
                 pair_batch.source_indices,
-                pair_batch.source_dataset_indices,
             ),
             (
                 "target_raw",
                 target_raw,
                 pair_batch.target_indices,
-                pair_batch.target_dataset_indices,
             ),
         ):
             self._validate_raw_batch_alignment(
                 name,
                 raw_batch,
                 expected_indices=expected_indices,
-                expected_dataset_indices=expected_dataset_indices,
             )
 
     def _raw_batch_numpy(
