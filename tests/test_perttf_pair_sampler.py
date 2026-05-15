@@ -85,8 +85,42 @@ def _dataset_group_config(*group_labels: str, **kwargs) -> PertTFAdapterConfig:
     )
 
 
+def _build_sampler(
+    metadata_index: MetadataIndex,
+    *,
+    batch_size: int,
+    config: PertTFAdapterConfig,
+    row_indices=None,
+    source_indices=None,
+    target_candidate_indices=None,
+    seed: int = 0,
+    drop_last: bool = True,
+    perturbed_target_policy: str = "self_to_control_label",
+) -> PerturbationPairSampler:
+    prepared = _prepare_perttf_metadata(
+        metadata_index,
+        config=config,
+        row_indices=row_indices,
+        source_indices=source_indices,
+        target_candidate_indices=target_candidate_indices,
+    )
+    return PerturbationPairSampler(
+        prepared.frame,
+        batch_size=batch_size,
+        perturbation_column=f"{config.perturbation_label}_id",
+        control_perturbation_ids=prepared.control_label_ids,
+        pairing_group_columns=tuple(f"{label_name}_id" for label_name in config.pairing_group_labels),
+        source_positions=prepared.row_selection.source_positions,
+        target_candidate_positions=prepared.row_selection.target_candidate_positions,
+        global_positions="global_row_index",
+        seed=seed,
+        drop_last=drop_last,
+        perturbed_target_policy=perturbed_target_policy,
+    )
+
+
 def test_default_pairing_can_cross_dataset_and_context_when_unconstrained() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_metadata_index(),
         batch_size=1,
         config=_default_config(),
@@ -96,7 +130,7 @@ def test_default_pairing_can_cross_dataset_and_context_when_unconstrained() -> N
         drop_last=False,
     )
 
-    batch = sampler.pair_source_indices([0], seed=11)
+    batch = sampler.pair_source_positions([0], seed=11)
 
     np.testing.assert_array_equal(batch.source_indices, np.asarray([0], dtype=np.int64))
     np.testing.assert_array_equal(batch.target_indices, np.asarray([7], dtype=np.int64))
@@ -104,7 +138,7 @@ def test_default_pairing_can_cross_dataset_and_context_when_unconstrained() -> N
 
 
 def test_explicit_dataset_pairing_uses_configured_dataset_label() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_metadata_index(),
         batch_size=1,
         config=_dataset_group_config("dataset"),
@@ -114,13 +148,13 @@ def test_explicit_dataset_pairing_uses_configured_dataset_label() -> None:
         drop_last=False,
     )
 
-    batch = sampler.pair_source_indices([0], seed=11)
+    batch = sampler.pair_source_positions([0], seed=11)
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([1], dtype=np.int64))
 
 
 def test_explicit_dataset_and_celltype_pairing_uses_both_group_labels() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_metadata_index(),
         batch_size=1,
         config=_dataset_group_config("dataset", "celltype"),
@@ -130,27 +164,27 @@ def test_explicit_dataset_and_celltype_pairing_uses_both_group_labels() -> None:
         drop_last=False,
     )
 
-    batch = sampler.pair_source_indices([3], seed=11)
+    batch = sampler.pair_source_positions([3], seed=11)
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([4], dtype=np.int64))
 
 
 def test_perturbed_sources_default_to_self_with_control_label_override() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_metadata_index(),
         batch_size=4,
         config=_default_config(),
         seed=3,
     )
 
-    batch = sampler.pair_source_indices([1, 6])
+    batch = sampler.pair_source_positions([1, 6])
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([1, 6], dtype=np.int64))
     np.testing.assert_array_equal(batch.target_perturbation_ids, np.asarray([0, 0], dtype=np.int64))
 
 
 def test_matched_control_policy_respects_explicit_pairing_groups() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_metadata_index(),
         batch_size=4,
         config=_dataset_group_config("dataset", "celltype"),
@@ -158,14 +192,14 @@ def test_matched_control_policy_respects_explicit_pairing_groups() -> None:
         seed=13,
     )
 
-    batch = sampler.pair_source_indices([1, 2, 6], seed=19)
+    batch = sampler.pair_source_positions([1, 2, 6], seed=19)
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([0, 0, 5], dtype=np.int64))
     np.testing.assert_array_equal(batch.target_perturbation_ids, np.asarray([0, 0, 0], dtype=np.int64))
 
 
 def test_missing_target_pool_raises_explicit_error() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_metadata_index(),
         batch_size=4,
         config=_dataset_group_config("dataset", "celltype"),
@@ -173,7 +207,7 @@ def test_missing_target_pool_raises_explicit_error() -> None:
     )
 
     with pytest.raises(RuntimeError, match="no matched control pool exists"):
-        sampler.pair_source_indices([7])
+        sampler.pair_source_positions([7])
 
 
 def test_row_selection_intersects_all_requested_pools_and_preserves_order() -> None:
@@ -186,8 +220,8 @@ def test_row_selection_intersects_all_requested_pools_and_preserves_order() -> N
     ).row_selection
 
     np.testing.assert_array_equal(selection.base_indices, np.asarray([3, 0, 1], dtype=np.int64))
-    np.testing.assert_array_equal(selection.source_indices, np.asarray([1, 0], dtype=np.int64))
-    np.testing.assert_array_equal(selection.target_candidate_indices, np.asarray([0, 3], dtype=np.int64))
+    np.testing.assert_array_equal(selection.source_positions, np.asarray([2, 1], dtype=np.int64))
+    np.testing.assert_array_equal(selection.target_candidate_positions, np.asarray([1, 0], dtype=np.int64))
 
 
 def test_prepared_metadata_compacts_rows_and_keeps_polars_frame() -> None:
@@ -222,7 +256,7 @@ def test_prepared_metadata_compacts_rows_and_keeps_polars_frame() -> None:
 
 
 def test_prepared_metadata_uses_filtered_base_pool_for_compaction() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_metadata_index(),
         batch_size=1,
         config=_default_config(),
@@ -232,18 +266,12 @@ def test_prepared_metadata_uses_filtered_base_pool_for_compaction() -> None:
         drop_last=False,
     )
 
-    np.testing.assert_array_equal(
-        sampler.effective_label_row_indices,
-        np.asarray([3, 0, 1], dtype=np.int64),
-    )
-    np.testing.assert_array_equal(
-        sampler._prepared_metadata.row_selection.base_indices,
-        np.asarray([3, 0, 1], dtype=np.int64),
-    )
+    np.testing.assert_array_equal(sampler.effective_source_positions, np.asarray([2], dtype=np.int64))
+    np.testing.assert_array_equal(sampler.effective_target_candidate_positions, np.asarray([1], dtype=np.int64))
 
 
 def test_source_only_subset_uses_filtered_base_pool_for_targets() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_two_row_metadata_index(),
         batch_size=1,
         config=_default_config(),
@@ -252,18 +280,18 @@ def test_source_only_subset_uses_filtered_base_pool_for_targets() -> None:
         drop_last=False,
     )
 
-    batch = sampler.pair_source_indices([0], seed=13)
+    batch = sampler.pair_source_positions([0], seed=13)
 
-    np.testing.assert_array_equal(sampler.effective_source_indices, np.asarray([0], dtype=np.int64))
+    np.testing.assert_array_equal(sampler.effective_source_positions, np.asarray([0], dtype=np.int64))
     np.testing.assert_array_equal(
-        sampler.effective_target_candidate_indices,
+        sampler.effective_target_candidate_positions,
         np.asarray([0, 1], dtype=np.int64),
     )
     np.testing.assert_array_equal(batch.target_indices, np.asarray([1], dtype=np.int64))
 
 
 def test_target_candidate_only_subset_is_allowed() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_two_row_metadata_index(),
         batch_size=2,
         config=_default_config(),
@@ -271,32 +299,32 @@ def test_target_candidate_only_subset_is_allowed() -> None:
         drop_last=False,
     )
 
-    batch = sampler.pair_source_indices([0, 1], seed=17)
+    batch = sampler.pair_source_positions([0, 1], seed=17)
 
-    np.testing.assert_array_equal(sampler.effective_source_indices, np.asarray([0, 1], dtype=np.int64))
+    np.testing.assert_array_equal(sampler.effective_source_positions, np.asarray([0, 1], dtype=np.int64))
     np.testing.assert_array_equal(
-        sampler.effective_target_candidate_indices,
+        sampler.effective_target_candidate_positions,
         np.asarray([1], dtype=np.int64),
     )
     np.testing.assert_array_equal(batch.target_indices, np.asarray([1, 1], dtype=np.int64))
 
 
 def test_default_non_perturbation_null_labels_are_encoded() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_null_context_metadata_index(),
         batch_size=1,
         config=_default_config(),
         drop_last=False,
     )
 
-    batch = sampler.pair_source_indices([0], seed=19)
+    batch = sampler.pair_source_positions([0], seed=19)
 
-    np.testing.assert_array_equal(sampler.effective_source_indices, np.asarray([0, 1], dtype=np.int64))
+    np.testing.assert_array_equal(sampler.effective_source_positions, np.asarray([0, 1], dtype=np.int64))
     np.testing.assert_array_equal(batch.source_indices, np.asarray([0], dtype=np.int64))
 
 
 def test_sampler_supports_perturbation_as_only_required_semantic_label() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_metadata_index(),
         batch_size=1,
         config=_default_config(label_fields={"perturb_label": "perturbation"}),
@@ -306,7 +334,7 @@ def test_sampler_supports_perturbation_as_only_required_semantic_label() -> None
         drop_last=False,
     )
 
-    batch = sampler.pair_source_indices([0], seed=29)
+    batch = sampler.pair_source_positions([0], seed=29)
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([6], dtype=np.int64))
     np.testing.assert_array_equal(batch.target_perturbation_ids, np.asarray([1], dtype=np.int64))
@@ -314,7 +342,7 @@ def test_sampler_supports_perturbation_as_only_required_semantic_label() -> None
 
 def test_custom_drop_null_labels_removes_selected_base_pool() -> None:
     with pytest.raises(ValueError, match="metadata row pool is empty"):
-        PerturbationPairSampler(
+        _build_sampler(
             _build_null_context_metadata_index(),
             batch_size=1,
             config=_default_config(drop_null_labels=("celltype",)),
@@ -322,8 +350,8 @@ def test_custom_drop_null_labels_removes_selected_base_pool() -> None:
         )
 
 
-def test_pair_source_indices_rejects_rows_outside_configured_source_pool() -> None:
-    sampler = PerturbationPairSampler(
+def test_pair_source_positions_rejects_rows_outside_configured_source_pool() -> None:
+    sampler = _build_sampler(
         _build_metadata_index(),
         batch_size=2,
         config=_default_config(),
@@ -332,13 +360,13 @@ def test_pair_source_indices_rejects_rows_outside_configured_source_pool() -> No
 
     with pytest.raises(
         ValueError,
-        match="configured source_indices pool",
+        match="configured source pool",
     ):
-        sampler.pair_source_indices([2])
+        sampler.pair_source_positions([2])
 
 
 def test_asymmetric_target_candidate_pool_preserves_pairing_invariants() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_metadata_index(),
         batch_size=3,
         config=_dataset_group_config("dataset", "celltype"),
@@ -348,14 +376,14 @@ def test_asymmetric_target_candidate_pool_preserves_pairing_invariants() -> None
         seed=13,
     )
 
-    batch = sampler.pair_source_indices([0, 3, 6], seed=19)
+    batch = sampler.pair_source_positions([0, 3, 6], seed=19)
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([2, 4, 5], dtype=np.int64))
     assert set(batch.target_indices.tolist()).issubset({2, 4, 5})
 
 
 def test_restricted_target_pool_can_make_source_unpairable() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_metadata_index(),
         batch_size=1,
         config=_default_config(),
@@ -367,12 +395,12 @@ def test_restricted_target_pool_can_make_source_unpairable() -> None:
         RuntimeError,
         match="configured target pool",
     ):
-        sampler.pair_source_indices([6])
+        sampler.pair_source_positions([6])
 
 
 def test_sampler_iteration_is_seed_deterministic_and_preserves_pairing_invariants() -> None:
     config = _dataset_group_config("dataset", "celltype")
-    sampler_a = PerturbationPairSampler(
+    sampler_a = _build_sampler(
         _build_metadata_index(),
         batch_size=3,
         config=config,
@@ -381,7 +409,7 @@ def test_sampler_iteration_is_seed_deterministic_and_preserves_pairing_invariant
         perturbed_target_policy="matched_control_cell",
         source_indices=[0, 1, 2, 3, 4, 5, 6],
     )
-    sampler_b = PerturbationPairSampler(
+    sampler_b = _build_sampler(
         _build_metadata_index(),
         batch_size=3,
         config=config,
@@ -402,7 +430,7 @@ def test_sampler_iteration_is_seed_deterministic_and_preserves_pairing_invariant
 
 
 def test_sampler_set_epoch_is_repeatable_and_changes_pair_sequence() -> None:
-    sampler = PerturbationPairSampler(
+    sampler = _build_sampler(
         _build_metadata_index(),
         batch_size=1,
         config=_default_config(),

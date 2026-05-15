@@ -22,6 +22,7 @@ from perturb_data_lab.loaders.adapters.perttf import (
     _collate_perttf_raw_pair_batch,
     _PertTFPairExpressionDataset,
     _PertTFPairReadBatchSampler,
+    _prepare_perttf_metadata,
 )
 
 
@@ -260,12 +261,12 @@ def test_paired_batch_builder_reconstructs_target_values_at_source_sampled_genes
 ) -> None:
     config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
     corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
-    pair_batch = PerturbationPairSampler(
-        corpus.metadata_index,
+    pair_batch = _build_pair_sampler(
+        corpus,
         batch_size=2,
         config=config,
         seed=7,
-    ).pair_source_indices([0, 1], seed=11)
+    ).pair_source_positions([0, 1], seed=11)
     builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
 
     batch = builder.build_paired_batch(
@@ -346,15 +347,15 @@ def test_paired_batch_builder_emits_extra_configured_label_tensors(
         },
     )
     corpus = load_corpus(str(_build_mixed_union_pair_corpus(tmp_path)))
-    pair_batch = PerturbationPairSampler(
-        corpus.metadata_index,
+    pair_batch = _build_pair_sampler(
+        corpus,
         batch_size=1,
         config=config,
         source_indices=[0],
         target_candidate_indices=[3],
         seed=7,
         drop_last=False,
-    ).pair_source_indices([0], seed=11)
+    ).pair_source_positions([0], seed=11)
     builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
 
     batch = builder.build_paired_batch(
@@ -377,12 +378,12 @@ def test_paired_batch_builder_accepts_precomputed_sampled_gene_ids_and_preserves
 ) -> None:
     config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=1.0)
     corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
-    pair_batch = PerturbationPairSampler(
-        corpus.metadata_index,
+    pair_batch = _build_pair_sampler(
+        corpus,
         batch_size=1,
         config=config,
         seed=3,
-    ).pair_source_indices([0], seed=13)
+    ).pair_source_positions([0], seed=13)
     builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
 
     batch = builder.build_paired_batch(
@@ -424,12 +425,12 @@ def test_paired_batch_builder_emits_union_full_expression_masks_for_mixed_datase
         include_full_expr=True,
     )
     corpus = load_corpus(str(_build_mixed_union_pair_corpus(tmp_path)))
-    pair_batch = PerturbationPairSampler(
-        corpus.metadata_index,
+    pair_batch = _build_pair_sampler(
+        corpus,
         batch_size=2,
         config=config,
         seed=19,
-    ).pair_source_indices([0, 2], seed=23)
+    ).pair_source_positions([0, 2], seed=23)
     builder = PertTFPairedBatchBuilder(corpus, seq_len=2, config=config)
 
     batch = builder.build_paired_batch(
@@ -473,12 +474,12 @@ def test_build_from_raw_pair_batch_matches_inspect_batch_path(
         include_full_expr=True,
     )
     corpus = load_corpus(str(_build_mixed_union_pair_corpus(tmp_path)))
-    pair_batch = PerturbationPairSampler(
-        corpus.metadata_index,
+    pair_batch = _build_pair_sampler(
+        corpus,
         batch_size=2,
         config=config,
         seed=19,
-    ).pair_source_indices([0, 2], seed=23)
+    ).pair_source_positions([0, 2], seed=23)
     builder = PertTFPairedBatchBuilder(corpus, seq_len=2, config=config)
 
     source_raw = corpus.inspect_batch(pair_batch.source_indices)
@@ -511,12 +512,12 @@ def test_build_from_raw_pair_batch_rejects_batch_size_mismatch(
 ) -> None:
     config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
     corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
-    pair_batch = PerturbationPairSampler(
-        corpus.metadata_index,
+    pair_batch = _build_pair_sampler(
+        corpus,
         batch_size=2,
         config=config,
         seed=7,
-    ).pair_source_indices([0, 1], seed=11)
+    ).pair_source_positions([0, 1], seed=11)
     builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
 
     source_raw = corpus.inspect_batch([int(pair_batch.source_indices[0])])
@@ -531,12 +532,12 @@ def test_build_from_raw_pair_batch_rejects_row_order_mismatch(
 ) -> None:
     config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
     corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
-    pair_batch = PerturbationPairSampler(
-        corpus.metadata_index,
+    pair_batch = _build_pair_sampler(
+        corpus,
         batch_size=2,
         config=config,
         seed=7,
-    ).pair_source_indices([0, 1], seed=11)
+    ).pair_source_positions([0, 1], seed=11)
     builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
 
     source_raw = corpus.inspect_batch(pair_batch.source_indices[::-1])
@@ -551,12 +552,12 @@ def test_build_from_raw_pair_batch_rejects_target_perturbation_shape_mismatch(
 ) -> None:
     config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
     corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
-    pair_batch = PerturbationPairSampler(
-        corpus.metadata_index,
+    pair_batch = _build_pair_sampler(
+        corpus,
         batch_size=2,
         config=config,
         seed=7,
-    ).pair_source_indices([0, 1], seed=11)
+    ).pair_source_positions([0, 1], seed=11)
     builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
 
     invalid_pair_batch = replace(
@@ -578,8 +579,8 @@ def _build_pair_read_loader(
     num_workers: int,
     multiprocessing_context: str | None,
 ):
-    pair_sampler = PerturbationPairSampler(
-        corpus.metadata_index,
+    pair_sampler = _build_pair_sampler(
+        corpus,
         batch_size=batch_size,
         config=PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0),
         seed=seed,
@@ -588,7 +589,7 @@ def _build_pair_read_loader(
     request_sampler = _PertTFPairReadBatchSampler(pair_sampler)
     dataset = _PertTFPairExpressionDataset(
         corpus.expression_reader,
-        total_rows=pair_sampler.total_rows,
+        total_rows=len(corpus.metadata_index),
     )
     loader_kwargs = {
         "batch_sampler": request_sampler,
@@ -598,6 +599,40 @@ def _build_pair_read_loader(
     if multiprocessing_context is not None:
         loader_kwargs["multiprocessing_context"] = multiprocessing_context
     return DataLoader(dataset, **loader_kwargs)
+
+
+def _build_pair_sampler(
+    corpus,
+    *,
+    batch_size: int,
+    config: PertTFAdapterConfig,
+    row_indices=None,
+    source_indices=None,
+    target_candidate_indices=None,
+    seed: int = 0,
+    drop_last: bool = True,
+    perturbed_target_policy: str = "self_to_control_label",
+) -> PerturbationPairSampler:
+    prepared = _prepare_perttf_metadata(
+        corpus.metadata_index,
+        config=config,
+        row_indices=row_indices,
+        source_indices=source_indices,
+        target_candidate_indices=target_candidate_indices,
+    )
+    return PerturbationPairSampler(
+        prepared.frame,
+        batch_size=batch_size,
+        perturbation_column=f"{config.perturbation_label}_id",
+        control_perturbation_ids=prepared.control_label_ids,
+        pairing_group_columns=tuple(f"{label_name}_id" for label_name in config.pairing_group_labels),
+        source_positions=prepared.row_selection.source_positions,
+        target_candidate_positions=prepared.row_selection.target_candidate_positions,
+        global_positions="global_row_index",
+        seed=seed,
+        drop_last=drop_last,
+        perturbed_target_policy=perturbed_target_policy,
+    )
 
 
 def _assert_pair_read_batch_matches_builder(
@@ -764,8 +799,8 @@ def test_pair_read_batch_sampler_tracks_epoch_and_batch_identity(
     tmp_path: Path,
 ) -> None:
     corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
-    sampler = PerturbationPairSampler(
-        corpus.metadata_index,
+    sampler = _build_pair_sampler(
+        corpus,
         batch_size=1,
         config=PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0),
         seed=13,
@@ -1011,12 +1046,12 @@ def test_paired_batch_builder_requires_size_factor_metadata(tmp_path: Path) -> N
 
     corpus = load_corpus(str(corpus_path))
     config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
-    pair_batch = PerturbationPairSampler(
-        corpus.metadata_index,
+    pair_batch = _build_pair_sampler(
+        corpus,
         batch_size=2,
         config=config,
         seed=7,
-    ).pair_source_indices([0, 1], seed=11)
+    ).pair_source_positions([0, 1], seed=11)
     builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
 
     with pytest.raises(RuntimeError, match="size_factor"):
