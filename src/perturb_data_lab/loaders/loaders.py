@@ -279,11 +279,11 @@ class DatasetBatchSampler:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         self._full_meta = metadata_index
-        self._meta = metadata_index.filter(
+        self._meta = metadata_index.df.filter(
             pl.col("dataset_index") == int(dataset_index)
         )
         self._row_indices = np.asarray(
-            self._meta.df["global_row_index"].to_numpy(),
+            self._meta["global_row_index"].to_numpy(),
             dtype=np.int64,
         ).copy()
         candidate_row_indices = _normalize_candidate_row_indices(
@@ -351,7 +351,7 @@ class DatasetContextBatchSampler:
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        self._meta = metadata_index
+        self._meta = metadata_index.df
         if dataset_index is not None:
             self._meta = self._meta.filter(
                 pl.col("dataset_index") == int(dataset_index)
@@ -375,13 +375,13 @@ class DatasetContextBatchSampler:
         self.epoch = 0
 
         # Pre-compute unique context values
-        if context_field not in self._meta.df.columns:
+        if context_field not in self._meta.columns:
             raise ValueError(
                 f"context_field '{context_field}' not found in metadata. "
-                f"Available columns: {self._meta.df.columns}"
+                f"Available columns: {self._meta.columns}"
             )
         self._context_values = sorted(
-            self._meta.df[context_field].unique().to_list()
+            self._meta[context_field].unique().to_list()
         )
         if not self._context_values:
             raise ValueError(

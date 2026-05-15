@@ -12,7 +12,7 @@ from .expression import (
     ZarrDatasetEntry,
     build_expression_reader,
 )
-from .index import MetadataIndex, MetadataRow
+from .index import MetadataIndex
 from .loaders import (
     DatasetRoutingTable,
     ExpressionBatchDataset,
@@ -57,7 +57,6 @@ from .adapters import (
 __all__ = [
     # Phase 1 — MetadataIndex
     "MetadataIndex",
-    "MetadataRow",
     # Phase 2 — ExpressionReader (backend-agnostic)
     "ExpressionReader",
     "BaseExpressionReader",

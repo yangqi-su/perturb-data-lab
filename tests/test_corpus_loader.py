@@ -1387,11 +1387,8 @@ class TestLoadCorpusAggregate:
         corpus = load_corpus(str(tmp_path))
 
         assert corpus.take_metadata([0], columns=["perturb_label"])["perturb_label"] == (None,)
-        with pytest.raises(
-            ValueError,
-            match="label row pool has null required pertTF labels",
-        ):
-            PertTFCorpusAdapter.from_corpus(corpus)
+        adapter = PertTFCorpusAdapter.from_corpus(corpus)
+        assert None not in adapter.labels_by_name["perturbation"]
 
     def test_global_row_indices_contiguous(self, tmp_path: Path) -> None:
         """Global row indices are 0..N-1 contiguous."""
