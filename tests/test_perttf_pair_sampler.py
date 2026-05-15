@@ -93,22 +93,6 @@ def test_missing_target_pool_raises_explicit_error() -> None:
         sampler.pair_source_indices([7])
 
 
-def test_warn_skip_policy_drops_unpairable_sources_with_warning() -> None:
-    sampler = PerturbationPairSampler(
-        _build_metadata_index(),
-        batch_size=4,
-        config=PertTFAdapterConfig(control_labels=("WT",)),
-        perturbed_target_policy="matched_control_cell",
-        missing_target_policy="warn_skip",
-    )
-
-    with pytest.warns(RuntimeWarning, match="unable to pair source row 7"):
-        batch = sampler.pair_source_indices([7, 6], seed=17)
-
-    np.testing.assert_array_equal(batch.source_indices, np.asarray([6], dtype=np.int64))
-    np.testing.assert_array_equal(batch.target_indices, np.asarray([5], dtype=np.int64))
-
-
 def test_target_candidate_indices_require_source_indices() -> None:
     with pytest.raises(ValueError, match="target_candidate_indices requires source_indices"):
         PerturbationPairSampler(
@@ -204,7 +188,7 @@ def test_sampler_iteration_is_seed_deterministic_and_preserves_pairing_invariant
         seed=29,
         drop_last=False,
         perturbed_target_policy="matched_control_cell",
-        missing_target_policy="warn_skip",
+        source_indices=[0, 1, 2, 3, 4, 5, 6],
     )
     sampler_b = PerturbationPairSampler(
         _build_metadata_index(),
@@ -213,13 +197,11 @@ def test_sampler_iteration_is_seed_deterministic_and_preserves_pairing_invariant
         seed=29,
         drop_last=False,
         perturbed_target_policy="matched_control_cell",
-        missing_target_policy="warn_skip",
+        source_indices=[0, 1, 2, 3, 4, 5, 6],
     )
 
-    with pytest.warns(RuntimeWarning, match="unable to pair source row 7"):
-        batches_a = list(sampler_a)
-    with pytest.warns(RuntimeWarning, match="unable to pair source row 7"):
-        batches_b = list(sampler_b)
+    batches_a = list(sampler_a)
+    batches_b = list(sampler_b)
 
     assert len(batches_a) == len(batches_b)
     for batch_a, batch_b in zip(batches_a, batches_b, strict=True):
