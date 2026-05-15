@@ -67,48 +67,104 @@ def _build_null_context_metadata_index() -> MetadataIndex:
     )
 
 
-def test_control_sources_pair_to_treated_targets_in_same_dataset_and_context() -> None:
-    sampler = PerturbationPairSampler(
-        _build_metadata_index(),
-        batch_size=4,
-        config=PertTFAdapterConfig(control_labels=("WT",)),
-        seed=7,
+def _default_config(**kwargs) -> PertTFAdapterConfig:
+    return PertTFAdapterConfig(control_labels=("WT",), **kwargs)
+
+
+def _dataset_group_config(*group_labels: str, **kwargs) -> PertTFAdapterConfig:
+    return PertTFAdapterConfig(
+        control_labels=("WT",),
+        label_fields={
+            "perturb_label": "perturbation",
+            "cell_context": "celltype",
+            "batch_id": "batch",
+            "dataset_index": "dataset",
+        },
+        pairing_group_labels=group_labels,
+        **kwargs,
     )
 
-    batch = sampler.pair_source_indices([0, 3], seed=11)
 
-    np.testing.assert_array_equal(batch.source_indices, np.asarray([0, 3], dtype=np.int64))
-    assert batch.target_indices[0] in {1, 2}
-    assert batch.target_indices[1] == 4
-    assert batch.source_dataset_indices.tolist() == batch.target_dataset_indices.tolist()
-    assert batch.source_cell_context_labels == batch.target_cell_context_labels
-    assert batch.target_perturbation_labels[0] in {"KO_A", "KO_B"}
-    assert batch.target_perturbation_labels[1] == "KO_C"
+def test_default_pairing_can_cross_dataset_and_context_when_unconstrained() -> None:
+    sampler = PerturbationPairSampler(
+        _build_metadata_index(),
+        batch_size=1,
+        config=_default_config(),
+        source_indices=[0],
+        target_candidate_indices=[7],
+        seed=7,
+        drop_last=False,
+    )
+
+    batch = sampler.pair_source_indices([0], seed=11)
+
+    np.testing.assert_array_equal(batch.source_indices, np.asarray([0], dtype=np.int64))
+    np.testing.assert_array_equal(batch.target_indices, np.asarray([7], dtype=np.int64))
+    assert batch.source_dataset_indices.tolist() == [0]
+    assert batch.target_dataset_indices.tolist() == [1]
+    assert batch.source_labels_by_name["celltype"] == ("T_cell",)
+    assert batch.target_labels_by_name["celltype"] == ("B_cell",)
+    assert batch.target_labels_by_name["perturbation"] == ("KO_D",)
+
+
+def test_explicit_dataset_pairing_uses_configured_dataset_label() -> None:
+    sampler = PerturbationPairSampler(
+        _build_metadata_index(),
+        batch_size=1,
+        config=_dataset_group_config("dataset"),
+        source_indices=[0],
+        target_candidate_indices=[1, 6],
+        seed=7,
+        drop_last=False,
+    )
+
+    batch = sampler.pair_source_indices([0], seed=11)
+
+    np.testing.assert_array_equal(batch.target_indices, np.asarray([1], dtype=np.int64))
+    assert batch.source_labels_by_name["dataset"] == batch.target_labels_by_name["dataset"]
+
+
+def test_explicit_dataset_and_celltype_pairing_uses_both_group_labels() -> None:
+    sampler = PerturbationPairSampler(
+        _build_metadata_index(),
+        batch_size=1,
+        config=_dataset_group_config("dataset", "celltype"),
+        source_indices=[3],
+        target_candidate_indices=[4, 7],
+        seed=7,
+        drop_last=False,
+    )
+
+    batch = sampler.pair_source_indices([3], seed=11)
+
+    np.testing.assert_array_equal(batch.target_indices, np.asarray([4], dtype=np.int64))
+    assert batch.source_labels_by_name["dataset"] == batch.target_labels_by_name["dataset"]
+    assert batch.source_labels_by_name["celltype"] == batch.target_labels_by_name["celltype"]
 
 
 def test_perturbed_sources_default_to_self_with_control_label_override() -> None:
     sampler = PerturbationPairSampler(
         _build_metadata_index(),
         batch_size=4,
-        config=PertTFAdapterConfig(control_labels=("WT",)),
+        config=_default_config(),
         seed=3,
     )
 
     batch = sampler.pair_source_indices([1, 6])
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([1, 6], dtype=np.int64))
-    assert batch.target_perturbation_labels == ("WT", "WT")
+    assert batch.target_labels_by_name["perturbation"] == ("WT", "WT")
     np.testing.assert_array_equal(
-        batch.target_perturbation_ids,
+        batch.target_label_ids_by_name["perturbation"],
         np.asarray([0, 0], dtype=np.int64),
     )
 
 
-def test_matched_control_policy_samples_same_dataset_and_context_controls() -> None:
+def test_matched_control_policy_respects_explicit_pairing_groups() -> None:
     sampler = PerturbationPairSampler(
         _build_metadata_index(),
         batch_size=4,
-        config=PertTFAdapterConfig(control_labels=("WT",)),
+        config=_dataset_group_config("dataset", "celltype"),
         perturbed_target_policy="matched_control_cell",
         seed=13,
     )
@@ -116,16 +172,16 @@ def test_matched_control_policy_samples_same_dataset_and_context_controls() -> N
     batch = sampler.pair_source_indices([1, 2, 6], seed=19)
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([0, 0, 5], dtype=np.int64))
-    assert batch.target_perturbation_labels == ("WT", "WT", "WT")
-    assert batch.source_dataset_indices.tolist() == batch.target_dataset_indices.tolist()
-    assert batch.source_cell_context_labels == batch.target_cell_context_labels
+    assert batch.target_labels_by_name["perturbation"] == ("WT", "WT", "WT")
+    assert batch.source_labels_by_name["dataset"] == batch.target_labels_by_name["dataset"]
+    assert batch.source_labels_by_name["celltype"] == batch.target_labels_by_name["celltype"]
 
 
 def test_missing_target_pool_raises_explicit_error() -> None:
     sampler = PerturbationPairSampler(
         _build_metadata_index(),
         batch_size=4,
-        config=PertTFAdapterConfig(control_labels=("WT",)),
+        config=_dataset_group_config("dataset", "celltype"),
         perturbed_target_policy="matched_control_cell",
     )
 
@@ -136,7 +192,7 @@ def test_missing_target_pool_raises_explicit_error() -> None:
 def test_row_selection_intersects_all_requested_pools_and_preserves_order() -> None:
     selection = _resolve_perttf_row_selection(
         _build_metadata_index(),
-        config=PertTFAdapterConfig(control_labels=("WT",)),
+        config=_default_config(),
         row_indices=[3, 0, 1],
         source_indices=[1, 6, 0],
         target_candidate_indices=[0, 2, 3],
@@ -150,7 +206,7 @@ def test_row_selection_intersects_all_requested_pools_and_preserves_order() -> N
 def test_encoded_metadata_table_compacts_rows_and_aligns_global_lookups() -> None:
     table = _build_encoded_metadata_table(
         _build_metadata_index(),
-        config=PertTFAdapterConfig(control_labels=("WT",)),
+        config=_default_config(),
         base_indices=np.asarray([4, 0, 1], dtype=np.int64),
     )
 
@@ -179,7 +235,7 @@ def test_encoded_metadata_table_uses_filtered_base_pool_for_compaction() -> None
     sampler = PerturbationPairSampler(
         _build_metadata_index(),
         batch_size=1,
-        config=PertTFAdapterConfig(control_labels=("WT",)),
+        config=_default_config(),
         row_indices=[3, 0, 1],
         source_indices=[1],
         target_candidate_indices=[0],
@@ -200,7 +256,7 @@ def test_source_only_subset_uses_filtered_base_pool_for_targets() -> None:
     sampler = PerturbationPairSampler(
         _build_two_row_metadata_index(),
         batch_size=1,
-        config=PertTFAdapterConfig(control_labels=("WT",)),
+        config=_default_config(),
         source_indices=[0],
         seed=11,
         drop_last=False,
@@ -220,7 +276,7 @@ def test_target_candidate_only_subset_is_allowed() -> None:
     sampler = PerturbationPairSampler(
         _build_two_row_metadata_index(),
         batch_size=2,
-        config=PertTFAdapterConfig(control_labels=("WT",)),
+        config=_default_config(),
         target_candidate_indices=[1],
         drop_last=False,
     )
@@ -239,18 +295,34 @@ def test_encode_null_labels_keeps_rows_and_uses_null_token() -> None:
     sampler = PerturbationPairSampler(
         _build_null_context_metadata_index(),
         batch_size=1,
-        config=PertTFAdapterConfig(
-            control_labels=("WT",),
-            encode_null_labels=("celltype",),
-        ),
+        config=_default_config(encode_null_labels=("celltype",)),
         drop_last=False,
     )
 
     batch = sampler.pair_source_indices([0], seed=19)
 
     np.testing.assert_array_equal(sampler.effective_source_indices, np.asarray([0, 1], dtype=np.int64))
-    assert batch.source_cell_context_labels == ("<null>",)
-    assert batch.target_cell_context_labels == ("<null>",)
+    assert batch.source_labels_by_name["celltype"] == ("<null>",)
+    assert batch.target_labels_by_name["celltype"] == ("<null>",)
+
+
+def test_sampler_supports_perturbation_as_only_required_semantic_label() -> None:
+    sampler = PerturbationPairSampler(
+        _build_metadata_index(),
+        batch_size=1,
+        config=_default_config(label_fields={"perturb_label": "perturbation"}),
+        source_indices=[0],
+        target_candidate_indices=[6],
+        seed=23,
+        drop_last=False,
+    )
+
+    batch = sampler.pair_source_indices([0], seed=29)
+
+    assert tuple(batch.source_label_ids_by_name) == ("perturbation",)
+    assert tuple(batch.target_label_ids_by_name) == ("perturbation",)
+    np.testing.assert_array_equal(batch.target_indices, np.asarray([6], dtype=np.int64))
+    assert batch.target_labels_by_name["perturbation"] == ("KO_A",)
 
 
 def test_error_null_labels_fail_on_selected_base_pool() -> None:
@@ -258,20 +330,14 @@ def test_error_null_labels_fail_on_selected_base_pool() -> None:
         PerturbationPairSampler(
             _build_null_context_metadata_index(),
             batch_size=1,
-            config=PertTFAdapterConfig(
-                control_labels=("WT",),
-                error_null_labels=("celltype",),
-            ),
+            config=_default_config(error_null_labels=("celltype",)),
         )
 
 
 def test_encoded_metadata_table_missing_global_rows_fail_clearly() -> None:
     table = _build_encoded_metadata_table(
         _build_null_context_metadata_index(),
-        config=PertTFAdapterConfig(
-            control_labels=("WT",),
-            encode_null_labels=("celltype",),
-        ),
+        config=_default_config(encode_null_labels=("celltype",)),
         base_indices=np.asarray([0, 1], dtype=np.int64),
     )
 
@@ -283,7 +349,7 @@ def test_pair_source_indices_rejects_rows_outside_configured_source_pool() -> No
     sampler = PerturbationPairSampler(
         _build_metadata_index(),
         batch_size=2,
-        config=PertTFAdapterConfig(control_labels=("WT",)),
+        config=_default_config(),
         source_indices=[0, 1, 5, 6],
     )
 
@@ -298,7 +364,7 @@ def test_asymmetric_target_candidate_pool_preserves_pairing_invariants() -> None
     sampler = PerturbationPairSampler(
         _build_metadata_index(),
         batch_size=3,
-        config=PertTFAdapterConfig(control_labels=("WT",)),
+        config=_dataset_group_config("dataset", "celltype"),
         source_indices=[0, 3, 6],
         target_candidate_indices=[2, 4, 5],
         perturbed_target_policy="matched_control_cell",
@@ -309,15 +375,15 @@ def test_asymmetric_target_candidate_pool_preserves_pairing_invariants() -> None
 
     np.testing.assert_array_equal(batch.target_indices, np.asarray([2, 4, 5], dtype=np.int64))
     assert set(batch.target_indices.tolist()).issubset({2, 4, 5})
-    assert batch.source_dataset_indices.tolist() == batch.target_dataset_indices.tolist()
-    assert batch.source_cell_context_labels == batch.target_cell_context_labels
+    assert batch.source_labels_by_name["dataset"] == batch.target_labels_by_name["dataset"]
+    assert batch.source_labels_by_name["celltype"] == batch.target_labels_by_name["celltype"]
 
 
 def test_restricted_target_pool_can_make_source_unpairable() -> None:
     sampler = PerturbationPairSampler(
         _build_metadata_index(),
         batch_size=1,
-        config=PertTFAdapterConfig(control_labels=("WT",)),
+        config=_default_config(),
         source_indices=[6],
         target_candidate_indices=[5],
     )
@@ -330,7 +396,7 @@ def test_restricted_target_pool_can_make_source_unpairable() -> None:
 
 
 def test_sampler_iteration_is_seed_deterministic_and_preserves_pairing_invariants() -> None:
-    config = PertTFAdapterConfig(control_labels=("WT",))
+    config = _dataset_group_config("dataset", "celltype")
     sampler_a = PerturbationPairSampler(
         _build_metadata_index(),
         batch_size=3,
@@ -357,18 +423,15 @@ def test_sampler_iteration_is_seed_deterministic_and_preserves_pairing_invariant
     for batch_a, batch_b in zip(batches_a, batches_b, strict=True):
         np.testing.assert_array_equal(batch_a.source_indices, batch_b.source_indices)
         np.testing.assert_array_equal(batch_a.target_indices, batch_b.target_indices)
-        np.testing.assert_array_equal(
-            batch_a.source_dataset_indices,
-            batch_a.target_dataset_indices,
-        )
-        assert batch_a.source_cell_context_labels == batch_a.target_cell_context_labels
+        assert batch_a.source_labels_by_name["dataset"] == batch_a.target_labels_by_name["dataset"]
+        assert batch_a.source_labels_by_name["celltype"] == batch_a.target_labels_by_name["celltype"]
 
 
 def test_sampler_set_epoch_is_repeatable_and_changes_pair_sequence() -> None:
     sampler = PerturbationPairSampler(
         _build_metadata_index(),
         batch_size=1,
-        config=PertTFAdapterConfig(control_labels=("WT",)),
+        config=_default_config(),
         source_indices=[0, 1, 5, 6],
         seed=17,
         drop_last=True,

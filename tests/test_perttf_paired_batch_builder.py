@@ -508,7 +508,7 @@ def test_build_from_raw_pair_batch_rejects_row_order_mismatch(
         builder.build_from_raw_pair_batch(pair_batch, source_raw, target_raw)
 
 
-def test_build_from_raw_pair_batch_rejects_cross_dataset_pair_batch(
+def test_build_from_raw_pair_batch_rejects_missing_required_label_ids(
     tmp_path: Path,
 ) -> None:
     config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
@@ -523,16 +523,20 @@ def test_build_from_raw_pair_batch_rejects_cross_dataset_pair_batch(
 
     invalid_pair_batch = replace(
         pair_batch,
-        target_dataset_indices=np.asarray([1, 0], dtype=np.int32),
+        target_label_ids_by_name={
+            label_name: label_ids
+            for label_name, label_ids in pair_batch.target_label_ids_by_name.items()
+            if label_name != "celltype"
+        },
     )
     source_raw = corpus.inspect_batch(pair_batch.source_indices)
     target_raw = corpus.inspect_batch(pair_batch.target_indices)
 
-    with pytest.raises(ValueError, match="same-dataset pairing"):
+    with pytest.raises(ValueError, match="missing label field 'celltype'"):
         builder.build_from_raw_pair_batch(invalid_pair_batch, source_raw, target_raw)
 
 
-def test_build_from_raw_pair_batch_rejects_cross_context_pair_batch(
+def test_build_from_raw_pair_batch_rejects_label_id_shape_mismatch(
     tmp_path: Path,
 ) -> None:
     config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
@@ -547,12 +551,15 @@ def test_build_from_raw_pair_batch_rejects_cross_context_pair_batch(
 
     invalid_pair_batch = replace(
         pair_batch,
-        target_cell_context_ids=np.asarray([9, 9], dtype=np.int64),
+        target_label_ids_by_name={
+            **pair_batch.target_label_ids_by_name,
+            "celltype": np.asarray([9], dtype=np.int64),
+        },
     )
     source_raw = corpus.inspect_batch(pair_batch.source_indices)
     target_raw = corpus.inspect_batch(pair_batch.target_indices)
 
-    with pytest.raises(ValueError, match="same-context pairing"):
+    with pytest.raises(ValueError, match=r"label field 'celltype'.*expected \(2,\)"):
         builder.build_from_raw_pair_batch(invalid_pair_batch, source_raw, target_raw)
 
 
