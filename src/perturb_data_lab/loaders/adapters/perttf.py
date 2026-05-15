@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from ..feature_registry import FeatureRegistry
 from ..gpu_pipeline import GPUSparsePipeline
 from ..index import MetadataIndex
-from ..loaders import DatasetRoutingTable, _normalize_candidate_row_indices
+from ..loaders import _normalize_candidate_row_indices
 
 if TYPE_CHECKING:
     from ..corpus_loader import Corpus
@@ -1203,13 +1203,13 @@ class _PertTFPairExpressionDataset:
         self,
         expression_reader: Any,
         *,
-        routing_table: DatasetRoutingTable,
+        total_rows: int,
     ) -> None:
         self._reader = expression_reader
-        self._routing_table = routing_table
+        self._total_rows = int(total_rows)
 
     def __len__(self) -> int:
-        return self._routing_table.total_rows
+        return self._total_rows
 
     def __getitems__(
         self,
@@ -1224,26 +1224,33 @@ class _PertTFPairExpressionDataset:
         return [
             {
                 "request": request,
-                "source_raw": self._read_raw_batch(pair_batch.source_indices),
-                "target_raw": self._read_raw_batch(pair_batch.target_indices),
+                "source_raw": self._read_raw_batch(
+                    pair_batch.source_indices,
+                    dataset_indices=pair_batch.source_dataset_indices,
+                ),
+                "target_raw": self._read_raw_batch(
+                    pair_batch.target_indices,
+                    dataset_indices=pair_batch.target_dataset_indices,
+                ),
             }
         ]
 
-    def _read_raw_batch(self, indices: np.ndarray) -> dict[str, Any]:
+    def _read_raw_batch(
+        self,
+        indices: np.ndarray,
+        *,
+        dataset_indices: np.ndarray,
+    ) -> dict[str, Any]:
         index_array = np.asarray(indices, dtype=np.int64)
         expr = self._reader.read_expression_flat(index_array.tolist())
-        dataset_index = self._routing_table.resolve_dataset_indices(index_array)
         batch: dict[str, Any] = {
             "batch_size": expr.batch_size,
             "global_row_index": expr.global_row_index,
-            "dataset_index": dataset_index,
+            "dataset_index": np.asarray(dataset_indices, dtype=np.int32),
             "row_offsets": expr.row_offsets,
             "expressed_gene_indices": expr.expressed_gene_indices,
             "expression_counts": expr.expression_counts,
         }
-        size_factor = self._routing_table.take_size_factor(index_array)
-        if size_factor is not None:
-            batch["size_factor"] = size_factor
         return batch
 
 
@@ -1329,6 +1336,7 @@ class PertTFPairedBatchBuilder:
         seq_len: int,
         config: PertTFAdapterConfig | None = None,
         adapter: "PertTFCorpusAdapter" | None = None,
+        encoded_metadata_table: _PertTFEncodedMetadataTable | None = None,
         device: torch.device | str | None = "cpu",
     ) -> None:
         if seq_len <= 0:
@@ -1343,6 +1351,7 @@ class PertTFPairedBatchBuilder:
         self._pad_token_id = int(self.adapter.stoi[self.config.pad_token])
         self._cls_token_id = int(self.adapter.stoi[self.config.cls_token])
         self._special_token_offset = self.adapter.special_token_offset
+        self._encoded_metadata_table = encoded_metadata_table
 
     def build_paired_batch(
         self,
@@ -1385,6 +1394,8 @@ class PertTFPairedBatchBuilder:
     ) -> dict[str, torch.Tensor]:
         self._validate_pair_batch(pair_batch)
         self._validate_raw_pair_batches(pair_batch, source_raw, target_raw)
+        source_raw = self._with_resolved_size_factor(source_raw)
+        target_raw = self._with_resolved_size_factor(target_raw)
 
         source_processed = self._pipeline.process_batch(
             source_raw,
@@ -1489,6 +1500,36 @@ class PertTFPairedBatchBuilder:
         return batch
 
     __call__ = build_paired_batch
+
+    def _with_resolved_size_factor(self, raw_batch: dict[str, Any]) -> dict[str, Any]:
+        if raw_batch.get("size_factor") is not None:
+            return raw_batch
+        global_indices = self._raw_batch_numpy(raw_batch, "global_row_index", dtype=np.int64)
+        size_factor = self._take_compact_size_factor(global_indices)
+        if size_factor is None:
+            size_factor = self._take_metadata_size_factor(global_indices)
+        if size_factor is None:
+            return raw_batch
+        resolved = dict(raw_batch)
+        resolved["size_factor"] = size_factor
+        return resolved
+
+    def _take_compact_size_factor(self, global_indices: np.ndarray) -> np.ndarray | None:
+        if self._encoded_metadata_table is None:
+            return None
+        try:
+            return self._encoded_metadata_table.take_size_factor(global_indices)
+        except KeyError:
+            return None
+
+    def _take_metadata_size_factor(self, global_indices: np.ndarray) -> np.ndarray | None:
+        if "size_factor" not in self.corpus.metadata_index.df.columns:
+            return None
+        gathered = self.corpus.metadata_index.take(global_indices, columns=["size_factor"])
+        size_factor_values = np.asarray(gathered["size_factor"], dtype=np.float32)
+        if size_factor_values.size == 0 or np.isnan(size_factor_values).all():
+            return None
+        return size_factor_values
 
     def _validate_pair_batch(self, pair_batch: PerturbationPairBatch) -> None:
         if pair_batch.source_indices.shape != pair_batch.target_indices.shape:
@@ -2005,6 +2046,7 @@ class PertTFPairedBatchLoader:
             seq_len=seq_len,
             config=resolved_config,
             adapter=resolved_adapter,
+            encoded_metadata_table=self.pair_sampler._encoded_metadata_table,
             device=device,
         )
         self.adapter = self._builder.adapter
@@ -2018,7 +2060,7 @@ class PertTFPairedBatchLoader:
         self._request_sampler = _PertTFPairReadBatchSampler(self.pair_sampler)
         self._dataset = _PertTFPairExpressionDataset(
             corpus.expression_reader,
-            routing_table=corpus.routing_table,
+            total_rows=self.pair_sampler.total_rows,
         )
         self._loader_kwargs = _perttf_loader_kwargs(
             num_workers=num_workers,

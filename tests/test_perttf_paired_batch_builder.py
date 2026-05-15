@@ -619,7 +619,7 @@ def _build_pair_read_loader(
     request_sampler = _PertTFPairReadBatchSampler(pair_sampler)
     dataset = _PertTFPairExpressionDataset(
         corpus.expression_reader,
-        routing_table=corpus.routing_table,
+        total_rows=pair_sampler.total_rows,
     )
     loader_kwargs = {
         "batch_sampler": request_sampler,
@@ -667,10 +667,7 @@ def _assert_pair_read_batch_matches_builder(
         source_raw["expression_counts"],
         torch.as_tensor(expected_source_raw["expression_counts"], dtype=torch.float32),
     )
-    torch.testing.assert_close(
-        source_raw["size_factor"],
-        torch.as_tensor(expected_source_raw["size_factor"], dtype=torch.float32),
-    )
+    assert "size_factor" not in source_raw
     torch.testing.assert_close(
         target_raw["global_row_index"],
         torch.as_tensor(expected_target_raw["global_row_index"], dtype=torch.long),
@@ -691,10 +688,7 @@ def _assert_pair_read_batch_matches_builder(
         target_raw["expression_counts"],
         torch.as_tensor(expected_target_raw["expression_counts"], dtype=torch.float32),
     )
-    torch.testing.assert_close(
-        target_raw["size_factor"],
-        torch.as_tensor(expected_target_raw["size_factor"], dtype=torch.float32),
-    )
+    assert "size_factor" not in target_raw
 
     split_batch = builder.build_from_raw_pair_batch(
         pair_batch,
@@ -786,12 +780,12 @@ def test_pair_read_dataset_state_stays_worker_light(tmp_path: Path) -> None:
     )
     dataset = _PertTFPairExpressionDataset(
         corpus.expression_reader,
-        routing_table=corpus.routing_table,
+        total_rows=len(corpus.metadata_index),
     )
 
-    assert set(dataset.__dict__) == {"_reader", "_routing_table"}
+    assert set(dataset.__dict__) == {"_reader", "_total_rows"}
     assert dataset.__dict__["_reader"] is corpus.expression_reader
-    assert dataset.__dict__["_routing_table"] is corpus.routing_table
+    assert dataset.__dict__["_total_rows"] == len(corpus.metadata_index)
     assert all(value is not corpus.metadata_index for value in dataset.__dict__.values())
     assert not any(torch.is_tensor(value) and value.is_cuda for value in dataset.__dict__.values())
     assert not any(isinstance(value, torch.device) for value in dataset.__dict__.values())
