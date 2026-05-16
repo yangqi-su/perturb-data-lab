@@ -198,10 +198,10 @@ def _make_var_df(dataset_id: str, n_genes: int) -> pl.DataFrame:
     rows = []
     for i in range(n_genes):
         rows.append({
-            "origin_index": str(i),
+            "origin_index": i,
             "gene_id": f"ENSG_{dataset_id}_{i:05d}",
             "canonical_gene_id": f"GENE_{i:05d}",
-            "global_id": str(i),
+            "global_id": i,
         })
     return pl.DataFrame(rows)
 
@@ -864,18 +864,18 @@ class TestLoadCorpusAggregate:
 
         pl.DataFrame(
             {
-                "origin_index": ["0", "1"],
+                "origin_index": np.asarray([0, 1], dtype=np.int32),
                 "gene_id": ["ENSG_Z_0", "ENSG_Z_1"],
                 "canonical_gene_id": ["GENE_B", "GENE_C"],
-                "global_id": ["0", "1"],
+                "global_id": np.asarray([0, 1], dtype=np.int32),
             }
         ).write_parquet(str(tmp_path / "meta" / "z_old" / "canonical_meta" / "canonical-var.parquet"))
         pl.DataFrame(
             {
-                "origin_index": ["0", "1", "2"],
+                "origin_index": np.asarray([0, 1, 2], dtype=np.int32),
                 "gene_id": ["ENSG_A_0", "ENSG_A_1", "ENSG_A_2"],
                 "canonical_gene_id": ["GENE_A", "GENE_C", "GENE_D"],
-                "global_id": ["0", "1", "2"],
+                "global_id": np.asarray([0, 1, 2], dtype=np.int32),
             }
         ).write_parquet(str(tmp_path / "meta" / "a_new" / "canonical_meta" / "canonical-var.parquet"))
 
@@ -924,18 +924,18 @@ class TestLoadCorpusAggregate:
 
         pl.DataFrame(
             {
-                "origin_index": ["0", "1"],
+                "origin_index": np.asarray([0, 1], dtype=np.int32),
                 "gene_id": ["ENSG_Z_0", "ENSG_Z_1"],
                 "canonical_gene_id": ["GENE_B", "GENE_C"],
-                "global_id": ["0", "1"],
+                "global_id": np.asarray([0, 1], dtype=np.int32),
             }
         ).write_parquet(str(tmp_path / "meta" / "z_old" / "canonical_meta" / "canonical-var.parquet"))
         pl.DataFrame(
             {
-                "origin_index": ["0", "1", "2"],
+                "origin_index": np.asarray([0, 1, 2], dtype=np.int32),
                 "gene_id": ["ENSG_A_0", "ENSG_A_1", "ENSG_A_2"],
                 "canonical_gene_id": ["GENE_A", "GENE_C", "GENE_D"],
-                "global_id": ["0", "1", "2"],
+                "global_id": np.asarray([0, 1, 2], dtype=np.int32),
             }
         ).write_parquet(str(tmp_path / "meta" / "a_new" / "canonical_meta" / "canonical-var.parquet"))
 

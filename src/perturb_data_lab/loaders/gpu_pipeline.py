@@ -5,8 +5,8 @@ maps local→global using ``FeatureRegistry.local_to_global_map``, samples
 genes per cell from per-dataset probability pools on GPU, and gathers
 expression counts into dense ``(batch_size, seq_len)`` tensors.
 
-``CPUPipeline`` provides an equivalent CPU path for validation, using
-numpy searchsorted and ``GlobalGeneSampler``.
+``CPUPipeline`` provides an equivalent CPU path for validation using numpy
+searchsorted.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
-from .feature_registry import FeatureRegistry, GlobalGeneSampler
+from .feature_registry import FeatureRegistry
 
 __all__ = [
     "GPUSparsePipeline",
@@ -551,9 +551,8 @@ class GPUSparsePipeline:
 class CPUPipeline:
     """CPU pipeline for cross-dataset gene resolution (validation/comparison).
 
-    Mirrors ``GPUSparsePipeline`` logic but runs on CPU with numpy and
-    ``GlobalGeneSampler``.  Useful for equivalence testing and environments
-    without a GPU.
+    Mirrors ``GPUSparsePipeline`` logic but runs on CPU with numpy. Useful for
+    equivalence testing and environments without a GPU.
 
     Parameters
     ----------
@@ -566,7 +565,7 @@ class CPUPipeline:
     invalid_count_value : float, default -1.0
         Sentinel for invalid count positions.
     seed : int, default 42
-        Seed for reproducibility of the internal ``GlobalGeneSampler``.
+        Seed for reproducibility of CPU-side sampling.
     """
 
     def __init__(
@@ -585,7 +584,6 @@ class CPUPipeline:
         self._pad_token_id = int(pad_token_id)
         self._invalid_count_value = float(invalid_count_value)
         self._rng = np.random.default_rng(int(seed))
-        self._sampler = GlobalGeneSampler(registry, self._rng)
         self._local_to_global = registry.local_to_global_map
         self._has_gene = registry.dataset_has_gene
         self._hvg_mask = registry.hvg_mask
@@ -643,7 +641,6 @@ class CPUPipeline:
         """
         if seed is not None:
             self._rng = np.random.default_rng(int(seed))
-            self._sampler = GlobalGeneSampler(self._registry, self._rng)
 
         if hvg_top_k is not None and int(hvg_top_k) <= 0:
             raise ValueError("hvg_top_k must be positive when provided")

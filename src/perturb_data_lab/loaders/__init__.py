@@ -29,7 +29,6 @@ from .corpus import (
 )
 from .feature_registry import (
     FeatureRegistry,
-    GlobalGeneSampler,
 )
 from .gene_tokenizer import (
     DatasetTokenSpan,
@@ -81,7 +80,6 @@ __all__ = [
     "collate_expression_batch_cpu",
     # Phase 2 — Feature Registry
     "FeatureRegistry",
-    "GlobalGeneSampler",
     "DatasetTokenSpan",
     "GeneTokenizer",
     # Phase 3 — GPU Pipeline

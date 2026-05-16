@@ -6,93 +6,64 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pytest
 
 from perturb_data_lab.loaders import FeatureRegistry
 
 
-_PLAN_RUN = (
-    Path("/autofs/projects-t3/lilab/yangqisu/repos/data_perturb_v2")
-    / "copilot/plans/active/plans-20260430-canonicalization-module-and-loader-adaptation"
-    / "outputs"
-)
-
-_PLAN_RUN_ARCHIVE = (
-    Path("/autofs/projects-t3/lilab/yangqisu/repos/data_perturb_v2")
-    / "copilot/plans/archive/plans-20260430-canonicalization-module-and-loader-adaptation"
-    / "outputs"
-)
-
-
-def _resolve_canonical_var_path(dataset_id: str) -> str:
-    for base in (_PLAN_RUN, _PLAN_RUN_ARCHIVE):
-        candidates = [
-            base / dataset_id / "canonical-var.parquet",
-            base / dataset_id / f"{dataset_id}-canonical-var.parquet",
-            base / dataset_id / f"{dataset_id}-release-canonical-var.parquet",
-            base / f"{dataset_id}-canonical-var.parquet",
-            base / f"{dataset_id}-release-canonical-var.parquet",
-        ]
-        for path in candidates:
-            if path.exists():
-                return str(path)
-    raise FileNotFoundError(f"canonical var parquet not found for {dataset_id}")
+def _write_canonical_var(path: Path, genes: list[str]) -> None:
+    frame = pl.DataFrame(
+        {
+            "origin_index": np.arange(len(genes), dtype=np.int32),
+            "gene_id": [f"ENSG_{gene}" for gene in genes],
+            "canonical_gene_id": genes,
+            "global_id": np.arange(len(genes), dtype=np.int32),
+        }
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.write_parquet(str(path))
 
 
 class TestFeatureRegistryCanonical:
-    """FeatureRegistry built from canonical var parquets."""
+    def test_from_canonical_var_parquets_loads(self, tmp_path: Path) -> None:
+        ds0 = tmp_path / "ds0" / "canonical-var.parquet"
+        ds1 = tmp_path / "ds1" / "canonical-var.parquet"
+        _write_canonical_var(ds0, ["GENE_A", "GENE_B"])
+        _write_canonical_var(ds1, ["GENE_B", "GENE_C"])
 
-    def test_from_canonical_var_parquets_loads(self):
-        var_paths = {
-            "dummy_00": _resolve_canonical_var_path("dummy_00"),
-            "dummy_01": _resolve_canonical_var_path("dummy_01"),
-        }
-        reg = FeatureRegistry.from_canonical_var_parquets(var_paths)
-        assert len(reg.dataset_ids) == 2
-        assert "dummy_00" in reg.dataset_ids
-        assert "dummy_01" in reg.dataset_ids
-
-    def test_global_vocab_size(self):
-        var_paths = {
-            "dummy_00": _resolve_canonical_var_path("dummy_00"),
-            "dummy_01": _resolve_canonical_var_path("dummy_01"),
-        }
-        reg = FeatureRegistry.from_canonical_var_parquets(var_paths)
-        assert reg.global_vocab_size == 22652
-
-    def test_max_local_vocab(self):
-        var_paths = {
-            "dummy_00": _resolve_canonical_var_path("dummy_00"),
-            "dummy_01": _resolve_canonical_var_path("dummy_01"),
-        }
-        reg = FeatureRegistry.from_canonical_var_parquets(var_paths)
-        assert reg.max_local_vocab == 15000
-
-    def test_local_to_global_map(self):
-        var_paths = {
-            "dummy_00": _resolve_canonical_var_path("dummy_00"),
-        }
-        reg = FeatureRegistry.from_canonical_var_parquets(var_paths)
-        m = reg.local_to_global_map
-        assert m.shape == (1, 10000)
-        np.testing.assert_array_equal(m[0, :5], np.array([0, 1, 2, 3, 4]))
-
-    def test_canonical_vs_raw_vocab_differs(self):
-        archived_root = Path(
-            "/autofs/projects-t3/lilab/yangqisu/repos/data_perturb_v2"
-            "/copilot/plans/archive/plans-20260427-backend-topology-validation"
-            "/outputs/lance-federated"
-        )
-        raw_df_00 = pl.read_parquet(
-            str(archived_root / "dummy_00/metadata/dummy_00-release-raw-var.parquet")
-        )
-        raw_df_01 = pl.read_parquet(
-            str(archived_root / "dummy_01/metadata/dummy_01-release-raw-var.parquet")
+        reg = FeatureRegistry.from_canonical_var_parquets(
+            {"ds0": ds0, "ds1": ds1},
+            global_id_by_feature_id={"GENE_A": 0, "GENE_B": 1, "GENE_C": 2},
         )
 
-        raw_reg = FeatureRegistry({"dummy_00": raw_df_00, "dummy_01": raw_df_01})
-        var_paths = {
-            "dummy_00": _resolve_canonical_var_path("dummy_00"),
-            "dummy_01": _resolve_canonical_var_path("dummy_01"),
-        }
-        canon_reg = FeatureRegistry.from_canonical_var_parquets(var_paths)
-        assert canon_reg.global_vocab_size == raw_reg.global_vocab_size
+        assert reg.dataset_ids == ("ds0", "ds1")
+        assert reg.global_vocab_size == 3
+        assert reg.max_local_vocab == 2
+        np.testing.assert_array_equal(
+            reg.local_to_global_map,
+            np.asarray([[0, 1], [1, 2]], dtype=np.int32),
+        )
+
+    def test_requires_tokenizer_mapping(self, tmp_path: Path) -> None:
+        ds0 = tmp_path / "ds0" / "canonical-var.parquet"
+        _write_canonical_var(ds0, ["GENE_A", "GENE_B"])
+
+        with pytest.raises(ValueError, match="missing from persisted gene tokenizer"):
+            FeatureRegistry.from_canonical_var_parquets(
+                {"ds0": ds0},
+                global_id_by_feature_id={"GENE_A": 0},
+            )
+
+    def test_requires_canonical_gene_id(self) -> None:
+        with pytest.raises(ValueError, match="canonical_gene_id"):
+            FeatureRegistry(
+                {
+                    "ds0": pl.DataFrame(
+                        {
+                            "origin_index": np.asarray([0, 1], dtype=np.int32),
+                            "feature_id": ["GENE_A", "GENE_B"],
+                        }
+                    )
+                },
+                global_id_by_feature_id={"GENE_A": 0, "GENE_B": 1},
+            )

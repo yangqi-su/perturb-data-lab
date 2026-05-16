@@ -32,10 +32,10 @@ def _write_canonical_obs(
 def _write_canonical_var(path: Path, gene_names: list[str]) -> None:
     frame = pl.DataFrame(
         {
-            "origin_index": [str(idx) for idx in range(len(gene_names))],
+            "origin_index": np.arange(len(gene_names), dtype=np.int32),
             "gene_id": [f"ENSG_{gene_name}" for gene_name in gene_names],
             "canonical_gene_id": gene_names,
-            "global_id": [str(idx) for idx in range(len(gene_names))],
+            "global_id": np.arange(len(gene_names), dtype=np.int32),
         }
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,6 +179,7 @@ def _build_feature_registry_with_partial_vocab(tmp_path: Path) -> FeatureRegistr
             "ds1": ds1_var,
         },
         dataset_order=["ds0", "ds1"],
+        global_id_by_feature_id={"GENE_A": 0, "GENE_B": 1, "GENE_C": 2, "GENE_D": 3},
         named_hvg_rank_paths={
             "ds0": ds0_hvg,
             "ds1": ds1_hvg,

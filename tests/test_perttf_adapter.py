@@ -28,17 +28,18 @@ def _build_feature_registry() -> FeatureRegistry:
             "ds0": pl.DataFrame(
                 {
                     "origin_index": [0, 1],
-                    "feature_id": ["GENE_B", "GENE_A"],
+                    "canonical_gene_id": ["GENE_B", "GENE_A"],
                 }
             ),
             "ds1": pl.DataFrame(
                 {
                     "origin_index": [0, 1],
-                    "feature_id": ["GENE_A", "GENE_C"],
+                    "canonical_gene_id": ["GENE_A", "GENE_C"],
                 }
             ),
         },
         dataset_order=["ds0", "ds1"],
+        global_id_by_feature_id={"GENE_B": 0, "GENE_A": 1, "GENE_C": 2},
     )
 
 
@@ -169,10 +170,10 @@ def _write_canonical_obs(path: Path, *, dataset_id: str, global_start: int) -> N
 def _write_canonical_var(path: Path, gene_names: list[str]) -> None:
     frame = pl.DataFrame(
         {
-            "origin_index": [str(idx) for idx in range(len(gene_names))],
+            "origin_index": np.arange(len(gene_names), dtype=np.int32),
             "gene_id": [f"ENSG_{gene_name}" for gene_name in gene_names],
             "canonical_gene_id": gene_names,
-            "global_id": [str(idx) for idx in range(len(gene_names))],
+            "global_id": np.arange(len(gene_names), dtype=np.int32),
         }
     )
     path.parent.mkdir(parents=True, exist_ok=True)
