@@ -39,7 +39,6 @@ def _build_feature_registry() -> FeatureRegistry:
             ),
         },
         dataset_order=["ds0", "ds1"],
-        global_id_by_feature_id={"GENE_B": 0, "GENE_A": 1, "GENE_C": 2},
     )
 
 

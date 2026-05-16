@@ -24,10 +24,6 @@ from .loaders import (
 from .feature_registry import (
     FeatureRegistry,
 )
-from .gene_tokenizer import (
-    DatasetTokenSpan,
-    GeneTokenizer,
-)
 from .corpus_loader import (
     Corpus,
     load_corpus,
@@ -69,8 +65,6 @@ __all__ = [
     "collate_expression_batch",
     # Phase 2 — Feature Registry
     "FeatureRegistry",
-    "DatasetTokenSpan",
-    "GeneTokenizer",
     # Phase 3 — GPU Pipeline
     "GPUSparsePipeline",
     # Phase 4 — pertTF-local adapters

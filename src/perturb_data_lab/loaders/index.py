@@ -84,6 +84,46 @@ class MetadataIndex:
         self._validate_flat_schema(df)
         self.df = df
 
+    @classmethod
+    def from_canonical_obs_parquets(
+        cls,
+        datasets_info: list[tuple[str, int, int, int]],
+        obs_paths: dict[str, Path],
+        extra_metadata_columns: Sequence[str] | None = None,
+    ) -> "MetadataIndex":
+        """Build a corpus-global metadata index from canonical obs parquets."""
+        processed: list[pl.DataFrame] = []
+
+        for ds_id, ds_index, g_start, _g_end in datasets_info:
+            obs_path = obs_paths[ds_id]
+            df = _load_canonical_obs_frame(
+                obs_path,
+                extra_metadata_columns=extra_metadata_columns,
+                context=f"canonical obs parquet for dataset '{ds_id}' at {obs_path}",
+            )
+            n_obs = len(df)
+            df = df.with_columns(
+                pl.lit(ds_index, dtype=pl.Int32).alias("dataset_index"),
+                (pl.int_range(0, n_obs, dtype=pl.Int64) + g_start).alias("global_row_index"),
+                pl.int_range(0, n_obs, dtype=pl.Int64).alias("local_row_index"),
+            )
+            processed.append(df)
+
+        combined = pl.concat(processed, how="diagonal_relaxed")
+        for col in _CANONICAL_OBS_STRUCTURAL_COLUMNS:
+            if col not in combined.columns:
+                fill_dtype = _CANONICAL_OBS_TYPED_DTYPES.get(col, pl.Utf8)
+                combined = combined.with_columns(pl.lit(None, dtype=fill_dtype).alias(col))
+
+        combined = _normalize_canonical_obs_dtypes(combined)
+        content_cols = [c for c in _CANONICAL_OBS_CONTENT_COLUMNS if c in combined.columns]
+        other_cols = sorted(
+            c for c in combined.columns
+            if c not in _CANONICAL_OBS_STRUCTURAL_COLUMNS and c not in content_cols
+        )
+        combined = combined.select(list(_CANONICAL_OBS_STRUCTURAL_COLUMNS) + content_cols + other_cols)
+        return cls(combined.sort("global_row_index"))
+
     @staticmethod
     def _validate_flat_schema(df: pl.DataFrame) -> None:
         for col_name in df.columns:

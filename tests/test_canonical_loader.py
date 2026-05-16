@@ -33,7 +33,6 @@ class TestFeatureRegistryCanonical:
 
         reg = FeatureRegistry.from_canonical_var_parquets(
             {"ds0": ds0, "ds1": ds1},
-            global_id_by_feature_id={"GENE_A": 0, "GENE_B": 1, "GENE_C": 2},
         )
 
         assert reg.dataset_ids == ("ds0", "ds1")
@@ -44,15 +43,22 @@ class TestFeatureRegistryCanonical:
             np.asarray([[0, 1], [1, 2]], dtype=np.int32),
         )
 
-    def test_requires_tokenizer_mapping(self, tmp_path: Path) -> None:
-        ds0 = tmp_path / "ds0" / "canonical-var.parquet"
-        _write_canonical_var(ds0, ["GENE_A", "GENE_B"])
+    def test_global_ids_follow_dataset_order(self, tmp_path: Path) -> None:
+        old_path = tmp_path / "z_old" / "canonical-var.parquet"
+        new_path = tmp_path / "a_new" / "canonical-var.parquet"
+        _write_canonical_var(old_path, ["GENE_B", "GENE_C"])
+        _write_canonical_var(new_path, ["GENE_A", "GENE_C", "GENE_D"])
 
-        with pytest.raises(ValueError, match="missing from persisted gene tokenizer"):
-            FeatureRegistry.from_canonical_var_parquets(
-                {"ds0": ds0},
-                global_id_by_feature_id={"GENE_A": 0},
-            )
+        reg = FeatureRegistry.from_canonical_var_parquets(
+            {"z_old": old_path, "a_new": new_path},
+            dataset_order=["z_old", "a_new"],
+        )
+
+        assert reg.global_feature_ids == ("GENE_B", "GENE_C", "GENE_A", "GENE_D")
+        np.testing.assert_array_equal(
+            reg.local_to_global_map,
+            np.asarray([[0, 1, -1], [2, 1, 3]], dtype=np.int32),
+        )
 
     def test_requires_canonical_gene_id(self) -> None:
         with pytest.raises(ValueError, match="canonical_gene_id"):
@@ -65,5 +71,4 @@ class TestFeatureRegistryCanonical:
                         }
                     )
                 },
-                global_id_by_feature_id={"GENE_A": 0, "GENE_B": 1},
             )

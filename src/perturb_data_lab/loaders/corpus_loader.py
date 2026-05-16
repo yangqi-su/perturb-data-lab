@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
-import polars as pl
 import yaml
 
 from .expression import (
@@ -23,15 +22,7 @@ from .expression import (
     build_expression_reader,
 )
 from .feature_registry import FeatureRegistry
-from .gene_tokenizer import GeneTokenizer
-from .index import (
-    MetadataIndex,
-    _CANONICAL_OBS_CONTENT_COLUMNS,
-    _CANONICAL_OBS_STRUCTURAL_COLUMNS,
-    _CANONICAL_OBS_TYPED_DTYPES,
-    _load_canonical_obs_frame,
-    _normalize_canonical_obs_dtypes,
-)
+from .index import MetadataIndex
 
 from ..materializers.paths import resolve_corpus_paths
 
@@ -290,8 +281,8 @@ def load_corpus(
     """Load a training-ready ``Corpus`` from a corpus directory.
 
     Reads ``corpus-index.yaml``, locates canonical obs/var parquets via
-    ``resolve_corpus_paths()``, and constructs expression, metadata, tokenizer,
-    and feature-registry components.
+    ``resolve_corpus_paths()``, and constructs expression, metadata, and
+    feature-registry components.
 
     Parameters
     ----------
@@ -328,7 +319,6 @@ def load_corpus(
     with open(index_path, encoding="utf-8") as handle:
         index_doc = yaml.safe_load(handle) or {}
     metadata = index_doc.get("global_metadata", {})
-    corpus_id = str(index_doc.get("corpus_id", root.name))
     topology = str(metadata.get("topology", ""))
     raw_backend = str(metadata.get("backend", ""))
     backend = _normalize_backend(raw_backend)
@@ -374,7 +364,7 @@ def load_corpus(
     # ------------------------------------------------------------------
     # 3. Build MetadataIndex from canonical obs parquets
     # ------------------------------------------------------------------
-    metadata_index = _build_metadata_index(
+    metadata_index = MetadataIndex.from_canonical_obs_parquets(
         datasets_info=global_ranges,
         obs_paths=canonical_obs_paths,
         extra_metadata_columns=extra_metadata_columns,
@@ -397,28 +387,9 @@ def load_corpus(
         ds_id: str(p) for ds_id, p in canonical_var_paths.items()
     }
     dataset_order = [ds_id for ds_id, *_ in global_ranges]
-    tokenizer_path_value = metadata.get("tokenizer_path")
-    tokenizer_path = (
-        root / str(tokenizer_path_value)
-        if tokenizer_path_value
-        else root / "gene-tokenizer.json"
-    )
-    if tokenizer_path.exists():
-        gene_tokenizer = GeneTokenizer.from_json(tokenizer_path)
-        if gene_tokenizer.dataset_build_order != tuple(dataset_order):
-            raise ValueError(
-                "Persisted gene tokenizer dataset_build_order does not match corpus-index.yaml order"
-            )
-    else:
-        gene_tokenizer = GeneTokenizer.build_from_canonical_var_parquets(
-            corpus_id=corpus_id,
-            named_var_paths=var_path_map,
-            dataset_order=dataset_order,
-        )
     feature_registry = FeatureRegistry.from_canonical_var_parquets(
         var_path_map,
         dataset_order=dataset_order,
-        global_id_by_feature_id=gene_tokenizer.token_to_id,
     )
 
     # ------------------------------------------------------------------
@@ -434,90 +405,3 @@ def load_corpus(
         backend=backend,
         corpus_root=root,
     )
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _build_metadata_index(
-    datasets_info: list[tuple[str, int, int, int]],
-    obs_paths: dict[str, Path],
-    extra_metadata_columns: Sequence[str] | None = None,
-) -> MetadataIndex:
-    """Build a ``MetadataIndex`` from per-dataset canonical obs parquets.
-
-    Reads each parquet, assigns corpus-global ``global_row_index`` and
-    ``dataset_index``, concatenates, and wraps in ``MetadataIndex``.
-
-    Parameters
-    ----------
-    datasets_info : list of (dataset_id, dataset_index, global_start, global_end)
-        Ordered per-dataset routing information from ``corpus-index.yaml``.
-    obs_paths : dict[str, Path]
-        Mapping ``dataset_id → canonical-obs.parquet`` path.
-    Returns
-    -------
-    MetadataIndex
-    """
-    processed: list[pl.DataFrame] = []
-
-    for ds_id, ds_index, g_start, g_end in datasets_info:
-        obs_path = obs_paths[ds_id]
-        df = _load_canonical_obs_frame(
-            obs_path,
-            extra_metadata_columns=extra_metadata_columns,
-            context=(
-                f"canonical obs parquet for dataset '{ds_id}' at {obs_path}"
-            ),
-        )
-        n_obs = len(df)
-
-        # Override with corpus-global values
-        df = df.with_columns(
-            pl.lit(ds_index, dtype=pl.Int32).alias("dataset_index"),
-        )
-        df = df.with_columns(
-            (pl.int_range(0, n_obs, dtype=pl.Int64) + g_start).alias(
-                "global_row_index"
-            ),
-        )
-        df = df.with_columns(
-            pl.int_range(0, n_obs, dtype=pl.Int64).alias("local_row_index"),
-        )
-
-        processed.append(df)
-
-    # Concatenate all datasets
-    combined = pl.concat(processed, how="diagonal_relaxed")
-
-    # Reorder: structural columns first, then canonical content, then the rest
-    structural = list(_CANONICAL_OBS_STRUCTURAL_COLUMNS)
-    # Ensure all structural columns exist (fill missing with null)
-    for col in structural:
-        if col not in combined.columns:
-            fill_dtype = _CANONICAL_OBS_TYPED_DTYPES.get(col, pl.Utf8)
-            combined = combined.with_columns(
-                pl.lit(None, dtype=fill_dtype).alias(col)
-            )
-
-    combined = _normalize_canonical_obs_dtypes(combined)
-
-    # Canonical content columns (may or may not all be present)
-    content_cols = [c for c in _CANONICAL_OBS_CONTENT_COLUMNS if c in combined.columns]
-
-    # Everything else (extensible / raw_ columns)
-    existing = set(combined.columns)
-    other_cols = sorted(
-        c for c in combined.columns
-        if c not in structural and c not in content_cols
-    )
-
-    col_order = structural + content_cols + other_cols
-    combined = combined.select(col_order)
-
-    # Sort by global_row_index for deterministic access
-    combined = combined.sort("global_row_index")
-
-    return MetadataIndex(combined)

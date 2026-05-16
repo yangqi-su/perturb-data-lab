@@ -179,7 +179,6 @@ def _build_feature_registry_with_partial_vocab(tmp_path: Path) -> FeatureRegistr
             "ds1": ds1_var,
         },
         dataset_order=["ds0", "ds1"],
-        global_id_by_feature_id={"GENE_A": 0, "GENE_B": 1, "GENE_C": 2, "GENE_D": 3},
     )
 
 
@@ -222,7 +221,6 @@ def test_feature_registry_hvg_without_default_selection_is_top_k_only(tmp_path: 
 
     registry = FeatureRegistry.from_canonical_var_parquets(
         {"ds0": var_path},
-        global_id_by_feature_id={"GENE_A": 0, "GENE_B": 1},
     )
 
     np.testing.assert_array_equal(registry.hvg_rank_matrix, np.asarray([[1, 2]], dtype=np.int32))

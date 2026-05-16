@@ -16,9 +16,11 @@ _UNMAPPED: int = -1
 class FeatureRegistry:
     """Map per-dataset local gene indices to shared global gene IDs.
 
-    The gene tokenizer owns the global canonical-gene ordering. This registry
-    turns each dataset's ``origin_index`` coordinates into those tokenizer IDs
-    and keeps optional canonical HVG ranks for loader-side sampling.
+    The registry assigns global gene IDs by walking canonical var parquets in
+    corpus dataset order and appending previously unseen ``canonical_gene_id``
+    values in local ``origin_index`` order. It then maps each dataset's local
+    gene coordinates to those global IDs and keeps optional canonical HVG ranks
+    for loader-side sampling.
     """
 
     @classmethod
@@ -26,7 +28,6 @@ class FeatureRegistry:
         cls,
         named_var_paths: Mapping[str, str | Path],
         *,
-        global_id_by_feature_id: Mapping[str, int],
         dataset_order: Sequence[str] | None = None,
     ) -> "FeatureRegistry":
         order = list(dataset_order) if dataset_order is not None else list(named_var_paths.keys())
@@ -42,7 +43,6 @@ class FeatureRegistry:
         return cls(
             named_var_dfs,
             dataset_order=order,
-            global_id_by_feature_id=global_id_by_feature_id,
             named_hvg_rank_dfs=named_hvg_rank_dfs or None,
         )
 
@@ -52,11 +52,24 @@ class FeatureRegistry:
         hvg_path = meta_root / "hvg.parquet"
         return hvg_path if hvg_path.exists() else None
 
+    @staticmethod
+    def _build_global_id_by_feature_id(
+        named_var_dfs: Mapping[str, pl.DataFrame],
+        dataset_order: Sequence[str],
+    ) -> dict[str, int]:
+        global_id_by_feature_id: dict[str, int] = {}
+        for dataset_id in dataset_order:
+            var_df = named_var_dfs[dataset_id].sort("origin_index")
+            FeatureRegistry._validate_var_df(var_df, dataset_id)
+            for feature_id in var_df["canonical_gene_id"].to_list():
+                if feature_id not in global_id_by_feature_id:
+                    global_id_by_feature_id[feature_id] = len(global_id_by_feature_id)
+        return global_id_by_feature_id
+
     def __init__(
         self,
         named_var_dfs: Mapping[str, pl.DataFrame],
         *,
-        global_id_by_feature_id: Mapping[str, int],
         dataset_order: Sequence[str] | None = None,
         named_hvg_rank_dfs: Mapping[str, pl.DataFrame] | None = None,
     ) -> None:
@@ -68,10 +81,10 @@ class FeatureRegistry:
             raise ValueError("dataset_order must contain exactly the named_var_dfs keys")
         self._n_datasets = len(self._dataset_ids)
 
-        self._feature_id_to_global = dict(global_id_by_feature_id)
+        self._feature_id_to_global = self._build_global_id_by_feature_id(named_var_dfs, self._dataset_ids)
         ids = sorted(self._feature_id_to_global.values())
         if ids != list(range(len(ids))):
-            raise ValueError("global_id_by_feature_id must define contiguous IDs 0..N-1")
+            raise ValueError("global feature IDs must be contiguous 0..N-1")
         self._global_vocab_size = len(self._feature_id_to_global)
 
         self._local_to_global: dict[int, np.ndarray] = {}
@@ -86,7 +99,7 @@ class FeatureRegistry:
             for local_idx, canonical_gene_id in enumerate(canonical_gene_ids):
                 if canonical_gene_id not in self._feature_id_to_global:
                     raise ValueError(
-                        f"canonical_gene_id {canonical_gene_id!r} missing from persisted gene tokenizer"
+                        f"canonical_gene_id {canonical_gene_id!r} missing from global feature map"
                     )
                 mapping[local_idx] = int(self._feature_id_to_global[canonical_gene_id])
             self._local_to_global[ds_idx] = mapping
