@@ -1,2693 +1,337 @@
-"""Unit tests for ``load_corpus()`` factory with mock data (no h5ad needed)."""
-
 from __future__ import annotations
 
-from functools import partial
-import json
-import pickle
-import shutil
-import tempfile
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import lance
 import numpy as np
 import polars as pl
 import pyarrow as pa
 import pytest
-from scipy import sparse
 import torch
-from torch.utils.data import DataLoader
 import yaml
+from torch.utils.data import DataLoader
 
 from perturb_data_lab.loaders import (
-    CPUPipeline,
     CorpusRandomBatchSampler,
-    DatasetEntry,
-    ExpressionBatch,
     ExpressionBatchDataset,
-    GeneTokenizer,
-    GPUSparsePipeline,
-    MetadataIndex,
-    PertTFAdapterConfig,
-    PertTFCorpusAdapter,
-    select_obs_indices,
+    build_loader,
     collate_expression_batch,
-    collate_expression_batch_cpu,
 )
-from perturb_data_lab.loaders.corpus_loader import (
-    Corpus,
-    _build_dataset_routing_table,
-    _read_raw_batch,
-    load_corpus,
+from perturb_data_lab.loaders.corpus_loader import Corpus, load_corpus
+
+
+N_GENES = 8
+LOADER_SEQ_LEN = 4
+
+DATASETS = (
+    {"dataset_id": "mock_00", "dataset_index": 0, "global_start": 0, "cell_count": 4},
+    {"dataset_id": "mock_01", "dataset_index": 1, "global_start": 4, "cell_count": 5},
 )
-from perturb_data_lab.materializers.backends import build_backend_fn
-from perturb_data_lab.materializers.chunk_translation import ChunkBundle
 
 
-LOADER_SEQ_LEN = 8
+def _obs_frame(dataset_id: str, dataset_index: int, global_start: int, n_cells: int) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "global_row_index": np.arange(global_start, global_start + n_cells, dtype=np.int64),
+            "cell_id": [f"{dataset_id}_cell_{idx}" for idx in range(n_cells)],
+            "dataset_id": [dataset_id] * n_cells,
+            "dataset_index": np.full(n_cells, dataset_index, dtype=np.int32),
+            "local_row_index": np.arange(n_cells, dtype=np.int64),
+            "size_factor": np.asarray([1.0 + 0.1 * idx for idx in range(n_cells)], dtype=np.float64),
+            "perturb_label": ["ctrl" if idx % 2 == 0 else "treat" for idx in range(n_cells)],
+            "perturb_type": ["CRISPR"] * n_cells,
+            "dose": [None] * n_cells,
+            "dose_unit": [None] * n_cells,
+            "timepoint": [None] * n_cells,
+            "timepoint_unit": [None] * n_cells,
+            "cell_context": ["K562"] * n_cells,
+            "cell_line_or_type": ["K562"] * n_cells,
+            "species": ["Homo sapiens"] * n_cells,
+            "tissue": ["bone marrow"] * n_cells,
+            "assay": ["Perturb-seq"] * n_cells,
+            "condition": ["mock"] * n_cells,
+            "batch_id": [f"batch_{dataset_index}"] * n_cells,
+            "donor_id": ["donor_0"] * n_cells,
+            "sex": ["NA"] * n_cells,
+            "disease_state": ["healthy"] * n_cells,
+        }
+    )
 
 
-def _assert_processed_loader_batch(batch: dict[str, Any], *, batch_size: int) -> None:
+def _var_frame() -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "origin_index": np.arange(N_GENES, dtype=np.int32),
+            "gene_id": [f"ENSG{i:05d}" for i in range(N_GENES)],
+            "canonical_gene_id": [f"GENE{i:05d}" for i in range(N_GENES)],
+            "global_id": np.arange(N_GENES, dtype=np.int32),
+        }
+    )
+
+
+def _expression_rows(n_cells: int, *, seed: int) -> list[dict[str, Any]]:
+    rng = np.random.default_rng(seed)
+    rows: list[dict[str, Any]] = []
+    for _ in range(n_cells):
+        genes = np.sort(rng.choice(N_GENES, size=3, replace=False).astype(np.int32))
+        counts = rng.integers(1, 5, size=3, dtype=np.int32)
+        rows.append(
+            {
+                "expressed_gene_indices": genes.tolist(),
+                "expression_counts": counts.tolist(),
+            }
+        )
+    return rows
+
+
+def _write_lance_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table = pa.table(
+        {
+            "expressed_gene_indices": pa.array(
+                [row["expressed_gene_indices"] for row in rows],
+                type=pa.list_(pa.int32()),
+            ),
+            "expression_counts": pa.array(
+                [row["expression_counts"] for row in rows],
+                type=pa.list_(pa.int32()),
+            ),
+        }
+    )
+    lance.write_dataset(table, str(path), mode="overwrite")
+
+
+def _write_corpus_index(root: Path, *, topology: str) -> None:
+    doc = {
+        "kind": "corpus-index",
+        "contract_version": "0.3.0",
+        "global_metadata": {"backend": "lance", "topology": topology},
+        "datasets": [
+            {
+                "dataset_id": item["dataset_id"],
+                "join_mode": "create_new" if idx == 0 else "append_routed",
+                "dataset_index": item["dataset_index"],
+                "cell_count": item["cell_count"],
+                "global_start": item["global_start"],
+                "global_end": item["global_start"] + item["cell_count"],
+            }
+            for idx, item in enumerate(DATASETS)
+        ],
+    }
+    with open(root / "corpus-index.yaml", "w", encoding="utf-8") as handle:
+        yaml.safe_dump(doc, handle)
+
+
+def _write_metadata(root: Path, *, topology: str) -> None:
+    for item in DATASETS:
+        if topology == "aggregate":
+            meta_root = root / "meta" / item["dataset_id"] / "canonical_meta"
+        else:
+            meta_root = root / item["dataset_id"] / "meta" / "canonical_meta"
+        meta_root.mkdir(parents=True, exist_ok=True)
+        _obs_frame(
+            item["dataset_id"],
+            item["dataset_index"],
+            item["global_start"],
+            item["cell_count"],
+        ).write_parquet(meta_root / "canonical-obs.parquet")
+        _var_frame().write_parquet(meta_root / "canonical-var.parquet")
+
+
+def _build_aggregate_lance_corpus(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    _write_corpus_index(root, topology="aggregate")
+    _write_metadata(root, topology="aggregate")
+    rows: list[dict[str, Any]] = []
+    for item in DATASETS:
+        rows.extend(_expression_rows(item["cell_count"], seed=100 + item["dataset_index"]))
+    _write_lance_rows(root / "matrix" / "aggregated-cells.lance", rows)
+
+
+def _build_federated_lance_corpus(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    _write_corpus_index(root, topology="federated")
+    _write_metadata(root, topology="federated")
+    for item in DATASETS:
+        rows = _expression_rows(item["cell_count"], seed=200 + item["dataset_index"])
+        _write_lance_rows(
+            root / item["dataset_id"] / "matrix" / f"{item['dataset_id']}.lance",
+            rows,
+        )
+
+
+def _assert_processed_batch(batch: dict[str, Any], *, batch_size: int) -> None:
     assert batch["batch_size"] == batch_size
     assert batch["seq_len"] == LOADER_SEQ_LEN
-    assert isinstance(batch["sampled_gene_ids"], torch.Tensor)
-    assert isinstance(batch["sampled_counts"], torch.Tensor)
-    assert isinstance(batch["valid_mask"], torch.Tensor)
-    assert isinstance(batch["exact_match_mask"], torch.Tensor)
-    assert isinstance(batch["dataset_index"], torch.Tensor)
-    assert isinstance(batch["global_row_index"], torch.Tensor)
+    for key in (
+        "sampled_gene_ids",
+        "sampled_counts",
+        "valid_mask",
+        "exact_match_mask",
+        "dataset_index",
+        "global_row_index",
+    ):
+        assert isinstance(batch[key], torch.Tensor)
     assert "row_offsets" not in batch
     assert "expressed_gene_indices" not in batch
     assert "expression_counts" not in batch
 
 
-def _assert_columnar_value_equal(actual: Any, expected: Any) -> None:
-    if isinstance(expected, np.ndarray):
-        np.testing.assert_array_equal(actual, expected)
-        return
-    assert actual == expected
+def test_load_corpus_builds_components_without_runtime_loader_state(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+
+    corpus = load_corpus(tmp_path)
+
+    assert isinstance(corpus, Corpus)
+    assert corpus.topology == "aggregate"
+    assert corpus.backend == "lance"
+    assert len(corpus.metadata_index) == 9
+    assert corpus.dataset_index_by_id == {"mock_00": 0, "mock_01": 1}
+    assert corpus.feature_registry.global_vocab_size == N_GENES
+    assert not hasattr(corpus, "loader")
+    assert not hasattr(corpus, "dataset")
+    assert not hasattr(corpus, "set_sampler")
+    assert not hasattr(corpus, "select_obs_indices")
 
 
-def _assert_expression_batch_equal(actual: Any, expected: Any) -> None:
-    assert actual.batch_size == expected.batch_size
-    np.testing.assert_array_equal(actual.global_row_index, expected.global_row_index)
-    np.testing.assert_array_equal(actual.row_offsets, expected.row_offsets)
-    np.testing.assert_array_equal(
-        actual.expressed_gene_indices,
-        expected.expressed_gene_indices,
-    )
-    np.testing.assert_array_equal(actual.expression_counts, expected.expression_counts)
+def test_read_expression_and_take_metadata_use_global_rows(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
+
+    expression = corpus.read_expression([0, 4, 8])
+    metadata = corpus.take_metadata([0, 4, 8], columns=["dataset_id", "dataset_index"])
+
+    np.testing.assert_array_equal(expression.global_row_index, [0, 4, 8])
+    assert expression.batch_size == 3
+    assert metadata["dataset_id"] == ("mock_00", "mock_01", "mock_01")
+    np.testing.assert_array_equal(metadata["dataset_index"], [0, 1, 1])
 
 
-def _assert_raw_batch_equal(actual: dict[str, Any], expected: dict[str, Any]) -> None:
-    assert actual.keys() == expected.keys()
-    assert actual["batch_size"] == expected["batch_size"]
-    for key in (
+def test_expression_dataset_is_expression_only(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
+    dataset = ExpressionBatchDataset(corpus.expression_reader, total_rows=len(corpus.metadata_index))
+
+    raw = dataset.__getitems__([0, 4, 8])[0]
+    assert set(raw) == {
+        "batch_size",
         "global_row_index",
-        "dataset_index",
-        "local_row_index",
         "row_offsets",
         "expressed_gene_indices",
         "expression_counts",
-        "size_factor",
-    ):
-        if key in expected:
-            np.testing.assert_array_equal(actual[key], expected[key])
-    if "meta_columns" in expected:
-        assert set(actual["meta_columns"]) == set(expected["meta_columns"])
-        for key, value in expected["meta_columns"].items():
-            _assert_columnar_value_equal(actual["meta_columns"][key], value)
-
-
-def _assert_take_metadata_equal(
-    actual: dict[str, np.ndarray | tuple],
-    expected: dict[str, np.ndarray | tuple],
-) -> None:
-    assert set(actual) == set(expected)
-    for key, value in expected.items():
-        _assert_columnar_value_equal(actual[key], value)
-
-
-def _make_routing_metadata_index(
-    *,
-    dataset_id: Sequence[str],
-    dataset_index: Sequence[int],
-    local_row_index: Sequence[int],
-) -> MetadataIndex:
-    n_rows = len(dataset_id)
-    return MetadataIndex(
-        pl.DataFrame(
-            {
-                "global_row_index": np.arange(n_rows, dtype=np.int64),
-                "cell_id": [f"cell_{idx:03d}" for idx in range(n_rows)],
-                "dataset_id": list(dataset_id),
-                "dataset_index": np.asarray(dataset_index, dtype=np.int32),
-                "local_row_index": np.asarray(local_row_index, dtype=np.int64),
-            }
-        )
-    )
-
-
-# ---------------------------------------------------------------------------
-# Helpers — build mock corpus on disk
-# ---------------------------------------------------------------------------
-
-N_GENES = 100  # per dataset
-
-
-def _make_obs_df(
-    dataset_id: str,
-    dataset_index: int,
-    n_cells: int,
-    global_start: int,
-    *,
-    canonical: bool = True,
-    include_size_factor: bool = True,
-    typed_structural: bool = False,
-    safe_nulls: bool = False,
-) -> pl.DataFrame:
-    """Create a canonical-obs DataFrame for testing."""
-    rows = []
-    rng = np.random.RandomState(dataset_index * 10_000 + global_start + n_cells)
-    for i in range(n_cells):
-        row: dict[str, Any] = {
-            "cell_id": f"{dataset_id}_cell_{i:04d}",
-            "dataset_id": dataset_id,
-            "dataset_index": dataset_index if typed_structural else str(dataset_index),
-            "global_row_index": global_start + i if typed_structural else str(global_start + i),
-            "local_row_index": i if typed_structural else str(i),
-            "perturb_label": "CRISPR_control" if i % 3 == 0 else "CRISPR_geneX",
-            "perturb_type": "CRISPR",
-            "dose": None if safe_nulls else "1.0",
-            "dose_unit": None if safe_nulls else "MOI",
-            "timepoint": None if safe_nulls else "7",
-            "timepoint_unit": None if safe_nulls else "days",
-            "cell_context": "",
-            "cell_line_or_type": "K562",
-            "species": "Homo sapiens",
-            "tissue": "bone marrow",
-            "assay": "Perturb-seq",
-            "condition": "NA",
-            "batch_id": f"batch_{i // 5}",
-            "donor_id": "donor_01",
-            "sex": "NA",
-            "disease_state": "healthy",
-        }
-        if include_size_factor:
-            size_factor = round(float(rng.uniform(0.5, 2.0)), 4)
-            row["size_factor"] = size_factor if typed_structural else str(size_factor)
-        rows.append(row)
-
-    return pl.DataFrame(rows)
-
-
-def _rewrite_canonical_obs_columns(
-    corpus_root: Path,
-    dataset_id: str,
-    transform: Any,
-) -> None:
-    obs_path = corpus_root / "meta" / dataset_id / "canonical_meta" / "canonical-obs.parquet"
-    frame = pl.read_parquet(obs_path)
-    updated = transform(frame)
-    updated.write_parquet(obs_path)
-
-
-def _make_var_df(dataset_id: str, n_genes: int) -> pl.DataFrame:
-    """Create a canonical-var DataFrame for testing."""
-    rows = []
-    for i in range(n_genes):
-        rows.append({
-            "origin_index": i,
-            "gene_id": f"ENSG_{dataset_id}_{i:05d}",
-            "canonical_gene_id": f"GENE_{i:05d}",
-            "global_id": i,
-        })
-    return pl.DataFrame(rows)
-
-
-def _make_lance_rows(n_cells: int) -> list[dict[str, Any]]:
-    """Create expression rows for Lance files."""
-    rows = []
-    rng = np.random.RandomState(42)
-    for _ in range(n_cells):
-        n_nonzero = rng.randint(20, min(90, N_GENES))
-        gene_indices = rng.choice(N_GENES, size=n_nonzero, replace=False).astype(np.int32)
-        gene_indices.sort()
-        counts = rng.poisson(2, size=n_nonzero).astype(np.int32)
-        rows.append({
-            "expressed_gene_indices": list(gene_indices),
-            "expression_counts": list(counts),
-        })
-    return rows
-
-
-def _bundle_for_rows(global_start: int, rows: list[dict[str, Any]]) -> ChunkBundle:
-    indptr = [0]
-    gene_indices: list[int] = []
-    counts: list[int] = []
-    row_sums: list[float] = []
-    expressed_gene_indices = [row["expressed_gene_indices"] for row in rows]
-    expression_counts = [row["expression_counts"] for row in rows]
-
-    for genes, values in zip(expressed_gene_indices, expression_counts, strict=True):
-        gene_indices.extend(genes)
-        counts.extend(values)
-        indptr.append(indptr[-1] + len(genes))
-        row_sums.append(float(np.sum(values)))
-
-    return ChunkBundle(
-        table=pa.table(
-            {
-                "global_row_index": pa.array(
-                    np.arange(global_start, global_start + len(rows), dtype=np.int64),
-                    type=pa.int64(),
-                ),
-                "expressed_gene_indices": pa.array(expressed_gene_indices, type=pa.list_(pa.int32())),
-                "expression_counts": pa.array(expression_counts, type=pa.list_(pa.int32())),
-            }
-        ),
-        row_sums=np.asarray(row_sums, dtype=np.float64),
-        indptr=np.asarray(indptr, dtype=np.int64),
-        indices=np.asarray(gene_indices, dtype=np.int32),
-        counts=np.asarray(counts, dtype=np.int32),
-        row_count=len(rows),
-    )
-
-
-def _write_backend_rows(
-    *,
-    backend: str,
-    dataset_id: str,
-    matrix_root: Path,
-    global_start: int,
-    rows: list[dict[str, Any]],
-) -> None:
-    writer = build_backend_fn(backend, "federated")
-    writer(
-        bundle=_bundle_for_rows(global_start, rows),
-        dataset_id=dataset_id,
-        matrix_root=matrix_root,
-        _writer_state=None,
-        _is_last_chunk=True,
-    )
-
-
-def _build_mock_federated_backend_corpus(
-    corpus_root: Path,
-    *,
-    index_backend: str,
-    writer_backend: str,
-    include_size_factor: bool = True,
-    typed_structural: bool = False,
-    safe_nulls: bool = False,
-) -> None:
-    """Build a minimal federated corpus for a non-Lance matrix backend."""
-    corpus_root.mkdir(parents=True, exist_ok=True)
-
-    ds_configs = [
-        {"dataset_id": "mock_00", "cell_count": 10, "global_start": 0, "global_end": 10, "dataset_index": 0},
-        {"dataset_id": "mock_01", "cell_count": 15, "global_start": 10, "global_end": 25, "dataset_index": 1},
-    ]
-
-    index_doc = {
-        "kind": "corpus-index",
-        "contract_version": "0.3.0",
-        "global_metadata": {
-            "backend": index_backend,
-            "topology": "federated",
-        },
-        "datasets": [
-            {
-                "dataset_id": ds["dataset_id"],
-                "join_mode": "create_new" if i == 0 else "append_routed",
-                "dataset_index": ds["dataset_index"],
-                "cell_count": ds["cell_count"],
-                "global_start": ds["global_start"],
-                "global_end": ds["global_end"],
-            }
-            for i, ds in enumerate(ds_configs)
-        ],
     }
-    with open(corpus_root / "corpus-index.yaml", "w") as f:
-        yaml.safe_dump(index_doc, f)
 
-    for ds in ds_configs:
-        ds_id = ds["dataset_id"]
-        ds_dir = corpus_root / ds_id
-        meta_dir = ds_dir / "meta" / "canonical_meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
-
-        obs_df = _make_obs_df(
-            ds_id,
-            ds["dataset_index"],
-            ds["cell_count"],
-            ds["global_start"],
-            include_size_factor=include_size_factor,
-            typed_structural=typed_structural,
-            safe_nulls=safe_nulls,
-        )
-        obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
-
-        var_df = _make_var_df(ds_id, N_GENES)
-        var_df.write_parquet(str(meta_dir / "canonical-var.parquet"))
-
-        matrix_dir = ds_dir / "matrix"
-        matrix_dir.mkdir(parents=True, exist_ok=True)
-        _write_backend_rows(
-            backend=writer_backend,
-            dataset_id=ds_id,
-            matrix_root=matrix_dir,
-            global_start=ds["global_start"],
-            rows=_make_lance_rows(ds["cell_count"]),
-        )
-
-
-def _assert_public_api_matches_federated_lance(
-    candidate: Corpus,
-    lance: Corpus,
-    indices: list[int],
-) -> None:
-    _assert_expression_batch_equal(
-        candidate.read_expression(indices),
-        lance.read_expression(indices),
+    sampler = CorpusRandomBatchSampler(
+        metadata_index=corpus.metadata_index,
+        batch_size=3,
+        drop_last=False,
+        seed=5,
     )
-    _assert_raw_batch_equal(
-        candidate.dataset().__getitems__(indices)[0],
-        lance.dataset().__getitems__(indices)[0],
-    )
-    _assert_take_metadata_equal(
-        candidate.take_metadata(indices, columns=["dataset_id", "local_row_index", "perturb_label"]),
-        lance.take_metadata(indices, columns=["dataset_id", "local_row_index", "perturb_label"]),
-    )
-    _assert_raw_batch_equal(
-        candidate.inspect_batch(indices, metadata_columns=["perturb_label"]),
-        lance.inspect_batch(indices, metadata_columns=["perturb_label"]),
-    )
-
-
-def _build_mock_aggregate_corpus(
-    corpus_root: Path,
-    *,
-    include_size_factor: bool = True,
-    typed_structural: bool = False,
-    safe_nulls: bool = False,
-) -> None:
-    """Build a minimal aggregate Lance corpus (2 datasets)."""
-    corpus_root.mkdir(parents=True, exist_ok=True)
-
-    # Dataset configs
-    ds_configs = [
-        {"dataset_id": "mock_00", "cell_count": 10, "global_start": 0, "global_end": 10, "dataset_index": 0},
-        {"dataset_id": "mock_01", "cell_count": 15, "global_start": 10, "global_end": 25, "dataset_index": 1},
-    ]
-
-    # Write corpus-index.yaml
-    index_doc = {
-        "kind": "corpus-index",
-        "contract_version": "0.3.0",
-        "global_metadata": {
-            "backend": "lance",
-            "topology": "aggregate",
-        },
-        "datasets": [
-            {
-                "dataset_id": ds["dataset_id"],
-                "join_mode": "create_new" if i == 0 else "append_routed",
-                "dataset_index": ds["dataset_index"],
-                "cell_count": ds["cell_count"],
-                "global_start": ds["global_start"],
-                "global_end": ds["global_end"],
-            }
-            for i, ds in enumerate(ds_configs)
-        ],
-    }
-    with open(corpus_root / "corpus-index.yaml", "w") as f:
-        yaml.safe_dump(index_doc, f)
-
-    # Write per-dataset canonical obs/var parquets (under meta/)
-    total_cells = 0
-    lance_rows: list[dict[str, Any]] = []
-    for ds in ds_configs:
-        ds_id = ds["dataset_id"]
-        meta_dir = corpus_root / "meta" / ds_id / "canonical_meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
-
-        # canonical-obs.parquet
-        obs_df = _make_obs_df(
-            ds_id,
-            ds["dataset_index"],
-            ds["cell_count"],
-            ds["global_start"],
-            include_size_factor=include_size_factor,
-            typed_structural=typed_structural,
-            safe_nulls=safe_nulls,
-        )
-        obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
-
-        # canonical-var.parquet
-        var_df = _make_var_df(ds_id, N_GENES)
-        var_df.write_parquet(str(meta_dir / "canonical-var.parquet"))
-
-        # Lance expression rows
-        lance_rows.extend(_make_lance_rows(ds["cell_count"]))
-        total_cells += ds["cell_count"]
-
-    # Write aggregate Lance file
-    matrix_dir = corpus_root / "matrix"
-    matrix_dir.mkdir(parents=True, exist_ok=True)
-    schema = pa.schema([
-        ("expressed_gene_indices", pa.list_(pa.int32())),
-        ("expression_counts", pa.list_(pa.int32())),
-    ])
-    table = pa.table(
-        {
-            "expressed_gene_indices": pa.array(
-                [row["expressed_gene_indices"] for row in lance_rows],
-                type=pa.list_(pa.int32()),
-            ),
-            "expression_counts": pa.array(
-                [row["expression_counts"] for row in lance_rows],
-                type=pa.list_(pa.int32()),
-            ),
-        },
-        schema=schema,
-    )
-    lance.write_dataset(table, str(matrix_dir / "aggregated-cells.lance"), mode="overwrite")
-
-
-def _build_mock_aggregate_zarr_corpus(
-    corpus_root: Path,
-    *,
-    include_size_factor: bool = True,
-    typed_structural: bool = False,
-    safe_nulls: bool = False,
-) -> None:
-    """Build a minimal aggregate Zarr corpus (2 datasets)."""
-    corpus_root.mkdir(parents=True, exist_ok=True)
-
-    ds_configs = [
-        {"dataset_id": "mock_00", "cell_count": 10, "global_start": 0, "global_end": 10, "dataset_index": 0},
-        {"dataset_id": "mock_01", "cell_count": 15, "global_start": 10, "global_end": 25, "dataset_index": 1},
-    ]
-
-    index_doc = {
-        "kind": "corpus-index",
-        "contract_version": "0.3.0",
-        "global_metadata": {
-            "backend": "zarr",
-            "topology": "aggregate",
-        },
-        "datasets": [
-            {
-                "dataset_id": ds["dataset_id"],
-                "join_mode": "create_new" if i == 0 else "append_routed",
-                "dataset_index": ds["dataset_index"],
-                "cell_count": ds["cell_count"],
-                "global_start": ds["global_start"],
-                "global_end": ds["global_end"],
-            }
-            for i, ds in enumerate(ds_configs)
-        ],
-    }
-    with open(corpus_root / "corpus-index.yaml", "w") as f:
-        yaml.safe_dump(index_doc, f)
-
-    writer = build_backend_fn("zarr", "aggregate")
-    writer_state: dict[str, Any] | None = None
-    matrix_dir = corpus_root / "matrix"
-    matrix_dir.mkdir(parents=True, exist_ok=True)
-
-    for i, ds in enumerate(ds_configs):
-        ds_id = ds["dataset_id"]
-        meta_dir = corpus_root / "meta" / ds_id / "canonical_meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
-
-        obs_df = _make_obs_df(
-            ds_id,
-            ds["dataset_index"],
-            ds["cell_count"],
-            ds["global_start"],
-            include_size_factor=include_size_factor,
-            typed_structural=typed_structural,
-            safe_nulls=safe_nulls,
-        )
-        obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
-
-        var_df = _make_var_df(ds_id, N_GENES)
-        var_df.write_parquet(str(meta_dir / "canonical-var.parquet"))
-
-        _, writer_state = writer(
-            bundle=_bundle_for_rows(ds["global_start"], _make_lance_rows(ds["cell_count"])),
-            dataset_id=ds_id,
-            matrix_root=matrix_dir,
-            _writer_state=writer_state,
-            _is_last_chunk=i == len(ds_configs) - 1,
-        )
-
-
-def _build_mock_aggregate_backend_corpus_from_configs(
-    corpus_root: Path,
-    *,
-    ds_configs: Sequence[dict[str, Any]],
-    include_size_factor: bool = True,
-    typed_structural: bool = False,
-    safe_nulls: bool = False,
-) -> None:
-    corpus_root.mkdir(parents=True, exist_ok=True)
-
-    normalized_configs: list[dict[str, Any]] = []
-    for ds in ds_configs:
-        rows = ds["rows"]
-        global_start = int(ds["global_start"])
-        cell_count = len(rows)
-        normalized_configs.append({
-            **ds,
-            "cell_count": cell_count,
-            "global_end": global_start + cell_count,
-        })
-
-    index_doc = {
-        "kind": "corpus-index",
-        "contract_version": "0.3.0",
-        "global_metadata": {
-            "backend": "lance",
-            "topology": "aggregate",
-        },
-        "datasets": [
-            {
-                "dataset_id": ds["dataset_id"],
-                "join_mode": "create_new" if i == 0 else "append_routed",
-                "dataset_index": ds["dataset_index"],
-                "cell_count": ds["cell_count"],
-                "global_start": ds["global_start"],
-                "global_end": ds["global_end"],
-            }
-            for i, ds in enumerate(normalized_configs)
-        ],
-    }
-    with open(corpus_root / "corpus-index.yaml", "w") as f:
-        yaml.safe_dump(index_doc, f)
-
-    matrix_dir = corpus_root / "matrix"
-    matrix_dir.mkdir(parents=True, exist_ok=True)
-
-    lance_rows: list[dict[str, Any]] = []
-
-    for ds in normalized_configs:
-        ds_id = str(ds["dataset_id"])
-        global_start = int(ds["global_start"])
-        dataset_index = int(ds["dataset_index"])
-        rows = list(ds["rows"])
-        n_genes = int(ds["n_genes"])
-
-        meta_dir = corpus_root / "meta" / ds_id / "canonical_meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
-
-        obs_df = _make_obs_df(
-            ds_id,
-            dataset_index,
-            len(rows),
-            global_start,
-            include_size_factor=include_size_factor,
-            typed_structural=typed_structural,
-            safe_nulls=safe_nulls,
-        )
-        obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
-
-        var_df = _make_var_df(ds_id, n_genes)
-        var_df.write_parquet(str(meta_dir / "canonical-var.parquet"))
-
-        lance_rows.extend(rows)
-
-    schema = pa.schema([
-        ("expressed_gene_indices", pa.list_(pa.int32())),
-        ("expression_counts", pa.list_(pa.int32())),
-    ])
-    table = pa.table(
-        {
-            "expressed_gene_indices": pa.array(
-                [row["expressed_gene_indices"] for row in lance_rows],
-                type=pa.list_(pa.int32()),
-            ),
-            "expression_counts": pa.array(
-                [row["expression_counts"] for row in lance_rows],
-                type=pa.list_(pa.int32()),
-            ),
-        },
-        schema=schema,
-    )
-    lance.write_dataset(table, str(matrix_dir / "aggregated-cells.lance"), mode="overwrite")
-
-
-def _build_mock_federated_corpus(
-    corpus_root: Path,
-    *,
-    include_size_factor: bool = True,
-    typed_structural: bool = False,
-    safe_nulls: bool = False,
-) -> None:
-    """Build a minimal federated Lance corpus (2 datasets)."""
-    corpus_root.mkdir(parents=True, exist_ok=True)
-
-    # Dataset configs
-    ds_configs = [
-        {"dataset_id": "mock_00", "cell_count": 10, "global_start": 0, "global_end": 10, "dataset_index": 0},
-        {"dataset_id": "mock_01", "cell_count": 15, "global_start": 10, "global_end": 25, "dataset_index": 1},
-    ]
-
-    # Write corpus-index.yaml
-    index_doc = {
-        "kind": "corpus-index",
-        "contract_version": "0.3.0",
-        "global_metadata": {
-            "backend": "lance",
-            "topology": "federated",
-        },
-        "datasets": [
-            {
-                "dataset_id": ds["dataset_id"],
-                "join_mode": "create_new" if i == 0 else "append_routed",
-                "dataset_index": ds["dataset_index"],
-                "cell_count": ds["cell_count"],
-                "global_start": ds["global_start"],
-                "global_end": ds["global_end"],
-            }
-            for i, ds in enumerate(ds_configs)
-        ],
-    }
-    with open(corpus_root / "corpus-index.yaml", "w") as f:
-        yaml.safe_dump(index_doc, f)
-
-    # Write per-dataset canonical obs/var parquets and Lance files
-    for ds in ds_configs:
-        ds_id = ds["dataset_id"]
-        ds_dir = corpus_root / ds_id
-        meta_dir = ds_dir / "meta" / "canonical_meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
-
-        # canonical-obs.parquet
-        obs_df = _make_obs_df(
-            ds_id,
-            ds["dataset_index"],
-            ds["cell_count"],
-            ds["global_start"],
-            include_size_factor=include_size_factor,
-            typed_structural=typed_structural,
-            safe_nulls=safe_nulls,
-        )
-        obs_df.write_parquet(str(meta_dir / "canonical-obs.parquet"))
-
-        # canonical-var.parquet
-        var_df = _make_var_df(ds_id, N_GENES)
-        var_df.write_parquet(str(meta_dir / "canonical-var.parquet"))
-
-        # Per-dataset Lance file
-        matrix_dir = ds_dir / "matrix"
-        matrix_dir.mkdir(parents=True, exist_ok=True)
-        lance_rows = _make_lance_rows(ds["cell_count"])
-        schema = pa.schema([
-            ("expressed_gene_indices", pa.list_(pa.int32())),
-            ("expression_counts", pa.list_(pa.int32())),
-        ])
-        table = pa.table(
-            {
-                "expressed_gene_indices": pa.array(
-                    [row["expressed_gene_indices"] for row in lance_rows],
-                    type=pa.list_(pa.int32()),
-                ),
-                "expression_counts": pa.array(
-                    [row["expression_counts"] for row in lance_rows],
-                    type=pa.list_(pa.int32()),
-                ),
-            },
-            schema=schema,
-        )
-        lance.write_dataset(table, str(matrix_dir / f"{ds_id}.lance"), mode="overwrite")
-
-
-def _build_mock_to_anndata_corpus(corpus_root: Path) -> None:
-    ds_configs = [
-        {
-            "dataset_id": "mock_00",
-            "dataset_index": 0,
-            "global_start": 0,
-            "n_genes": 4,
-            "rows": [
-                {
-                    "expressed_gene_indices": [1, 3],
-                    "expression_counts": [5, 7],
-                },
-                {
-                    "expressed_gene_indices": [],
-                    "expression_counts": [],
-                },
-                {
-                    "expressed_gene_indices": [0, 2, 3],
-                    "expression_counts": [1, 2, 3],
-                },
-            ],
-        },
-        {
-            "dataset_id": "mock_01",
-            "dataset_index": 1,
-            "global_start": 3,
-            "n_genes": 4,
-            "rows": [
-                {
-                    "expressed_gene_indices": [0],
-                    "expression_counts": [9],
-                },
-                {
-                    "expressed_gene_indices": [2],
-                    "expression_counts": [4],
-                },
-            ],
-        },
-    ]
-    _build_mock_aggregate_backend_corpus_from_configs(
-        corpus_root,
-        ds_configs=ds_configs,
-        typed_structural=True,
-    )
-
-
-def _build_mock_selection_corpus(corpus_root: Path) -> None:
-    ds_configs = [
-        {
-            "dataset_id": "mock_00",
-            "dataset_index": 0,
-            "global_start": 0,
-            "n_genes": 4,
-            "rows": [
-                {"expressed_gene_indices": [0], "expression_counts": [1]},
-                {"expressed_gene_indices": [1], "expression_counts": [2]},
-                {"expressed_gene_indices": [2], "expression_counts": [3]},
-                {"expressed_gene_indices": [3], "expression_counts": [4]},
-                {"expressed_gene_indices": [0, 2], "expression_counts": [5, 1]},
-                {"expressed_gene_indices": [], "expression_counts": []},
-            ],
-        },
-        {
-            "dataset_id": "mock_01",
-            "dataset_index": 1,
-            "global_start": 6,
-            "n_genes": 4,
-            "rows": [
-                {"expressed_gene_indices": [1], "expression_counts": [9]},
-                {"expressed_gene_indices": [0, 3], "expression_counts": [2, 2]},
-            ],
-        },
-    ]
-    _build_mock_aggregate_backend_corpus_from_configs(
-        corpus_root,
-        ds_configs=ds_configs,
-        typed_structural=True,
-    )
-    _rewrite_canonical_obs_columns(
-        corpus_root,
-        "mock_00",
-        lambda frame: frame.with_columns(
-            [
-                pl.Series(
-                    "perturb_label",
-                    ["ctrl", "ctrl", "ctrl", "ctrl", "treat", "treat"],
-                ),
-                pl.Series(
-                    "batch_id",
-                    ["batch_a", "batch_a", "batch_b", None, "batch_b", None],
-                ),
-                pl.Series(
-                    "donor_id",
-                    ["donor_0", "donor_0", "donor_1", "donor_1", "donor_1", "donor_2"],
-                ),
-            ]
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
-
-class TestLoadCorpusAggregate:
-    """Test ``load_corpus()`` with aggregate Lance topology."""
-
-    def test_corpus_structure(self, tmp_path: Path) -> None:
-        """``load_corpus()`` returns a fully populated ``Corpus`` object."""
-        _build_mock_aggregate_corpus(tmp_path)
-
-        corpus = load_corpus(str(tmp_path))
-
-        assert isinstance(corpus, Corpus)
-        assert corpus.topology == "aggregate"
-        assert corpus.backend == "lance"
-        assert corpus.corpus_root == tmp_path.resolve()
-        assert not hasattr(corpus, "batch_executor")
-        assert corpus.feature_registry is not None
-        assert corpus.metadata_index is not None
-        assert len(corpus.dataset_entries) == 2
-
-    def test_feature_registry_properties(self, tmp_path: Path) -> None:
-        """Feature registry reflects mock gene vocabulary."""
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        fr = corpus.feature_registry
-        assert fr.n_datasets == 2
-        assert fr.global_vocab_size == N_GENES  # same gene pool
-        assert fr.max_local_vocab == N_GENES
-        assert fr.dataset_ids == ("mock_00", "mock_01")
-
-    def test_feature_registry_uses_persisted_gene_tokenizer_ids(self, tmp_path: Path) -> None:
-        ds_configs = [
-            {
-                "dataset_id": "z_old",
-                "dataset_index": 0,
-                "global_start": 0,
-                "n_genes": 2,
-                "rows": _make_lance_rows(2),
-            },
-            {
-                "dataset_id": "a_new",
-                "dataset_index": 1,
-                "global_start": 2,
-                "n_genes": 3,
-                "rows": _make_lance_rows(2),
-            },
-        ]
-        _build_mock_aggregate_backend_corpus_from_configs(
-            tmp_path,
-            ds_configs=ds_configs,
-        )
-
-        pl.DataFrame(
-            {
-                "origin_index": np.asarray([0, 1], dtype=np.int32),
-                "gene_id": ["ENSG_Z_0", "ENSG_Z_1"],
-                "canonical_gene_id": ["GENE_B", "GENE_C"],
-                "global_id": np.asarray([0, 1], dtype=np.int32),
-            }
-        ).write_parquet(str(tmp_path / "meta" / "z_old" / "canonical_meta" / "canonical-var.parquet"))
-        pl.DataFrame(
-            {
-                "origin_index": np.asarray([0, 1, 2], dtype=np.int32),
-                "gene_id": ["ENSG_A_0", "ENSG_A_1", "ENSG_A_2"],
-                "canonical_gene_id": ["GENE_A", "GENE_C", "GENE_D"],
-                "global_id": np.asarray([0, 1, 2], dtype=np.int32),
-            }
-        ).write_parquet(str(tmp_path / "meta" / "a_new" / "canonical_meta" / "canonical-var.parquet"))
-
-        tokenizer = GeneTokenizer.empty(corpus_id="test-corpus")
-        tokenizer = tokenizer.append_dataset("z_old", ["GENE_B", "GENE_C"])
-        tokenizer = tokenizer.append_dataset("a_new", ["GENE_A", "GENE_C", "GENE_D"])
-        tokenizer.to_json(tmp_path / "gene-tokenizer.json")
-
-        corpus = load_corpus(str(tmp_path))
-
-        assert corpus.feature_registry.dataset_ids == ("z_old", "a_new")
-        assert corpus.feature_registry.global_vocab_size == 4
-        np.testing.assert_array_equal(
-            corpus.feature_registry.local_to_global_map[0, :2],
-            np.array([0, 1], dtype=np.int32),
-        )
-        np.testing.assert_array_equal(
-            corpus.feature_registry.local_to_global_map[1, :3],
-            np.array([2, 1, 3], dtype=np.int32),
-        )
-
-    def test_feature_registry_falls_back_to_corpus_order_without_tokenizer(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        ds_configs = [
-            {
-                "dataset_id": "z_old",
-                "dataset_index": 0,
-                "global_start": 0,
-                "n_genes": 2,
-                "rows": _make_lance_rows(2),
-            },
-            {
-                "dataset_id": "a_new",
-                "dataset_index": 1,
-                "global_start": 2,
-                "n_genes": 3,
-                "rows": _make_lance_rows(2),
-            },
-        ]
-        _build_mock_aggregate_backend_corpus_from_configs(
-            tmp_path,
-            ds_configs=ds_configs,
-        )
-
-        pl.DataFrame(
-            {
-                "origin_index": np.asarray([0, 1], dtype=np.int32),
-                "gene_id": ["ENSG_Z_0", "ENSG_Z_1"],
-                "canonical_gene_id": ["GENE_B", "GENE_C"],
-                "global_id": np.asarray([0, 1], dtype=np.int32),
-            }
-        ).write_parquet(str(tmp_path / "meta" / "z_old" / "canonical_meta" / "canonical-var.parquet"))
-        pl.DataFrame(
-            {
-                "origin_index": np.asarray([0, 1, 2], dtype=np.int32),
-                "gene_id": ["ENSG_A_0", "ENSG_A_1", "ENSG_A_2"],
-                "canonical_gene_id": ["GENE_A", "GENE_C", "GENE_D"],
-                "global_id": np.asarray([0, 1, 2], dtype=np.int32),
-            }
-        ).write_parquet(str(tmp_path / "meta" / "a_new" / "canonical_meta" / "canonical-var.parquet"))
-
-        corpus = load_corpus(str(tmp_path))
-
-        assert corpus.feature_registry.dataset_ids == ("z_old", "a_new")
-        assert corpus.feature_registry.global_vocab_size == 4
-        np.testing.assert_array_equal(
-            corpus.feature_registry.local_to_global_map[1, :3],
-            np.array([2, 1, 3], dtype=np.int32),
-        )
-
-    def test_metadata_index_properties(self, tmp_path: Path) -> None:
-        """Metadata index has correct row count and columns."""
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        mi = corpus.metadata_index
-        assert len(mi) == 25  # 10 + 15 cells
-        assert "global_row_index" in mi.df.columns
-        assert "cell_id" in mi.df.columns
-        assert "dataset_id" in mi.df.columns
-        assert "size_factor" in mi.df.columns
-        assert "perturb_label" in mi.df.columns
-
-    def test_load_corpus_casts_legacy_string_structural_fields(self, tmp_path: Path) -> None:
-        """Legacy all-string canonical obs fixtures still load with typed structure."""
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        schema = corpus.metadata_index.df.schema
-        assert schema["global_row_index"] == pl.Int64
-        assert schema["dataset_index"] == pl.Int32
-        assert schema["local_row_index"] == pl.Int64
-        assert schema["size_factor"] == pl.Float64
-
-    def test_load_corpus_normalizes_null_like_literals_in_canonical_string_columns(
-        self, tmp_path: Path,
-    ) -> None:
-        """Canonical string columns load null-like literals as true nulls."""
-        _build_mock_aggregate_corpus(tmp_path, typed_structural=True)
-        canonical_null_literals = {
-            "cell_id": "",
-            "perturb_label": " nan ",
-            "perturb_type": " None ",
-            "dose": " null ",
-            "dose_unit": " . ",
-            "timepoint": " - ",
-            "timepoint_unit": " NA ",
-            "cell_context": " nan ",
-            "cell_line_or_type": " None ",
-            "species": " null ",
-            "tissue": " . ",
-            "assay": " - ",
-            "condition": " NA ",
-            "batch_id": " nan ",
-            "donor_id": " None ",
-            "sex": " null ",
-            "disease_state": " . ",
-        }
-        _rewrite_canonical_obs_columns(
-            tmp_path,
-            "mock_00",
-            lambda frame: frame.with_columns(
-                [
-                    pl.Series(
-                        column_name,
-                        [literal, *frame[column_name].to_list()[1:]],
-                    )
-                    for column_name, literal in canonical_null_literals.items()
-                ]
-            ),
-        )
-        corpus = load_corpus(str(tmp_path))
-
-        mi = corpus.metadata_index
-        schema = mi.df.schema
-        assert schema["global_row_index"] == pl.Int64
-        assert schema["dataset_index"] == pl.Int32
-        assert schema["local_row_index"] == pl.Int64
-        assert schema["size_factor"] == pl.Float64
-        first_row = mi.df.row(0, named=True)
-        for column_name in canonical_null_literals:
-            assert first_row[column_name] is None
-
-    def test_to_anndata_builds_counts_only_csr_with_requested_row_order(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        _build_mock_to_anndata_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        adata = corpus.to_anndata(
-            dataset_id="mock_00",
-            row_indices=[2, 0],
-            obs_columns=["perturb_label"],
-            var_columns=["gene_id"],
-        )
-
-        assert adata.n_obs == 2
-        assert adata.n_vars == 4
-        assert sparse.isspmatrix_csr(adata.X)
-        np.testing.assert_array_equal(
-            adata.X.toarray(),
-            np.array(
-                [
-                    [1, 0, 2, 3],
-                    [0, 5, 0, 7],
-                ],
-                dtype=np.int32,
-            ),
-        )
-        assert len(adata.layers) == 0
-        assert adata.obs["global_row_index"].tolist() == [2, 0]
-        assert adata.obs["local_row_index"].tolist() == [2, 0]
-        assert adata.obs["dataset_id"].tolist() == ["mock_00", "mock_00"]
-        assert "perturb_label" in adata.obs.columns
-        assert adata.var["origin_index"].tolist() == [0, 1, 2, 3]
-        assert adata.var["global_id"].tolist() == [0, 1, 2, 3]
-        assert adata.var["gene_id"].tolist() == [
-            "ENSG_mock_00_00000",
-            "ENSG_mock_00_00001",
-            "ENSG_mock_00_00002",
-            "ENSG_mock_00_00003",
-        ]
-
-    def test_to_anndata_dry_run_reports_exact_shape_and_memory(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        _build_mock_to_anndata_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        estimate = corpus.to_anndata(
-            dataset_id="mock_00",
-            row_indices=[0, 2],
-            obs_columns=["perturb_label"],
-            var_columns=["gene_id"],
-            dry_run=True,
-            max_memory_bytes=32,
-            on_exceed="raise",
-        )
-
-        assert estimate["dataset_id"] == "mock_00"
-        assert estimate["n_obs"] == 2
-        assert estimate["n_vars"] == 4
-        assert estimate["nnz"] == 5
-        assert estimate["csr_memory_bytes"] == {
-            "data": 20,
-            "indices": 20,
-            "indptr": 24,
-            "total": 64,
-        }
-        assert estimate["selected_row_index_summary"] == {
-            "source": "user-specified",
-            "selection_size": 2,
-            "min_global_row_index": 0,
-            "max_global_row_index": 2,
-            "is_contiguous": False,
-        }
-        assert estimate["memory_limit_exceeded"] is True
-        assert estimate["memory_guard_action"] == "raise"
-        assert estimate["memory_guard_message"] is not None
-
-    def test_to_anndata_memory_guard_raises_before_materialization(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        _build_mock_to_anndata_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        with pytest.raises(MemoryError, match="max_memory_bytes"):
-            corpus.to_anndata(
-                dataset_id="mock_00",
-                row_indices=[0, 2],
-                max_memory_bytes=32,
-                on_exceed="raise",
+    batch = next(
+        iter(
+            DataLoader(
+                dataset,
+                batch_sampler=sampler,
+                collate_fn=collate_expression_batch,
+                num_workers=0,
             )
+        )
+    )
+    assert isinstance(batch["global_row_index"], torch.Tensor)
+    assert "dataset_index" not in batch
+    assert "size_factor" not in batch
 
-    def test_to_anndata_rejects_cross_dataset_row_indices(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        _build_mock_to_anndata_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
 
-        with pytest.raises(IndexError, match="must stay within dataset 'mock_00'"):
-            corpus.to_anndata(dataset_id="mock_00", row_indices=[0, 3])
+def test_build_loader_attaches_metadata_from_metadata_index(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
 
-    def test_select_obs_indices_random_is_deterministic_and_feeds_to_anndata(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        _build_mock_selection_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        selection_a = select_obs_indices(
+    batch = next(
+        build_loader(
             corpus,
-            dataset_id="mock_00",
-            strategy="random",
-            max_cells=3,
-            seed=17,
+            batch_size=3,
+            seq_len=LOADER_SEQ_LEN,
+            seed=2,
+            device="cpu",
+            metadata_columns=["perturb_label", "size_factor"],
         )
-        selection_b = corpus.select_obs_indices(
-            dataset_id="mock_00",
-            strategy="random",
-            max_cells=3,
-            seed=17,
-        )
-
-        assert selection_a.row_indices == selection_b.row_indices
-        assert len(selection_a.row_indices) == 3
-        assert all(0 <= idx < 6 for idx in selection_a.row_indices)
-
-        adata = corpus.to_anndata(
-            dataset_id="mock_00",
-            row_indices=selection_a.row_indices,
-        )
-        assert adata.obs["global_row_index"].tolist() == list(selection_a.row_indices)
-
-    def test_select_obs_indices_balanced_reports_group_counts_and_respects_candidate_universe(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        _build_mock_selection_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        candidate_indices = [0, 1, 2, 4, 5]
-
-        selection = corpus.select_obs_indices(
-            dataset_id="mock_00",
-            strategy="balanced",
-            row_indices=candidate_indices,
-            max_cells=4,
-            stratify_by=["perturb_label"],
-            max_per_group=2,
-            seed=5,
-        )
-
-        assert set(selection.row_indices).issubset(set(candidate_indices))
-        assert selection.selected_local_row_indices == selection.row_indices
-        counts = {
-            record["group_values"]["perturb_label"]: record
-            for record in selection.group_counts
-        }
-        assert counts["ctrl"]["available_count"] == 3
-        assert counts["ctrl"]["selected_count"] == 2
-        assert counts["treat"]["available_count"] == 2
-        assert counts["treat"]["selected_count"] == 2
-        assert sum(record["selected_count"] for record in selection.group_counts) == 4
-
-    def test_select_obs_indices_drop_null_groups_records_summary(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        _build_mock_selection_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        selection = corpus.select_obs_indices(
-            dataset_id="mock_00",
-            strategy="stratified",
-            max_cells=3,
-            stratify_by=["batch_id"],
-            drop_null_groups=True,
-            seed=9,
-        )
-
-        assert set(selection.row_indices).isdisjoint({3, 5})
-        assert selection.dropped_or_underfilled_groups == (
-            {
-                "group_key": '{"batch_id": null}',
-                "group_values": {"batch_id": None},
-                "available_count": 2,
-                "selected_count": 0,
-                "reason": "null-group-dropped",
-                "min_per_group": None,
-            },
-        )
-
-    def test_select_obs_indices_rejects_invalid_metadata_column(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        _build_mock_selection_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        with pytest.raises(ValueError, match="metadata column 'missing_col' not found"):
-            corpus.select_obs_indices(
-                dataset_id="mock_00",
-                strategy="balanced",
-                stratify_by=["missing_col"],
-                max_cells=2,
-            )
-
-    @pytest.mark.parametrize(
-        ("kwargs", "match"),
-        [
-            ({"row_indices": [0, 0]}, "must be unique"),
-            ({"row_indices": [0, 6]}, "must stay within dataset 'mock_00'"),
-            (
-                {
-                    "row_indices": [3, 5],
-                    "strategy": "balanced",
-                    "stratify_by": ["batch_id"],
-                    "drop_null_groups": True,
-                    "max_cells": 1,
-                },
-                "selection is empty after dropping null groups",
-            ),
-        ],
     )
-    def test_select_obs_indices_failures_are_clear(
-        self,
-        tmp_path: Path,
-        kwargs: dict[str, Any],
-        match: str,
-    ) -> None:
-        _build_mock_selection_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
 
-        with pytest.raises((ValueError, IndexError), match=match):
-            corpus.select_obs_indices(dataset_id="mock_00", **kwargs)
-
-    def test_select_obs_indices_write_provenance_is_json_and_parquet_safe(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        _build_mock_selection_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        selection = corpus.select_obs_indices(
-            dataset_id="mock_00",
-            strategy="balanced",
-            max_cells=4,
-            stratify_by=["perturb_label", "donor_id"],
-            seed=13,
-        )
-
-        paths = selection.write_provenance(tmp_path / "selection-artifacts")
-
-        summary_payload = json.loads(paths["summary_path"].read_text(encoding="utf-8"))
-        assert summary_payload["selected_global_row_indices"] == list(selection.row_indices)
-        assert summary_payload["strategy"] == "balanced"
-
-        row_frame = pl.read_parquet(paths["rows_path"])
-        assert row_frame["global_row_index"].to_list() == list(selection.row_indices)
-        assert row_frame["strategy"].to_list() == ["balanced"] * len(selection.row_indices)
-
-    def test_load_corpus_projects_canonical_core_columns_only_by_default(
-        self, tmp_path: Path,
-    ) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        _rewrite_canonical_obs_columns(
-            tmp_path,
-            "mock_00",
-            lambda frame: frame.with_columns(
-                pl.Series("qc_bucket", ["pass"] * len(frame)),
-            ),
-        )
-        _rewrite_canonical_obs_columns(
-            tmp_path,
-            "mock_01",
-            lambda frame: frame.with_columns(
-                pl.Series("qc_bucket", ["review"] * len(frame)),
-            ),
-        )
-
-        corpus = load_corpus(str(tmp_path))
-
-        assert "qc_bucket" not in corpus.metadata_index.df.columns
-        assert "perturb_label" in corpus.metadata_index.df.columns
-
-    def test_load_corpus_can_load_explicit_extra_metadata_columns(
-        self, tmp_path: Path,
-    ) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        _rewrite_canonical_obs_columns(
-            tmp_path,
-            "mock_00",
-            lambda frame: frame.with_columns(
-                pl.Series("qc_bucket", [" NA ", *[f"qc_{idx}" for idx in range(1, len(frame))]]),
-            ),
-        )
-        _rewrite_canonical_obs_columns(
-            tmp_path,
-            "mock_01",
-            lambda frame: frame.with_columns(
-                pl.Series("qc_bucket", ["-", *[f"qc_{idx}" for idx in range(1, len(frame))]]),
-            ),
-        )
-
-        corpus = load_corpus(
-            str(tmp_path),
-            extra_metadata_columns=["qc_bucket"],
-        )
-
-        assert "qc_bucket" in corpus.metadata_index.df.columns
-        taken = corpus.take_metadata([0, 10], columns=["qc_bucket"])
-        assert taken["qc_bucket"] == (" NA ", "-")
-
-    def test_load_corpus_rejects_missing_requested_extra_metadata_column(
-        self, tmp_path: Path,
-    ) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-
-        with pytest.raises(
-            ValueError,
-            match="missing requested extra metadata columns: 'qc_bucket'",
-        ):
-            load_corpus(str(tmp_path), extra_metadata_columns=["qc_bucket"])
-
-    def test_load_corpus_keeps_old_corpora_missing_canonical_columns_loadable(
-        self, tmp_path: Path,
-    ) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        _rewrite_canonical_obs_columns(
-            tmp_path,
-            "mock_00",
-            lambda frame: frame.drop("condition"),
-        )
-
-        corpus = load_corpus(str(tmp_path))
-
-        assert "condition" in corpus.metadata_index.df.columns
-        assert corpus.take_metadata([0], columns=["condition"])["condition"] == (None,)
-        assert corpus.take_metadata([10], columns=["condition"])["condition"] == (None,)
-
-    def test_load_corpus_exposes_null_labels_to_downstream_adapters(
-        self, tmp_path: Path,
-    ) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        _rewrite_canonical_obs_columns(
-            tmp_path,
-            "mock_00",
-            lambda frame: frame.with_columns(
-                pl.Series("cell_context", ["context"] * len(frame)),
-                pl.Series(
-                    "perturb_label",
-                    [" NA ", *frame["perturb_label"].to_list()[1:]],
-                ),
-            ),
-        )
-        _rewrite_canonical_obs_columns(
-            tmp_path,
-            "mock_01",
-            lambda frame: frame.with_columns(
-                pl.Series("cell_context", ["context"] * len(frame)),
-            ),
-        )
-
-        corpus = load_corpus(str(tmp_path))
-
-        assert corpus.take_metadata([0], columns=["perturb_label"])["perturb_label"] == (None,)
-        adapter = PertTFCorpusAdapter.from_corpus(corpus)
-        assert None not in adapter.labels_by_name["perturbation"]
-
-    def test_global_row_indices_contiguous(self, tmp_path: Path) -> None:
-        """Global row indices are 0..N-1 contiguous."""
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        gr = corpus.metadata_index.df["global_row_index"].to_numpy()
-        assert gr[0] == 0
-        assert gr[-1] == 24
-        assert np.array_equal(gr, np.arange(25))
-
-    def test_inspect_batch_reads_cells(self, tmp_path: Path) -> None:
-        """Corpus inspection helper can read expression + metadata."""
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = corpus.inspect_batch([0, 5, 12, 24], metadata_columns=["perturb_label"])
-        assert batch["batch_size"] == 4
-        assert len(batch["global_row_index"]) == 4
-        assert batch["row_offsets"][0] == 0
-        # Every cell should have at least one expressed gene
-        assert len(batch["expressed_gene_indices"]) > 0
-        assert len(batch["expression_counts"]) > 0
-        assert set(batch["meta_columns"]) == {"perturb_label"}
-
-    def test_dataset_entries_cover_full_range(self, tmp_path: Path) -> None:
-        """Dataset entries have correct global_start/end ranges."""
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        entries = sorted(corpus.dataset_entries, key=lambda e: e.global_start)
-        assert entries[0].dataset_id == "mock_00"
-        assert entries[0].global_start == 0
-        assert entries[0].global_end == 10
-        assert entries[1].dataset_id == "mock_01"
-        assert entries[1].global_start == 10
-        assert entries[1].global_end == 25
-
-
-class TestLoadCorpusAggregateZarrPhase2:
-    """Phase 2 aggregate Zarr public API tests."""
-
-    @staticmethod
-    def _load_backend_pair(tmp_path: Path) -> tuple[Corpus, Corpus]:
-        lance_root = tmp_path / "lance"
-        zarr_root = tmp_path / "zarr"
-        _build_mock_aggregate_corpus(lance_root)
-        _build_mock_aggregate_zarr_corpus(zarr_root)
-        return load_corpus(str(lance_root)), load_corpus(str(zarr_root))
-
-    def test_load_corpus_builds_aggregate_zarr_entries(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_zarr_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        assert corpus.topology == "aggregate"
-        assert corpus.backend == "zarr"
-        assert len(corpus.dataset_entries) == 2
-        assert [
-            (entry.dataset_id, entry.global_start, entry.global_end)
-            for entry in corpus.dataset_entries
-        ] == [
-            ("mock_00", 0, 10),
-            ("mock_01", 10, 25),
-        ]
-
-    def test_load_corpus_allows_missing_optional_aggregate_zarr_meta(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        _build_mock_aggregate_zarr_corpus(tmp_path)
-        (tmp_path / "matrix" / "aggregated-meta.json").unlink()
-
-        corpus = load_corpus(str(tmp_path))
-
-        assert corpus.backend == "zarr"
-
-    @pytest.mark.parametrize(
-        "indices",
-        [
-            [0, 1, 2, 3],
-            [24, 10, 9, 0],
-            [8, 10, 24, 0],
-            [],
-        ],
+    _assert_processed_batch(batch, batch_size=3)
+    expected = corpus.take_metadata(
+        batch["global_row_index"].cpu().numpy(),
+        columns=["dataset_index", "size_factor", "perturb_label"],
     )
-    def test_aggregate_zarr_public_reads_match_aggregate_lance(
-        self,
-        tmp_path: Path,
-        indices: list[int],
-    ) -> None:
-        lance_corpus, zarr_corpus = self._load_backend_pair(tmp_path)
-
-        _assert_public_api_matches_federated_lance(zarr_corpus, lance_corpus, indices)
-
-    def test_aggregate_zarr_cpu_loader_matches_sampler_and_metadata_contract(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        lance_corpus, zarr_corpus = self._load_backend_pair(tmp_path)
-        lance_corpus.set_sampler(batch_size=4, seed=11)
-        zarr_corpus.set_sampler(batch_size=4, seed=11)
-
-        lance_batch = next(
-            lance_corpus.loader(
-                processing="cpu",
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-        zarr_batch = next(
-            zarr_corpus.loader(
-                processing="cpu",
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-
-        _assert_processed_loader_batch(zarr_batch, batch_size=4)
-        np.testing.assert_array_equal(
-            zarr_batch["global_row_index"],
-            lance_batch["global_row_index"],
-        )
-        np.testing.assert_array_equal(
-            zarr_batch["dataset_index"],
-            lance_batch["dataset_index"],
-        )
-        assert zarr_batch["meta_columns"] == lance_batch["meta_columns"]
-
-    @pytest.mark.parametrize(
-        ("artifact_name", "message"),
-        [
-            ("aggregated-row-offsets.zarr", "Aggregate Zarr row-offsets artifact not found"),
-            ("aggregated-indices.zarr", "Aggregate Zarr indices artifact not found"),
-            ("aggregated-counts.zarr", "Aggregate Zarr counts artifact not found"),
-        ],
-    )
-    def test_missing_aggregate_zarr_artifact_fails_with_clear_error(
-        self,
-        tmp_path: Path,
-        artifact_name: str,
-        message: str,
-    ) -> None:
-        _build_mock_aggregate_zarr_corpus(tmp_path)
-        shutil.rmtree(tmp_path / "matrix" / artifact_name)
-
-        with pytest.raises(FileNotFoundError, match=message):
-            load_corpus(str(tmp_path))
-
-
-class TestLoadCorpusFederated:
-    """Test ``load_corpus()`` with federated Lance topology."""
-
-    def test_corpus_structure(self, tmp_path: Path) -> None:
-        """``load_corpus()`` returns a fully populated ``Corpus`` object."""
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        assert isinstance(corpus, Corpus)
-        assert corpus.topology == "federated"
-        assert corpus.backend == "lance"
-        assert corpus.corpus_root == tmp_path.resolve()
-        assert not hasattr(corpus, "batch_executor")
-        assert corpus.feature_registry is not None
-        assert corpus.metadata_index is not None
-        assert len(corpus.dataset_entries) == 2
-
-    def test_feature_registry_properties(self, tmp_path: Path) -> None:
-        """Feature registry reflects mock gene vocabulary."""
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        fr = corpus.feature_registry
-        assert fr.n_datasets == 2
-        assert fr.global_vocab_size == N_GENES
-        assert fr.max_local_vocab == N_GENES
-        assert fr.dataset_ids == ("mock_00", "mock_01")
-
-    def test_metadata_index_properties(self, tmp_path: Path) -> None:
-        """Metadata index has correct row count and columns."""
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        mi = corpus.metadata_index
-        assert len(mi) == 25
-        assert "dataset_id" in mi.df.columns
-        # Verify dataset separation
-        mock00 = mi.df.filter(pl.col("dataset_id") == "mock_00")
-        assert len(mock00) == 10
-        mock01 = mi.df.filter(pl.col("dataset_id") == "mock_01")
-        assert len(mock01) == 15
-
-    def test_inspect_batch_reads_cells(self, tmp_path: Path) -> None:
-        """Corpus inspection helper can read federated expression + metadata."""
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = corpus.inspect_batch([2, 8, 11, 20], metadata_columns=["perturb_label"])
-        assert batch["batch_size"] == 4
-        assert len(batch["expressed_gene_indices"]) > 0
-        assert batch["meta_columns"]["perturb_label"]
-
-    def test_dataset_entries_have_lance_paths(self, tmp_path: Path) -> None:
-        """Federated entries are ``LanceDatasetEntry`` with per-file paths."""
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        from perturb_data_lab.loaders.expression import LanceDatasetEntry
-
-        for entry in corpus.dataset_entries:
-            assert isinstance(entry, LanceDatasetEntry)
-            assert Path(str(entry.lance_path)).exists()
-            assert str(entry.lance_path).endswith(f"{entry.dataset_id}.lance")
-
-
-class TestLoadCorpusFederatedZarrPhase2:
-    """Phase 2 federated Zarr public API tests."""
-
-    @staticmethod
-    def _load_backend_pair(tmp_path: Path) -> tuple[Corpus, Corpus]:
-        lance_root = tmp_path / "lance"
-        zarr_root = tmp_path / "zarr"
-        _build_mock_federated_corpus(lance_root)
-        _build_mock_federated_backend_corpus(
-            zarr_root,
-            index_backend="zarr",
-            writer_backend="zarr",
-        )
-        return load_corpus(str(lance_root)), load_corpus(str(zarr_root))
-
-    def test_load_corpus_builds_zarr_dataset_entries(self, tmp_path: Path) -> None:
-        _build_mock_federated_backend_corpus(
-            tmp_path,
-            index_backend="zarr",
-            writer_backend="zarr",
-        )
-        corpus = load_corpus(str(tmp_path))
-
-        from perturb_data_lab.loaders.expression import ZarrDatasetEntry
-
-        assert corpus.topology == "federated"
-        assert corpus.backend == "zarr"
-        assert len(corpus.dataset_entries) == 2
-        for entry in corpus.dataset_entries:
-            assert isinstance(entry, ZarrDatasetEntry)
-            assert Path(str(entry.offsets_path)).is_dir()
-            assert Path(str(entry.indices_path)).is_dir()
-            assert Path(str(entry.counts_path)).is_dir()
-
-    @pytest.mark.parametrize(
-        "indices",
-        [
-            [0, 1, 2, 3],
-            [24, 10, 9, 0],
-            [8, 10, 24, 0],
-            [],
-        ],
-    )
-    def test_zarr_public_reads_match_federated_lance(
-        self,
-        tmp_path: Path,
-        indices: list[int],
-    ) -> None:
-        lance_corpus, zarr_corpus = self._load_backend_pair(tmp_path)
-
-        _assert_public_api_matches_federated_lance(zarr_corpus, lance_corpus, indices)
-
-    def test_zarr_cpu_loader_matches_sampler_and_metadata_contract(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        lance_corpus, zarr_corpus = self._load_backend_pair(tmp_path)
-        lance_corpus.set_sampler(batch_size=4, seed=11)
-        zarr_corpus.set_sampler(batch_size=4, seed=11)
-
-        lance_batch = next(
-            lance_corpus.loader(
-                processing="cpu",
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-        zarr_batch = next(
-            zarr_corpus.loader(
-                processing="cpu",
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-
-        _assert_processed_loader_batch(zarr_batch, batch_size=4)
-        np.testing.assert_array_equal(
-            zarr_batch["global_row_index"],
-            lance_batch["global_row_index"],
-        )
-        np.testing.assert_array_equal(
-            zarr_batch["dataset_index"],
-            lance_batch["dataset_index"],
-        )
-        assert zarr_batch["meta_columns"] == lance_batch["meta_columns"]
-
-    @pytest.mark.parametrize(
-        ("artifact_name", "message"),
-        [
-            ("mock_00-row-offsets.zarr", "Zarr row-offsets artifact not found"),
-            ("mock_00-indices.zarr", "Zarr indices artifact not found"),
-            ("mock_00-counts.zarr", "Zarr counts artifact not found"),
-        ],
-    )
-    def test_missing_zarr_artifact_fails_with_clear_error(
-        self,
-        tmp_path: Path,
-        artifact_name: str,
-        message: str,
-    ) -> None:
-        _build_mock_federated_backend_corpus(
-            tmp_path,
-            index_backend="zarr",
-            writer_backend="zarr",
-        )
-        artifact_path = tmp_path / "mock_00" / "matrix" / artifact_name
-        shutil.rmtree(artifact_path)
-
-        with pytest.raises(FileNotFoundError, match=message):
-            load_corpus(str(tmp_path))
-
-
-class TestCorpusApiPhase2:
-    """Phase 2 corpus-level API scaffolding tests."""
-
-    def test_set_sampler_stores_default_sampler(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        sampler = corpus.set_sampler(batch_size=4, seed=7)
-
-        assert sampler is corpus.sampler
-        assert corpus.sampler_params == {
-            "sampler": "corpus_random",
-            "batch_size": 4,
-            "drop_last": True,
-            "seed": 7,
-        }
-
-    def test_set_sampler_stores_row_index_subset(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        sampler = corpus.set_sampler(batch_size=3, seed=7, row_indices=[1, 3, 20])
-
-        assert sampler is corpus.sampler
-        assert corpus.sampler_params == {
-            "sampler": "corpus_random",
-            "batch_size": 3,
-            "drop_last": True,
-            "seed": 7,
-            "row_indices": (1, 3, 20),
-        }
-
-    def test_dataset_rejects_metadata_columns(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        with pytest.raises(ValueError, match="no longer accepts metadata_columns"):
-            corpus.dataset(metadata_columns=["perturb_label"])
-
-    def test_dataset_returns_raw_expression_batches(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        dataset = corpus.dataset()
-
-        batch = dataset.__getitems__([0, 10, 24])[0]
-        assert set(batch) == {
-            "batch_size",
-            "global_row_index",
-            "dataset_index",
-            "size_factor",
-            "row_offsets",
-            "expressed_gene_indices",
-            "expression_counts",
-        }
-        assert "local_row_index" not in batch
-
-    def test_loader_can_attach_local_row_index_as_metadata_column(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(
-            corpus.loader(
-                processing="gpu",
-                batch_size=4,
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["local_row_index"],
-            )
-        )
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        assert "local_row_index" not in batch
-        expected = corpus.take_metadata(
-            batch["global_row_index"].cpu().numpy(),
-            columns=["local_row_index"],
-        )
-        np.testing.assert_array_equal(
-            batch["meta_columns"]["local_row_index"],
-            expected["local_row_index"],
-        )
-
-    def test_build_dataset_routing_table_rejects_cross_dataset_entry(self) -> None:
-        metadata_index = _make_routing_metadata_index(
-            dataset_id=("ds0", "ds1"),
-            dataset_index=(0, 1),
-            local_row_index=(0, 0),
-        )
-
-        with pytest.raises(ValueError, match="stay within a single dataset"):
-            _build_dataset_routing_table(
-                metadata_index,
-                [DatasetEntry(dataset_id="entry_0", global_start=0, global_end=2)],
-            )
-
-    def test_build_dataset_routing_table_rejects_noncontiguous_local_rows(self) -> None:
-        metadata_index = _make_routing_metadata_index(
-            dataset_id=("ds0", "ds0"),
-            dataset_index=(0, 0),
-            local_row_index=(0, 2),
-        )
-
-        with pytest.raises(ValueError, match="contiguous local row indices"):
-            _build_dataset_routing_table(
-                metadata_index,
-                [DatasetEntry(dataset_id="entry_0", global_start=0, global_end=2)],
-            )
-
-    def test_loader_defaults_to_batch_size_128(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        captured: dict[str, Any] = {}
-
-        class FakeDataLoader:
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                captured.update(kwargs)
-
-            def __iter__(self):
-                return iter(())
-
-        monkeypatch.setattr(
-            "perturb_data_lab.loaders.corpus_loader.DataLoader",
-            FakeDataLoader,
-        )
-
-        corpus.loader(seq_len=LOADER_SEQ_LEN)
-
-        assert captured["batch_sampler"].batch_size == 128
-
-    def test_loader_row_indices_supports_inline_default_sampler(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(
-            corpus.loader(
-                processing="cpu",
-                row_indices=[2, 7, 10, 14],
-                seq_len=LOADER_SEQ_LEN,
-            )
-        )
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        assert set(batch["global_row_index"].cpu().numpy().tolist()) == {2, 7, 10, 14}
-
-    def test_loader_accepts_inline_sampler_defaults(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(
-            corpus.loader(
-                processing="gpu",
-                batch_size=4,
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        assert batch["meta_columns"]["perturb_label"]
-
-    def test_loader_metadata_attachment_supports_size_factor(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(
-            corpus.loader(
-                processing="gpu",
-                batch_size=4,
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["size_factor", "perturb_label"],
-            )
-        )
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        assert set(batch["meta_columns"]) == {"size_factor", "perturb_label"}
-        np.testing.assert_allclose(
-            batch["meta_columns"]["size_factor"],
-            batch["size_factor"].cpu().numpy(),
-        )
-
-    def test_loader_uses_stored_sampler(self, tmp_path: Path) -> None:
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        corpus.set_sampler(batch_size=5, seed=3)
-
-        batch = next(corpus.loader(processing="cpu", seq_len=LOADER_SEQ_LEN))
-
-        _assert_processed_loader_batch(batch, batch_size=5)
-
-    def test_loader_warns_when_local_sampler_overrides_stored_sampler(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        corpus.set_sampler(batch_size=5, seed=3)
-
-        with pytest.warns(UserWarning, match="loader-local sampler"):
-            batch = next(
-                corpus.loader(
-                    processing="cpu",
-                    batch_size=4,
-                    seq_len=LOADER_SEQ_LEN,
-                )
-            )
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-
-    def test_loader_validates_metadata_columns_and_worker_params(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        with pytest.raises(ValueError, match="reserved raw batch field"):
-            corpus.inspect_batch([0], metadata_columns=["dataset_index"])
-
-        with pytest.raises(ValueError, match="persistent_workers requires num_workers > 0"):
-            next(corpus.loader(batch_size=4, persistent_workers=True))
-
-        with pytest.raises(ValueError, match="seq_len is required"):
-            next(corpus.loader(batch_size=4))
-
-        with pytest.raises(ValueError, match="processing='cpu' only supports CPU devices"):
-            next(corpus.loader(batch_size=4, seq_len=LOADER_SEQ_LEN, processing="cpu", device="cuda"))
-
-    def test_loader_omits_metadata_columns_by_default(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(corpus.loader(processing="gpu", batch_size=4, seq_len=LOADER_SEQ_LEN))
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        assert "meta_columns" not in batch
-
-    def test_loader_allows_multiworker_federated_lance_spawn(self, tmp_path: Path) -> None:
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(
-            corpus.loader(
-                batch_size=4,
-                seq_len=LOADER_SEQ_LEN,
-                num_workers=1,
-                multiprocessing_context="spawn",
-            )
-        )
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-
-    @pytest.mark.parametrize(
-        ("row_indices", "message"),
-        [
-            ([[0, 1], [2, 3]], "row_indices must be a 1-D sequence"),
-            ([1, 1, 2], "row_indices must be unique corpus-global row indices"),
-            ([25], "row_indices contains out-of-range corpus-global row indices"),
-        ],
-    )
-    def test_row_indices_validation_fails_clearly(
-        self,
-        tmp_path: Path,
-        row_indices: Any,
-        message: str,
-    ) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        with pytest.raises((ValueError, IndexError), match=message):
-            corpus.set_sampler(batch_size=2, row_indices=row_indices)
-
-
-class TestAggregateLancePhase4:
-    """Phase 4 aggregate Lance worker-safe dataset tests."""
-
-    def test_dataset_opens_lance_lazily(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        dataset = corpus.dataset()
-
-        assert type(dataset) is ExpressionBatchDataset
-        assert dataset.topology == "aggregate"
-        assert dataset.backend == "lance"
-        assert dataset._reader._dataset is None
-
-        batch = dataset.__getitems__([0, 10, 24])[0]
-
-        assert dataset._reader._dataset is not None
-        np.testing.assert_array_equal(batch["global_row_index"], [0, 10, 24])
-        assert batch["dataset_index"].tolist() == [0, 1, 1]
-        assert "local_row_index" not in batch
-
-    def test_dataset_pickle_state_drops_open_lance_handle(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        dataset = corpus.dataset()
-        dataset.__getitems__([1, 11, 21])
-        assert dataset._reader._dataset is not None
-
-        restored = pickle.loads(pickle.dumps(dataset))
-
-        assert restored._reader._dataset is None
-        batch = restored.__getitems__([2, 12, 22])[0]
-        np.testing.assert_array_equal(batch["global_row_index"], [2, 12, 22])
-
-    def test_loader_allows_multiworker_aggregate_lance_spawn(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(
-            corpus.loader(
-                processing="gpu",
-                batch_size=4,
-                seq_len=LOADER_SEQ_LEN,
-                num_workers=1,
-                multiprocessing_context="spawn",
-            )
-        )
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-
-    def test_loader_attaches_metadata_after_gpu_processing(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(
-            corpus.loader(
-                batch_size=4,
-                seq_len=LOADER_SEQ_LEN,
-                num_workers=1,
-                multiprocessing_context="spawn",
-                metadata_columns=["perturb_label", "cell_line_or_type"],
-            )
-        )
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        assert batch["meta_columns"]["perturb_label"]
-        assert batch["meta_columns"]["cell_line_or_type"] == (
-            "K562",
-            "K562",
-            "K562",
-            "K562",
-        )
-
-    def test_loader_dataset_sampler_drives_aggregate_batches(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        corpus.set_sampler(
+    np.testing.assert_array_equal(batch["dataset_index"].cpu().numpy(), expected["dataset_index"])
+    np.testing.assert_allclose(batch["size_factor"].cpu().numpy(), expected["size_factor"])
+    assert batch["meta_columns"]["perturb_label"] == expected["perturb_label"]
+    np.testing.assert_allclose(batch["meta_columns"]["size_factor"], expected["size_factor"])
+
+
+def test_build_loader_respects_dataset_sampler_and_row_indices(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
+
+    batch = next(
+        build_loader(
+            corpus,
             sampler="dataset",
             dataset_index=1,
-            batch_size=4,
-            seed=7,
-        )
-
-        batch = next(corpus.loader(processing="gpu", seq_len=LOADER_SEQ_LEN))
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        global_indices = batch["global_row_index"].cpu().numpy()
-        assert np.all(global_indices >= 10)
-        assert np.all(global_indices < 25)
-
-    def test_loader_dataset_sampler_intersects_row_indices(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        corpus.set_sampler(
-            sampler="dataset",
-            dataset_index=1,
+            row_indices=[4, 5, 6],
             batch_size=5,
             drop_last=False,
             shuffle=False,
-            row_indices=[4, 9, 10, 12, 20],
+            seq_len=LOADER_SEQ_LEN,
+            device="cpu",
         )
-
-        batch = next(corpus.loader(processing="cpu", seq_len=LOADER_SEQ_LEN))
-
-        _assert_processed_loader_batch(batch, batch_size=3)
-        np.testing.assert_array_equal(
-            batch["global_row_index"].cpu().numpy(),
-            np.array([10, 12, 20]),
-        )
-
-    def test_loader_dataset_context_sampler_preserves_context_group(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(
-            corpus.loader(
-                processing="gpu",
-                sampler="dataset_context",
-                dataset_index=1,
-                context_field="perturb_label",
-                batch_size=3,
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-
-        _assert_processed_loader_batch(batch, batch_size=3)
-        assert len(set(batch["meta_columns"]["perturb_label"])) == 1
-
-    def test_loader_dataset_context_sampler_preserves_context_inside_row_indices(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batches = list(
-            corpus.loader(
-                processing="cpu",
-                sampler="dataset_context",
-                dataset_index=1,
-                context_field="perturb_label",
-                batch_size=2,
-                drop_last=False,
-                shuffle=False,
-                row_indices=[10, 11, 13, 14, 16, 17],
-                seq_len=LOADER_SEQ_LEN,
-                metadata_columns=["perturb_label"],
-            )
-        )
-
-        assert len(batches) == 2
-        for batch in batches:
-            _assert_processed_loader_batch(batch, batch_size=2)
-            assert set(batch["global_row_index"].cpu().numpy().tolist()) <= {10, 11, 13, 14, 16, 17}
-            assert len(set(batch["meta_columns"]["perturb_label"])) == 1
-
-
-class TestFederatedLancePhase5:
-    """Phase 5 federated Lance worker-safe dataset tests."""
-
-    def test_dataset_opens_federated_lance_lazily(self, tmp_path: Path) -> None:
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        dataset = corpus.dataset()
-
-        assert type(dataset) is ExpressionBatchDataset
-        assert dataset.topology == "federated"
-        assert dataset.backend == "lance"
-        assert dataset._reader._datasets == {}
-
-        batch = dataset.__getitems__([24, 0, 10, 9])[0]
-
-        assert set(dataset._reader._datasets) == {"mock_00", "mock_01"}
-        np.testing.assert_array_equal(batch["global_row_index"], [24, 0, 10, 9])
-        assert batch["dataset_index"].tolist() == [1, 0, 1, 0]
-        assert "local_row_index" not in batch
-
-    def test_dataset_pickle_state_drops_open_federated_handles(self, tmp_path: Path) -> None:
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        dataset = corpus.dataset()
-        dataset.__getitems__([1, 11, 21])
-        assert dataset._reader._datasets
-
-        restored = pickle.loads(pickle.dumps(dataset))
-
-        assert restored._reader._datasets == {}
-        batch = restored.__getitems__([2, 12, 22])[0]
-        np.testing.assert_array_equal(batch["global_row_index"], [2, 12, 22])
-        assert set(restored._reader._datasets) == {"mock_00", "mock_01"}
-
-    def test_loader_attaches_metadata_after_cpu_processing(self, tmp_path: Path) -> None:
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(
-            corpus.loader(
-                processing="cpu",
-                batch_size=4,
-                seq_len=LOADER_SEQ_LEN,
-                num_workers=1,
-                multiprocessing_context="spawn",
-                metadata_columns=["perturb_label"],
-            )
-        )
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        assert batch["sampled_gene_ids"].device.type == "cpu"
-        assert batch["meta_columns"]["perturb_label"]
-
-    def test_loader_dataset_sampler_drives_federated_batches(self, tmp_path: Path) -> None:
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        corpus.set_sampler(
-            sampler="dataset",
-            dataset_index=0,
-            batch_size=4,
-            seed=11,
-        )
-
-        batch = next(corpus.loader(processing="cpu", seq_len=LOADER_SEQ_LEN))
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        global_indices = batch["global_row_index"].cpu().numpy()
-        assert np.all(global_indices >= 0)
-        assert np.all(global_indices < 10)
-
-
-class TestCorpusInspectionHelpersPhase5:
-    """Phase 5 corpus-level inspection helper tests."""
-
-    def test_read_expression_matches_expression_reader(self, tmp_path: Path) -> None:
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        indices = [24, 0, 10, 9]
-
-        expr = corpus.read_expression(indices)
-        expected = corpus.expression_reader.read_expression_flat(indices)
-
-        _assert_expression_batch_equal(expr, expected)
-
-    def test_take_metadata_matches_metadata_index_take(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(
-            tmp_path,
-            typed_structural=True,
-            safe_nulls=True,
-        )
-        corpus = load_corpus(str(tmp_path))
-        indices = [0, 10]
-
-        taken = corpus.take_metadata(
-            indices,
-            columns=["dataset_id", "cell_id", "dataset_index", "size_factor", "dose", "timepoint", "perturb_label"],
-        )
-        expected = corpus.metadata_index.take(
-            indices,
-            ["dataset_id", "cell_id", "dataset_index", "size_factor", "dose", "timepoint", "perturb_label"],
-        )
-
-        assert np.issubdtype(taken["dataset_index"].dtype, np.integer)
-        assert np.issubdtype(taken["size_factor"].dtype, np.floating)
-        assert taken["dose"] == (None, None)
-        assert taken["timepoint"] == (None, None)
-        _assert_columnar_value_equal(taken["dataset_id"], expected["dataset_id"])
-        _assert_columnar_value_equal(taken["cell_id"], expected["cell_id"])
-        _assert_columnar_value_equal(taken["dataset_index"], expected["dataset_index"])
-        np.testing.assert_allclose(taken["size_factor"], expected["size_factor"])
-        _assert_columnar_value_equal(taken["dose"], expected["dose"])
-        _assert_columnar_value_equal(taken["timepoint"], expected["timepoint"])
-        _assert_columnar_value_equal(taken["perturb_label"], expected["perturb_label"])
-
-    def test_inspect_batch_matches_direct_raw_batch_contract(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path, typed_structural=True, safe_nulls=True)
-        corpus = load_corpus(str(tmp_path))
-        indices = [0, 5, 12, 24]
-
-        batch = corpus.inspect_batch(
-            indices,
-            metadata_columns=["perturb_label", "dose", "size_factor"],
-        )
-        expected = _read_raw_batch(
-            corpus.expression_reader,
-            corpus.metadata_index,
-            indices,
-            metadata_columns=["perturb_label", "dose", "size_factor"],
-        )
-
-        assert set(batch.keys()) == set(expected.keys())
-        for key in (
-            "global_row_index",
-            "dataset_index",
-            "local_row_index",
-            "row_offsets",
-            "expressed_gene_indices",
-            "expression_counts",
-            "size_factor",
-        ):
-            np.testing.assert_array_equal(batch[key], expected[key])
-        assert set(batch["meta_columns"]) == set(expected["meta_columns"])
-        for key, value in expected["meta_columns"].items():
-            _assert_columnar_value_equal(batch["meta_columns"][key], value)
-
-
-class TestLegacySurfaceRemovalPhase6:
-    """Phase 6 import and API removal checks."""
-
-    @pytest.mark.parametrize(
-        "symbol",
-        [
-            "BatchExecutor",
-            "RawExpressionBatch",
-            "RawExpressionBatchDataset",
-            "PerturbBatchDataset",
-            "collate_batch_dict",
-            "FastTrainingBatch",
-            "BatchMetadata",
-            "LanceExpressionBatchDataset",
-            "AggregateLanceExpressionBatchDataset",
-        ],
     )
-    def test_removed_public_symbols_are_not_importable(self, symbol: str) -> None:
-        with pytest.raises(ImportError):
-            exec(f"from perturb_data_lab.loaders import {symbol}", {}, {})
+
+    _assert_processed_batch(batch, batch_size=3)
+    np.testing.assert_array_equal(batch["global_row_index"].cpu().numpy(), [4, 5, 6])
+    np.testing.assert_array_equal(batch["dataset_index"].cpu().numpy(), [1, 1, 1])
 
 
-class TestCorpusLoaderPhase6:
-    """Phase 6 end-to-end CPU/GPU loader routing tests."""
+def test_build_loader_context_sampler_keeps_context_group(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
 
-    def test_aggregate_gpu_loader_route(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(corpus.loader(processing="gpu", batch_size=4, seq_len=LOADER_SEQ_LEN))
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        assert batch["sampled_gene_ids"].shape == (4, LOADER_SEQ_LEN)
-        assert "local_row_index" not in batch
-
-    def test_aggregate_cpu_loader_route(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(corpus.loader(processing="cpu", batch_size=4, seq_len=LOADER_SEQ_LEN))
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        assert batch["sampled_gene_ids"].device.type == "cpu"
-        assert "local_row_index" not in batch
-
-    def test_federated_gpu_loader_route(self, tmp_path: Path) -> None:
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(corpus.loader(processing="gpu", batch_size=4, seq_len=LOADER_SEQ_LEN))
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        assert batch["sampled_gene_ids"].shape == (4, LOADER_SEQ_LEN)
-        assert "local_row_index" not in batch
-
-    def test_federated_cpu_loader_route(self, tmp_path: Path) -> None:
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(corpus.loader(processing="cpu", batch_size=4, seq_len=LOADER_SEQ_LEN))
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-        assert batch["sampled_gene_ids"].device.type == "cpu"
-        assert "local_row_index" not in batch
-
-    def test_cpu_loader_supports_multiworker_spawn_aggregate(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(
-            corpus.loader(
-                processing="cpu",
-                batch_size=4,
-                seq_len=LOADER_SEQ_LEN,
-                num_workers=1,
-                multiprocessing_context="spawn",
-            )
+    batch = next(
+        build_loader(
+            corpus,
+            sampler="dataset_context",
+            dataset_index=1,
+            context_field="perturb_label",
+            batch_size=2,
+            seq_len=LOADER_SEQ_LEN,
+            device="cpu",
+            metadata_columns=["perturb_label"],
         )
+    )
 
-        _assert_processed_loader_batch(batch, batch_size=4)
-
-    def test_cpu_loader_supports_multiworker_spawn_federated(self, tmp_path: Path) -> None:
-        _build_mock_federated_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = next(
-            corpus.loader(
-                processing="cpu",
-                batch_size=4,
-                seq_len=LOADER_SEQ_LEN,
-                num_workers=1,
-                multiprocessing_context="spawn",
-            )
-        )
-
-        _assert_processed_loader_batch(batch, batch_size=4)
-
-    def test_lance_workers_default_to_spawn(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        captured: dict[str, Any] = {}
-
-        class FakeDataLoader:
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                captured.update(kwargs)
-
-            def __iter__(self):
-                return iter(())
-
-        monkeypatch.setattr(
-            "perturb_data_lab.loaders.corpus_loader.DataLoader",
-            FakeDataLoader,
-        )
-
-        corpus.loader(processing="gpu", batch_size=4, seq_len=LOADER_SEQ_LEN, num_workers=1)
-
-        assert captured["multiprocessing_context"] == "spawn"
+    _assert_processed_batch(batch, batch_size=2)
+    assert len(set(batch["meta_columns"]["perturb_label"])) == 1
 
 
-class TestModernCollatesPhase5:
-    """Phase 5 custom DataLoader and collate tests."""
+def test_load_corpus_federated_reader_uses_dataset_files(tmp_path: Path) -> None:
+    _build_federated_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
 
-    def test_custom_dataloader_supports_collate_expression_batch(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        dataset = corpus.dataset()
-        sampler = CorpusRandomBatchSampler(
-            metadata_index=corpus.metadata_index,
-            batch_size=3,
-            drop_last=False,
-            seed=5,
-        )
+    batch = corpus.read_expression([0, 4, 8])
 
-        loader = DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            collate_fn=collate_expression_batch,
-            num_workers=0,
-        )
-
-        batch = next(iter(loader))
-
-        assert batch["batch_size"] == 3
-        assert isinstance(batch["global_row_index"], torch.Tensor)
-        assert isinstance(batch["dataset_index"], torch.Tensor)
-        assert isinstance(batch["row_offsets"], torch.Tensor)
-        assert isinstance(batch["expressed_gene_indices"], torch.Tensor)
-        assert isinstance(batch["expression_counts"], torch.Tensor)
-        assert batch["global_row_index"].dtype == torch.long
-        assert batch["size_factor"].dtype == torch.float32
-        assert "local_row_index" not in batch
-
-    def test_custom_dataloader_supports_collate_expression_batch_cpu(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        dataset = corpus.dataset()
-        sampler = CorpusRandomBatchSampler(
-            metadata_index=corpus.metadata_index,
-            batch_size=3,
-            drop_last=False,
-            seed=7,
-        )
-        pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=LOADER_SEQ_LEN)
-
-        loader = DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            collate_fn=partial(
-                collate_expression_batch_cpu,
-                pipeline=pipeline,
-                sampled_gene_ids=torch.arange(
-                    LOADER_SEQ_LEN,
-                    dtype=torch.long,
-                ).repeat(3, 1),
-            ),
-            num_workers=0,
-        )
-
-        batch = next(iter(loader))
-
-        _assert_processed_loader_batch(batch, batch_size=3)
-        assert batch["sampled_gene_ids"].device.type == "cpu"
-
-    def test_collate_expression_batch_preserves_meta_columns(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch = corpus.inspect_batch([0, 10, 24], metadata_columns=["perturb_label"])
-        collated = collate_expression_batch([batch])
-
-        assert collated["meta_columns"] == batch["meta_columns"]
-        assert collated["size_factor"].dtype == torch.float32
-
-    def test_collate_expression_batch_cpu_preserves_meta_columns(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-        pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=LOADER_SEQ_LEN)
-        batch = corpus.inspect_batch([1, 11, 21], metadata_columns=["perturb_label"])
-
-        collated = collate_expression_batch_cpu(
-            [batch],
-            pipeline=pipeline,
-            sampled_gene_ids=torch.arange(LOADER_SEQ_LEN, dtype=torch.long).repeat(3, 1),
-        )
-
-        assert collated["meta_columns"] == batch["meta_columns"]
-        assert collated["size_factor"].dtype == torch.float32
+    assert corpus.topology == "federated"
+    np.testing.assert_array_equal(batch.global_row_index, [0, 4, 8])
+    assert batch.batch_size == 3
 
 
-class TestSparsePipelinePhase3:
-    """Phase 3 metadata-light sparse pipeline tests."""
+def test_load_corpus_rejects_unknown_backend(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    index_path = tmp_path / "corpus-index.yaml"
+    with open(index_path, encoding="utf-8") as handle:
+        doc = yaml.safe_load(handle)
+    doc["global_metadata"]["backend"] = "unknown_backend"
+    with open(index_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(doc, handle)
 
-    def test_raw_loader_path_allows_missing_size_factor(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path, include_size_factor=False)
-        corpus = load_corpus(str(tmp_path))
-
-        raw_batch = corpus.dataset().__getitems__([0, 10, 24])[0]
-        assert "size_factor" not in raw_batch
-
-        loader_batch = next(corpus.loader(processing="gpu", batch_size=4, seq_len=LOADER_SEQ_LEN))
-        assert "size_factor" not in loader_batch
-
-    def test_gpu_pipeline_output_is_size_factor_independent(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch_with_size_factor = corpus.dataset().__getitems__([0, 10, 24])[0]
-        batch_without_size_factor = {
-            key: value
-            for key, value in batch_with_size_factor.items()
-            if key != "size_factor"
-        }
-
-        collated_with = collate_expression_batch([batch_with_size_factor])
-        collated_without = collate_expression_batch([batch_without_size_factor])
-        pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=8)
-        sampled_gene_ids = torch.arange(8, dtype=torch.long).repeat(3, 1)
-
-        result_with = pipeline.process_batch(
-            collated_with, device="cpu", sampled_gene_ids=sampled_gene_ids
-        )
-        result_without = pipeline.process_batch(
-            collated_without, device="cpu", sampled_gene_ids=sampled_gene_ids
-        )
-
-        assert "size_factor" in result_with
-        assert "size_factor" not in result_without
-        assert result_with["batch_size"] == result_without["batch_size"] == 3
-        assert result_with["seq_len"] == result_without["seq_len"] == 8
-        for key in (
-            "sampled_gene_ids",
-            "sampled_counts",
-            "valid_mask",
-            "exact_match_mask",
-            "dataset_index",
-            "global_row_index",
-        ):
-            assert torch.equal(result_with[key], result_without[key])
-
-    def test_collate_expression_batch_cpu_allows_missing_size_factor(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch_with_size_factor = corpus.dataset().__getitems__([1, 11, 21])[0]
-        batch_without_size_factor = {
-            key: value
-            for key, value in batch_with_size_factor.items()
-            if key != "size_factor"
-        }
-
-        pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=8)
-        sampled_gene_ids = torch.arange(8, dtype=torch.long).repeat(3, 1)
-        collate = partial(
-            collate_expression_batch_cpu,
-            pipeline=pipeline,
-            sampled_gene_ids=sampled_gene_ids,
-        )
-
-        result_with = collate([batch_with_size_factor])
-        result_without = collate([batch_without_size_factor])
-
-        assert "size_factor" in result_with
-        assert "size_factor" not in result_without
-        for key in (
-            "sampled_gene_ids",
-            "sampled_counts",
-            "valid_mask",
-            "exact_match_mask",
-            "dataset_index",
-            "global_row_index",
-        ):
-            assert torch.equal(result_with[key], result_without[key])
-
-    def test_cpu_pipeline_allows_missing_size_factor(self, tmp_path: Path) -> None:
-        _build_mock_aggregate_corpus(tmp_path)
-        corpus = load_corpus(str(tmp_path))
-
-        batch_with_size_factor = corpus.dataset().__getitems__([2, 12, 22])[0]
-        batch_without_size_factor = {
-            key: value
-            for key, value in batch_with_size_factor.items()
-            if key != "size_factor"
-        }
-
-        pipeline = CPUPipeline(corpus.feature_registry, seq_len=8, seed=7)
-        sampled_gene_ids = np.arange(8, dtype=np.int32).reshape(1, 8).repeat(3, axis=0)
-
-        result_with = pipeline.process_batch(
-            batch_with_size_factor, sampled_gene_ids=sampled_gene_ids
-        )
-        result_without = pipeline.process_batch(
-            batch_without_size_factor, sampled_gene_ids=sampled_gene_ids
-        )
-
-        assert "size_factor" in result_with
-        assert "size_factor" not in result_without
-        assert result_with["batch_size"] == result_without["batch_size"] == 3
-        assert result_with["seq_len"] == result_without["seq_len"] == 8
-        for key in (
-            "sampled_gene_ids",
-            "sampled_counts",
-            "valid_mask",
-            "exact_match_mask",
-            "dataset_index",
-            "global_row_index",
-        ):
-            np.testing.assert_array_equal(result_with[key], result_without[key])
-
-
-class TestLoadCorpusErrors:
-    """Error handling tests."""
-
-    def test_missing_corpus_index(self, tmp_path: Path) -> None:
-        """Raises FileNotFoundError when corpus-index.yaml is missing."""
-        with pytest.raises(FileNotFoundError, match="corpus-index.yaml"):
-            load_corpus(str(tmp_path))
-
-    def test_missing_canonical_obs(self, tmp_path: Path) -> None:
-        """Raises FileNotFoundError when canonical-obs.parquet is missing."""
-        _build_mock_aggregate_corpus(tmp_path)
-        # Remove one obs file
-        obs_path = tmp_path / "meta" / "mock_00" / "canonical_meta" / "canonical-obs.parquet"
-        obs_path.unlink()
-
-        with pytest.raises(FileNotFoundError, match="canonical-obs.parquet"):
-            load_corpus(str(tmp_path))
-
-    def test_missing_canonical_var(self, tmp_path: Path) -> None:
-        """Raises FileNotFoundError when canonical-var.parquet is missing."""
-        _build_mock_aggregate_corpus(tmp_path)
-        # Remove one var file
-        var_path = tmp_path / "meta" / "mock_00" / "canonical_meta" / "canonical-var.parquet"
-        var_path.unlink()
-
-        with pytest.raises(FileNotFoundError, match="canonical-var.parquet"):
-            load_corpus(str(tmp_path))
-
-    def test_missing_lance_file_aggregate(self, tmp_path: Path) -> None:
-        """Raises FileNotFoundError when aggregate Lance file is missing."""
-        _build_mock_aggregate_corpus(tmp_path)
-        lance_path = tmp_path / "matrix" / "aggregated-cells.lance"
-        import shutil
-        shutil.rmtree(lance_path)
-
-        with pytest.raises(FileNotFoundError, match="aggregated-cells.lance"):
-            load_corpus(str(tmp_path))
-
-    def test_missing_lance_file_federated(self, tmp_path: Path) -> None:
-        """Raises FileNotFoundError when a federated Lance file is missing."""
-        _build_mock_federated_corpus(tmp_path)
-        lance_path = tmp_path / "mock_00" / "matrix" / "mock_00.lance"
-        import shutil
-        shutil.rmtree(lance_path)
-
-        with pytest.raises(FileNotFoundError, match=".lance"):
-            load_corpus(str(tmp_path))
-
-    def test_unknown_topology(self, tmp_path: Path) -> None:
-        """Raises ValueError for unknown topology."""
-        _build_mock_aggregate_corpus(tmp_path)
-        # Corrupt the topology in the index
-        index_path = tmp_path / "corpus-index.yaml"
-        with open(index_path) as f:
-            doc = yaml.safe_load(f)
-        doc["global_metadata"]["topology"] = "unknown"
-        with open(index_path, "w") as f:
-            yaml.safe_dump(doc, f)
-
-        with pytest.raises(ValueError, match="topology"):
-            load_corpus(str(tmp_path))
-
-    def test_unknown_backend(self, tmp_path: Path) -> None:
-        """Raises ValueError for unknown backend."""
-        _build_mock_aggregate_corpus(tmp_path)
-        # Corrupt the backend
-        index_path = tmp_path / "corpus-index.yaml"
-        with open(index_path) as f:
-            doc = yaml.safe_load(f)
-        doc["global_metadata"]["backend"] = "unknown_backend"
-        with open(index_path, "w") as f:
-            yaml.safe_dump(doc, f)
-
-        with pytest.raises(ValueError, match="backend"):
-            load_corpus(str(tmp_path))
+    with pytest.raises(ValueError, match="backend"):
+        load_corpus(tmp_path)

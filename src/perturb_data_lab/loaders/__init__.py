@@ -14,14 +14,14 @@ from .expression import (
 )
 from .index import MetadataIndex
 from .loaders import (
-    DatasetRoutingTable,
     ExpressionBatchDataset,
     CorpusRandomBatchSampler,
     DatasetBatchSampler,
     DatasetContextBatchSampler,
     ExpressionBatch,
+    build_loader,
     collate_expression_batch,
-    collate_expression_batch_cpu,
+    read_expression_raw_batch,
 )
 from .corpus import (
     read_raw_obs_parquet,
@@ -36,9 +36,7 @@ from .gene_tokenizer import (
 )
 from .corpus_loader import (
     Corpus,
-    ObsSelection,
     load_corpus,
-    select_obs_indices,
 )
 from .gpu_pipeline import (
     GPUSparsePipeline,
@@ -74,10 +72,10 @@ __all__ = [
     "DatasetBatchSampler",
     "DatasetContextBatchSampler",
     # Phase 3 — Data loaders
-    "DatasetRoutingTable",
     "ExpressionBatchDataset",
+    "build_loader",
     "collate_expression_batch",
-    "collate_expression_batch_cpu",
+    "read_expression_raw_batch",
     # Phase 2 — Feature Registry
     "FeatureRegistry",
     "DatasetTokenSpan",
@@ -94,9 +92,7 @@ __all__ = [
     "PertTFCorpusAdapter",
     # Phase N — Corpus loader factory
     "Corpus",
-    "ObsSelection",
     "load_corpus",
-    "select_obs_indices",
     # Utilities
     "read_raw_obs_parquet",
     "read_raw_var_parquet",

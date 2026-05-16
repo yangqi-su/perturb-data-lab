@@ -17,6 +17,7 @@ from perturb_data_lab.loaders import (
     PertTFCorpusAdapter,
     PerturbationPairSampler,
     load_corpus,
+    read_expression_raw_batch,
 )
 from perturb_data_lab.loaders.adapters.perttf import (
     _collate_perttf_raw_pair_batch,
@@ -465,7 +466,7 @@ def test_paired_batch_builder_emits_union_full_expression_masks_for_mixed_datase
     assert batch["full_expr_next_mask"][1].tolist() == [True, False, True, True]
 
 
-def test_build_from_raw_pair_batch_matches_inspect_batch_path(
+def test_build_from_raw_pair_batch_matches_direct_builder_path(
     tmp_path: Path,
 ) -> None:
     config = PertTFAdapterConfig(
@@ -482,10 +483,10 @@ def test_build_from_raw_pair_batch_matches_inspect_batch_path(
     ).pair_source_positions([0, 2], seed=23)
     builder = PertTFPairedBatchBuilder(corpus, seq_len=2, config=config)
 
-    source_raw = corpus.inspect_batch(pair_batch.source_indices)
-    target_raw = corpus.inspect_batch(pair_batch.target_indices)
+    source_raw = read_expression_raw_batch(corpus.expression_reader, pair_batch.source_indices)
+    target_raw = read_expression_raw_batch(corpus.expression_reader, pair_batch.target_indices)
 
-    inspect_batch_output = builder.build_paired_batch(
+    direct_output = builder.build_paired_batch(
         pair_batch,
         seed=29,
         sampling_mode="hvg",
@@ -502,9 +503,9 @@ def test_build_from_raw_pair_batch_matches_inspect_batch_path(
         hvg_top_k=1,
     )
 
-    assert inspect_batch_output.keys() == raw_batch_output.keys()
-    for key in inspect_batch_output:
-        torch.testing.assert_close(inspect_batch_output[key], raw_batch_output[key])
+    assert direct_output.keys() == raw_batch_output.keys()
+    for key in direct_output:
+        torch.testing.assert_close(direct_output[key], raw_batch_output[key])
 
 
 def test_build_from_raw_pair_batch_rejects_batch_size_mismatch(
@@ -520,8 +521,8 @@ def test_build_from_raw_pair_batch_rejects_batch_size_mismatch(
     ).pair_source_positions([0, 1], seed=11)
     builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
 
-    source_raw = corpus.inspect_batch([int(pair_batch.source_indices[0])])
-    target_raw = corpus.inspect_batch(pair_batch.target_indices)
+    source_raw = read_expression_raw_batch(corpus.expression_reader, [int(pair_batch.source_indices[0])])
+    target_raw = read_expression_raw_batch(corpus.expression_reader, pair_batch.target_indices)
 
     with pytest.raises(ValueError, match="source_raw batch_size"):
         builder.build_from_raw_pair_batch(pair_batch, source_raw, target_raw)
@@ -540,8 +541,8 @@ def test_build_from_raw_pair_batch_rejects_row_order_mismatch(
     ).pair_source_positions([0, 1], seed=11)
     builder = PertTFPairedBatchBuilder(corpus, seq_len=3, config=config)
 
-    source_raw = corpus.inspect_batch(pair_batch.source_indices[::-1])
-    target_raw = corpus.inspect_batch(pair_batch.target_indices)
+    source_raw = read_expression_raw_batch(corpus.expression_reader, pair_batch.source_indices[::-1])
+    target_raw = read_expression_raw_batch(corpus.expression_reader, pair_batch.target_indices)
 
     with pytest.raises(ValueError, match="source_raw global_row_index"):
         builder.build_from_raw_pair_batch(pair_batch, source_raw, target_raw)
@@ -564,8 +565,8 @@ def test_build_from_raw_pair_batch_rejects_target_perturbation_shape_mismatch(
         pair_batch,
         target_perturbation_ids=np.asarray([0], dtype=np.int64),
     )
-    source_raw = corpus.inspect_batch(pair_batch.source_indices)
-    target_raw = corpus.inspect_batch(pair_batch.target_indices)
+    source_raw = read_expression_raw_batch(corpus.expression_reader, pair_batch.source_indices)
+    target_raw = read_expression_raw_batch(corpus.expression_reader, pair_batch.target_indices)
 
     with pytest.raises(ValueError, match="target_perturbation_ids"):
         builder.build_from_raw_pair_batch(invalid_pair_batch, source_raw, target_raw)
@@ -646,8 +647,8 @@ def _assert_pair_read_batch_matches_builder(
     source_raw = batch["source_raw"]
     target_raw = batch["target_raw"]
 
-    expected_source_raw = corpus.inspect_batch(pair_batch.source_indices)
-    expected_target_raw = corpus.inspect_batch(pair_batch.target_indices)
+    expected_source_raw = read_expression_raw_batch(corpus.expression_reader, pair_batch.source_indices)
+    expected_target_raw = read_expression_raw_batch(corpus.expression_reader, pair_batch.target_indices)
 
     assert source_raw["batch_size"] == expected_source_raw["batch_size"]
     assert target_raw["batch_size"] == expected_target_raw["batch_size"]

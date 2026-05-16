@@ -164,19 +164,10 @@ def _resolve_feature_contexts(
     *,
     dataset_id: str | None,
 ) -> list[PpFeatureContext]:
-    routing = corpus.routing_table
-    dataset_ids = routing.dataset_ids
-    if not dataset_ids:
-        dataset_ids = tuple(
-            dataset_id
-            for dataset_id, _ in sorted(
-                corpus.dataset_index_by_id.items(),
-                key=lambda item: item[1],
-            )
-        )
-
-    starts = np.asarray(routing.dataset_starts, dtype=np.int64)
-    stops = np.asarray(routing.dataset_stops, dtype=np.int64)
+    entries = sorted(corpus.dataset_entries, key=lambda entry: entry.global_start)
+    dataset_ids = tuple(entry.dataset_id for entry in entries)
+    starts = np.asarray([entry.global_start for entry in entries], dtype=np.int64)
+    stops = np.asarray([entry.global_end for entry in entries], dtype=np.int64)
     selected_dataset_ids = dataset_ids if dataset_id is None else (dataset_id,)
 
     contexts: list[PpFeatureContext] = []

@@ -16,6 +16,7 @@ import yaml
 
 from ..materializers.paths import resolve_corpus_paths
 from .corpus_loader import Corpus, load_corpus
+from .loaders import build_loader, read_expression_raw_batch
 
 __all__ = ["validate_cross_backend_contract"]
 
@@ -40,8 +41,7 @@ def validate_cross_backend_contract(
     sample_indices:
         Ordered global row indices used for deterministic cross-backend reads.
     metadata_columns:
-        Metadata columns requested through ``Corpus.inspect_batch(...)`` and
-        ``Corpus.loader(...)``.
+        Metadata columns requested through ``build_loader(...)``.
     loader_batch_size:
         Batch size used for the CPU loader comparison.
     seq_len:
@@ -103,14 +103,13 @@ def validate_cross_backend_contract(
         index_report = _validate_loaded_corpus_index(backend, corpus, index_doc)
 
         expression_batch = corpus.read_expression(normalized_indices)
-        dataset_batch = corpus.dataset().__getitems__(normalized_indices)[0]
+        raw_expression_batch = read_expression_raw_batch(
+            corpus.expression_reader,
+            normalized_indices,
+        )
         taken_metadata = corpus.take_metadata(
             normalized_indices,
             columns=metadata_columns,
-        )
-        inspected_batch = corpus.inspect_batch(
-            normalized_indices,
-            metadata_columns=metadata_columns,
         )
         loader_batch = _read_loader_batch(
             corpus,
@@ -136,18 +135,13 @@ def validate_cross_backend_contract(
                 "nonzero_count": int(expression_batch.expression_counts.size),
                 "global_row_index_preview": expression_batch.global_row_index[:5].tolist(),
             },
-            "dataset": {
-                "batch_size": int(dataset_batch["batch_size"]),
-                "nonzero_count": int(dataset_batch["expression_counts"].size),
-                "global_row_index_preview": dataset_batch["global_row_index"][:5].tolist(),
+            "raw_expression_batch": {
+                "batch_size": int(raw_expression_batch["batch_size"]),
+                "nonzero_count": int(raw_expression_batch["expression_counts"].size),
+                "global_row_index_preview": raw_expression_batch["global_row_index"][:5].tolist(),
             },
             "take_metadata": {
                 "columns": sorted(taken_metadata.keys()),
-            },
-            "inspect_batch": {
-                "batch_size": int(inspected_batch["batch_size"]),
-                "metadata_columns": sorted(inspected_batch.get("meta_columns", {}).keys()),
-                "global_row_index_preview": inspected_batch["global_row_index"][:5].tolist(),
             },
             "loader": {
                 "batch_size": int(loader_batch["batch_size"]),
@@ -159,9 +153,8 @@ def validate_cross_backend_contract(
         backend_state[backend] = {
             "corpus": corpus,
             "expression": expression_batch,
-            "dataset": dataset_batch,
+            "raw_expression_batch": raw_expression_batch,
             "take_metadata": taken_metadata,
-            "inspect_batch": inspected_batch,
             "loader": loader_batch,
             "index_report": index_report,
         }
@@ -188,9 +181,9 @@ def validate_cross_backend_contract(
             baseline_backend=baseline_backend,
         )
         _assert_raw_batch_equal(
-            current_state["dataset"],
-            baseline_state["dataset"],
-            layer="dataset",
+            current_state["raw_expression_batch"],
+            baseline_state["raw_expression_batch"],
+            layer="raw_expression_batch",
             backend=backend,
             baseline_backend=baseline_backend,
         )
@@ -198,13 +191,6 @@ def validate_cross_backend_contract(
             current_state["take_metadata"],
             baseline_state["take_metadata"],
             layer="take_metadata",
-            backend=backend,
-            baseline_backend=baseline_backend,
-        )
-        _assert_raw_batch_equal(
-            current_state["inspect_batch"],
-            baseline_state["inspect_batch"],
-            layer="inspect_batch",
             backend=backend,
             baseline_backend=baseline_backend,
         )
@@ -221,9 +207,8 @@ def validate_cross_backend_contract(
             "layers": {
                 "corpus_index": "success",
                 "read_expression": "success",
-                "dataset": "success",
+                "raw_expression_batch": "success",
                 "take_metadata": "success",
-                "inspect_batch": "success",
                 "loader": "success",
             },
         }
@@ -436,8 +421,8 @@ def _read_loader_batch(
 ) -> dict[str, Any]:
     _reset_loader_rngs(rng_seed)
     batch = next(
-        corpus.loader(
-            processing="cpu",
+        build_loader(
+            corpus,
             batch_size=batch_size,
             seq_len=seq_len,
             seed=sampler_seed,

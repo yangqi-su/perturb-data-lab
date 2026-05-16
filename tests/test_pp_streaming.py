@@ -859,12 +859,9 @@ def test_run_pca_incremental_pca_fit_subset_transforms_all_and_respects_hvgs(
     _build_mock_federated_lance_corpus(tmp_path)
     corpus = load_corpus(str(tmp_path))
     hvgs = calculate_hvgs(corpus, dataset_id="mock_00", batch_size=4, n_hvg=7)
-    fit_selection = corpus.select_obs_indices(
-        dataset_id="mock_00",
-        strategy="random",
-        max_cells=6,
-        seed=13,
-    )
+    fit_row_indices = corpus.metadata_index.df.filter(
+        pl.col("dataset_id") == "mock_00"
+    ).sample(6, seed=13)["global_row_index"].to_numpy()
 
     result = run_pca(
         corpus,
@@ -873,7 +870,7 @@ def test_run_pca_incremental_pca_fit_subset_transforms_all_and_respects_hvgs(
         batch_size=4,
         n_components=3,
         hvg_frame=hvgs,
-        fit_row_indices=fit_selection.row_indices,
+        fit_row_indices=fit_row_indices,
     )
 
     selected = result.selected_features.sort("selected_feature_index")
@@ -883,7 +880,7 @@ def test_run_pca_incremental_pca_fit_subset_transforms_all_and_respects_hvgs(
         n_components=3,
         batch_size=4,
         selected_global_feature_ids=selected["global_feature_id"].to_numpy(),
-        fit_row_indices=np.asarray(fit_selection.row_indices, dtype=np.int64),
+        fit_row_indices=np.asarray(fit_row_indices, dtype=np.int64),
     )
 
     assert result.embeddings.shape == (10, 7)
@@ -939,7 +936,7 @@ def test_run_pca_incremental_pca_fit_subset_transforms_all_and_respects_hvgs(
         reference["explained_variance_ratio"],
         atol=1e-6,
     )
-    assert result.component_stats["n_obs"].unique().to_list() == [len(fit_selection.row_indices)]
+    assert result.component_stats["n_obs"].unique().to_list() == [len(fit_row_indices)]
 
 
 def test_run_pca_incremental_pca_memory_guard_raises_before_writes(tmp_path: Path) -> None:

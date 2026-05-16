@@ -28,6 +28,7 @@ from perturb_data_lab.loaders import (
     PertTFPairedBatchLoader,
     PertTFCorpusAdapter,
     load_corpus,
+    read_expression_raw_batch,
 )
 
 
@@ -200,8 +201,14 @@ def _verify_sampled_alignment(
     observed: ObservedLoaderBatch,
     batch: dict[str, torch.Tensor],
 ) -> dict[str, Any]:
-    source_raw = corpus.inspect_batch(observed.source_indices.tolist())
-    target_raw = corpus.inspect_batch(observed.target_indices.tolist())
+    source_raw = read_expression_raw_batch(
+        corpus.expression_reader,
+        observed.source_indices.tolist(),
+    )
+    target_raw = read_expression_raw_batch(
+        corpus.expression_reader,
+        observed.target_indices.tolist(),
+    )
     pad_token_id = adapter.to_simple_vocab_stoi()[adapter.config.pad_token]
     cls_offset = 1 if adapter.config.append_cls else 0
     token_offset = adapter.special_token_offset

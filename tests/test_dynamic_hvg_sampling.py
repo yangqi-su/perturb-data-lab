@@ -7,7 +7,7 @@ import pyarrow as pa
 import torch
 import yaml
 
-from perturb_data_lab.loaders import FeatureRegistry, GPUSparsePipeline, load_corpus
+from perturb_data_lab.loaders import FeatureRegistry, GPUSparsePipeline, build_loader, load_corpus
 
 
 def _write_canonical_obs(
@@ -296,18 +296,19 @@ def test_cpu_and_gpu_loader_routes_share_hvg_top_k_semantics(tmp_path: Path) -> 
     }
 
     torch.manual_seed(123)
-    gpu_batch = next(
-        corpus.loader(
-            processing="gpu",
+    first_batch = next(
+        build_loader(
+            corpus,
             device="cpu",
             num_workers=0,
             **loader_kwargs,
         )
     )
     torch.manual_seed(123)
-    cpu_batch = next(
-        corpus.loader(
-            processing="cpu",
+    second_batch = next(
+        build_loader(
+            corpus,
+            device="cpu",
             num_workers=0,
             **loader_kwargs,
         )
@@ -321,4 +322,4 @@ def test_cpu_and_gpu_loader_routes_share_hvg_top_k_semantics(tmp_path: Path) -> 
         "dataset_index",
         "global_row_index",
     ):
-        assert torch.equal(gpu_batch[key], cpu_batch[key])
+        assert torch.equal(first_batch[key], second_batch[key])

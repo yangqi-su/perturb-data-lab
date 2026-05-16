@@ -225,7 +225,7 @@ class GPUSparsePipeline:
         Parameters
         ----------
         batch : dict
-            Output of ``Corpus.inspect_batch()`` or the raw corpus loader.
+            Raw expression batch with attached ``dataset_index``.
             Required keys:
             ``expressed_gene_indices``, ``expression_counts``, ``row_offsets``,
             ``dataset_index``, ``batch_size``, and ``global_row_index``.
@@ -614,7 +614,7 @@ class CPUPipeline:
         Parameters
         ----------
         batch : dict
-            Output of ``Corpus.inspect_batch()`` or ``ExpressionBatchDataset``.
+            Raw expression batch with attached ``dataset_index``.
         seed : int or None
             If given, re-seeds the internal sampler for reproducibility.
         sampled_gene_ids : np.ndarray or None

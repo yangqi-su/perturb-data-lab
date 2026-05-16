@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from ..feature_registry import FeatureRegistry
 from ..gpu_pipeline import GPUSparsePipeline
 from ..index import MetadataIndex
-from ..loaders import _normalize_candidate_row_indices
+from ..loaders import _normalize_candidate_row_indices, read_expression_raw_batch
 
 if TYPE_CHECKING:
     from ..corpus_loader import Corpus
@@ -727,16 +727,7 @@ class _PertTFPairExpressionDataset:
         self,
         indices: np.ndarray,
     ) -> dict[str, Any]:
-        index_array = np.asarray(indices, dtype=np.int64)
-        expr = self._reader.read_expression_flat(index_array.tolist())
-        batch: dict[str, Any] = {
-            "batch_size": expr.batch_size,
-            "global_row_index": expr.global_row_index,
-            "row_offsets": expr.row_offsets,
-            "expressed_gene_indices": expr.expressed_gene_indices,
-            "expression_counts": expr.expression_counts,
-        }
-        return batch
+        return read_expression_raw_batch(self._reader, indices)
 
 
 def _collate_expression_like_raw_batch(raw_batch: dict[str, Any]) -> dict[str, Any]:
@@ -858,8 +849,14 @@ class PertTFPairedBatchBuilder:
         hvg_weight: float = 3.0,
         hvg_top_k: int | None = None,
     ) -> dict[str, torch.Tensor]:
-        source_raw = self.corpus.inspect_batch(pair_batch.source_indices)
-        target_raw = self.corpus.inspect_batch(pair_batch.target_indices)
+        source_raw = read_expression_raw_batch(
+            self.corpus.expression_reader,
+            pair_batch.source_indices,
+        )
+        target_raw = read_expression_raw_batch(
+            self.corpus.expression_reader,
+            pair_batch.target_indices,
+        )
 
         return self.build_from_raw_pair_batch(
             pair_batch,
