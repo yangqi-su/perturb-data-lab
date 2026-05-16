@@ -18,7 +18,7 @@ from perturb_data_lab.loaders.expression import (
     ZarrDatasetEntry,
     build_expression_reader,
 )
-from perturb_data_lab.loaders.loaders import ExpressionBatch
+from perturb_data_lab.loaders.expression import ExpressionBatch
 
 _ARCHIVED_ROOT = (
     Path("/autofs/projects-t3/lilab/yangqisu/repos/data_perturb_v2")

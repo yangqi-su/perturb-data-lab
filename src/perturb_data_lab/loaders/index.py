@@ -247,6 +247,35 @@ def _normalize_extra_metadata_columns(
     return tuple(normalized)
 
 
+def _normalize_global_row_indices(
+    row_indices: Sequence[int] | np.ndarray | None,
+    *,
+    start: int,
+    end: int,
+    field_name: str = "row_indices",
+    none_policy: str = "range",
+) -> np.ndarray | None:
+    if row_indices is None:
+        if none_policy == "none":
+            return None
+        return np.arange(int(start), int(end), dtype=np.int64)
+
+    raw = np.asarray(row_indices)
+    if raw.ndim != 1:
+        raise ValueError(f"{field_name} must be a 1-D sequence of corpus-global row indices")
+    if raw.size == 0:
+        raise ValueError(f"{field_name} must contain at least one corpus-global row index")
+    if raw.dtype.kind not in {"i", "u"}:
+        raise ValueError(f"{field_name} must contain only integer corpus-global row indices")
+
+    normalized = raw.astype(np.int64, copy=False)
+    if np.unique(normalized).size != normalized.size:
+        raise ValueError(f"{field_name} must be unique corpus-global row indices")
+    if np.any(normalized < int(start)) or np.any(normalized >= int(end)):
+        raise IndexError(f"{field_name} contains out-of-range corpus-global row indices")
+    return normalized.copy()
+
+
 def _null_if_legacy_missing(expr: pl.Expr) -> pl.Expr:
     """Convert configured canonical null-like strings to true nulls."""
     normalized = expr.cast(pl.Utf8).str.strip_chars().str.to_lowercase()

@@ -9,7 +9,7 @@ import numpy as np
 from scipy import sparse
 
 from ..loaders.corpus_loader import Corpus
-from ..loaders.loaders import ExpressionBatch
+from ..loaders.expression import ExpressionBatch
 
 
 @dataclass(frozen=True)

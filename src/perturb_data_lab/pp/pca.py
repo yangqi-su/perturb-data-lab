@@ -11,6 +11,7 @@ import polars as pl
 from scipy.sparse import csr_matrix
 
 from ..loaders.corpus_loader import Corpus
+from ..loaders.index import _normalize_global_row_indices
 from .artifacts import prepare_pp_output, write_pp_provenance
 from .streaming import (
     PpBatch,
@@ -331,26 +332,15 @@ def _normalize_context_row_indices(
     context: PpFeatureContext,
     row_indices: Sequence[int] | np.ndarray | None,
 ) -> np.ndarray:
-    if row_indices is None:
-        return np.arange(context.global_start, context.global_end, dtype=np.int64)
-
-    raw = np.asarray(row_indices)
-    if raw.ndim != 1:
-        raise ValueError("row indices must be a 1-D sequence of corpus-global row indices")
-    if raw.size == 0:
-        raise ValueError("row indices must contain at least one corpus-global row index")
-    if raw.dtype.kind not in {"i", "u"}:
-        raise ValueError("row indices must contain only integer corpus-global row indices")
-
-    normalized = raw.astype(np.int64, copy=False)
-    if np.unique(normalized).size != normalized.size:
-        raise ValueError("row indices must be unique corpus-global row indices")
-    if np.any(normalized < context.global_start) or np.any(normalized >= context.global_end):
-        raise IndexError(
-            f"row indices must stay within dataset {context.dataset_id!r} global range "
-            f"[{context.global_start}, {context.global_end})"
-        )
-    return normalized.copy()
+    normalized = _normalize_global_row_indices(
+        row_indices,
+        start=context.global_start,
+        end=context.global_end,
+        field_name="row_indices",
+        none_policy="range",
+    )
+    assert normalized is not None
+    return normalized
 
 
 def _build_incremental_fit_chunks(

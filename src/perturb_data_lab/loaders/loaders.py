@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Iterator, Sequence
 
 import numpy as np
@@ -10,7 +9,9 @@ import polars as pl
 import torch
 from torch.utils.data import DataLoader
 
+from .expression import ExpressionBatch
 from .gpu_pipeline import GPUSparsePipeline
+from .index import _normalize_global_row_indices
 
 __all__ = [
     "ExpressionBatch",
@@ -41,28 +42,6 @@ _LOADER_METADATA_RESERVED_OVERRIDES: frozenset[str] = frozenset(
 )
 
 
-@dataclass(frozen=True)
-class ExpressionBatch:
-    """Flat sparse expression arrays for one batch."""
-
-    batch_size: int
-    global_row_index: np.ndarray
-    row_offsets: np.ndarray
-    expressed_gene_indices: np.ndarray
-    expression_counts: np.ndarray
-
-    def row_slice(self, row_position: int) -> slice:
-        start = int(self.row_offsets[row_position])
-        stop = int(self.row_offsets[row_position + 1])
-        return slice(start, stop)
-
-    def row_gene_indices(self, row_position: int) -> np.ndarray:
-        return self.expressed_gene_indices[self.row_slice(row_position)]
-
-    def row_counts(self, row_position: int) -> np.ndarray:
-        return self.expression_counts[self.row_slice(row_position)]
-
-
 def _normalize_batch_indices(indices: torch.Tensor | np.ndarray | Sequence[int]) -> np.ndarray:
     if isinstance(indices, torch.Tensor):
         return indices.detach().cpu().numpy().astype(np.int64, copy=False)
@@ -73,23 +52,13 @@ def _normalize_candidate_row_indices(
     metadata_index: "MetadataIndex",
     row_indices: Sequence[int] | np.ndarray | None,
 ) -> np.ndarray | None:
-    if row_indices is None:
-        return None
-
-    raw = np.asarray(row_indices)
-    if raw.ndim != 1:
-        raise ValueError("row_indices must be a 1-D sequence of corpus-global row indices")
-    if raw.size == 0:
-        raise ValueError("row_indices must contain at least one corpus-global row index")
-    if raw.dtype.kind not in {"i", "u"}:
-        raise ValueError("row_indices must contain only integer corpus-global row indices")
-
-    normalized = raw.astype(np.int64, copy=False)
-    if np.unique(normalized).size != normalized.size:
-        raise ValueError("row_indices must be unique corpus-global row indices")
-    if np.any(normalized < 0) or np.any(normalized >= len(metadata_index)):
-        raise IndexError("row_indices contains out-of-range corpus-global row indices")
-    return normalized.copy()
+    return _normalize_global_row_indices(
+        row_indices,
+        start=0,
+        end=len(metadata_index),
+        field_name="row_indices",
+        none_policy="none",
+    )
 
 
 def _normalize_metadata_columns(

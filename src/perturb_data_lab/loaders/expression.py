@@ -23,9 +23,8 @@ from typing import Protocol, Sequence
 
 import numpy as np
 
-from .loaders import ExpressionBatch
-
 __all__ = [
+    "ExpressionBatch",
     "ExpressionReader",
     "BaseExpressionReader",
     "AggregateLanceReader",
@@ -54,6 +53,28 @@ constant as the hard upper bound.
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExpressionBatch:
+    """Flat sparse expression arrays for one batch."""
+
+    batch_size: int
+    global_row_index: np.ndarray
+    row_offsets: np.ndarray
+    expressed_gene_indices: np.ndarray
+    expression_counts: np.ndarray
+
+    def row_slice(self, row_position: int) -> slice:
+        start = int(self.row_offsets[row_position])
+        stop = int(self.row_offsets[row_position + 1])
+        return slice(start, stop)
+
+    def row_gene_indices(self, row_position: int) -> np.ndarray:
+        return self.expressed_gene_indices[self.row_slice(row_position)]
+
+    def row_counts(self, row_position: int) -> np.ndarray:
+        return self.expression_counts[self.row_slice(row_position)]
 
 
 @dataclass(frozen=True)
@@ -490,76 +511,6 @@ class FederatedLanceReader(BaseExpressionReader):
             table = ds.take(chunk)
             cells.extend(_table_to_cells(table))
         return cells
-
-    # ------------------------------------------------------------------
-    # Fast path — direct flat read (Phase 3)
-    # ------------------------------------------------------------------
-
-    def read_expression_flat(
-        self, global_indices: Sequence[int]
-    ) -> ExpressionBatch:
-        """Read expression data directly as flat arrays (federated fast path).
-
-        Groups indices by dataset/file, performs chunked ``take()`` calls
-        per dataset, and returns concatenated flat expression arrays with
-        row offsets.
-
-        This path retains per-dataset grouping (federated topology cannot
-        avoid it) but bypasses the shared reassembly helper for a more direct
-        flat implementation.
-
-        Parameters
-        ----------
-        global_indices : sequence of int
-            Corpus-global cell indices.
-
-        Returns
-        -------
-        ExpressionBatch
-            Flat expression batch with concatenated arrays and row offsets.
-
-        Raises
-        ------
-        IndexError
-            If any index is out of range or not registered in any dataset.
-        """
-        if not global_indices:
-            return _empty_expression_batch()
-
-        indices = [int(idx) for idx in global_indices]
-        n = len(indices)
-        self._validate_all(indices)
-
-        # Group by dataset, preserving the output position of each index.
-        # Within each dataset, selections are in the same relative order
-        # as they appear in the input.
-        # grouped[dataset_id] = list[(output_pos, local_index)]
-        grouped: dict[str, list[tuple[int, int]]] = {}
-        for output_pos, global_idx in enumerate(indices):
-            entry, local_idx = self._resolve_entry(global_idx)
-            grouped.setdefault(entry.dataset_id, []).append(
-                (output_pos, local_idx)
-            )
-
-        cells_by_pos: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-
-        for ds_id, selections in grouped.items():
-            lance_entry = self._find_entry_by_id(ds_id)
-            assert isinstance(lance_entry, LanceDatasetEntry)
-            ds = self._open_dataset(lance_entry)
-
-            local_indices = [local for _, local in selections]
-            output_positions = [pos for pos, _ in selections]
-
-            idx_pos = 0
-            for chunk in _chunk_indices(local_indices):
-                for cell in _table_to_cells(ds.take(chunk)):
-                    pos = output_positions[idx_pos]
-                    cells_by_pos[pos] = cell
-                    idx_pos += 1
-
-        ordered_cells = [cells_by_pos[pos] for pos in range(n)]
-        return _cell_arrays_to_expression_batch(indices, ordered_cells)
 
 
 # ===================================================================
