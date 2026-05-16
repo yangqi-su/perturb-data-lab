@@ -99,16 +99,7 @@ class MetadataIndex:
     def __repr__(self) -> str:
         return f"MetadataIndex({len(self)} rows, {len(self.df.columns)} columns)"
 
-    def get_column(self, col_name: str) -> np.ndarray | tuple | None:
-        """Return a full column, or None when absent."""
-        if col_name not in self.df.columns:
-            return None
-        series = self.df[col_name]
-        if series.dtype in self._NUMERIC_DTYPES:
-            return series.to_numpy()
-        return tuple(series.to_list())
-
-    def gather_columns(
+    def take(
         self,
         indices: list[int] | np.ndarray,
         columns: list[str] | tuple[str, ...] | None = None,
@@ -124,13 +115,6 @@ class MetadataIndex:
             else:
                 result[col_name] = tuple(self.df[indices_arr, col_name].to_list())
         return result
-
-    def take(
-        self,
-        indices: list[int] | np.ndarray,
-        columns: list[str] | tuple[str, ...] | None = None,
-    ) -> dict[str, np.ndarray | tuple]:
-        return self.gather_columns(indices, columns)
 
 
 def _normalize_canonical_obs_dtypes(df: pl.DataFrame) -> pl.DataFrame:

@@ -395,7 +395,7 @@ def _read_pp_batch_for_rows(
     context: PpFeatureContext,
     row_indices: np.ndarray,
 ) -> PpBatch:
-    expression_batch = corpus.read_expression(row_indices)
+    expression_batch = corpus.expression_reader.read_expression_flat(row_indices.tolist())
     metadata = corpus.take_metadata(row_indices, columns=("local_row_index", "size_factor"))
     raw_size_factor = metadata.get("size_factor")
     size_factor = (

@@ -84,46 +84,6 @@ class ZarrDatasetEntry(DatasetEntry):
     counts_path: str | Path
 
 
-@dataclass(frozen=True)
-class ArrowIpcDatasetEntry(DatasetEntry):
-    """Legacy removed-backend entry retained only for direct imports."""
-
-    arrow_path: str | Path
-
-
-@dataclass(frozen=True)
-class HfDatasetsDatasetEntry(DatasetEntry):
-    """Legacy removed-backend entry retained only for direct imports."""
-
-    dataset_path: str | Path
-
-
-@dataclass(frozen=True)
-class ParquetDatasetEntry(DatasetEntry):
-    """Legacy removed-backend entry retained only for direct imports."""
-
-    parquet_path: str | Path
-
-
-@dataclass(frozen=True)
-class WebDatasetEntry(DatasetEntry):
-    """Legacy removed-backend entry retained only for direct imports."""
-
-    tar_path: str | Path
-
-
-@dataclass(frozen=True)
-class CsrMemmapShardEntry(DatasetEntry):
-    """Legacy removed-backend entry retained only for direct imports."""
-
-    shard_id: int
-    shard_path: Path
-    row_offsets_path: Path
-    gene_indices_path: Path
-    counts_path: Path
-    n_cells: int
-
-
 # ---------------------------------------------------------------------------
 # Protocol
 # ---------------------------------------------------------------------------
@@ -709,78 +669,6 @@ class FederatedZarrReader(BaseExpressionReader):
 
 
 # ===================================================================
-# Removed backend stubs
-# ===================================================================
-
-
-def _unsupported_backend_error(backend: str) -> ValueError:
-    return ValueError(
-        f"Backend '{backend}' is not supported in slim main. Only "
-        "'lance' and 'zarr' readers remain available."
-    )
-
-
-class AggregateTileDBReader(BaseExpressionReader):
-    """Legacy removed-backend stub retained only for direct imports."""
-
-    def __init__(self, *args, **kwargs):
-        raise _unsupported_backend_error("tiledb")
-
-    def _read_local_cells(self, entry: DatasetEntry, local_indices: list[int]):
-        raise AssertionError("unreachable")
-
-
-class FederatedArrowIpcReader(BaseExpressionReader):
-    """Legacy removed-backend stub retained only for direct imports."""
-
-    def __init__(self, *args, **kwargs):
-        raise _unsupported_backend_error("arrow_ipc")
-
-    def _read_local_cells(self, entry: DatasetEntry, local_indices: list[int]):
-        raise AssertionError("unreachable")
-
-
-class FederatedHfDatasetsReader(BaseExpressionReader):
-    """Legacy removed-backend stub retained only for direct imports."""
-
-    def __init__(self, *args, **kwargs):
-        raise _unsupported_backend_error("hf_datasets")
-
-    def _read_local_cells(self, entry: DatasetEntry, local_indices: list[int]):
-        raise AssertionError("unreachable")
-
-
-class FederatedParquetReader(BaseExpressionReader):
-    """Legacy removed-backend stub retained only for direct imports."""
-
-    def __init__(self, *args, **kwargs):
-        raise _unsupported_backend_error("parquet")
-
-    def _read_local_cells(self, entry: DatasetEntry, local_indices: list[int]):
-        raise AssertionError("unreachable")
-
-
-class FederatedWebDatasetReader(BaseExpressionReader):
-    """Legacy removed-backend stub retained only for direct imports."""
-
-    def __init__(self, *args, **kwargs):
-        raise _unsupported_backend_error("webdataset")
-
-    def _read_local_cells(self, entry: DatasetEntry, local_indices: list[int]):
-        raise AssertionError("unreachable")
-
-
-class AggregateCsrMemmapReader(BaseExpressionReader):
-    """Legacy removed-backend stub retained only for direct imports."""
-
-    def __init__(self, *args, **kwargs):
-        raise _unsupported_backend_error("csr_memmap")
-
-    def _read_local_cells(self, entry: DatasetEntry, local_indices: list[int]):
-        raise AssertionError("unreachable")
-
-
-# ===================================================================
 # Factory
 # ===================================================================
 
@@ -836,23 +724,7 @@ def build_expression_reader(
         else:
             return FederatedZarrReader(entries)  # type: ignore[arg-type]
 
-    else:
-        if backend in {
-            "tiledb",
-            "arrow_ipc",
-            "arrow-parquet",
-            "parquet",
-            "hf_datasets",
-            "hf-datasets",
-            "webdataset",
-            "csr_memmap",
-            "csr-memmap",
-        }:
-            raise _unsupported_backend_error(backend)
-        raise ValueError(
-            f"Unknown backend '{backend}'. "
-            f"Supported: lance, zarr."
-        )
+    raise ValueError(f"Unknown backend '{backend}'. Supported: lance, zarr.")
 
 
 # ---------------------------------------------------------------------------

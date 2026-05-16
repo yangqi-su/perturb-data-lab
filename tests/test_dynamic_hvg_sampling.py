@@ -180,11 +180,6 @@ def _build_feature_registry_with_partial_vocab(tmp_path: Path) -> FeatureRegistr
         },
         dataset_order=["ds0", "ds1"],
         global_id_by_feature_id={"GENE_A": 0, "GENE_B": 1, "GENE_C": 2, "GENE_D": 3},
-        named_hvg_rank_paths={
-            "ds0": ds0_hvg,
-            "ds1": ds1_hvg,
-        },
-        default_n_hvg_by_dataset={"ds0": 1, "ds1": 2},
     )
 
 
@@ -212,6 +207,26 @@ def test_load_corpus_reads_hvg_rank_matrix_from_parquet(tmp_path: Path) -> None:
             dtype=bool,
         ),
     )
+
+
+def test_feature_registry_hvg_without_default_selection_is_top_k_only(tmp_path: Path) -> None:
+    var_path = tmp_path / "meta" / "ds0" / "canonical_meta" / "canonical-var.parquet"
+    hvg_path = tmp_path / "meta" / "ds0" / "hvg.parquet"
+    _write_canonical_var(var_path, ["GENE_A", "GENE_B"])
+    pl.DataFrame(
+        {
+            "origin_index": np.asarray([0, 1], dtype=np.int32),
+            "hvg_rank": np.asarray([1, 2], dtype=np.int32),
+        }
+    ).write_parquet(hvg_path)
+
+    registry = FeatureRegistry.from_canonical_var_parquets(
+        {"ds0": var_path},
+        global_id_by_feature_id={"GENE_A": 0, "GENE_B": 1},
+    )
+
+    np.testing.assert_array_equal(registry.hvg_rank_matrix, np.asarray([[1, 2]], dtype=np.int32))
+    np.testing.assert_array_equal(registry.hvg_mask, np.asarray([[False, False]], dtype=bool))
 
 
 def test_dynamic_hvg_top_k_changes_weighted_probs_without_rematerialization(tmp_path: Path) -> None:
@@ -286,8 +301,9 @@ def test_cpu_and_gpu_loader_routes_share_hvg_top_k_semantics(tmp_path: Path) -> 
     loader_kwargs = {
         "batch_size": 2,
         "drop_last": False,
-        "sampler": "dataset",
-        "dataset_index": 0,
+        "sampler": "context",
+        "context_columns": ("dataset_id",),
+        "row_indices": [0, 1],
         "shuffle": False,
         "seed": 17,
         "seq_len": 2,

@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from perturb_data_lab.loaders import (
     CorpusRandomBatchSampler,
+    ContextBatchSampler,
     ExpressionBatchDataset,
     build_loader,
     collate_expression_batch,
@@ -191,15 +192,16 @@ def test_load_corpus_builds_components_without_runtime_loader_state(tmp_path: Pa
     assert corpus.feature_registry.global_vocab_size == N_GENES
     assert not hasattr(corpus, "loader")
     assert not hasattr(corpus, "dataset")
+    assert not hasattr(corpus, "read_expression")
     assert not hasattr(corpus, "set_sampler")
     assert not hasattr(corpus, "select_obs_indices")
 
 
-def test_read_expression_and_take_metadata_use_global_rows(tmp_path: Path) -> None:
+def test_expression_reader_and_take_metadata_use_global_rows(tmp_path: Path) -> None:
     _build_aggregate_lance_corpus(tmp_path)
     corpus = load_corpus(tmp_path)
 
-    expression = corpus.read_expression([0, 4, 8])
+    expression = corpus.expression_reader.read_expression_flat([0, 4, 8])
     metadata = corpus.take_metadata([0, 4, 8], columns=["dataset_id", "dataset_index"])
 
     np.testing.assert_array_equal(expression.global_row_index, [0, 4, 8])
@@ -214,13 +216,8 @@ def test_expression_dataset_is_expression_only(tmp_path: Path) -> None:
     dataset = ExpressionBatchDataset(corpus.expression_reader, total_rows=len(corpus.metadata_index))
 
     raw = dataset.__getitems__([0, 4, 8])[0]
-    assert set(raw) == {
-        "batch_size",
-        "global_row_index",
-        "row_offsets",
-        "expressed_gene_indices",
-        "expression_counts",
-    }
+    assert raw.batch_size == 3
+    np.testing.assert_array_equal(raw.global_row_index, [0, 4, 8])
 
     sampler = CorpusRandomBatchSampler(
         metadata_index=corpus.metadata_index,
@@ -269,15 +266,15 @@ def test_build_loader_attaches_metadata_from_metadata_index(tmp_path: Path) -> N
     np.testing.assert_allclose(batch["meta_columns"]["size_factor"], expected["size_factor"])
 
 
-def test_build_loader_respects_dataset_sampler_and_row_indices(tmp_path: Path) -> None:
+def test_build_loader_respects_context_sampler_and_row_indices(tmp_path: Path) -> None:
     _build_aggregate_lance_corpus(tmp_path)
     corpus = load_corpus(tmp_path)
 
     batch = next(
         build_loader(
             corpus,
-            sampler="dataset",
-            dataset_index=1,
+            sampler="context",
+            context_columns=("dataset_id",),
             row_indices=[4, 5, 6],
             batch_size=5,
             drop_last=False,
@@ -299,9 +296,9 @@ def test_build_loader_context_sampler_keeps_context_group(tmp_path: Path) -> Non
     batch = next(
         build_loader(
             corpus,
-            sampler="dataset_context",
-            dataset_index=1,
-            context_field="perturb_label",
+            sampler="context",
+            context_columns=("dataset_id", "perturb_label"),
+            row_indices=[4, 5, 6, 7, 8],
             batch_size=2,
             seq_len=LOADER_SEQ_LEN,
             device="cpu",
@@ -313,11 +310,28 @@ def test_build_loader_context_sampler_keeps_context_group(tmp_path: Path) -> Non
     assert len(set(batch["meta_columns"]["perturb_label"])) == 1
 
 
+def test_context_sampler_exhausts_each_context_group(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
+
+    sampler = ContextBatchSampler(
+        metadata_index=corpus.metadata_index,
+        context_columns=("dataset_id", "perturb_label"),
+        row_indices=[4, 5, 6, 7, 8],
+        batch_size=2,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    assert list(sampler) == [[4, 6], [8], [5, 7]]
+    assert len(sampler) == 3
+
+
 def test_load_corpus_federated_reader_uses_dataset_files(tmp_path: Path) -> None:
     _build_federated_lance_corpus(tmp_path)
     corpus = load_corpus(tmp_path)
 
-    batch = corpus.read_expression([0, 4, 8])
+    batch = corpus.expression_reader.read_expression_flat([0, 4, 8])
 
     assert corpus.topology == "federated"
     np.testing.assert_array_equal(batch.global_row_index, [0, 4, 8])

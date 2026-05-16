@@ -16,16 +16,10 @@ from .index import MetadataIndex
 from .loaders import (
     ExpressionBatchDataset,
     CorpusRandomBatchSampler,
-    DatasetBatchSampler,
-    DatasetContextBatchSampler,
+    ContextBatchSampler,
     ExpressionBatch,
     build_loader,
     collate_expression_batch,
-    read_expression_raw_batch,
-)
-from .corpus import (
-    read_raw_obs_parquet,
-    read_raw_var_parquet,
 )
 from .feature_registry import (
     FeatureRegistry,
@@ -40,7 +34,6 @@ from .corpus_loader import (
 )
 from .gpu_pipeline import (
     GPUSparsePipeline,
-    CPUPipeline,
 )
 from .adapters import (
     PertTFAdapterConfig,
@@ -69,20 +62,17 @@ __all__ = [
     "ExpressionBatch",
     # Phase 3 — Samplers (MetadataIndex-backed)
     "CorpusRandomBatchSampler",
-    "DatasetBatchSampler",
-    "DatasetContextBatchSampler",
+    "ContextBatchSampler",
     # Phase 3 — Data loaders
     "ExpressionBatchDataset",
     "build_loader",
     "collate_expression_batch",
-    "read_expression_raw_batch",
     # Phase 2 — Feature Registry
     "FeatureRegistry",
     "DatasetTokenSpan",
     "GeneTokenizer",
     # Phase 3 — GPU Pipeline
     "GPUSparsePipeline",
-    "CPUPipeline",
     # Phase 4 — pertTF-local adapters
     "PertTFAdapterConfig",
     "PertTFPairedBatchLoader",
@@ -93,7 +83,4 @@ __all__ = [
     # Phase N — Corpus loader factory
     "Corpus",
     "load_corpus",
-    # Utilities
-    "read_raw_obs_parquet",
-    "read_raw_var_parquet",
 ]

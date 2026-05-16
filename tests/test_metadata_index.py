@@ -34,21 +34,6 @@ def test_rejects_nested_columns() -> None:
         MetadataIndex(pl.DataFrame({"global_row_index": [0], "nested": [[1, 2]]}))
 
 
-def test_get_column_returns_numeric_array() -> None:
-    meta = _meta()
-    values = meta.get_column("dataset_index")
-    assert isinstance(values, np.ndarray)
-    np.testing.assert_array_equal(values, np.asarray([0, 0, 1, 1, 1], dtype=np.int32))
-
-
-def test_get_column_returns_string_tuple() -> None:
-    assert _meta().get_column("dataset_id") == ("ds0", "ds0", "ds1", "ds1", "ds1")
-
-
-def test_get_column_missing_returns_none() -> None:
-    assert _meta().get_column("missing") is None
-
-
 def test_take_preserves_order_and_types() -> None:
     meta = _meta()
     taken = meta.take([3, 1, 4], columns=("global_row_index", "dataset_id", "size_factor"))
@@ -58,9 +43,9 @@ def test_take_preserves_order_and_types() -> None:
     np.testing.assert_allclose(taken["size_factor"], np.asarray([1.2, 1.1, 1.3]))
 
 
-def test_gather_columns_defaults_to_all_columns() -> None:
+def test_take_defaults_to_all_columns() -> None:
     meta = _meta()
-    gathered = meta.gather_columns([0, 2])
+    gathered = meta.take([0, 2])
     assert tuple(gathered) == tuple(meta.df.columns)
     np.testing.assert_array_equal(gathered["global_row_index"], np.asarray([0, 2]))
     assert gathered["cell_id"] == ("cell_0", "cell_2")

@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from ..feature_registry import FeatureRegistry
 from ..gpu_pipeline import GPUSparsePipeline
 from ..index import MetadataIndex
-from ..loaders import _normalize_candidate_row_indices, read_expression_raw_batch
+from ..loaders import ExpressionBatch, _normalize_candidate_row_indices
 
 if TYPE_CHECKING:
     from ..corpus_loader import Corpus
@@ -70,6 +70,22 @@ def _derive_perttf_stream_seed(
         ]
     )
     return int(seed_sequence.generate_state(1, dtype=np.uint64)[0])
+
+
+def _expression_batch_to_raw_dict(batch: ExpressionBatch) -> dict[str, Any]:
+    return {
+        "batch_size": batch.batch_size,
+        "global_row_index": batch.global_row_index,
+        "row_offsets": batch.row_offsets,
+        "expressed_gene_indices": batch.expressed_gene_indices,
+        "expression_counts": batch.expression_counts,
+    }
+
+
+def _read_expression_raw_batch(expression_reader: Any, indices: Sequence[int] | np.ndarray) -> dict[str, Any]:
+    return _expression_batch_to_raw_dict(
+        expression_reader.read_expression_flat(np.asarray(indices, dtype=np.int64).tolist())
+    )
 
 
 @dataclass(frozen=True)
@@ -727,7 +743,7 @@ class _PertTFPairExpressionDataset:
         self,
         indices: np.ndarray,
     ) -> dict[str, Any]:
-        return read_expression_raw_batch(self._reader, indices)
+        return _read_expression_raw_batch(self._reader, indices)
 
 
 def _collate_expression_like_raw_batch(raw_batch: dict[str, Any]) -> dict[str, Any]:
@@ -849,11 +865,11 @@ class PertTFPairedBatchBuilder:
         hvg_weight: float = 3.0,
         hvg_top_k: int | None = None,
     ) -> dict[str, torch.Tensor]:
-        source_raw = read_expression_raw_batch(
+        source_raw = _read_expression_raw_batch(
             self.corpus.expression_reader,
             pair_batch.source_indices,
         )
-        target_raw = read_expression_raw_batch(
+        target_raw = _read_expression_raw_batch(
             self.corpus.expression_reader,
             pair_batch.target_indices,
         )

@@ -28,27 +28,29 @@ class FeatureRegistry:
         *,
         global_id_by_feature_id: Mapping[str, int],
         dataset_order: Sequence[str] | None = None,
-        named_hvg_rank_paths: Mapping[str, str | Path] | None = None,
-        default_n_hvg_by_dataset: Mapping[str, int] | None = None,
     ) -> "FeatureRegistry":
         order = list(dataset_order) if dataset_order is not None else list(named_var_paths.keys())
         named_var_dfs = {
             dataset_id: pl.read_parquet(str(named_var_paths[dataset_id])).sort("origin_index")
             for dataset_id in order
         }
-        named_hvg_rank_dfs = None
-        if named_hvg_rank_paths is not None:
-            named_hvg_rank_dfs = {
-                dataset_id: pl.read_parquet(str(path))
-                for dataset_id, path in named_hvg_rank_paths.items()
-            }
+        named_hvg_rank_dfs = {
+            dataset_id: pl.read_parquet(str(hvg_path))
+            for dataset_id in order
+            if (hvg_path := cls._discover_hvg_path(Path(named_var_paths[dataset_id]))) is not None
+        }
         return cls(
             named_var_dfs,
             dataset_order=order,
             global_id_by_feature_id=global_id_by_feature_id,
-            named_hvg_rank_dfs=named_hvg_rank_dfs,
-            default_n_hvg_by_dataset=default_n_hvg_by_dataset,
+            named_hvg_rank_dfs=named_hvg_rank_dfs or None,
         )
+
+    @staticmethod
+    def _discover_hvg_path(var_path: Path) -> Path | None:
+        meta_root = var_path.parent.parent if var_path.parent.name == "canonical_meta" else var_path.parent
+        hvg_path = meta_root / "hvg.parquet"
+        return hvg_path if hvg_path.exists() else None
 
     def __init__(
         self,
@@ -57,7 +59,6 @@ class FeatureRegistry:
         global_id_by_feature_id: Mapping[str, int],
         dataset_order: Sequence[str] | None = None,
         named_hvg_rank_dfs: Mapping[str, pl.DataFrame] | None = None,
-        default_n_hvg_by_dataset: Mapping[str, int] | None = None,
     ) -> None:
         if not named_var_dfs:
             raise ValueError("named_var_dfs must not be empty")
@@ -90,11 +91,7 @@ class FeatureRegistry:
                 mapping[local_idx] = int(self._feature_id_to_global[canonical_gene_id])
             self._local_to_global[ds_idx] = mapping
 
-            default_n_hvg = (
-                int(default_n_hvg_by_dataset[ds_id])
-                if default_n_hvg_by_dataset is not None and ds_id in default_n_hvg_by_dataset
-                else None
-            )
+            default_n_hvg = None
             hvg_rank = None
             if named_hvg_rank_dfs is not None and ds_id in named_hvg_rank_dfs:
                 hvg_rank, inferred_default_n_hvg = self._parse_hvg_ranking_df(

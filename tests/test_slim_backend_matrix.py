@@ -36,13 +36,13 @@ def test_removed_materializer_backends_raise_clear_error(backend: str) -> None:
     ["arrow-parquet", "arrow_ipc", "hf-datasets", "parquet", "tiledb", "csr-memmap"],
 )
 def test_removed_corpus_backends_fail_clearly(backend: str) -> None:
-    with pytest.raises(ValueError, match="not supported in slim main"):
+    with pytest.raises(ValueError, match="Unsupported corpus backend"):
         _normalize_backend(backend)
 
 
 @pytest.mark.parametrize("backend", ["arrow_ipc", "hf_datasets", "parquet", "tiledb", "webdataset", "csr_memmap"])
 def test_removed_expression_readers_raise_clear_error(backend: str) -> None:
-    with pytest.raises(ValueError, match="not supported in slim main"):
+    with pytest.raises(ValueError, match="Unknown backend"):
         build_expression_reader(backend, "federated", [DatasetEntry("ds", 0, 1)])
 
 

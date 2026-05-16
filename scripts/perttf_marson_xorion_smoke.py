@@ -28,8 +28,8 @@ from perturb_data_lab.loaders import (
     PertTFPairedBatchLoader,
     PertTFCorpusAdapter,
     load_corpus,
-    read_expression_raw_batch,
 )
+from perturb_data_lab.materializers.paths import resolve_corpus_paths
 
 
 def _utc_now() -> str:
@@ -58,7 +58,6 @@ class DatasetEntry:
     dataset_index: int
     global_start: int
     global_end: int
-    manifest_path: Path
 
 
 @dataclass(frozen=True)
@@ -82,20 +81,12 @@ def _load_dataset_entries(corpus_root: Path) -> list[DatasetEntry]:
     entries: list[DatasetEntry] = []
     for item in index_doc.get("datasets", []):
         dataset_id = str(item["dataset_id"])
-        manifest_value = item.get(
-            "manifest_path",
-            f"meta/{dataset_id}/materialization-manifest.yaml",
-        )
-        manifest_path = Path(str(manifest_value))
-        if not manifest_path.is_absolute():
-            manifest_path = corpus_root / manifest_path
         entries.append(
             DatasetEntry(
                 dataset_id=dataset_id,
                 dataset_index=int(item["dataset_index"]),
                 global_start=int(item["global_start"]),
                 global_end=int(item["global_end"]),
-                manifest_path=manifest_path,
             )
         )
     if not entries:
@@ -195,20 +186,25 @@ def _row_global_counts(raw_batch: dict[str, Any], row_pos: int, local_to_global:
     }
 
 
+def _read_expression_raw_batch(corpus, indices: list[int]) -> dict[str, Any]:
+    batch = corpus.expression_reader.read_expression_flat(indices)
+    return {
+        "batch_size": batch.batch_size,
+        "global_row_index": batch.global_row_index,
+        "row_offsets": batch.row_offsets,
+        "expressed_gene_indices": batch.expressed_gene_indices,
+        "expression_counts": batch.expression_counts,
+    }
+
+
 def _verify_sampled_alignment(
     corpus,
     adapter: PertTFCorpusAdapter,
     observed: ObservedLoaderBatch,
     batch: dict[str, torch.Tensor],
 ) -> dict[str, Any]:
-    source_raw = read_expression_raw_batch(
-        corpus.expression_reader,
-        observed.source_indices.tolist(),
-    )
-    target_raw = read_expression_raw_batch(
-        corpus.expression_reader,
-        observed.target_indices.tolist(),
-    )
+    source_raw = _read_expression_raw_batch(corpus, observed.source_indices.tolist())
+    target_raw = _read_expression_raw_batch(corpus, observed.target_indices.tolist())
     pad_token_id = adapter.to_simple_vocab_stoi()[adapter.config.pad_token]
     cls_offset = 1 if adapter.config.append_cls else 0
     token_offset = adapter.special_token_offset
@@ -306,16 +302,17 @@ def _dataset_hvg_summary(corpus, entries: list[DatasetEntry]) -> list[dict[str, 
     has_gene = feature_registry.dataset_has_gene
     summary: list[dict[str, Any]] = []
     for entry in entries:
-        manifest_doc = _read_yaml(entry.manifest_path)
-        hvg_path = Path(str(manifest_doc.get("hvg_ranking_path", "")))
+        hvg_path = resolve_corpus_paths(
+            corpus.topology,
+            corpus.corpus_root,
+            entry.dataset_id,
+        ).meta_root / "hvg.parquet"
         summary.append(
             {
                 "dataset_id": entry.dataset_id,
                 "dataset_index": entry.dataset_index,
-                "manifest_path": str(entry.manifest_path),
                 "hvg_ranking_path": str(hvg_path),
                 "hvg_ranking_exists": hvg_path.exists(),
-                "default_n_hvg": int(manifest_doc.get("default_n_hvg", 0) or 0),
                 "feature_count": int(has_gene[entry.dataset_index].sum()),
                 "ranked_feature_count": int((rank_matrix[entry.dataset_index] > 0).sum()),
             }
@@ -325,7 +322,7 @@ def _dataset_hvg_summary(corpus, entries: list[DatasetEntry]) -> list[dict[str, 
 
 def _write_markdown_summary(path: Path, summary: dict[str, Any]) -> None:
     dataset_lines = "\n".join(
-        f"- `{item['dataset_id']}`: ranked `{item['ranked_feature_count']}` / feature `{item['feature_count']}`, default_n_hvg `{item['default_n_hvg']}`, manifest path exists `{item['hvg_ranking_exists']}`"
+        f"- `{item['dataset_id']}`: ranked `{item['ranked_feature_count']}` / feature `{item['feature_count']}`, hvg path exists `{item['hvg_ranking_exists']}`"
         for item in summary["hvg_discovery"]
     )
     selected_lines = "\n".join(

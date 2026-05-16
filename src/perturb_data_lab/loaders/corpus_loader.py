@@ -9,11 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Sequence
 
 import numpy as np
 import polars as pl
-import torch
 import yaml
 
 from .expression import (
@@ -33,10 +32,7 @@ from .index import (
     _load_canonical_obs_frame,
     _normalize_canonical_obs_dtypes,
 )
-from .loaders import ExpressionBatch
 
-# Import path resolver (Phase 1 output — canonical_meta under meta/)
-from ..materializers.models import MaterializationManifest
 from ..materializers.paths import resolve_corpus_paths
 
 __all__ = [
@@ -79,17 +75,9 @@ class Corpus:
     backend: str = ""
     corpus_root: Path = Path()
 
-    def read_expression(
-        self,
-        indices: torch.Tensor | np.ndarray | Sequence[int],
-    ) -> ExpressionBatch:
-        """Read flat expression arrays for ad-hoc corpus inspection."""
-        normalized_indices = _normalize_batch_indices(indices).tolist()
-        return self.expression_reader.read_expression_flat(normalized_indices)
-
     def take_metadata(
         self,
-        indices: torch.Tensor | np.ndarray | Sequence[int],
+        indices: np.ndarray | Sequence[int],
         *,
         columns: Sequence[str] | None = None,
     ) -> dict[str, np.ndarray | tuple]:
@@ -109,28 +97,8 @@ class Corpus:
 _BACKEND_NORMALIZE: dict[str, str] = {
     "lance": "lance",
     "zarr": "zarr",
-    # legacy / alternate names
     "lancedb": "lance",
 }
-
-_REMOVED_BACKEND_NAMES: frozenset[str] = frozenset(
-    {
-        "arrow-parquet",
-        "arrow_parquet",
-        "arrow-ipc",
-        "arrow_ipc",
-        "arrow_hf",
-        "hf-datasets",
-        "hf_datasets",
-        "huggingface-datasets",
-        "datasets",
-        "parquet",
-        "tiledb",
-        "webdataset",
-        "csr-memmap",
-        "csr_memmap",
-    }
-)
 
 
 def _normalize_backend(raw: str) -> str:
@@ -139,12 +107,6 @@ def _normalize_backend(raw: str) -> str:
         raise ValueError("corpus-index.yaml global_metadata.backend is empty")
     norm = _BACKEND_NORMALIZE.get(raw)
     if norm is None:
-        if raw in _REMOVED_BACKEND_NAMES:
-            raise ValueError(
-                f"Backend '{raw}' is not supported in slim main. Only 'lance' "
-                "and 'zarr' corpora can be loaded here; use the preserved "
-                "experimental snapshot branch for removed backends."
-            )
         raise ValueError(
             f"Unsupported corpus backend '{raw}'. "
             f"Supported: {sorted(_BACKEND_NORMALIZE.keys())}"
@@ -309,11 +271,9 @@ def _normalize_take_columns(
 
 
 def _normalize_batch_indices(
-    indices: torch.Tensor | np.ndarray | Sequence[int],
+    indices: np.ndarray | Sequence[int],
 ) -> np.ndarray:
-    """Convert batch row indices from torch/numpy/sequence form to int64."""
-    if isinstance(indices, torch.Tensor):
-        return indices.detach().cpu().numpy().astype(np.int64, copy=False)
+    """Convert batch row indices to int64."""
     return np.asarray(indices, dtype=np.int64)
 
 
@@ -325,7 +285,6 @@ def _normalize_batch_indices(
 def load_corpus(
     corpus_root: str | Path,
     *,
-    use_canonical: bool = True,
     extra_metadata_columns: Sequence[str] | None = None,
 ) -> Corpus:
     """Load a training-ready ``Corpus`` from a corpus directory.
@@ -338,10 +297,6 @@ def load_corpus(
     ----------
     corpus_root : str or Path
         Path to a corpus directory containing ``corpus-index.yaml``.
-    use_canonical : bool
-        Whether to use canonical obs/var parquets.  Default ``True``.
-        When ``True``, reads ``canonical-obs.parquet`` and
-        ``canonical-var.parquet`` from ``meta/{id}/canonical_meta/``.
     extra_metadata_columns : sequence of str, optional
         Additional canonical-obs parquet columns to load into
         ``metadata_index`` beyond the default canonical/core projection.
@@ -350,7 +305,7 @@ def load_corpus(
     -------
     Corpus
         Fully-constructed corpus components ready for ``build_loader(...)`` or
-        direct ``read_expression(...)`` / ``take_metadata(...)`` inspection.
+        direct expression-reader / ``take_metadata(...)`` inspection.
 
     Raises
     ------
@@ -370,7 +325,8 @@ def load_corpus(
     # ------------------------------------------------------------------
     # 1. Parse corpus-index.yaml
     # ------------------------------------------------------------------
-    index_doc = _read_yaml(index_path)
+    with open(index_path, encoding="utf-8") as handle:
+        index_doc = yaml.safe_load(handle) or {}
     metadata = index_doc.get("global_metadata", {})
     corpus_id = str(index_doc.get("corpus_id", root.name))
     topology = str(metadata.get("topology", ""))
@@ -387,8 +343,6 @@ def load_corpus(
     # ------------------------------------------------------------------
     canonical_obs_paths: dict[str, Path] = {}
     canonical_var_paths: dict[str, Path] = {}
-    hvg_rank_paths: dict[str, str | Path] = {}
-    default_n_hvg_by_dataset: dict[str, int] = {}
     global_ranges: list[tuple[str, int, int, int]] = []
     # (dataset_id, dataset_index, global_start, global_end)
 
@@ -415,16 +369,6 @@ def load_corpus(
 
         canonical_obs_paths[ds_id] = obs_path
         canonical_var_paths[ds_id] = var_path
-        hvg_path, default_n_hvg = _resolve_dataset_hvg_inputs(
-            corpus_root=root,
-            topology=topology,
-            dataset_id=ds_id,
-            ds_entry=ds_entry,
-        )
-        if hvg_path is not None:
-            hvg_rank_paths[ds_id] = hvg_path
-        if default_n_hvg is not None:
-            default_n_hvg_by_dataset[ds_id] = int(default_n_hvg)
         global_ranges.append((ds_id, ds_index, g_start, g_end))
 
     # ------------------------------------------------------------------
@@ -433,7 +377,6 @@ def load_corpus(
     metadata_index = _build_metadata_index(
         datasets_info=global_ranges,
         obs_paths=canonical_obs_paths,
-        use_canonical=use_canonical,
         extra_metadata_columns=extra_metadata_columns,
     )
 
@@ -476,8 +419,6 @@ def load_corpus(
         var_path_map,
         dataset_order=dataset_order,
         global_id_by_feature_id=gene_tokenizer.token_to_id,
-        named_hvg_rank_paths=hvg_rank_paths or None,
-        default_n_hvg_by_dataset=default_n_hvg_by_dataset or None,
     )
 
     # ------------------------------------------------------------------
@@ -500,50 +441,9 @@ def load_corpus(
 # ---------------------------------------------------------------------------
 
 
-def _read_yaml(path: Path) -> dict[str, Any]:
-    """Read a YAML file and return the parsed dict."""
-    with open(path, "r") as fh:
-        return yaml.safe_load(fh) or {}
-
-
-def _resolve_dataset_hvg_inputs(
-    *,
-    corpus_root: Path,
-    topology: str,
-    dataset_id: str,
-    ds_entry: dict[str, Any],
-) -> tuple[Path | None, int | None]:
-    """Resolve an optional canonical ``hvg.parquet`` plus default top-k."""
-    resolved_paths = resolve_corpus_paths(topology, corpus_root, dataset_id)
-    manifest_path_value = ds_entry.get("manifest_path")
-    manifest: MaterializationManifest | None = None
-
-    if manifest_path_value:
-        manifest_path = Path(str(manifest_path_value))
-        if not manifest_path.is_absolute():
-            manifest_path = corpus_root / manifest_path
-        if manifest_path.exists():
-            manifest = MaterializationManifest.from_yaml_file(manifest_path)
-
-    default_n_hvg = manifest.default_n_hvg if manifest is not None else None
-    candidates: list[Path] = []
-    if manifest is not None and manifest.hvg_ranking_path:
-        manifest_hvg_path = Path(manifest.hvg_ranking_path)
-        if not manifest_hvg_path.is_absolute():
-            manifest_hvg_path = corpus_root / manifest_hvg_path
-        candidates.append(manifest_hvg_path)
-    candidates.append(resolved_paths.meta_root / "hvg.parquet")
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate, default_n_hvg
-    return None, default_n_hvg
-
-
 def _build_metadata_index(
     datasets_info: list[tuple[str, int, int, int]],
     obs_paths: dict[str, Path],
-    use_canonical: bool = True,
     extra_metadata_columns: Sequence[str] | None = None,
 ) -> MetadataIndex:
     """Build a ``MetadataIndex`` from per-dataset canonical obs parquets.
@@ -557,20 +457,10 @@ def _build_metadata_index(
         Ordered per-dataset routing information from ``corpus-index.yaml``.
     obs_paths : dict[str, Path]
         Mapping ``dataset_id → canonical-obs.parquet`` path.
-    use_canonical : bool
-        When ``True``, canonical columns (``perturb_label``, etc.) are
-        expected in the parquet.
-
     Returns
     -------
     MetadataIndex
     """
-    if not use_canonical:
-        raise NotImplementedError(
-            "Non-canonical MetadataIndex loading is not yet supported in "
-            "load_corpus(). Pass use_canonical=True."
-        )
-
     processed: list[pl.DataFrame] = []
 
     for ds_id, ds_index, g_start, g_end in datasets_info:

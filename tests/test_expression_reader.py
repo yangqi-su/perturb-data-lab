@@ -268,5 +268,5 @@ class TestSlimReaderFlatContract:
         ["arrow_ipc", "hf_datasets", "parquet", "webdataset", "tiledb", "csr_memmap"],
     )
     def test_removed_backends_raise_clear_error(self, backend: str) -> None:
-        with pytest.raises(ValueError, match="not supported in slim main"):
+        with pytest.raises(ValueError, match="Unknown backend"):
             build_expression_reader(backend, "federated", [DatasetEntry("dummy", 0, 1)])

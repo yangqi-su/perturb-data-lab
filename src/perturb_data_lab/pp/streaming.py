@@ -77,7 +77,7 @@ def iter_dataset_batches(
         for start in range(context.global_start, context.global_end, batch_size):
             stop = min(start + batch_size, context.global_end)
             batch_indices = np.arange(start, stop, dtype=np.int64)
-            expr = corpus.read_expression(batch_indices)
+            expr = corpus.expression_reader.read_expression_flat(batch_indices.tolist())
             metadata = corpus.take_metadata(
                 batch_indices,
                 columns=("local_row_index", "size_factor"),

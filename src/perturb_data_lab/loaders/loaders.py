@@ -15,12 +15,10 @@ from .gpu_pipeline import GPUSparsePipeline
 __all__ = [
     "ExpressionBatch",
     "CorpusRandomBatchSampler",
-    "DatasetBatchSampler",
-    "DatasetContextBatchSampler",
+    "ContextBatchSampler",
     "ExpressionBatchDataset",
     "build_loader",
     "collate_expression_batch",
-    "read_expression_raw_batch",
 ]
 
 
@@ -173,22 +171,6 @@ def _attach_requested_metadata(
     return batch
 
 
-def read_expression_raw_batch(
-    expression_reader: Any,
-    indices: torch.Tensor | np.ndarray | Sequence[int],
-) -> dict[str, Any]:
-    """Read expression-only raw batch fields for corpus-global row indices."""
-    index_array = _normalize_batch_indices(indices)
-    expr = expression_reader.read_expression_flat(index_array.tolist())
-    return {
-        "batch_size": expr.batch_size,
-        "global_row_index": expr.global_row_index,
-        "row_offsets": expr.row_offsets,
-        "expressed_gene_indices": expr.expressed_gene_indices,
-        "expression_counts": expr.expression_counts,
-    }
-
-
 class CorpusRandomBatchSampler:
     """Yield random corpus-global row batches from an optional row universe."""
 
@@ -234,14 +216,30 @@ class CorpusRandomBatchSampler:
             yield sorted(indices.tolist())
 
 
-class DatasetBatchSampler:
-    """Yield batches restricted to one ``dataset_index``."""
+def _normalize_context_columns(context_columns: Sequence[str] | None) -> tuple[str, ...]:
+    if context_columns is None:
+        raise ValueError("context_columns is required when sampler='context'")
+    if isinstance(context_columns, (str, bytes)):
+        raise TypeError("context_columns must be a sequence of metadata column names")
+    columns = tuple(context_columns)
+    if not columns:
+        raise ValueError("context_columns must contain at least one metadata column")
+    for column in columns:
+        if not isinstance(column, str) or not column:
+            raise ValueError("context_columns must contain non-empty strings")
+    if len(set(columns)) != len(columns):
+        raise ValueError("context_columns must be unique")
+    return columns
+
+
+class ContextBatchSampler:
+    """Exhaust pure-context batches grouped by metadata columns."""
 
     def __init__(
         self,
         *,
         metadata_index: "MetadataIndex",
-        dataset_index: int,
+        context_columns: Sequence[str],
         batch_size: int,
         row_indices: Sequence[int] | np.ndarray | None = None,
         drop_last: bool = False,
@@ -250,87 +248,27 @@ class DatasetBatchSampler:
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        frame = metadata_index.df.filter(pl.col("dataset_index") == int(dataset_index))
-        row_indices_arr = np.asarray(frame["global_row_index"].to_numpy(), dtype=np.int64).copy()
-        candidate_row_indices = _normalize_candidate_row_indices(metadata_index, row_indices)
-        if candidate_row_indices is not None:
-            row_indices_arr = row_indices_arr[
-                np.isin(row_indices_arr, candidate_row_indices, assume_unique=True)
-            ]
-        if len(row_indices_arr) == 0:
-            raise ValueError(
-                f"dataset_index {dataset_index} has no rows under the requested row_indices restriction"
-            )
-        self._row_indices = row_indices_arr
-        self.dataset_index = int(dataset_index)
-        self.batch_size = int(batch_size)
-        self.drop_last = bool(drop_last)
-        self.shuffle = bool(shuffle)
-        self.seed = int(seed)
-        self.epoch = 0
-
-    def __len__(self) -> int:
-        if self.drop_last:
-            return len(self._row_indices) // self.batch_size
-        return (len(self._row_indices) + self.batch_size - 1) // self.batch_size
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = int(epoch)
-
-    def __iter__(self):
-        rng = np.random.default_rng(self.seed + self.epoch)
-        all_indices = self._row_indices.copy()
-        if self.shuffle:
-            rng.shuffle(all_indices)
-        for start in range(0, len(all_indices), self.batch_size):
-            batch = all_indices[start : start + self.batch_size]
-            if len(batch) < self.batch_size and self.drop_last:
-                continue
-            yield batch.tolist()
-
-
-class DatasetContextBatchSampler:
-    """Yield one sampled batch per context group."""
-
-    def __init__(
-        self,
-        *,
-        metadata_index: "MetadataIndex",
-        batch_size: int,
-        context_field: str = "raw_cell_type",
-        dataset_index: int | None = None,
-        row_indices: Sequence[int] | np.ndarray | None = None,
-        drop_last: bool = False,
-        shuffle: bool = True,
-        seed: int = 0,
-    ):
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        if context_field not in metadata_index.df.columns:
-            raise ValueError(
-                f"context_field {context_field!r} not found. Available columns: {metadata_index.df.columns}"
-            )
+        columns = _normalize_context_columns(context_columns)
+        missing = [column for column in columns if column not in metadata_index.df.columns]
+        if missing:
+            raise ValueError(f"context_columns not found in metadata_index: {missing}")
 
         frame = metadata_index.df
-        if dataset_index is not None:
-            frame = frame.filter(pl.col("dataset_index") == int(dataset_index))
         candidate_row_indices = _normalize_candidate_row_indices(metadata_index, row_indices)
         if candidate_row_indices is not None:
             frame = frame.filter(pl.col("global_row_index").is_in(candidate_row_indices.tolist()))
-
-        grouped = frame.group_by(context_field, maintain_order=True).agg(
+        grouped = frame.group_by(list(columns), maintain_order=True).agg(
             pl.col("global_row_index").alias("row_indices")
         )
         if grouped.height == 0:
-            raise ValueError(f"no context groups found for field {context_field!r}")
+            raise ValueError("no context groups found for the requested rows")
 
-        self._groups: list[tuple[Any, np.ndarray]] = [
-            (row[context_field], np.asarray(row["row_indices"], dtype=np.int64))
+        self._groups: list[np.ndarray] = [
+            np.asarray(row["row_indices"], dtype=np.int64)
             for row in grouped.iter_rows(named=True)
         ]
+        self.context_columns = columns
         self.batch_size = int(batch_size)
-        self.context_field = context_field
-        self.dataset_index = int(dataset_index) if dataset_index is not None else None
         self.drop_last = bool(drop_last)
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
@@ -338,26 +276,27 @@ class DatasetContextBatchSampler:
 
     def __len__(self) -> int:
         if self.drop_last:
-            return sum(len(rows) >= self.batch_size for _, rows in self._groups)
-        return len(self._groups)
+            return sum(len(rows) // self.batch_size for rows in self._groups)
+        return sum((len(rows) + self.batch_size - 1) // self.batch_size for rows in self._groups)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
     def __iter__(self):
-        group_order = np.arange(len(self._groups), dtype=np.int64)
         rng = np.random.default_rng(self.seed + self.epoch)
+        group_order = np.arange(len(self._groups), dtype=np.int64)
         if self.shuffle:
             rng.shuffle(group_order)
 
         for group_pos in group_order.tolist():
-            _, rows = self._groups[group_pos]
-            actual_size = min(self.batch_size, len(rows))
-            if actual_size < self.batch_size and self.drop_last:
-                continue
-            group_rng = np.random.default_rng(self.seed + self.epoch * 10000 + group_pos)
-            sampled = group_rng.choice(rows, size=actual_size, replace=False)
-            yield sorted(sampled.astype(np.int64, copy=False).tolist())
+            rows = self._groups[group_pos].copy()
+            if self.shuffle:
+                rng.shuffle(rows)
+            for start in range(0, len(rows), self.batch_size):
+                batch = rows[start : start + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                yield batch.astype(np.int64, copy=False).tolist()
 
 
 class ExpressionBatchDataset:
@@ -370,8 +309,8 @@ class ExpressionBatchDataset:
     def __len__(self) -> int:
         return self._total_rows
 
-    def __getitems__(self, indices: Sequence[int]) -> list[dict[str, Any]]:
-        return [read_expression_raw_batch(self._reader, indices)]
+    def __getitems__(self, indices: Sequence[int]) -> list[ExpressionBatch]:
+        return [self._reader.read_expression_flat(list(indices))]
 
 
 def _unwrap_single_prebatched_item(items: list[dict[str, Any]], *, collate_name: str) -> dict[str, Any]:
@@ -382,15 +321,15 @@ def _unwrap_single_prebatched_item(items: list[dict[str, Any]], *, collate_name:
     return items[0]
 
 
-def collate_expression_batch(items: list[dict[str, Any]]) -> dict[str, Any]:
+def collate_expression_batch(items: list[ExpressionBatch]) -> dict[str, Any]:
     """Unwrap one expression-only batch and convert arrays to torch tensors."""
     batch = _unwrap_single_prebatched_item(items, collate_name="collate_expression_batch")
     return {
-        "batch_size": batch["batch_size"],
-        "global_row_index": torch.as_tensor(batch["global_row_index"], dtype=torch.long),
-        "row_offsets": torch.as_tensor(batch["row_offsets"], dtype=torch.long),
-        "expressed_gene_indices": torch.as_tensor(batch["expressed_gene_indices"], dtype=torch.long),
-        "expression_counts": torch.as_tensor(batch["expression_counts"], dtype=torch.float32),
+        "batch_size": batch.batch_size,
+        "global_row_index": torch.as_tensor(batch.global_row_index, dtype=torch.long),
+        "row_offsets": torch.as_tensor(batch.row_offsets, dtype=torch.long),
+        "expressed_gene_indices": torch.as_tensor(batch.expressed_gene_indices, dtype=torch.long),
+        "expression_counts": torch.as_tensor(batch.expression_counts, dtype=torch.float32),
     }
 
 
@@ -398,8 +337,8 @@ def _normalize_sampler_kind(sampler: str) -> str:
     if not isinstance(sampler, str):
         raise TypeError("sampler must be a string")
     kind = sampler.strip().lower().replace("-", "_")
-    if kind not in {"corpus_random", "dataset", "dataset_context"}:
-        raise ValueError("sampler must be one of 'corpus_random', 'dataset', or 'dataset_context'")
+    if kind not in {"corpus_random", "context"}:
+        raise ValueError("sampler must be one of 'corpus_random' or 'context'")
     return kind
 
 
@@ -411,8 +350,7 @@ def _build_sampler(
     drop_last: bool,
     seed: int,
     shuffle: bool,
-    dataset_index: int | None,
-    context_field: str,
+    context_columns: Sequence[str] | None,
     row_indices: Sequence[int] | np.ndarray | None,
 ) -> Any:
     kind = _normalize_sampler_kind(sampler)
@@ -424,23 +362,10 @@ def _build_sampler(
             drop_last=drop_last,
             seed=seed,
         )
-    if dataset_index is None:
-        raise ValueError(f"dataset_index is required for sampler={kind!r}")
-    if kind == "dataset":
-        return DatasetBatchSampler(
-            metadata_index=corpus.metadata_index,
-            dataset_index=dataset_index,
-            batch_size=batch_size,
-            row_indices=row_indices,
-            drop_last=drop_last,
-            shuffle=shuffle,
-            seed=seed,
-        )
-    return DatasetContextBatchSampler(
+    return ContextBatchSampler(
         metadata_index=corpus.metadata_index,
         batch_size=batch_size,
-        context_field=context_field,
-        dataset_index=dataset_index,
+        context_columns=_normalize_context_columns(context_columns),
         row_indices=row_indices,
         drop_last=drop_last,
         shuffle=shuffle,
@@ -497,8 +422,7 @@ def build_loader(
     drop_last: bool = False,
     seed: int = 0,
     shuffle: bool = True,
-    dataset_index: int | None = None,
-    context_field: str = "raw_cell_type",
+    context_columns: Sequence[str] | None = None,
     sampling_mode: str = "uniform",
     expressed_weight: float = 3.0,
     hvg_weight: float = 3.0,
@@ -528,8 +452,7 @@ def build_loader(
         drop_last=drop_last,
         seed=seed,
         shuffle=shuffle,
-        dataset_index=dataset_index,
-        context_field=context_field,
+        context_columns=context_columns,
         row_indices=row_indices,
     )
     data_loader = DataLoader(

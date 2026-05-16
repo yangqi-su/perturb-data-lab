@@ -16,7 +16,7 @@ import yaml
 
 from ..materializers.paths import resolve_corpus_paths
 from .corpus_loader import Corpus, load_corpus
-from .loaders import build_loader, read_expression_raw_batch
+from .loaders import build_loader
 
 __all__ = ["validate_cross_backend_contract"]
 
@@ -102,11 +102,7 @@ def validate_cross_backend_contract(
         corpus = _load_backend_corpus(backend, root)
         index_report = _validate_loaded_corpus_index(backend, corpus, index_doc)
 
-        expression_batch = corpus.read_expression(normalized_indices)
-        raw_expression_batch = read_expression_raw_batch(
-            corpus.expression_reader,
-            normalized_indices,
-        )
+        expression_batch = corpus.expression_reader.read_expression_flat(normalized_indices)
         taken_metadata = corpus.take_metadata(
             normalized_indices,
             columns=metadata_columns,
@@ -130,15 +126,10 @@ def validate_cross_backend_contract(
                 "topology": corpus.topology,
                 "dataset_entry_count": len(corpus.dataset_entries),
             },
-            "read_expression": {
+            "expression_reader": {
                 "batch_size": int(expression_batch.batch_size),
                 "nonzero_count": int(expression_batch.expression_counts.size),
                 "global_row_index_preview": expression_batch.global_row_index[:5].tolist(),
-            },
-            "raw_expression_batch": {
-                "batch_size": int(raw_expression_batch["batch_size"]),
-                "nonzero_count": int(raw_expression_batch["expression_counts"].size),
-                "global_row_index_preview": raw_expression_batch["global_row_index"][:5].tolist(),
             },
             "take_metadata": {
                 "columns": sorted(taken_metadata.keys()),
@@ -153,7 +144,6 @@ def validate_cross_backend_contract(
         backend_state[backend] = {
             "corpus": corpus,
             "expression": expression_batch,
-            "raw_expression_batch": raw_expression_batch,
             "take_metadata": taken_metadata,
             "loader": loader_batch,
             "index_report": index_report,
@@ -176,14 +166,7 @@ def validate_cross_backend_contract(
         _assert_expression_batch_equal(
             current_state["expression"],
             baseline_state["expression"],
-            layer="read_expression",
-            backend=backend,
-            baseline_backend=baseline_backend,
-        )
-        _assert_raw_batch_equal(
-            current_state["raw_expression_batch"],
-            baseline_state["raw_expression_batch"],
-            layer="raw_expression_batch",
+            layer="expression_reader",
             backend=backend,
             baseline_backend=baseline_backend,
         )
@@ -206,8 +189,7 @@ def validate_cross_backend_contract(
             "status": "success",
             "layers": {
                 "corpus_index": "success",
-                "read_expression": "success",
-                "raw_expression_batch": "success",
+                "expression_reader": "success",
                 "take_metadata": "success",
                 "loader": "success",
             },
@@ -520,50 +502,6 @@ def _assert_expression_batch_equal(
         backend=backend,
         baseline_backend=baseline_backend,
     )
-
-
-def _assert_raw_batch_equal(
-    actual: dict[str, Any],
-    expected: dict[str, Any],
-    *,
-    layer: str,
-    backend: str,
-    baseline_backend: str,
-) -> None:
-    if actual.keys() != expected.keys():
-        raise AssertionError(
-            f"{backend} vs {baseline_backend} failed at {layer}.keys: {sorted(actual.keys())} != {sorted(expected.keys())}"
-        )
-    if actual["batch_size"] != expected["batch_size"]:
-        raise AssertionError(
-            f"{backend} vs {baseline_backend} failed at {layer}.batch_size: "
-            f"{actual['batch_size']} != {expected['batch_size']}"
-        )
-    for key in (
-        "global_row_index",
-        "dataset_index",
-        "local_row_index",
-        "row_offsets",
-        "expressed_gene_indices",
-        "expression_counts",
-        "size_factor",
-    ):
-        if key in expected:
-            _assert_array_equal(
-                actual[key],
-                expected[key],
-                layer=f"{layer}.{key}",
-                backend=backend,
-                baseline_backend=baseline_backend,
-            )
-    if "meta_columns" in expected:
-        _assert_meta_columns_equal(
-            actual["meta_columns"],
-            expected["meta_columns"],
-            layer=f"{layer}.meta_columns",
-            backend=backend,
-            baseline_backend=baseline_backend,
-        )
 
 
 def _assert_loader_batch_equal(
