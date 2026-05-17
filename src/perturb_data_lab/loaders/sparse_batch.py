@@ -1,9 +1,9 @@
-"""Phase 3: GPU Pipeline with Cross-Dataset Gene Resolution.
+"""Sparse expression batch processing with cross-dataset gene resolution.
 
-``GPUSparsePipeline`` receives flat raw batch dicts from corpus loaders,
+``SparseBatchProcessor`` receives flat raw batch dicts from corpus loaders,
 maps local→global using ``FeatureRegistry.local_to_global_map``, samples
-genes per cell from per-dataset probability pools on GPU, and gathers
-expression counts into dense ``(batch_size, seq_len)`` tensors.
+genes per cell from per-dataset probability pools, and gathers expression
+counts into dense ``(batch_size, seq_len)`` tensors on the requested device.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from torch.nn.utils.rnn import pad_sequence
 from .feature_registry import FeatureRegistry
 
 __all__ = [
-    "GPUSparsePipeline",
+    "SparseBatchProcessor",
 ]
 
 # Default sentinel values
@@ -26,16 +26,16 @@ DEFAULT_INVALID_COUNT_VALUE: float = -1.0
 
 
 # ---------------------------------------------------------------------------
-# GPU Pipeline
+# Sparse batch processor
 # ---------------------------------------------------------------------------
 
 
-class GPUSparsePipeline:
-    """GPU sparse pipeline for cross-dataset gene resolution.
+class SparseBatchProcessor:
+    """Process sparse expression arrays into sampled training tensors.
 
     Receives flat expression arrays from corpus raw batch dicts,
     resolves local gene indices to global gene IDs, samples from per-dataset
-    probability pools on GPU, and gathers counts via searchsorted+gather.
+    probability pools, and gathers counts via searchsorted+gather.
 
     Parameters
     ----------

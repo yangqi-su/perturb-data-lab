@@ -7,7 +7,7 @@ import pyarrow as pa
 import torch
 import yaml
 
-from perturb_data_lab.loaders import FeatureRegistry, GPUSparsePipeline, build_loader, load_corpus
+from perturb_data_lab.loaders import FeatureRegistry, SparseBatchProcessor, build_loader, load_corpus
 
 
 def _write_canonical_obs(
@@ -229,7 +229,7 @@ def test_feature_registry_hvg_without_default_selection_is_top_k_only(tmp_path: 
 
 def test_dynamic_hvg_top_k_changes_weighted_probs_without_rematerialization(tmp_path: Path) -> None:
     corpus = load_corpus(str(_build_runtime_hvg_corpus(tmp_path)))
-    pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=2)
+    pipeline = SparseBatchProcessor(corpus.feature_registry, seq_len=2)
     device = torch.device("cpu")
     cached = pipeline._cached_tensors(device)
     dataset_indices = torch.tensor([0], dtype=torch.long, device=device)
@@ -271,7 +271,7 @@ def test_dynamic_hvg_top_k_changes_weighted_probs_without_rematerialization(tmp_
 
 def test_hvg_weighted_probs_zero_absent_genes(tmp_path: Path) -> None:
     registry = _build_feature_registry_with_partial_vocab(tmp_path)
-    pipeline = GPUSparsePipeline(registry, seq_len=2)
+    pipeline = SparseBatchProcessor(registry, seq_len=2)
     device = torch.device("cpu")
     cached = pipeline._cached_tensors(device)
 

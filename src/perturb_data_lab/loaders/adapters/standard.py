@@ -1,4 +1,4 @@
-"""PyTorch expression datasets, samplers, and loader construction."""
+"""Standard PyTorch adapter for corpus expression batches."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ import polars as pl
 import torch
 from torch.utils.data import DataLoader
 
-from .expression import ExpressionBatch
-from .gpu_pipeline import GPUSparsePipeline
-from .index import _normalize_candidate_row_indices
+from ..expression import ExpressionBatch
+from ..index import _normalize_candidate_row_indices
+from ..sparse_batch import SparseBatchProcessor
 
 __all__ = [
     "ExpressionBatch",
@@ -390,7 +390,7 @@ def build_loader(
             backend=corpus.backend,
         ),
     )
-    pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=resolved_seq_len)
+    pipeline = SparseBatchProcessor(corpus.feature_registry, seq_len=resolved_seq_len)
 
     def _iterator() -> Iterator[dict[str, Any]]:
         for expression_batch in data_loader:

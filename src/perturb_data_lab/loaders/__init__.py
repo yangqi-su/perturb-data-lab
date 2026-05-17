@@ -13,14 +13,14 @@ from .expression import (
     build_expression_reader,
 )
 from .index import MetadataIndex
-from .loaders import (
+from .adapters import (
     ExpressionBatchDataset,
     CorpusRandomBatchSampler,
     ContextBatchSampler,
-    ExpressionBatch,
     build_loader,
     collate_expression_batch,
 )
+from .expression import ExpressionBatch
 from .feature_registry import (
     FeatureRegistry,
 )
@@ -28,8 +28,8 @@ from .corpus_loader import (
     Corpus,
     load_corpus,
 )
-from .gpu_pipeline import (
-    GPUSparsePipeline,
+from .sparse_batch import (
+    SparseBatchProcessor,
 )
 from .adapters import (
     PertTFAdapterConfig,
@@ -65,8 +65,8 @@ __all__ = [
     "collate_expression_batch",
     # Phase 2 — Feature Registry
     "FeatureRegistry",
-    # Phase 3 — GPU Pipeline
-    "GPUSparsePipeline",
+    # Phase 3 — sparse batch processing
+    "SparseBatchProcessor",
     # Phase 4 — pertTF-local adapters
     "PertTFAdapterConfig",
     "PertTFPairedBatchLoader",

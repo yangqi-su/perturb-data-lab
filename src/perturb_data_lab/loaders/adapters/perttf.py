@@ -12,10 +12,10 @@ import polars as pl
 import torch
 from torch.utils.data import DataLoader
 
+from ..expression import ExpressionBatch
 from ..feature_registry import FeatureRegistry
-from ..gpu_pipeline import GPUSparsePipeline
 from ..index import MetadataIndex, _normalize_candidate_row_indices
-from ..loaders import ExpressionBatch
+from ..sparse_batch import SparseBatchProcessor
 
 if TYPE_CHECKING:
     from ..corpus_loader import Corpus
@@ -840,7 +840,7 @@ class PertTFPairedBatchBuilder:
         self.config = resolved_adapter.config
         self.seq_len = int(seq_len)
         self.device = torch.device("cpu" if device is None else device)
-        self._pipeline = GPUSparsePipeline(corpus.feature_registry, seq_len=self.seq_len)
+        self._pipeline = SparseBatchProcessor(corpus.feature_registry, seq_len=self.seq_len)
         self._pad_token_id = int(self.adapter.stoi[self.config.pad_token])
         self._cls_token_id = int(self.adapter.stoi[self.config.cls_token])
         self._special_token_offset = self.adapter.special_token_offset
