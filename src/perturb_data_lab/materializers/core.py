@@ -1010,7 +1010,6 @@ def update_corpus_index(
     corpus_index_path: Path,
     new_dataset_record: DatasetJoinRecord,
     global_metadata: GlobalMetadataDocument | None = None,
-    emission_spec_path: str | None = None,
     backend: str | None = None,
     topology: str | None = None,
 ) -> CorpusIndexDocument:
@@ -1041,8 +1040,6 @@ def update_corpus_index(
     global_metadata : GlobalMetadataDocument | None
         Global metadata for new corpus creation.  Required when creating
         a new corpus; ignored for existing corpora.
-    emission_spec_path : str | None
-        Relative path to ``corpus-emission-spec.yaml`` from the corpus root.
     backend : str | None
         Backend declaration for the corpus (e.g., "lance", "zarr"). Required when creating a new corpus; written to
         ``global-metadata.yaml``.
@@ -1117,8 +1114,6 @@ def update_corpus_index(
         }
         if global_metadata is not None:
             gmeta_dict = global_metadata.to_dict()
-        if emission_spec_path is not None:
-            gmeta_dict["emission_spec_path"] = emission_spec_path
         global_meta = gmeta_dict
         # Write global-metadata.yaml only when we have meaningful content
         if gmeta_dict:

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 import polars as pl
@@ -12,6 +13,24 @@ from .streaming import PpFeatureContext, iter_dataset_batches
 
 if TYPE_CHECKING:
     from ..loaders.corpus_loader import Corpus
+
+
+@dataclass(frozen=True)
+class RecalcHvgDatasetResult:
+    dataset_id: str
+    output_path: str
+    row_count: int
+    manifest_updated: bool
+
+
+@dataclass(frozen=True)
+class RecalcHvgSummary:
+    corpus_root: str
+    dataset_count: int
+    n_hvg: int
+    batch_size: int
+    update_manifests: bool
+    datasets: tuple[RecalcHvgDatasetResult, ...]
 
 
 @dataclass
@@ -229,6 +248,84 @@ def calculate_hvgs(
     if not frames:
         return _empty_hvg_frame()
     return pl.concat(frames, rechunk=True).sort(["dataset_index", "origin_index"])
+
+
+def recalc_hvg(
+    corpus_root: str | Path,
+    *,
+    dataset_ids: Sequence[str] | None = None,
+    batch_size: int = 1024,
+    n_hvg: int = 2000,
+    update_manifests: bool = True,
+) -> RecalcHvgSummary:
+    """Recalculate per-dataset ``hvg.parquet`` files for a current corpus."""
+    from ..loaders import load_corpus
+    from ..materializers.models import CorpusIndexDocument, MaterializationManifest
+    from ..materializers.paths import resolve_corpus_paths
+
+    root = Path(corpus_root).resolve()
+    corpus = load_corpus(root)
+    selected = tuple(dataset_ids) if dataset_ids is not None else tuple(
+        entry.dataset_id for entry in sorted(corpus.dataset_entries, key=lambda e: e.global_start)
+    )
+    known = set(corpus.dataset_index_by_id)
+    unknown = sorted(set(selected) - known)
+    if unknown:
+        raise KeyError(f"Unknown dataset_id(s) for HVG recalculation: {', '.join(unknown)}")
+
+    corpus_index = CorpusIndexDocument.from_yaml_file(root / "corpus-index.yaml")
+    manifest_by_dataset = {
+        dataset.dataset_id: root / dataset.manifest_path
+        for dataset in corpus_index.datasets
+    }
+    results: list[RecalcHvgDatasetResult] = []
+    canonical_columns = [
+        "origin_index",
+        "feature_id",
+        "mean_log1p_expr",
+        "variance_log1p_expr",
+        "dispersion_log",
+        "dispersion_norm",
+        "hvg_rank",
+        "selected_at_default_n_hvg",
+    ]
+
+    for dataset_id in selected:
+        frame = calculate_hvgs(corpus, dataset_id=dataset_id, batch_size=batch_size, n_hvg=n_hvg)
+        compact = frame.select(canonical_columns).sort("origin_index")
+        output_path = resolve_corpus_paths(corpus.topology, root, dataset_id).meta_root / "hvg.parquet"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        compact.write_parquet(output_path)
+
+        manifest_updated = False
+        if update_manifests:
+            manifest_path = manifest_by_dataset[dataset_id]
+            manifest = MaterializationManifest.from_yaml_file(manifest_path)
+            updated = replace(
+                manifest,
+                hvg_ranking_path=str(output_path.relative_to(root)),
+                default_n_hvg=int(n_hvg),
+            )
+            updated.write_yaml(manifest_path)
+            manifest_updated = True
+
+        results.append(
+            RecalcHvgDatasetResult(
+                dataset_id=dataset_id,
+                output_path=str(output_path),
+                row_count=compact.height,
+                manifest_updated=manifest_updated,
+            )
+        )
+
+    return RecalcHvgSummary(
+        corpus_root=str(root),
+        dataset_count=len(results),
+        n_hvg=int(n_hvg),
+        batch_size=int(batch_size),
+        update_manifests=bool(update_manifests),
+        datasets=tuple(results),
+    )
 
 
 def _empty_hvg_frame() -> pl.DataFrame:

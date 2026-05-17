@@ -1,9 +1,7 @@
-"""Focused tests for existing-corpus HVG backfill."""
+"""Focused tests for current-corpus HVG recalculation."""
 
 from __future__ import annotations
 
-import argparse
-import json
 from pathlib import Path
 
 import lance
@@ -13,16 +11,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 
-from perturb_data_lab.cli import _cmd_backfill_hvg, build_parser
+from perturb_data_lab.cli import _cmd_recalc_hvg, build_parser
 from perturb_data_lab.loaders import load_corpus
-from perturb_data_lab.materializers import backfill_hvg_rankings_for_corpus
 from perturb_data_lab.materializers.models import (
     CountSourceSpec,
     MaterializationManifest,
     OutputRoots,
     ProvenanceSpec,
 )
-from perturb_data_lab.pp import calculate_hvgs
+from perturb_data_lab.pp import calculate_hvgs, recalc_hvg
 
 
 def _write_feature_meta(meta_root: Path, feature_ids: list[str]) -> Path:
@@ -207,107 +204,87 @@ def _build_mock_aggregate_lance_corpus(corpus_root: Path) -> None:
     )
 
 
-class TestHVGBackfillParser:
-    def test_backfill_hvg_subcommand(self):
+class TestRecalcHvgParser:
+    def test_recalc_hvg_subcommand(self):
         parser = build_parser()
-        ns = parser.parse_args(["backfill-hvg", "--corpus-root", "/corpus"])
-        assert ns.command == "backfill-hvg"
+        ns = parser.parse_args(["recalc-hvg", "--corpus-root", "/corpus"])
+        assert ns.command == "recalc-hvg"
         assert ns.corpus_root == "/corpus"
-        assert ns.chunk_rows == 50_000
+        assert ns.batch_size == 1024
         assert ns.update_manifests is True
 
 
-class TestHVGBackfill:
-    def test_backfill_recomputes_dataset_local_hvg_artifacts(self, tmp_path: Path):
+class TestRecalcHvg:
+    def test_recalc_writes_dataset_local_hvg_artifacts(self, tmp_path: Path):
         _build_mock_aggregate_lance_corpus(tmp_path)
 
-        summary = backfill_hvg_rankings_for_corpus(
+        summary = recalc_hvg(
             tmp_path,
-            chunk_rows=2,
+            batch_size=2,
             n_hvg=2,
         )
 
         assert summary.dataset_count == 2
-        assert summary.topology == "aggregate"
         assert [dataset.dataset_id for dataset in summary.datasets] == ["ds_a", "ds_b"]
 
         for dataset in summary.datasets:
             output_path = Path(dataset.output_path)
-            manifest_path = Path(dataset.manifest_path)
+            manifest_path = output_path.parent / "materialization-manifest.yaml"
             table = pq.read_table(output_path).to_pandas()
             manifest = MaterializationManifest.from_yaml_file(manifest_path)
 
             assert output_path == tmp_path / "meta" / dataset.dataset_id / "hvg.parquet"
-            assert dataset.row_count == dataset.feature_count == 3
-            assert table["feature_id"].tolist()
+            assert dataset.row_count == 3
+            assert table.columns.tolist() == [
+                "origin_index",
+                "feature_id",
+                "mean_log1p_expr",
+                "variance_log1p_expr",
+                "dispersion_log",
+                "dispersion_norm",
+                "hvg_rank",
+                "selected_at_default_n_hvg",
+            ]
             assert manifest.hvg_ranking_path == f"meta/{dataset.dataset_id}/hvg.parquet"
             assert manifest.default_n_hvg == 2
             assert dataset.manifest_updated is True
-            assert dataset.sha256
 
-    def test_backfill_cli_writes_summary_json(self, tmp_path: Path):
+    def test_recalc_cli_writes_hvg_artifacts(self, tmp_path: Path):
         _build_mock_aggregate_lance_corpus(tmp_path)
-        summary_json = tmp_path / "summary.json"
+        parser = build_parser()
+        args = parser.parse_args([
+            "recalc-hvg",
+            "--corpus-root", str(tmp_path),
+            "--batch-size", "2",
+            "--n-hvg", "2",
+        ])
+        _cmd_recalc_hvg(args)
 
-        args = argparse.Namespace(
-            corpus_root=str(tmp_path),
-            dataset_id=None,
-            output_root=None,
-            chunk_rows=2,
-            n_hvg=2,
-            summary_json=str(summary_json),
-            overwrite=False,
-            update_manifests=True,
-        )
-        _cmd_backfill_hvg(args)
+        assert (tmp_path / "meta" / "ds_a" / "hvg.parquet").exists()
+        assert (tmp_path / "meta" / "ds_b" / "hvg.parquet").exists()
 
-        payload = json.loads(summary_json.read_text(encoding="utf-8"))
-        assert payload["dataset_count"] == 2
-        assert sorted(dataset["dataset_id"] for dataset in payload["datasets"]) == ["ds_a", "ds_b"]
-
-    def test_backfill_writes_same_ranked_metrics_as_pp_calculate_hvgs(self, tmp_path: Path):
+    def test_recalc_writes_same_ranked_metrics_as_pp_calculate_hvgs(self, tmp_path: Path):
         _build_mock_aggregate_lance_corpus(tmp_path)
         corpus = load_corpus(str(tmp_path))
 
         pp_hvgs = calculate_hvgs(corpus, batch_size=2, n_hvg=2).select(
             [
-                "dataset_id",
-                "dataset_index",
                 "origin_index",
-                "gene_id",
-                "mean",
-                "variance",
-                "dispersion_norm",
-                "hvg_rank",
-                "is_hvg",
-                "n_cells_detected",
+                "feature_id",
                 "mean_log1p_expr",
                 "variance_log1p_expr",
+                "dispersion_log",
+                "dispersion_norm",
+                "hvg_rank",
+                "selected_at_default_n_hvg",
             ]
         )
 
-        summary = backfill_hvg_rankings_for_corpus(tmp_path, chunk_rows=2, n_hvg=2)
+        summary = recalc_hvg(tmp_path, batch_size=2, n_hvg=2)
         written = pl.concat(
             [pl.read_parquet(dataset.output_path) for dataset in summary.datasets],
             rechunk=True,
-        ).sort(["dataset_index", "origin_index"])
+        ).sort(["feature_id", "origin_index"])
+        expected = pp_hvgs.sort(["feature_id", "origin_index"])
 
-        assert {
-            "dataset_id",
-            "dataset_index",
-            "origin_index",
-            "gene_id",
-            "feature_id",
-            "mean",
-            "variance",
-            "dispersion",
-            "dispersion_log",
-            "dispersion_norm",
-            "hvg_rank",
-            "is_hvg",
-            "selected_at_default_n_hvg",
-            "n_cells_detected",
-            "mean_log1p_expr",
-            "variance_log1p_expr",
-        }.issubset(set(written.columns))
-        assert written.select(pp_hvgs.columns).to_dict(as_series=False) == pp_hvgs.to_dict(as_series=False)
+        assert written.to_dict(as_series=False) == expected.to_dict(as_series=False)

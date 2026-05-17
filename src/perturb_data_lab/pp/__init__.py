@@ -7,7 +7,7 @@ from .artifacts import (
     write_pp_provenance,
 )
 from .de import rank_genes_ttest
-from .hvg import calculate_hvgs
+from .hvg import RecalcHvgDatasetResult, RecalcHvgSummary, calculate_hvgs, recalc_hvg
 from .pca import PpPcaResult, run_pca
 from .stats import calculate_lognorm_stats
 from .streaming import (
@@ -22,6 +22,8 @@ __all__ = [
     "PpBatch",
     "PpFeatureContext",
     "PpPcaResult",
+    "RecalcHvgDatasetResult",
+    "RecalcHvgSummary",
     "build_pp_provenance",
     "calculate_hvgs",
     "calculate_lognorm_stats",
@@ -29,6 +31,7 @@ __all__ = [
     "log1p_size_factor_batch",
     "prepare_pp_output",
     "rank_genes_ttest",
+    "recalc_hvg",
     "run_pca",
     "write_pp_provenance",
 ]

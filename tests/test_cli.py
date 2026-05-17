@@ -193,20 +193,18 @@ class TestParserConstruction:
         ns = parser.parse_args(["corpus-gc", "/corpus"])
         assert ns.dry_run is False
 
-    def test_backfill_hvg_subcommand(self):
+    def test_recalc_hvg_subcommand(self):
         parser = build_parser()
         ns = parser.parse_args([
-            "backfill-hvg",
+            "recalc-hvg",
             "--corpus-root", "/corpus",
             "--dataset-id", "ds1",
-            "--chunk-rows", "1234",
-            "--summary-json", "/tmp/summary.json",
+            "--batch-size", "1234",
         ])
-        assert ns.command == "backfill-hvg"
+        assert ns.command == "recalc-hvg"
         assert ns.corpus_root == "/corpus"
         assert ns.dataset_id == ["ds1"]
-        assert ns.chunk_rows == 1234
-        assert ns.summary_json == "/tmp/summary.json"
+        assert ns.batch_size == 1234
         assert ns.update_manifests is True
 
     def test_unknown_subcommand_exits(self):
@@ -758,7 +756,7 @@ class TestCLIHelp:
             parser.parse_args(["--help"])
         captured = capsys.readouterr()
         # Current commands should appear
-        for cmd in ["inspect", "materialize", "draft-schema", "canonicalize", "backfill-hvg", "corpus-validate", "corpus-gc"]:
+        for cmd in ["inspect", "materialize", "draft-schema", "canonicalize", "recalc-hvg", "corpus-validate", "corpus-gc"]:
             assert cmd in captured.out
         # Removed commands should NOT appear
         for cmd in ["stage2-materialize", "corpus-create", "corpus-append"]:

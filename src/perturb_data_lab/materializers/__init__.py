@@ -26,8 +26,6 @@ _EXPORT_MAP = {
     # Core classes
     "CanonicalCellRecord": (".core", "CanonicalCellRecord"),
     "update_corpus_index": (".core", "update_corpus_index"),
-    # Emission spec
-    "CorpusEmissionSpec": (".emission_spec", "CorpusEmissionSpec"),
     # Models
     "MaterializationManifest": (".models", "MaterializationManifest"),
     "CorpusIndexDocument": (".models", "CorpusIndexDocument"),
@@ -40,8 +38,6 @@ _EXPORT_MAP = {
     "register_materialization": (".registration", "register_materialization"),
     "corpus_exists": (".registration", "corpus_exists"),
     "manifest_to_join_record": (".registration", "manifest_to_join_record"),
-    # HVG backfill
-    "backfill_hvg_rankings_for_corpus": (".hvg_backfill", "backfill_hvg_rankings_for_corpus"),
 }
 
 
@@ -64,8 +60,6 @@ __all__ = [
     # Core classes
     "CanonicalCellRecord",
     "update_corpus_index",
-    # Emission spec
-    "CorpusEmissionSpec",
     # Models
     "MaterializationManifest",
     "CorpusIndexDocument",
@@ -78,6 +72,4 @@ __all__ = [
     "register_materialization",
     "corpus_exists",
     "manifest_to_join_record",
-    # HVG backfill
-    "backfill_hvg_rankings_for_corpus",
 ]

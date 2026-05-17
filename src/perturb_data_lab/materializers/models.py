@@ -303,7 +303,6 @@ class GlobalMetadataDocument(YamlDocument):
     raw_field_policy: str
     backend: str | None = None  # lance | zarr
     topology: str | None = None  # federated | aggregate (Stage 2 contract: separate from backend)
-    emission_spec_path: str | None = None  # relative path from corpus root to corpus-emission-spec.yaml
     notes: tuple[str, ...] = ()
 
     def validate(self) -> None:
@@ -324,7 +323,6 @@ class GlobalMetadataDocument(YamlDocument):
             raw_field_policy=str(data.get("raw_field_policy", "preserve-unchanged")),
             backend=data.get("backend"),
             topology=data.get("topology"),
-            emission_spec_path=data.get("emission_spec_path"),
             notes=tuple(str(item) for item in data.get("notes", [])),
         )
         document.validate()

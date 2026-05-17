@@ -1,18 +1,12 @@
-"""HVG ranking artifact and corpus emission spec tests.
+"""HVG ranking artifact tests.
 
 Tests cover:
-- CorpusEmissionSpec round-trip (YAML read/write)
-- CorpusEmissionSpec field accessors
 - HVG ranking parquet schema and deterministic ranking semantics
 - Manifest hvg_ranking_path wiring
-- Loader integration with emission spec metadata wiring
 """
 
 from __future__ import annotations
 
-import json
-import sqlite3
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -22,7 +16,6 @@ import pytest
 
 from perturb_data_lab.contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
 from perturb_data_lab.materializers import (
-    CorpusEmissionSpec,
     update_corpus_index,
 )
 from perturb_data_lab.materializers.chunk_translation import (
@@ -37,65 +30,6 @@ from perturb_data_lab.materializers.models import (
     OutputRoots,
     ProvenanceSpec,
 )
-
-
-# ---------------------------------------------------------------------------
-# CorpusEmissionSpec round-trip and field accessors
-# ---------------------------------------------------------------------------
-
-
-class TestCorpusEmissionSpecRoundTrip:
-    def test_spec_to_dict(self):
-        spec = CorpusEmissionSpec(
-            corpus_id="test-corpus",
-            perturbation_fields=("perturbation_label", "control_flag"),
-            context_fields=("dataset_id", "cell_context"),
-            output_convention="dict",
-        )
-        d = spec.to_dict()
-        assert d["kind"] == "corpus-emission-spec"
-        assert d["corpus_id"] == "test-corpus"
-        assert d["perturbation_fields"] == ["perturbation_label", "control_flag"]
-        assert d["context_fields"] == ["dataset_id", "cell_context"]
-
-    def test_spec_write_read_round_trip(self, tmp_path: Path):
-        spec = CorpusEmissionSpec(
-            corpus_id="test-corpus",
-            perturbation_fields=("perturbation_label", "perturbation_type"),
-            context_fields=("dataset_id", "tissue"),
-            output_convention="dict",
-            hvg_ranking_path="metadata/ds1/hvg.parquet",
-            default_n_hvg=2000,
-        )
-        path = tmp_path / "corpus-emission-spec.yaml"
-        spec.write_yaml(path)
-        loaded = CorpusEmissionSpec.from_yaml_file(path)
-        assert loaded.corpus_id == "test-corpus"
-        assert loaded.perturbation_fields == ("perturbation_label", "perturbation_type")
-        assert loaded.context_fields == ("dataset_id", "tissue")
-        assert loaded.hvg_ranking_path == "metadata/ds1/hvg.parquet"
-        assert loaded.default_n_hvg == 2000
-
-    def test_emitted_perturbation_fields(self):
-        spec = CorpusEmissionSpec(
-            corpus_id="c",
-            perturbation_fields=("perturbation_label", "target_id", "control_flag"),
-        )
-        assert spec.emitted_perturbation_fields() == ("perturbation_label", "target_id", "control_flag")
-
-    def test_emitted_context_fields(self):
-        spec = CorpusEmissionSpec(
-            corpus_id="c",
-            context_fields=("dataset_id", "cell_context", "tissue"),
-        )
-        assert spec.emitted_context_fields() == ("dataset_id", "cell_context", "tissue")
-
-    def test_default_fields(self):
-        spec = CorpusEmissionSpec(corpus_id="c")
-        # Should have the Phase 1 contract defaults
-        assert "perturbation_label" in spec.perturbation_fields
-        assert "dataset_id" in spec.context_fields
-
 
 # ---------------------------------------------------------------------------
 # HVG ranking parquet content tests
@@ -211,13 +145,13 @@ class TestMaterializationManifestHVGRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# update_corpus_index with emission spec path
+# update_corpus_index global metadata
 # ---------------------------------------------------------------------------
 
 
-class TestUpdateCorpusIndexWithEmissionSpec:
-    def test_new_corpus_writes_global_metadata_with_emission_spec_path(self, tmp_path: Path):
-        """Creating a new corpus index writes global-metadata.yaml with emission_spec_path."""
+class TestUpdateCorpusIndexGlobalMetadata:
+    def test_new_corpus_writes_global_metadata(self, tmp_path: Path):
+        """Creating a new corpus index writes global-metadata.yaml."""
         corpus_index = tmp_path / "corpus-index.yaml"
         dataset_record = DatasetJoinRecord(
             dataset_id="ds1",
@@ -230,7 +164,6 @@ class TestUpdateCorpusIndexWithEmissionSpec:
         update_corpus_index(
             corpus_index_path=corpus_index,
             new_dataset_record=dataset_record,
-            emission_spec_path="corpus-emission-spec.yaml",
             backend="lance",
             topology="aggregate",
         )
@@ -240,7 +173,8 @@ class TestUpdateCorpusIndexWithEmissionSpec:
         import yaml
 
         meta = yaml.safe_load(global_meta_path.read_text())
-        assert meta["emission_spec_path"] == "corpus-emission-spec.yaml"
+        assert meta["backend"] == "lance"
+        assert meta["topology"] == "aggregate"
 
 
 # ---------------------------------------------------------------------------

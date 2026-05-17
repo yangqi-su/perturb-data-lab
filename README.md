@@ -27,9 +27,7 @@ perturb-data-lab/
 │   └── perturb_data_lab/
 │       ├── contracts.py
 │       ├── inspectors/
-│       ├── materializers/
-│       │   ├── tokenizer.py      # corpus-level JSON tokenizer
-│       │   └── emission_spec.py # corpus-level emission spec
+│       ├── materializers/         # corpus materialization writers and manifests
 │       ├── loaders/
 │       │   ├── corpus_loader.py  # load_corpus(), Corpus, sampler/loader API
 │       │   ├── loaders.py        # datasets, samplers, collate helpers
@@ -41,9 +39,9 @@ perturb-data-lab/
 
 ## Current outputs
 
-- `src/perturb_data_lab/cli.py`: public `inspect`, `materialize`, `draft-schema`, `canonicalize`, `backfill-hvg`, `corpus-validate`, and `corpus-gc` entrypoints
+- `src/perturb_data_lab/cli.py`: public `inspect`, `materialize`, `draft-schema`, `canonicalize`, `recalc-hvg`, `corpus-validate`, and `corpus-gc` entrypoints
 - `src/perturb_data_lab/inspectors/`: inspection models, count-source audits, recovery classification, and review-bundle generation
-- `src/perturb_data_lab/materializers/`: create/append corpus writers, aggregate/federated backends, manifests, and emission-spec helpers
+- `src/perturb_data_lab/materializers/`: create/append corpus writers, aggregate/federated backends, and manifests
 - `src/perturb_data_lab/canonical/`: draft/final schema application and canonical obs/var generation
 - `src/perturb_data_lab/loaders/corpus_loader.py`: `load_corpus()` and `Corpus` for unified runtime access
 - `src/perturb_data_lab/pp/`: backend-agnostic streamed per-dataset stats, HVG, IncrementalPCA, and Welch DE helpers

@@ -1,12 +1,9 @@
 kind: global-metadata
-contract_version: 0.2.0
+contract_version: 0.3.0
 corpus_id: perturb-data-lab-v0
-feature_registry_id: ""  # deprecated: replaced by tokenizer_path in contract 0.2.0
 missing_value_literal: NA
 raw_field_policy: preserve-unchanged
-tokenizer_path: tokenizer.json
-emission_spec_path: corpus-emission-spec.yaml
+backend: lance
+topology: aggregate
 notes:
-  - tokenizer.json provides the authoritative append-safe token mapping
-  - corpus-emission-spec.yaml controls which fields loaders emit at runtime
   - each dataset metadata directory now includes a canonical hvg.parquet ranking artifact
