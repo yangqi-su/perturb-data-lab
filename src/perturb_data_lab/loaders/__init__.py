@@ -24,6 +24,9 @@ from .expression import ExpressionBatch
 from .feature_registry import (
     FeatureRegistry,
 )
+from .gene_token_mapper import (
+    GeneTokenMapper,
+)
 from .corpus_loader import (
     Corpus,
     load_corpus,
@@ -65,6 +68,7 @@ __all__ = [
     "collate_expression_batch",
     # Phase 2 — Feature Registry
     "FeatureRegistry",
+    "GeneTokenMapper",
     # Phase 3 — sparse batch processing
     "SparseBatchProcessor",
     # Phase 4 — pertTF-local adapters

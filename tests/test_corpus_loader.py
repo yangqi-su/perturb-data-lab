@@ -16,6 +16,7 @@ from perturb_data_lab.loaders import (
     CorpusRandomBatchSampler,
     ContextBatchSampler,
     ExpressionBatchDataset,
+    GeneTokenMapper,
     build_loader,
     collate_expression_batch,
 )
@@ -300,6 +301,39 @@ def test_build_loader_attaches_metadata_from_metadata_index(tmp_path: Path) -> N
     np.testing.assert_allclose(batch["size_factor"].cpu().numpy(), expected["size_factor"])
     assert batch["meta_columns"]["perturb_label"] == expected["perturb_label"]
     np.testing.assert_allclose(batch["meta_columns"]["size_factor"], expected["size_factor"])
+
+
+def test_build_loader_can_exclude_genes_missing_from_model_tokenizer(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    corpus = load_corpus(tmp_path)
+    tokenizer_stoi = {
+        "<pad>": 0,
+        "<cls>": 1,
+        "<unk>": 2,
+        **{f"GENE{idx:05d}": 100 + idx for idx in range(4)},
+    }
+    mapper = GeneTokenMapper.from_tokenizer_stoi(corpus.feature_registry, tokenizer_stoi)
+
+    batch = next(
+        build_loader(
+            corpus,
+            batch_size=3,
+            seq_len=4,
+            seed=2,
+            device="cpu",
+            gene_token_mapper=mapper,
+            missing_token_policy="exclude",
+        )
+    )
+
+    assert "gene_ids" in batch
+    assert "gene_token_mask" in batch
+    assert torch.all(batch["sampled_gene_ids"] < 4)
+    assert torch.all(batch["gene_token_mask"])
+    torch.testing.assert_close(
+        batch["gene_ids"],
+        batch["sampled_gene_ids"] + 100,
+    )
 
 
 def test_build_loader_respects_context_sampler_and_row_indices(tmp_path: Path) -> None:

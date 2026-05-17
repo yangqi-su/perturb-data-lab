@@ -284,6 +284,29 @@ def test_corpus_adapter_emits_simple_vocab_compatible_mapping(tmp_path: Path) ->
     assert list(stoi.values()) == list(range(len(stoi)))
 
 
+def test_corpus_adapter_accepts_custom_gene_tokenizer(tmp_path: Path) -> None:
+    corpus = load_corpus(str(_build_small_corpus(tmp_path)))
+    adapter = PertTFCorpusAdapter.from_corpus(
+        corpus,
+        tokenizer_stoi={
+            "<pad>": 0,
+            "<cls>": 1,
+            "<unk>": 2,
+            "<eos>": 3,
+            "GENE_A": 101,
+            "GENE_C": 303,
+        },
+    )
+
+    np.testing.assert_array_equal(adapter.gene_token_ids, [0, 101, 303])
+    np.testing.assert_array_equal(
+        adapter.gene_token_mapper.tokenizable_by_global_id,
+        [False, True, True],
+    )
+    assert adapter.token_id_for_global_id(1) == 101
+    assert adapter.global_id_for_token_id(101) == 1
+
+
 def test_corpus_adapter_builds_deterministic_maps_and_control_slots(
     tmp_path: Path,
 ) -> None:

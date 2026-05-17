@@ -417,6 +417,45 @@ def test_paired_batch_builder_accepts_precomputed_sampled_gene_ids_and_preserves
     ]
 
 
+def test_paired_batch_builder_uses_custom_tokenizer_and_excludes_missing_genes(
+    tmp_path: Path,
+) -> None:
+    config = PertTFAdapterConfig(control_labels=("WT",), mask_ratio=0.0)
+    corpus = load_corpus(str(_build_small_pair_corpus(tmp_path)))
+    adapter = PertTFCorpusAdapter.from_corpus(
+        corpus,
+        config,
+        tokenizer_stoi={
+            "<pad>": 0,
+            "<cls>": 1,
+            "<unk>": 2,
+            "<eos>": 3,
+            "GENE_A": 17,
+            "GENE_B": 23,
+        },
+    )
+    pair_batch = _build_pair_sampler(
+        corpus,
+        batch_size=1,
+        config=config,
+        seed=3,
+    ).pair_source_positions([0], seed=13)
+    builder = PertTFPairedBatchBuilder(
+        corpus,
+        seq_len=2,
+        config=config,
+        adapter=adapter,
+        missing_token_policy="exclude",
+    )
+
+    batch = builder.build_paired_batch(pair_batch, seed=17, sampling_mode="uniform")
+
+    assert batch["gene_ids"].shape == (1, 3)
+    assert batch["gene_ids"][0, 0].item() == 1
+    assert set(batch["gene_ids"][0, 1:].tolist()).issubset({17, 23})
+    assert 0 not in batch["gene_ids"][0, 1:].tolist()
+
+
 def test_paired_batch_builder_emits_union_full_expression_masks_for_mixed_datasets(
     tmp_path: Path,
 ) -> None:

@@ -56,6 +56,7 @@ class SparseBatchProcessor:
         *,
         pad_token_id: int = DEFAULT_PAD_TOKEN_ID,
         invalid_count_value: float = DEFAULT_INVALID_COUNT_VALUE,
+        sampling_gene_mask: np.ndarray | None = None,
     ):
         if seq_len <= 0:
             raise ValueError("seq_len must be positive")
@@ -72,6 +73,7 @@ class SparseBatchProcessor:
         self._hvg_rank_np = registry.hvg_rank_matrix
         self._max_local_vocab = registry.max_local_vocab
         self._global_vocab = registry.global_vocab_size
+        self._sampling_gene_mask_np = self._normalize_sampling_gene_mask(sampling_gene_mask)
 
         # Per-instance device tensor caches (fork-safe:
         # class-level CUDA tensor dicts would leak across forked
@@ -110,7 +112,30 @@ class SparseBatchProcessor:
                     self._hvg_rank_np, dtype=torch.int32, device=device
                 ),
             }
+            if self._sampling_gene_mask_np is not None:
+                self._device_caches[key]["sampling_gene_mask"] = torch.as_tensor(
+                    self._sampling_gene_mask_np, dtype=torch.bool, device=device
+                )
         return self._device_caches[key]
+
+    def _normalize_sampling_gene_mask(self, mask: np.ndarray | None) -> np.ndarray | None:
+        if mask is None:
+            return None
+        normalized = np.asarray(mask, dtype=bool)
+        if normalized.shape != (self._global_vocab,):
+            raise ValueError("sampling_gene_mask must have one entry per global gene")
+        tokenizable_counts = (self._has_gene_np & normalized).sum(axis=1)
+        too_small = np.flatnonzero(tokenizable_counts < self._seq_len)
+        if too_small.size:
+            details = ", ".join(
+                f"dataset {int(ds_idx)} has {int(tokenizable_counts[ds_idx])} genes"
+                for ds_idx in too_small.tolist()
+            )
+            raise ValueError(
+                "sampling_gene_mask leaves fewer tokenizable genes than seq_len: "
+                f"{details}"
+            )
+        return normalized
 
     # ------------------------------------------------------------------
     # Weighted probability construction
@@ -131,6 +156,7 @@ class SparseBatchProcessor:
         has_gene_t: torch.Tensor | None = None,
         hvg_t: torch.Tensor | None = None,
         hvg_rank_t: torch.Tensor | None = None,
+        sampling_gene_mask_t: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Build per-cell probability tensors for weighted ``multinomial`` sampling.
 
@@ -138,9 +164,16 @@ class SparseBatchProcessor:
         """
         if sampling_mode == "uniform":
             # Uniform probabilities over each cell's dataset valid gene pool
-            if gene_prob_t is None:
-                raise ValueError("gene_prob_t required for uniform mode")
-            return gene_prob_t[dataset_indices]  # (bsz, global_vocab)
+            if sampling_gene_mask_t is None:
+                if gene_prob_t is None:
+                    raise ValueError("gene_prob_t required for uniform mode")
+                return gene_prob_t[dataset_indices]  # (bsz, global_vocab)
+            if has_gene_t is None:
+                raise ValueError("has_gene_t required for masked uniform mode")
+            valid_genes = has_gene_t[dataset_indices] & sampling_gene_mask_t.unsqueeze(0)
+            probs = valid_genes.float()
+            probs /= probs.sum(dim=1, keepdim=True)
+            return probs
 
         if sampling_mode == "expressed":
             # Expressed-biased: expressed genes get weight bonus
@@ -151,6 +184,9 @@ class SparseBatchProcessor:
 
             # Build (bsz, global_vocab) binary mask efficiently using scatter
             valid_positions = global_genes_sorted < self._global_vocab  # (bsz, max_nnz)
+            if sampling_gene_mask_t is not None:
+                safe_genes = global_genes_sorted.clamp(0, self._global_vocab - 1)
+                valid_positions &= sampling_gene_mask_t[safe_genes]
             n_valid = int(valid_positions.sum().item())
 
             if n_valid > 0:
@@ -165,9 +201,14 @@ class SparseBatchProcessor:
                 valid_rows = torch.empty(0, dtype=torch.long, device=device)
                 valid_cols = torch.empty(0, dtype=torch.long, device=device)
 
-            probs = torch.ones(
-                (bsz, self._global_vocab), dtype=torch.float32, device=device
-            )
+            if sampling_gene_mask_t is None:
+                probs = torch.ones(
+                    (bsz, self._global_vocab), dtype=torch.float32, device=device
+                )
+            else:
+                if has_gene_t is None:
+                    raise ValueError("has_gene_t required for masked expressed mode")
+                probs = (has_gene_t[dataset_indices] & sampling_gene_mask_t.unsqueeze(0)).float()
             # Expressed genes get expressed_weight bonus on top of base 1.0
             if n_valid > 0:
                 probs[valid_rows, valid_cols] += float(expressed_weight)
@@ -180,6 +221,8 @@ class SparseBatchProcessor:
                 raise ValueError("has_gene_t required for hvg mode")
 
             valid_genes = has_gene_t[dataset_indices]  # (bsz, global_vocab) bool
+            if sampling_gene_mask_t is not None:
+                valid_genes &= sampling_gene_mask_t.unsqueeze(0)
             if hvg_top_k is None:
                 if hvg_t is None:
                     raise ValueError("hvg_t required for default hvg mode")
@@ -278,6 +321,7 @@ class SparseBatchProcessor:
         has_gene_t = cached["has_gene"]
         hvg_t = cached["hvg_mask"]
         hvg_rank_t = cached["hvg_rank"]
+        sampling_gene_mask_t = cached.get("sampling_gene_mask")
 
         # ---- Move flat arrays to device ----
         flat_gene_indices = torch.as_tensor(
@@ -373,6 +417,7 @@ class SparseBatchProcessor:
                     has_gene_t=has_gene_t,
                     hvg_t=hvg_t,
                     hvg_rank_t=hvg_rank_t,
+                    sampling_gene_mask_t=sampling_gene_mask_t,
                 )
                 sampled_gids = torch.multinomial(
                     probs,
@@ -474,6 +519,7 @@ class SparseBatchProcessor:
                 has_gene_t=has_gene_t,
                 hvg_t=hvg_t,
                 hvg_rank_t=hvg_rank_t,
+                sampling_gene_mask_t=sampling_gene_mask_t,
             )
             sampled_gids = torch.multinomial(
                 probs,

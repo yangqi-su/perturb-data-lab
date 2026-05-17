@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..expression import ExpressionBatch
+from ..gene_token_mapper import GeneTokenMapper
 from ..index import _normalize_candidate_row_indices
 from ..sparse_batch import SparseBatchProcessor
 
@@ -329,6 +330,15 @@ def _build_dataloader_kwargs(
     return kwargs
 
 
+def _normalize_missing_token_policy(policy: str) -> str:
+    if not isinstance(policy, str):
+        raise TypeError("missing_token_policy must be a string")
+    normalized = policy.strip().lower().replace("-", "_")
+    if normalized not in {"exclude", "pad"}:
+        raise ValueError("missing_token_policy must be one of 'exclude' or 'pad'")
+    return normalized
+
+
 def build_loader(
     corpus: Any,
     *,
@@ -350,6 +360,8 @@ def build_loader(
     hvg_weight: float = 3.0,
     hvg_top_k: int | None = None,
     row_indices: Sequence[int] | np.ndarray | None = None,
+    gene_token_mapper: GeneTokenMapper | None = None,
+    missing_token_policy: str = "exclude",
     device: torch.device | str | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield processed sparse training batches from a loaded corpus.
@@ -364,6 +376,9 @@ def build_loader(
     resolved_batch_size = int(batch_size)
     if resolved_batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    resolved_missing_policy = _normalize_missing_token_policy(missing_token_policy)
+    if gene_token_mapper is not None:
+        gene_token_mapper.check_feature_registry(corpus.feature_registry)
 
     resolved_metadata_columns = _normalize_metadata_columns(corpus.metadata_index, metadata_columns)
     dataset_obj = ExpressionBatchDataset(corpus.expression_reader, total_rows=len(corpus.metadata_index))
@@ -390,7 +405,16 @@ def build_loader(
             backend=corpus.backend,
         ),
     )
-    pipeline = SparseBatchProcessor(corpus.feature_registry, seq_len=resolved_seq_len)
+    pipeline = SparseBatchProcessor(
+        corpus.feature_registry,
+        seq_len=resolved_seq_len,
+        sampling_gene_mask=(
+            gene_token_mapper.tokenizable_by_global_id
+            if gene_token_mapper is not None and resolved_missing_policy == "exclude"
+            and not bool(gene_token_mapper.tokenizable_by_global_id.all())
+            else None
+        ),
+    )
 
     def _iterator() -> Iterator[dict[str, Any]]:
         for expression_batch in data_loader:
@@ -407,6 +431,13 @@ def build_loader(
                 hvg_weight=hvg_weight,
                 hvg_top_k=hvg_top_k,
             )
+            if gene_token_mapper is not None:
+                gene_ids, gene_token_mask = gene_token_mapper.encode_global_ids(
+                    processed["sampled_gene_ids"],
+                    processed["valid_mask"],
+                )
+                processed["gene_ids"] = gene_ids
+                processed["gene_token_mask"] = gene_token_mask
             if resolved_metadata_columns:
                 processed["meta_columns"] = {
                     column: gathered[column]

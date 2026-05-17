@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 import polars as pl
@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..expression import ExpressionBatch
-from ..feature_registry import FeatureRegistry
+from ..gene_token_mapper import GeneTokenMapper
 from ..index import MetadataIndex, _normalize_candidate_row_indices
 from ..sparse_batch import SparseBatchProcessor
 
@@ -48,6 +48,15 @@ def _check_unique_strings(values: Sequence[Any], *, field_name: str) -> None:
         _check_nonempty_string(value, field_name=field_name)
     if len(set(values)) != len(values):
         raise ValueError(f"{field_name} must be unique")
+
+
+def _normalize_missing_token_policy(policy: str) -> str:
+    if not isinstance(policy, str):
+        raise TypeError("missing_token_policy must be a string")
+    normalized = policy.strip().lower().replace("-", "_")
+    if normalized not in {"exclude", "pad"}:
+        raise ValueError("missing_token_policy must be one of 'exclude' or 'pad'")
+    return normalized
 
 
 def _ordered_unique(labels: Iterable[str]) -> tuple[str, ...]:
@@ -369,48 +378,6 @@ def _take_prepared_column(
 ) -> np.ndarray:
     positions = _positions_for_global_rows(prepared_metadata, global_indices)
     return np.asarray(prepared_metadata.frame[column], dtype=dtype)[positions]
-
-
-def _build_vocab_fields(
-    feature_registry: FeatureRegistry,
-    *,
-    special_tokens: Sequence[str] = _DEFAULT_SPECIAL_TOKENS,
-) -> tuple[
-    tuple[str, ...],
-    tuple[str, ...],
-    tuple[str, ...],
-    dict[str, int],
-    int,
-    np.ndarray,
-]:
-    _check_unique_strings(special_tokens, field_name="special_tokens")
-    normalized_specials = tuple(special_tokens)
-    feature_ids = feature_registry.global_feature_ids
-    overlap = set(normalized_specials).intersection(feature_ids)
-    if overlap:
-        raise ValueError(
-            "feature IDs overlap reserved special tokens: "
-            f"{sorted(overlap)}"
-        )
-    tokens_in_order = normalized_specials + feature_ids
-    stoi = {
-        token: token_id
-        for token_id, token in enumerate(tokens_in_order)
-    }
-    special_token_offset = len(normalized_specials)
-    gene_token_ids = np.arange(
-        special_token_offset,
-        special_token_offset + len(feature_ids),
-        dtype=np.int64,
-    )
-    return (
-        normalized_specials,
-        feature_ids,
-        tokens_in_order,
-        stoi,
-        special_token_offset,
-        gene_token_ids,
-    )
 
 
 @dataclass(frozen=True)
@@ -830,6 +797,7 @@ class PertTFPairedBatchBuilder:
         config: PertTFAdapterConfig | None = None,
         adapter: "PertTFCorpusAdapter" | None = None,
         prepared_metadata: _PertTFPreparedMetadata | None = None,
+        missing_token_policy: str = "exclude",
         device: torch.device | str | None = "cpu",
     ) -> None:
         if seq_len <= 0:
@@ -840,10 +808,22 @@ class PertTFPairedBatchBuilder:
         self.config = resolved_adapter.config
         self.seq_len = int(seq_len)
         self.device = torch.device("cpu" if device is None else device)
-        self._pipeline = SparseBatchProcessor(corpus.feature_registry, seq_len=self.seq_len)
-        self._pad_token_id = int(self.adapter.stoi[self.config.pad_token])
-        self._cls_token_id = int(self.adapter.stoi[self.config.cls_token])
-        self._special_token_offset = self.adapter.special_token_offset
+        self.missing_token_policy = _normalize_missing_token_policy(missing_token_policy)
+        self._gene_token_mapper = self.adapter.gene_token_mapper
+        self._pipeline = SparseBatchProcessor(
+            corpus.feature_registry,
+            seq_len=self.seq_len,
+            sampling_gene_mask=(
+                self._gene_token_mapper.tokenizable_by_global_id
+                if self.missing_token_policy == "exclude"
+                and not bool(self._gene_token_mapper.tokenizable_by_global_id.all())
+                else None
+            ),
+        )
+        self._pad_token_id = int(self._gene_token_mapper.pad_token_id)
+        if self.config.append_cls and self._gene_token_mapper.cls_token_id is None:
+            raise ValueError("append_cls=True requires a cls token in the gene token mapper")
+        self._cls_token_id = self._gene_token_mapper.cls_token_id
         self._prepared_metadata = prepared_metadata or _prepare_perttf_metadata(
             corpus.metadata_index,
             config=self.config,
@@ -937,14 +917,17 @@ class PertTFPairedBatchBuilder:
                 "target reconstruction changed valid source-sampled gene IDs"
             )
 
-        gene_ids = self._to_token_ids(source_sampled_gene_ids, source_valid_mask)
+        gene_ids, source_token_valid_mask = self._to_token_ids(
+            source_sampled_gene_ids,
+            source_valid_mask,
+        )
         source_values = self._to_value_tensor(
             source_processed["sampled_counts"],
-            source_valid_mask,
+            source_token_valid_mask,
         )
         target_values_next = self._to_value_tensor(
             target_processed["sampled_counts"],
-            target_valid_mask,
+            target_valid_mask & source_token_valid_mask,
         )
 
         batch_size = int(source_processed["batch_size"])
@@ -1099,13 +1082,12 @@ class PertTFPairedBatchBuilder:
         self,
         sampled_gene_ids: torch.Tensor,
         valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        token_ids = torch.where(
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_ids, token_valid_mask = self._gene_token_mapper.encode_global_ids(
+            sampled_gene_ids.to(dtype=torch.long),
             valid_mask,
-            sampled_gene_ids.to(dtype=torch.long) + self._special_token_offset,
-            torch.full_like(sampled_gene_ids, self._pad_token_id, dtype=torch.long),
         )
-        return self._prepend_cls_gene_ids(token_ids)
+        return self._prepend_cls_gene_ids(token_ids), token_valid_mask
 
     def _to_value_tensor(
         self,
@@ -1128,7 +1110,7 @@ class PertTFPairedBatchBuilder:
             return gene_ids
         cls_column = torch.full(
             (gene_ids.shape[0], 1),
-            self._cls_token_id,
+            int(self._cls_token_id),
             dtype=torch.long,
             device=gene_ids.device,
         )
@@ -1157,7 +1139,7 @@ class PertTFPairedBatchBuilder:
 
     def _full_gene_ids(self, batch_size: int) -> torch.Tensor:
         full_gene_ids = torch.as_tensor(
-            self.adapter.gene_token_ids,
+            self._gene_token_mapper.global_to_token_id,
             dtype=torch.long,
             device=self.device,
         ).unsqueeze(0)
@@ -1182,8 +1164,9 @@ class PertTFPairedBatchBuilder:
 
         local_to_global = self.corpus.feature_registry.local_to_global_map
         dataset_has_gene = self.corpus.feature_registry.dataset_has_gene
+        tokenizable = self._gene_token_mapper.tokenizable_by_global_id
         full_mask = torch.as_tensor(
-            dataset_has_gene[dataset_indices],
+            dataset_has_gene[dataset_indices] & tokenizable,
             dtype=torch.bool,
             device=self.device,
         )
@@ -1276,6 +1259,7 @@ class PertTFCorpusAdapter:
     stoi: dict[str, int]
     special_token_offset: int
     gene_token_ids: np.ndarray
+    gene_token_mapper: GeneTokenMapper
     labels_by_name: dict[str, tuple[str, ...]]
     label_to_index_by_name: dict[str, dict[str, int]]
     control_label_ids: tuple[int, ...]
@@ -1287,19 +1271,32 @@ class PertTFCorpusAdapter:
         config: PertTFAdapterConfig | None = None,
         row_indices: Sequence[int] | np.ndarray | None = None,
         prepared_metadata: _PertTFPreparedMetadata | None = None,
+        tokenizer_stoi: Mapping[str, int] | None = None,
+        gene_token_mapper: GeneTokenMapper | None = None,
+        feature_id_to_token: Mapping[str, str] | None = None,
     ) -> "PertTFCorpusAdapter":
         resolved = config or PertTFAdapterConfig()
-        (
-            special_tokens,
-            feature_ids_by_global_id,
-            tokens_in_order,
-            stoi,
-            special_token_offset,
-            gene_token_ids,
-        ) = _build_vocab_fields(
-            corpus.feature_registry,
-            special_tokens=resolved.special_tokens,
-        )
+        if gene_token_mapper is not None and tokenizer_stoi is not None:
+            raise ValueError("pass either gene_token_mapper or tokenizer_stoi, not both")
+        if gene_token_mapper is None:
+            if tokenizer_stoi is None:
+                gene_token_mapper = GeneTokenMapper.from_feature_registry(
+                    corpus.feature_registry,
+                    special_tokens=resolved.special_tokens,
+                    pad_token=resolved.pad_token,
+                    cls_token=resolved.cls_token,
+                    unk_token=resolved.unk_token,
+                )
+            else:
+                gene_token_mapper = GeneTokenMapper.from_tokenizer_stoi(
+                    corpus.feature_registry,
+                    tokenizer_stoi,
+                    pad_token=resolved.pad_token,
+                    cls_token=resolved.cls_token,
+                    unk_token=resolved.unk_token,
+                    feature_id_to_token=feature_id_to_token,
+                )
+        gene_token_mapper.check_feature_registry(corpus.feature_registry)
         if prepared_metadata is None:
             prepared_metadata = _prepare_perttf_metadata(
                 corpus.metadata_index,
@@ -1318,12 +1315,13 @@ class PertTFCorpusAdapter:
         }
         return cls(
             config=resolved,
-            special_tokens=special_tokens,
-            feature_ids_by_global_id=feature_ids_by_global_id,
-            tokens_in_order=tokens_in_order,
-            stoi=stoi,
-            special_token_offset=special_token_offset,
-            gene_token_ids=gene_token_ids,
+            special_tokens=tuple(resolved.special_tokens),
+            feature_ids_by_global_id=gene_token_mapper.feature_ids_by_global_id,
+            tokens_in_order=gene_token_mapper.tokens_in_order,
+            stoi=dict(gene_token_mapper.stoi),
+            special_token_offset=len(resolved.special_tokens),
+            gene_token_ids=gene_token_mapper.global_to_token_id.copy(),
+            gene_token_mapper=gene_token_mapper,
             labels_by_name=labels_by_name,
             label_to_index_by_name=label_to_index_by_name,
             control_label_ids=prepared_metadata.control_label_ids,
@@ -1332,15 +1330,25 @@ class PertTFCorpusAdapter:
     def token_id_for_global_id(self, global_id: int) -> int:
         if global_id < 0 or global_id >= len(self.feature_ids_by_global_id):
             raise IndexError(f"global_id {global_id} out of range")
-        return self.special_token_offset + int(global_id)
+        return int(self.gene_token_mapper.global_to_token_id[int(global_id)])
 
     def global_id_for_token_id(self, token_id: int) -> int | None:
-        if token_id < self.special_token_offset:
+        special_ids = {
+            int(self.stoi[token])
+            for token in self.special_tokens
+            if token in self.stoi
+        }
+        if int(token_id) in special_ids:
             return None
-        global_id = int(token_id) - self.special_token_offset
-        if global_id >= len(self.feature_ids_by_global_id):
+        matches = np.flatnonzero(
+            (self.gene_token_mapper.global_to_token_id == int(token_id))
+            & self.gene_token_mapper.tokenizable_by_global_id
+        )
+        if matches.size == 0:
             raise IndexError(f"token_id {token_id} out of range")
-        return global_id
+        if matches.size > 1:
+            raise ValueError(f"token_id {token_id} maps to multiple global gene IDs")
+        return int(matches[0])
 
     def feature_id_for_token_id(self, token_id: int) -> str:
         global_id = self.global_id_for_token_id(token_id)
@@ -1375,6 +1383,7 @@ class PertTFCorpusAdapter:
         return {
             "genes": list(self.feature_ids_by_global_id),
             "gene_token_ids": self.gene_token_ids.copy(),
+            "tokenizable_by_global_id": self.gene_token_mapper.tokenizable_by_global_id.copy(),
             "simple_vocab_stoi": self.to_simple_vocab_stoi(),
             "labels_by_name": {
                 label_name: tuple(labels)
@@ -1409,6 +1418,7 @@ class PertTFPairedBatchLoader:
         expressed_weight: float = 3.0,
         hvg_weight: float = 3.0,
         hvg_top_k: int | None = None,
+        missing_token_policy: str = "exclude",
         num_workers: int = 0,
         multiprocessing_context: str | None = None,
         pin_memory: bool = False,
@@ -1455,6 +1465,7 @@ class PertTFPairedBatchLoader:
             config=resolved_config,
             adapter=resolved_adapter,
             prepared_metadata=prepared_metadata,
+            missing_token_policy=missing_token_policy,
             device=device,
         )
         self.adapter = self._builder.adapter
