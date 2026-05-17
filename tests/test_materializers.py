@@ -361,8 +361,8 @@ class TestManifestToJoinRecordRoute:
             assert record.join_mode == "append_routed"
             assert record.dataset_id == "ds_append"
 
-    def test_corpus_ledger_writes_append_routed_join_mode(self):
-        """Corpus ledger YAML and Parquet record append_routed for appended datasets."""
+    def test_corpus_index_writes_append_routed_join_mode(self):
+        """Corpus index records append_routed for appended datasets."""
         with tempfile.TemporaryDirectory() as tmpdir:
             idx_path = Path(tmpdir) / "corpus-index.yaml"
 
@@ -389,13 +389,7 @@ class TestManifestToJoinRecordRoute:
             assert updated.datasets[0].join_mode == "create_new"
             assert updated.datasets[1].join_mode == "append_routed"
 
-            # Verify Parquet ledger
-            import pyarrow.parquet as pq
-            ledger_path = Path(tmpdir) / "corpus-ledger.parquet"
-            assert ledger_path.exists()
-            table = pq.read_table(str(ledger_path))
-            join_modes = table.column("join_mode").to_pylist()
-            assert join_modes == ["create_new", "append_routed"]
+            assert [d.join_mode for d in updated.datasets] == ["create_new", "append_routed"]
 
 
 class TestStage2MaterializerConstructorApi:

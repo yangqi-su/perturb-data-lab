@@ -856,11 +856,10 @@ def _cmd_corpus_gc(args: argparse.Namespace) -> None:
         for rid in sorted(registered_ids):
             print(f"    - {rid}")
 
-    # Scan for dataset directories not in the ledger
+    # Scan for dataset directories not in the corpus index.
     orphaned: list[Path] = []
     known_metadata = {
-        "corpus-index.yaml", "corpus-ledger.parquet",
-        "global-metadata.yaml", "corpus-emission-spec.yaml",
+        "corpus-index.yaml", "global-metadata.yaml", "corpus-emission-spec.yaml",
     }
 
     for entry in sorted(corpus_root.iterdir()):

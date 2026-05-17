@@ -65,7 +65,6 @@ def _safe_serialize(val: Any) -> Any:
 from .models import (
     CellMetadataRecord,
     CorpusIndexDocument,
-    CorpusLedgerEntry,
     CountSourceSpec,
     DatasetJoinRecord,
     DatasetMetadataSummary,
@@ -145,7 +144,7 @@ class Stage2Materializer:
     corpus_index_path : str | None, default None
         Path to ``corpus-index.yaml`` for corpus registration. Required when
         ``register=True``. When provided, the corpus ledger
-        (``corpus-ledger.parquet``) is updated after materialization.
+        (``corpus-index.yaml``) is updated after materialization.
     corpus_id : str | None, default None
         Corpus identifier. Required when registering a new corpus; inferred from
         existing ledger for append operations.
@@ -427,8 +426,7 @@ class Stage2Materializer:
             manifest.write_yaml(manifest_path)
 
             # --- Phase 4: Corpus registration ---
-            # If register=True, register this dataset with the corpus ledger.
-            # This updates corpus-index.yaml and corpus-ledger.parquet.
+            # If register=True, register this dataset with corpus-index.yaml.
             if self.register:
                 from .models import CorpusRegistrationInfo
                 from .registration import register_materialization
@@ -445,9 +443,6 @@ class Stage2Materializer:
                     corpus_id=resolved_corpus_id,
                     is_create=is_create,
                     corpus_index_path=str(Path(self.corpus_index_path).resolve()),
-                    ledger_path=str(
-                        (Path(self.corpus_index_path).parent / "corpus-ledger.parquet").resolve()
-                    ),
                     dataset_index=join_record.dataset_index,
                     global_start=join_record.global_start,
                     global_end=join_record.global_end,
@@ -1258,98 +1253,4 @@ def update_corpus_index(
     )
     updated.write_yaml(corpus_index_path)
 
-    # Write Parquet corpus ledger (Stage 2 contract: Parquet primary)
-    # Rebuild the full ledger from the updated corpus index to ensure consistency.
-    # This is safe because we always load the existing YAML index on append.
-    ledger_path = corpus_index_path.parent / "corpus-ledger.parquet"
-    # Resolve topology: use explicit parameter, infer from backend, or default to federated
-    effective_backend = backend or updated.global_metadata.get("backend")
-    effective_topology = topology or updated.global_metadata.get("topology") or (
-        "aggregate" if effective_backend == "lance" else "federated"
-    )
-    _write_corpus_ledger_parquet(ledger_path, updated, effective_backend, effective_topology)
-
     return updated
-
-
-def _backfill_feature_count(manifest_path: Path) -> int:
-    """Read a materialization manifest and return the feature_count.
-
-    Parameters
-    ----------
-    manifest_path : Path
-        Path to a materialization-manifest.yaml.
-
-    Returns
-    -------
-    int
-        The feature_count from the manifest, or 0 if unreadable.
-    """
-    try:
-        m = MaterializationManifest.from_yaml_file(manifest_path)
-        return m.feature_count
-    except Exception:
-        return 0
-
-
-def _write_corpus_ledger_parquet(
-    ledger_path: Path,
-    corpus: CorpusIndexDocument,
-    backend: str | None,
-    topology: str,
-) -> None:
-    """Write or overwrite the Parquet corpus ledger from the corpus index.
-
-    The Parquet ledger is the primary machine-readable artifact for Stage 2
-    corpus tracking. The YAML corpus-index.yaml remains for human review.
-
-    feature_count is back-filled from each dataset's materialization-manifest.yaml
-    when the manifest path is resolvable from the corpus root.
-    """
-    import datetime
-
-    corpus_root = ledger_path.parent
-
-    entries = []
-    for d in corpus.datasets:
-        # Back-fill feature_count from the per-dataset manifest
-        feature_count = 0
-        manifest_path = corpus_root / d.manifest_path
-        if manifest_path.exists():
-            feature_count = _backfill_feature_count(manifest_path)
-
-        entry = CorpusLedgerEntry(
-            corpus_id=corpus.corpus_id,
-            dataset_id=d.dataset_id,
-            dataset_index=d.dataset_index,
-            join_mode=d.join_mode,
-            manifest_path=d.manifest_path,
-            backend=backend or str(corpus.global_metadata.get("backend") or "lance"),
-            topology=topology,
-            cell_count=d.cell_count,
-            feature_count=feature_count,
-            global_start=d.global_start,
-            global_end=d.global_end,
-            created_at=datetime.datetime.utcnow().isoformat(),
-        )
-        entry.validate()
-        entries.append(entry.to_dict())
-
-    if not entries:
-        return
-
-    table = pa.table({
-        "corpus_id": pa.array([e["corpus_id"] for e in entries], type=pa.string()),
-        "dataset_id": pa.array([e["dataset_id"] for e in entries], type=pa.string()),
-        "dataset_index": pa.array([e["dataset_index"] for e in entries], type=pa.int32()),
-        "join_mode": pa.array([e["join_mode"] for e in entries], type=pa.string()),
-        "manifest_path": pa.array([e["manifest_path"] for e in entries], type=pa.string()),
-        "backend": pa.array([e["backend"] for e in entries], type=pa.string()),
-        "topology": pa.array([e["topology"] for e in entries], type=pa.string()),
-        "cell_count": pa.array([e["cell_count"] for e in entries], type=pa.int64()),
-        "feature_count": pa.array([e["feature_count"] for e in entries], type=pa.int64()),
-        "global_start": pa.array([e["global_start"] for e in entries], type=pa.int64()),
-        "global_end": pa.array([e["global_end"] for e in entries], type=pa.int64()),
-        "created_at": pa.array([e["created_at"] for e in entries], type=pa.string()),
-    })
-    pq.write_table(table, str(ledger_path))

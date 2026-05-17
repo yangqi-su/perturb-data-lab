@@ -1,34 +1,16 @@
 """Corpus registration flow for Stage 2 materialization.
 
-This module provides the registration layer that connects Stage2Materializer
-output to the corpus ledger. It handles the create-vs-append decision,
-dataset index assignment, global range computation, and ledger persistence.
-
-The registration flow is:
-1. Stage2Materializer.materialize() produces a MaterializationManifest
-2. register_materialization() converts the manifest to a DatasetJoinRecord
-   and registers it in the corpus ledger via update_corpus_index
-3. The Parquet corpus-ledger.parquet is updated or created as the
-   authoritative machine-readable corpus index
-
-Design principles:
-- Registration is explicit and routing-oriented, not schema-dependent
-- The ledger is append-only: existing entries are never modified
-- create_new and append_routed are the two join modes
-- feature_count is back-filled from per-dataset manifests when writing the ledger
+This module connects a per-dataset materialization manifest to the corpus-level
+``corpus-index.yaml`` used by downstream loaders. It handles create-vs-append,
+dataset index assignment, and global row range computation.
 """
 
 from __future__ import annotations
 
-import datetime
 from pathlib import Path
-from typing import Any
-
-import pyarrow.parquet as pq
 
 from .core import update_corpus_index
 from .models import (
-    CorpusLedgerEntry,
     DatasetJoinRecord,
     GlobalMetadataDocument,
     MaterializationManifest,
@@ -46,7 +28,7 @@ def manifest_to_join_record(
     manifest : MaterializationManifest
         The manifest produced by Stage2Materializer.materialize().
     corpus_root : Path
-        The root directory of the corpus (where corpus-ledger.parquet lives).
+        The root directory of the corpus.
 
     Returns
     -------
@@ -87,12 +69,12 @@ def register_materialization(
     backend: str | None = None,
     topology: str | None = None,
 ) -> tuple[DatasetJoinRecord, str, bool]:
-    """Register a Stage2Materializer output to the corpus ledger.
+    """Register a Stage2Materializer output to the corpus index.
 
     This is the primary registration entry point for Stage 2. It:
-    1. Determines whether the corpus exists (ledger present)
+    1. Determines whether the corpus index exists
     2. Converts the manifest to a DatasetJoinRecord
-    3. Calls update_corpus_index to update the YAML and Parquet ledger
+    3. Calls update_corpus_index to update corpus-index.yaml
     4. Returns the join record, corpus_id, and whether this was a create (True) or append (False)
 
     Parameters
@@ -101,7 +83,7 @@ def register_materialization(
         The filled manifest from Stage2Materializer.materialize().
     corpus_index_path : Path
         Path to corpus-index.yaml (or where it will be written for new corpora).
-        The Parquet ledger is written alongside at corpus_index_path.parent.
+        Path to corpus-index.yaml.
     corpus_id : str | None
         Corpus identifier. Required for new corpus creation; inferred from
         existing ledger for append operations.
@@ -128,7 +110,6 @@ def register_materialization(
     Notes
     -----
     - The manifest's outputs are verified to exist before registration
-    - The ledger is append-only; existing entries are never modified
     - For aggregate topology, global_start/global_end are computed by
       update_corpus_index from the running cell count total
     """
@@ -137,11 +118,9 @@ def register_materialization(
     # Verify key manifest outputs exist before registering
     _verify_manifest_outputs(manifest)
 
-    # Determine if corpus exists by checking for existing ledger or YAML
+    # Determine if corpus exists by checking the corpus index.
     yaml_exists = corpus_index_path.exists()
-    ledger_path = corpus_root / "corpus-ledger.parquet"
-    ledger_exists = ledger_path.exists()
-    is_create = not yaml_exists and not ledger_exists
+    is_create = not yaml_exists
 
     # Convert manifest to join record
     join_record = manifest_to_join_record(manifest, corpus_root)
@@ -185,17 +164,13 @@ def register_materialization(
             if topology is None:
                 topology = existing_meta.topology
 
-        # Read corpus_id from existing ledger if not provided
+        # Read corpus_id from the existing corpus index if not provided.
         if corpus_id is None:
-            if ledger_exists:
-                corpus_id = _read_corpus_id_from_ledger(ledger_path)
-            else:
-                # Fall back to yaml-based corpus index
-                from .models import CorpusIndexDocument
-                existing_corpus = CorpusIndexDocument.from_yaml_file(corpus_index_path)
-                corpus_id = existing_corpus.corpus_id
+            from .models import CorpusIndexDocument
+            existing_corpus = CorpusIndexDocument.from_yaml_file(corpus_index_path)
+            corpus_id = existing_corpus.corpus_id
 
-    # Call update_corpus_index which writes both YAML and Parquet ledger
+    # Call update_corpus_index which writes corpus-index.yaml.
     updated_corpus = update_corpus_index(
         corpus_index_path=corpus_index_path,
         new_dataset_record=join_record,
@@ -269,73 +244,8 @@ def _verify_manifest_outputs(manifest: MaterializationManifest) -> None:
         )
 
 
-def _read_corpus_id_from_ledger(ledger_path: Path) -> str:
-    """Read the corpus_id from an existing Parquet ledger.
-
-    Parameters
-    ----------
-    ledger_path : Path
-        Path to corpus-ledger.parquet.
-
-    Returns
-    -------
-    str
-        The corpus_id from the first row of the ledger.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the ledger does not exist.
-    ValueError
-        If the ledger is empty.
-    """
-    table = pq.read_table(str(ledger_path))
-    corpus_ids = table.column("corpus_id").to_pylist()
-    if not corpus_ids:
-        raise ValueError(f"corpus ledger at {ledger_path} is empty")
-    return str(corpus_ids[0])
-
-
-def read_corpus_ledger(
-    ledger_path: Path,
-) -> list[CorpusLedgerEntry]:
-    """Read the Parquet corpus ledger and return a list of ledger entries.
-
-    Parameters
-    ----------
-    ledger_path : Path
-        Path to corpus-ledger.parquet.
-
-    Returns
-    -------
-    list[CorpusLedgerEntry]
-        All entries in the corpus ledger, in order of dataset_index.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the ledger does not exist.
-
-    Notes
-    -----
-    The Parquet ledger is the authoritative machine-readable corpus index.
-    It is append-only: entries are never modified after being written.
-    """
-    if not ledger_path.exists():
-        raise FileNotFoundError(
-            f"corpus ledger not found: {ledger_path}; "
-            "use register_materialization() to create a new corpus"
-        )
-
-    table = pq.read_table(str(ledger_path))
-    entries = []
-    for row in table.to_pylist():
-        entries.append(CorpusLedgerEntry.from_dict(row))
-    return entries
-
-
 def corpus_exists(corpus_root: Path) -> bool:
-    """Check whether a corpus ledger exists at the given corpus root.
+    """Check whether a corpus index exists at the given corpus root.
 
     Parameters
     ----------
@@ -345,50 +255,6 @@ def corpus_exists(corpus_root: Path) -> bool:
     Returns
     -------
     bool
-        True if corpus-ledger.parquet OR corpus-index.yaml exists at corpus_root.
+        True if corpus-index.yaml exists at corpus_root.
     """
-    return (corpus_root / "corpus-ledger.parquet").exists() or (
-        corpus_root / "corpus-index.yaml"
-    ).exists()
-
-
-def get_corpus_summary(ledger_path: Path) -> dict[str, Any]:
-    """Return a summary of the corpus from the ledger.
-
-    Parameters
-    ----------
-    ledger_path : Path
-        Path to corpus-ledger.parquet.
-
-    Returns
-    -------
-    dict with keys:
-        - corpus_id: str
-        - total_datasets: int
-        - total_cells: int
-        - backend: str
-        - topology: str
-        - entries: list of dict representations
-
-    Raises
-    ------
-    FileNotFoundError
-        If the ledger does not exist.
-    ValueError
-        If the ledger is empty.
-    """
-    entries = read_corpus_ledger(ledger_path)
-    if not entries:
-        raise ValueError(f"corpus ledger at {ledger_path} is empty")
-
-    first = entries[0]
-    total_cells = sum(e.cell_count for e in entries)
-
-    return {
-        "corpus_id": first.corpus_id,
-        "total_datasets": len(entries),
-        "total_cells": total_cells,
-        "backend": first.backend,
-        "topology": first.topology,
-        "entries": [e.to_dict() for e in entries],
-    }
+    return (corpus_root / "corpus-index.yaml").exists()
