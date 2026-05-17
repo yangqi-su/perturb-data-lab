@@ -10,11 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
-from perturb_data_lab.contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
+from perturb_data_lab.contracts import CONTRACT_VERSION
 from perturb_data_lab.materializers import (
     update_corpus_index,
 )
@@ -25,7 +23,6 @@ from perturb_data_lab.materializers.chunk_translation import (
 from perturb_data_lab.materializers.models import (
     CountSourceSpec,
     DatasetJoinRecord,
-    GlobalMetadataDocument,
     MaterializationManifest,
     OutputRoots,
     ProvenanceSpec,
@@ -80,24 +77,15 @@ class TestHVGRankingParquet:
         assert frame["hvg_rank"].tolist() == [1, 2, 3]
         assert frame["selected_at_default_n_hvg"].tolist() == [True, True, False]
 
-    def test_stage2_materializer_writes_hvg_parquet(self, tmp_path: Path):
-        from perturb_data_lab.materializers import Stage2Materializer
+    def test_hvg_writer_writes_hvg_parquet(self, tmp_path: Path):
+        from perturb_data_lab.materializers.metadata_writers import write_hvg_ranking_parquet
 
-        materializer = Stage2Materializer(
-            source_path="/fake/source.h5ad",
-            review_bundle_path="/fake/dataset-summary.yaml",
-            output_roots=OutputRoots(
-                metadata_root=str(tmp_path / "meta"),
-                matrix_root=str(tmp_path / "matrix"),
-            ),
-            dataset_id="syn-ds",
-            n_hvg=2,
-        )
-        path = materializer._write_hvg_ranking_parquet(
+        path = write_hvg_ranking_parquet(
             sum_log1p=np.array([6.0, 2.0, 5.0], dtype=np.float64),
             sum_log1p_sq=np.array([12.0, 2.5, 9.0], dtype=np.float64),
             n_cells_total=4,
             feature_ids=("g0", "g1", "g2"),
+            n_hvg=2,
             meta_root=tmp_path / "meta",
         )
         loaded = pq.read_table(path).to_pandas()

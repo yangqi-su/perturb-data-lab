@@ -1,4 +1,4 @@
-"""Phase 2 tests for unified materialize CLI and corpus-gc command."""
+"""Tests for the top-level CLI."""
 
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ class TestParserConstruction:
             "--mode", "create",
             "--source", "/data/test.h5ad",
             "--dataset-id", "ds1",
-            "--review-bundle", "/data/summary.yaml",
+            "--inspection-summary", "/data/summary.yaml",
             "--output-corpus", "/corpus",
             "--backend", "zarr",
         ])
@@ -71,7 +71,7 @@ class TestParserConstruction:
         assert ns.mode == "create"
         assert ns.source == "/data/test.h5ad"
         assert ns.dataset_id == "ds1"
-        assert ns.review_bundle == "/data/summary.yaml"
+        assert ns.inspection_summary == "/data/summary.yaml"
         assert ns.output_corpus == "/corpus"
         assert ns.backend == "zarr"
         assert ns.topology is None
@@ -115,7 +115,7 @@ class TestParserConstruction:
             "materialize",
             "--mode", "create",
             "--input-dir", "/data/h5ad/",
-            "--review-bundle-dir", "/data/reviews/",
+            "--inspection-summary-dir", "/data/reviews/",
             "--output-corpus", "/corpus",
             "--backend", "zarr",
             "--dry-run",
@@ -123,7 +123,7 @@ class TestParserConstruction:
         assert ns.command == "materialize"
         assert ns.mode == "create"
         assert ns.input_dir == "/data/h5ad/"
-        assert ns.review_bundle_dir == "/data/reviews/"
+        assert ns.inspection_summary_dir == "/data/reviews/"
         assert ns.dry_run is True
 
     def test_materialize_parses_ambiguous_input(self):
@@ -136,7 +136,7 @@ class TestParserConstruction:
             "--source", "/data/test.h5ad",
             "--input-list", "/data/list.csv",
             "--dataset-id", "ds1",
-            "--review-bundle", "/data/summary.yaml",
+            "--inspection-summary", "/data/summary.yaml",
             "--output-corpus", "/corpus",
             "--backend", "zarr",
         ])
@@ -151,7 +151,7 @@ class TestParserConstruction:
             "--mode", "create",
             "--source", "/data/test.h5ad",
             "--dataset-id", "ds1",
-            "--review-bundle", "/data/summary.yaml",
+            "--inspection-summary", "/data/summary.yaml",
             "--output-corpus", "/corpus",
             "--backend", "zarr",
         ])
@@ -174,7 +174,7 @@ class TestParserConstruction:
                 "--mode", "create",
                 "--source", "/data/test.h5ad",
                 "--dataset-id", "ds1",
-                "--review-bundle", "/data/summary.yaml",
+                "--inspection-summary", "/data/summary.yaml",
                 "--output-corpus", "/corpus",
                 "--backend", "arrow-parquet",
             ])
@@ -213,7 +213,7 @@ class TestParserConstruction:
             parser.parse_args(["unknown-cmd"])
 
     def test_removed_subcommands_not_present(self):
-        """Verify stage2-materialize, corpus-create, corpus-append are gone."""
+        """Verify legacy materialize entry points are gone."""
         parser = build_parser()
         choices = parser._subparsers._group_actions[0].choices
         assert "stage2-materialize" not in choices
@@ -257,17 +257,17 @@ class TestMaterializeDatasetRouting:
 
                 return _Manifest()
 
-        monkeypatch.setattr(materializers_mod, "Stage2Materializer", _DummyMaterializer)
+        monkeypatch.setattr(materializers_mod, "DatasetMaterializer", _DummyMaterializer)
 
         ds = _DatasetInput(
             source=str(tmp_path / "dummy.h5ad"),
             dataset_id="dummy_00",
-            review_bundle=str(tmp_path / "dummy-summary.yaml"),
+            inspection_summary=str(tmp_path / "dummy-summary.yaml"),
         )
         args = argparse.Namespace(
             backend="lance",
             topology="aggregate",
-            rerun_stage1=False,
+            rerun_inspection=False,
             n_hvg=2000,
             corpus_id="test-corpus",
         )
@@ -314,17 +314,17 @@ class TestMaterializeDatasetRouting:
 
                 return _Manifest()
 
-        monkeypatch.setattr(materializers_mod, "Stage2Materializer", _DummyMaterializer)
+        monkeypatch.setattr(materializers_mod, "DatasetMaterializer", _DummyMaterializer)
 
         ds = _DatasetInput(
             source=str(tmp_path / "dummy.h5ad"),
             dataset_id="dummy_00",
-            review_bundle=str(tmp_path / "dummy-summary.yaml"),
+            inspection_summary=str(tmp_path / "dummy-summary.yaml"),
         )
         args = argparse.Namespace(
             backend="lance",
             topology="federated",
-            rerun_stage1=False,
+            rerun_inspection=False,
             n_hvg=2000,
             corpus_id="test-corpus",
         )
@@ -364,7 +364,7 @@ class TestParseInputListCsv:
     def test_parses_basic_csv(self, tmp_path: Path):
         csv_path = tmp_path / "datasets.csv"
         csv_path.write_text(
-            "source,dataset_id,review_bundle\n"
+            "source,dataset_id,inspection_summary\n"
             "/data/ds1.h5ad,ds1,/reviews/ds1-summary.yaml\n"
             "/data/ds2.h5ad,ds2,/reviews/ds2-summary.yaml\n"
         )
@@ -381,14 +381,14 @@ class TestParseInputListCsv:
 
     def test_raises_on_empty_csv(self, tmp_path: Path):
         csv_path = tmp_path / "empty.csv"
-        csv_path.write_text("source,dataset_id,review_bundle\n")
+        csv_path.write_text("source,dataset_id,inspection_summary\n")
         with pytest.raises(ValueError, match="no dataset rows"):
             _parse_input_list_csv(csv_path)
 
     def test_strips_whitespace(self, tmp_path: Path):
         csv_path = tmp_path / "datasets.csv"
         csv_path.write_text(
-            "source,dataset_id,review_bundle\n"
+            "source,dataset_id,inspection_summary\n"
             " /data/ds1.h5ad , ds1 , /reviews/ds1-summary.yaml \n"
         )
         inputs = _parse_input_list_csv(csv_path)
@@ -400,11 +400,11 @@ class TestScanInputDir:
     """Test _scan_input_dir function."""
 
     def test_scans_h5ad_files(self, tmp_path: Path):
-        # Create h5ad files and review bundles
+        # Create h5ad files and inspection summaries
         (tmp_path / "ds_a.h5ad").touch()
         (tmp_path / "ds_b.h5ad").touch()
         (tmp_path / "ds_c.txt").touch()  # should be ignored
-        # Review bundles
+        # Inspection summaries
         (tmp_path / "ds_a-summary.yaml").write_text("kind: review")
         (tmp_path / "ds_b-summary.yaml").write_text("kind: review")
 
@@ -412,16 +412,16 @@ class TestScanInputDir:
         assert len(inputs) == 2
         assert {d.dataset_id for d in inputs} == {"ds_a", "ds_b"}
 
-    def test_raises_when_review_bundle_missing(self, tmp_path: Path):
+    def test_raises_when_inspection_summary_missing(self, tmp_path: Path):
         (tmp_path / "ds_a.h5ad").touch()
-        with pytest.raises(FileNotFoundError, match="Review bundle not found"):
+        with pytest.raises(FileNotFoundError, match="Inspection summary not found"):
             _scan_input_dir(tmp_path)
 
     def test_raises_on_empty_dir(self, tmp_path: Path):
         with pytest.raises(FileNotFoundError, match="No .h5ad files"):
             _scan_input_dir(tmp_path)
 
-    def test_uses_alternate_review_bundle_dir(self, tmp_path: Path):
+    def test_uses_alternate_inspection_summary_dir(self, tmp_path: Path):
         h5ad_dir = tmp_path / "h5ad"
         review_dir = tmp_path / "reviews"
         h5ad_dir.mkdir()
@@ -429,10 +429,10 @@ class TestScanInputDir:
         (h5ad_dir / "ds_a.h5ad").touch()
         (review_dir / "ds_a-summary.yaml").write_text("kind: review")
 
-        inputs = _scan_input_dir(h5ad_dir, review_bundle_dir=review_dir)
+        inputs = _scan_input_dir(h5ad_dir, inspection_summary_dir=review_dir)
         assert len(inputs) == 1
         assert inputs[0].dataset_id == "ds_a"
-        assert inputs[0].review_bundle == str(review_dir / "ds_a-summary.yaml")
+        assert inputs[0].inspection_summary == str(review_dir / "ds_a-summary.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +446,7 @@ class TestResolveInputs:
     def test_rejects_no_input_mode(self):
         args = argparse.Namespace(
             source=None, input_list=None, input_dir=None,
-            rerun_stage1=False,
+            rerun_inspection=False,
         )
         with pytest.raises(SystemExit) as exc_info:
             _resolve_inputs(args)
@@ -458,16 +458,16 @@ class TestResolveInputs:
             input_list=None,
             input_dir=None,
             dataset_id="ds1",
-            review_bundle=str(tmp_path / "summary.yaml"),
-            rerun_stage1=False,
+            inspection_summary=str(tmp_path / "summary.yaml"),
+            rerun_inspection=False,
         )
-        # Need the review_bundle to exist or it will fail on that first
+        # Need the inspection summary to exist or it will fail on that first
         (tmp_path / "summary.yaml").write_text("kind: review")
         with pytest.raises(SystemExit) as exc_info:
             _resolve_inputs(args)
         assert exc_info.value.code == 1
 
-    def test_rejects_missing_review_bundle(self, tmp_path: Path):
+    def test_rejects_missing_inspection_summary(self, tmp_path: Path):
         h5ad_path = tmp_path / "test.h5ad"
         h5ad_path.touch()
         args = argparse.Namespace(
@@ -475,8 +475,8 @@ class TestResolveInputs:
             input_list=None,
             input_dir=None,
             dataset_id="ds1",
-            review_bundle=str(tmp_path / "nonexistent-summary.yaml"),
-            rerun_stage1=False,
+            inspection_summary=str(tmp_path / "nonexistent-summary.yaml"),
+            rerun_inspection=False,
         )
         with pytest.raises(SystemExit) as exc_info:
             _resolve_inputs(args)
@@ -492,8 +492,8 @@ class TestResolveInputs:
             input_list=None,
             input_dir=None,
             dataset_id="ds1",
-            review_bundle=str(bundle_path),
-            rerun_stage1=False,
+            inspection_summary=str(bundle_path),
+            rerun_inspection=False,
         )
         inputs = _resolve_inputs(args)
         assert len(inputs) == 1
@@ -504,7 +504,7 @@ class TestResolveInputs:
         """Duplicate detection within batch happens in _resolve_inputs."""
         csv_path = tmp_path / "datasets.csv"
         csv_path.write_text(
-            "source,dataset_id,review_bundle\n"
+            "source,dataset_id,inspection_summary\n"
             "/data/ds1.h5ad,dup_id,/reviews/ds1-summary.yaml\n"
             "/data/ds2.h5ad,dup_id,/reviews/ds2-summary.yaml\n"
         )
@@ -512,14 +512,14 @@ class TestResolveInputs:
             source=None,
             input_list=str(csv_path),
             input_dir=None,
-            rerun_stage1=False,
+            rerun_inspection=False,
         )
         with pytest.raises(SystemExit) as exc_info:
             _resolve_inputs(args)
         assert exc_info.value.code == 1
 
-    def test_skips_review_check_with_rerun_stage1(self, tmp_path: Path):
-        """With rerun_stage1=True, missing review bundle is tolerated."""
+    def test_skips_summary_check_with_rerun_inspection(self, tmp_path: Path):
+        """With rerun_inspection=True, missing summary is tolerated."""
         h5ad_path = tmp_path / "test.h5ad"
         h5ad_path.touch()
         args = argparse.Namespace(
@@ -527,8 +527,8 @@ class TestResolveInputs:
             input_list=None,
             input_dir=None,
             dataset_id="ds1",
-            review_bundle=str(tmp_path / "nonexistent-summary.yaml"),
-            rerun_stage1=True,
+            inspection_summary=str(tmp_path / "nonexistent-summary.yaml"),
+            rerun_inspection=True,
         )
         inputs = _resolve_inputs(args)
         assert len(inputs) == 1
@@ -536,7 +536,7 @@ class TestResolveInputs:
 
 
 # ---------------------------------------------------------------------------
-# Corpus-validate command tests (kept from Phase 1)
+# Corpus-validate command tests
 # ---------------------------------------------------------------------------
 
 
@@ -626,7 +626,7 @@ class TestCorpusValidateCmd:
 
 
 # ---------------------------------------------------------------------------
-# Corpus-gc command tests (new)
+# Corpus-gc command tests
 # ---------------------------------------------------------------------------
 
 
@@ -764,7 +764,7 @@ class TestCLIHelp:
 
 
 # ---------------------------------------------------------------------------
-# Canonicalize CLI tests (Phase 3)
+# Canonicalize CLI tests
 # ---------------------------------------------------------------------------
 
 
@@ -1575,13 +1575,13 @@ class TestMaterializeCmd:
             input_list=None,
             input_dir=None,
             dataset_id="dummy_00",
-            review_bundle=str(review),
-            review_bundle_dir=None,
+            inspection_summary=str(review),
+            inspection_summary_dir=None,
             output_corpus=str(corpus_root),
             backend="lance",
             topology=None,
             corpus_id="test-v0",
-            rerun_stage1=False,
+            rerun_inspection=False,
             n_hvg=2000,
             dry_run=True,
         )
@@ -1631,13 +1631,13 @@ class TestMaterializeCmd:
             input_list=None,
             input_dir=None,
             dataset_id="dummy_00",
-            review_bundle=str(review),
-            review_bundle_dir=None,
+            inspection_summary=str(review),
+            inspection_summary_dir=None,
             output_corpus=str(corpus_root),
             backend=None,
             topology=None,
             corpus_id="test-v0",
-            rerun_stage1=False,
+            rerun_inspection=False,
             n_hvg=2000,
             dry_run=True,
         )
@@ -1695,13 +1695,13 @@ class TestMaterializeCmd:
             input_list=None,
             input_dir=None,
             dataset_id="dummy_01",
-            review_bundle=str(review),
-            review_bundle_dir=None,
+            inspection_summary=str(review),
+            inspection_summary_dir=None,
             output_corpus=str(corpus_root),
             backend=None,
             topology=None,
             corpus_id="test-v0",
-            rerun_stage1=False,
+            rerun_inspection=False,
             n_hvg=2000,
             dry_run=True,
         )
@@ -1750,7 +1750,7 @@ class TestMaterializeCmd:
 
         input_list = tmp_path / "inputs.csv"
         input_list.write_text(
-            "source,dataset_id,review_bundle\n"
+            "source,dataset_id,inspection_summary\n"
             f"{tmp_path / 'dummy_01.h5ad'},dummy_01,{tmp_path / 'dummy_01-summary.yaml'}\n"
             f"{tmp_path / 'dummy_02.h5ad'},dummy_02,{tmp_path / 'dummy_02-summary.yaml'}\n",
             encoding="utf-8",
@@ -1766,13 +1766,13 @@ class TestMaterializeCmd:
             input_list=str(input_list),
             input_dir=None,
             dataset_id=None,
-            review_bundle=None,
-            review_bundle_dir=None,
+            inspection_summary=None,
+            inspection_summary_dir=None,
             output_corpus=str(corpus_root),
             backend=None,
             topology=None,
             corpus_id="test-v0",
-            rerun_stage1=False,
+            rerun_inspection=False,
             n_hvg=2000,
             dry_run=False,
         )

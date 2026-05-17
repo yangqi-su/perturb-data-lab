@@ -1,4 +1,4 @@
-"""Focused tests for the Phase 6 streamed ``perturb_data_lab.pp`` helpers."""
+"""Focused tests for streamed ``perturb_data_lab.pp`` helpers."""
 
 from __future__ import annotations
 

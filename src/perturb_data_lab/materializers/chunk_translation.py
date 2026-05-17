@@ -1,4 +1,4 @@
-"""Shared sparse chunk translation for Stage 2 backend writers.
+"""Shared sparse chunk translation for backend writers.
 
 The materializer slices the selected count matrix into CSR chunks, then this module
 normalizes each chunk into raw sparse buffers. Lance and Zarr writers decide how to
@@ -56,7 +56,7 @@ class ChunkBundle:
         **Dataset-local** gene indices (int32) for all non-zero entries in this chunk.
         Raw buffer for backends that need it. These indices are in the original
         dataset's feature space — no canonical gene mapping has been applied.
-        Canonical mapping is deferred to Stage 3.
+        Canonical mapping happens later in the loader/adapter layer.
     counts : np.ndarray
         Expression counts (int32) for all non-zero entries in this chunk. Raw buffer
         for backends that need it.
@@ -94,7 +94,8 @@ def _translate_chunk(
     operation on the nonzero values — no full-matrix densification.
 
     ``expressed_gene_indices`` are in **dataset-local feature space** — no canonical
-    gene mapping is applied at this stage. Canonical mapping is deferred to Stage 3.
+    gene mapping is applied here. Canonical mapping happens later in the
+    loader/adapter layer.
 
     Parameters
     ----------

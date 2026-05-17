@@ -1,18 +1,7 @@
-"""Stage 2 materializer — schema-independent, Stage-1-gated, count-first.
+"""Public materialization API.
 
-Phase 3 canonical materializer (expression-first, tokenizer-free) is preserved
-as the legacy schema-first path. Stage 2 adds:
-
-- ``Stage2Materializer``: schema-independent materialization entry that accepts
-  a Stage 1 ``dataset-summary.yaml`` as the only gating artifact (no schema.yaml)
-- Count-first path driven by the Stage 1 approved count source decision
-- Parquet raw metadata sidecars (SQLite deprecated for new artifacts)
-- Backend/topology separation in all interfaces
-
-This module exposes the public materializer API lazily so lightweight runtime
-imports (for example loader-only smoke validation) do not eagerly import heavy
-or environment-sensitive modules such as ``sqlite3`` until they are actually
-needed.
+Exports are loaded lazily so loader-only imports do not eagerly import heavier
+materialization dependencies until they are needed.
 """
 
 from __future__ import annotations
@@ -21,11 +10,8 @@ from importlib import import_module
 
 
 _EXPORT_MAP = {
-    # Stage 2 — schema-independent entry point
-    "Stage2Materializer": (".core", "Stage2Materializer"),
-    # Core classes
-    "CanonicalCellRecord": (".core", "CanonicalCellRecord"),
-    "update_corpus_index": (".core", "update_corpus_index"),
+    "DatasetMaterializer": (".core", "DatasetMaterializer"),
+    "update_corpus_index": (".corpus_index", "update_corpus_index"),
     # Models
     "MaterializationManifest": (".models", "MaterializationManifest"),
     "CorpusIndexDocument": (".models", "CorpusIndexDocument"),
@@ -33,7 +19,6 @@ _EXPORT_MAP = {
     "CountSourceSpec": (".models", "CountSourceSpec"),
     "OutputRoots": (".models", "OutputRoots"),
     "ProvenanceSpec": (".models", "ProvenanceSpec"),
-    # Phase 4 corpus registration
     "CorpusRegistrationInfo": (".models", "CorpusRegistrationInfo"),
     "register_materialization": (".registration", "register_materialization"),
     "corpus_exists": (".registration", "corpus_exists"),
@@ -55,10 +40,7 @@ def __dir__() -> list[str]:
     return sorted(list(globals().keys()) + list(_EXPORT_MAP.keys()))
 
 __all__ = [
-    # Stage 2 — schema-independent entry point
-    "Stage2Materializer",
-    # Core classes
-    "CanonicalCellRecord",
+    "DatasetMaterializer",
     "update_corpus_index",
     # Models
     "MaterializationManifest",
@@ -67,7 +49,6 @@ __all__ = [
     "CountSourceSpec",
     "OutputRoots",
     "ProvenanceSpec",
-    # Phase 4 corpus registration
     "CorpusRegistrationInfo",
     "register_materialization",
     "corpus_exists",

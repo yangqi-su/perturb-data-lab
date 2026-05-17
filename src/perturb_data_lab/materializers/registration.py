@@ -1,4 +1,4 @@
-"""Corpus registration flow for Stage 2 materialization.
+"""Corpus registration for materialized datasets.
 
 This module connects a per-dataset materialization manifest to the corpus-level
 ``corpus-index.yaml`` used by downstream loaders. It handles create-vs-append,
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .core import update_corpus_index
+from .corpus_index import update_corpus_index
 from .models import (
     CorpusIndexDocument,
     DatasetJoinRecord,
@@ -27,7 +27,7 @@ def manifest_to_join_record(
     Parameters
     ----------
     manifest : MaterializationManifest
-        The manifest produced by Stage2Materializer.materialize().
+        The manifest produced by DatasetMaterializer.materialize().
     corpus_root : Path
         The root directory of the corpus.
 
@@ -69,9 +69,9 @@ def register_materialization(
     backend: str | None = None,
     topology: str | None = None,
 ) -> tuple[DatasetJoinRecord, str, bool]:
-    """Register a Stage2Materializer output to the corpus index.
+    """Register a materialized dataset in the corpus index.
 
-    This is the primary registration entry point for Stage 2. It:
+    This function:
     1. Determines whether the corpus index exists
     2. Converts the manifest to a DatasetJoinRecord
     3. Calls update_corpus_index to update corpus-index.yaml
@@ -80,7 +80,7 @@ def register_materialization(
     Parameters
     ----------
     manifest : MaterializationManifest
-        The filled manifest from Stage2Materializer.materialize().
+        The filled manifest from DatasetMaterializer.materialize().
     corpus_index_path : Path
         Path to corpus-index.yaml (or where it will be written for new corpora).
     corpus_id : str | None

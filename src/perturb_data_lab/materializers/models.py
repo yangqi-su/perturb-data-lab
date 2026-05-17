@@ -1,4 +1,4 @@
-"""Phase 3 materializer typed models."""
+"""Typed documents used by materialization and corpus loading."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ class OutputRoots:
 @dataclass(frozen=True)
 class ProvenanceSpec:
     source_path: str
-    review_bundle: str  # Stage 1 dataset-summary.yaml path (the gating artifact)
+    review_bundle: str  # dataset-summary.yaml copied into the materialized dataset
     accepted_schema_copy: str | None = None  # optional audit copy, NOT read back
 
     @classmethod
@@ -92,10 +92,10 @@ class ProvenanceSpec:
 
 @dataclass(frozen=True)
 class CorpusRegistrationInfo:
-    """Registration metadata produced when Stage2Materializer registers with a corpus.
+    """Registration metadata written after a dataset joins a corpus.
 
     This is written into the MaterializationManifest when register=True is set
-    on Stage2Materializer. It records whether the dataset was registered as a
+    on DatasetMaterializer. It records whether the dataset was registered as a
     new corpus creation or an append, and the paths to the corpus artifacts.
     """
 
@@ -128,7 +128,7 @@ class MaterializationManifest(YamlDocument):
     dataset_id: str
     route: str  # create_new | append_routed
     backend: str  # lance | zarr
-    topology: str  # federated | aggregate (Stage 2 contract: backend and topology are separate)
+    topology: str  # federated | aggregate
     count_source: CountSourceSpec
     outputs: OutputRoots
     provenance: ProvenanceSpec
@@ -141,7 +141,7 @@ class MaterializationManifest(YamlDocument):
     integer_verified: bool = False
     cell_count: int = 0  # number of cells materialized (set by materialize() for corpus index use)
     feature_count: int = 0  # number of features in dataset-local feature space
-    # Phase 4: corpus registration info (set when Stage2Materializer.register=True)
+    # Corpus registration info, set when DatasetMaterializer.register=True.
     corpus_registration: CorpusRegistrationInfo | None = None
     notes: tuple[str, ...] = ()
 
@@ -302,7 +302,7 @@ class GlobalMetadataDocument(YamlDocument):
     missing_value_literal: str
     raw_field_policy: str
     backend: str | None = None  # lance | zarr
-    topology: str | None = None  # federated | aggregate (Stage 2 contract: separate from backend)
+    topology: str | None = None  # federated | aggregate
     notes: tuple[str, ...] = ()
 
     def validate(self) -> None:

@@ -1,19 +1,14 @@
-"""Phase 3 materializer smoke tests using synthetic fixtures."""
+"""Materializer smoke tests using synthetic fixtures."""
 
 from __future__ import annotations
 
 import tempfile
 from pathlib import Path
 
-import numpy as np
 import pytest
 import yaml
-from scipy.sparse import csr_matrix
 
-from perturb_data_lab.materializers import (
-    CanonicalCellRecord,
-    update_corpus_index,
-)
+from perturb_data_lab.materializers import update_corpus_index
 from perturb_data_lab.materializers.models import (
     CountSourceSpec,
     DatasetJoinRecord,
@@ -21,52 +16,6 @@ from perturb_data_lab.materializers.models import (
     OutputRoots,
     ProvenanceSpec,
 )
-
-
-class TestCanonicalCellRecord:
-    """Test the canonical sparse per-cell record contract."""
-
-    def test_integer_sparse_check(self):
-        record = CanonicalCellRecord(
-            expressed_gene_indices=(0, 3, 7),
-            expression_counts=(5, 2, 8),
-            cell_id="cell_001",
-            dataset_id="test_ds",
-            size_factor=1.0,
-            canonical_perturbation={},
-            canonical_context={},
-            raw_fields={},
-        )
-        assert record.is_integer_sparse()
-
-    def test_non_integer_fails_check(self):
-        record = CanonicalCellRecord(
-            expressed_gene_indices=(0, 3),
-            expression_counts=(5.0, 2.1),  # non-integer
-            cell_id="cell_001",
-            dataset_id="test_ds",
-            size_factor=1.0,
-            canonical_perturbation={},
-            canonical_context={},
-            raw_fields={},
-        )
-        assert not record.is_integer_sparse()
-
-    def test_to_csr_matrix_parts(self):
-        record = CanonicalCellRecord(
-            expressed_gene_indices=(1, 4, 8),
-            expression_counts=(3, 7, 1),
-            cell_id="cell_001",
-            dataset_id="test_ds",
-            size_factor=1.5,
-            canonical_perturbation={},
-            canonical_context={},
-            raw_fields={},
-        )
-        data, indices, indptr = record.to_csr_matrix_parts(total_genes=10)
-        np.testing.assert_array_equal(data, [3, 7, 1])
-        np.testing.assert_array_equal(indices, [1, 4, 8])
-        np.testing.assert_array_equal(indptr, [0, 3])
 
 
 class TestCorpusIndexUpdate:
@@ -256,7 +205,7 @@ class TestMaterializationManifest:
 
 
 class TestManifestToJoinRecordRoute:
-    """Test manifest route propagation to DatasetJoinRecord and corpus ledger."""
+    """Test manifest route propagation to DatasetJoinRecord."""
 
     def test_create_new_route_propagates_to_join_record(self):
         """manifest_to_join_record preserves create_new route."""
@@ -345,20 +294,20 @@ class TestManifestToJoinRecordRoute:
             assert [d.join_mode for d in updated.datasets] == ["create_new", "append_routed"]
 
 
-class TestStage2MaterializerConstructorApi:
-    """Test Stage2Materializer constructor accepts mode, writer_state, _is_last_dataset."""
+class TestDatasetMaterializerConstructorApi:
+    """Test DatasetMaterializer constructor options."""
 
     def test_constructor_accepts_mode_create_default(self):
         """Default mode is 'create' and is stored as instance attribute."""
         try:
-            from perturb_data_lab.materializers import Stage2Materializer
+            from perturb_data_lab.materializers import DatasetMaterializer
         except ImportError:
-            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+            pytest.skip("DatasetMaterializer import unavailable (anndata not installed)")
         from perturb_data_lab.materializers.models import OutputRoots
 
-        mat = Stage2Materializer(
+        mat = DatasetMaterializer(
             source_path="/fake/source.h5ad",
-            review_bundle_path="/fake/bundle.yaml",
+            inspection_summary_path="/fake/dataset-summary.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             dataset_id="ds_test",
         )
@@ -367,14 +316,14 @@ class TestStage2MaterializerConstructorApi:
     def test_constructor_accepts_mode_append(self):
         """mode='append' is accepted and stored."""
         try:
-            from perturb_data_lab.materializers import Stage2Materializer
+            from perturb_data_lab.materializers import DatasetMaterializer
         except ImportError:
-            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+            pytest.skip("DatasetMaterializer import unavailable (anndata not installed)")
         from perturb_data_lab.materializers.models import OutputRoots
 
-        mat = Stage2Materializer(
+        mat = DatasetMaterializer(
             source_path="/fake/source.h5ad",
-            review_bundle_path="/fake/bundle.yaml",
+            inspection_summary_path="/fake/dataset-summary.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             dataset_id="ds_test",
             mode="append",
@@ -384,15 +333,15 @@ class TestStage2MaterializerConstructorApi:
     def test_constructor_rejects_invalid_mode(self):
         """Invalid mode raises ValueError."""
         try:
-            from perturb_data_lab.materializers import Stage2Materializer
+            from perturb_data_lab.materializers import DatasetMaterializer
         except ImportError:
-            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+            pytest.skip("DatasetMaterializer import unavailable (anndata not installed)")
         from perturb_data_lab.materializers.models import OutputRoots
 
         with pytest.raises(ValueError, match="mode must be 'create' or 'append'"):
-            Stage2Materializer(
+            DatasetMaterializer(
                 source_path="/fake/source.h5ad",
-                review_bundle_path="/fake/bundle.yaml",
+                inspection_summary_path="/fake/dataset-summary.yaml",
                 output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
                 dataset_id="ds_test",
                 mode="invalid",
@@ -401,15 +350,15 @@ class TestStage2MaterializerConstructorApi:
     def test_constructor_accepts_writer_state(self):
         """writer_state parameter is stored as instance attribute."""
         try:
-            from perturb_data_lab.materializers import Stage2Materializer
+            from perturb_data_lab.materializers import DatasetMaterializer
         except ImportError:
-            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+            pytest.skip("DatasetMaterializer import unavailable (anndata not installed)")
         from perturb_data_lab.materializers.models import OutputRoots
 
         state = {"lance_path": "/corpus/cells.lance", "initialized": True}
-        mat = Stage2Materializer(
+        mat = DatasetMaterializer(
             source_path="/fake/source.h5ad",
-            review_bundle_path="/fake/bundle.yaml",
+            inspection_summary_path="/fake/dataset-summary.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             dataset_id="ds_test",
             writer_state=state,
@@ -419,14 +368,14 @@ class TestStage2MaterializerConstructorApi:
     def test_constructor_accepts_writer_state_none_default(self):
         """writer_state defaults to None."""
         try:
-            from perturb_data_lab.materializers import Stage2Materializer
+            from perturb_data_lab.materializers import DatasetMaterializer
         except ImportError:
-            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+            pytest.skip("DatasetMaterializer import unavailable (anndata not installed)")
         from perturb_data_lab.materializers.models import OutputRoots
 
-        mat = Stage2Materializer(
+        mat = DatasetMaterializer(
             source_path="/fake/source.h5ad",
-            review_bundle_path="/fake/bundle.yaml",
+            inspection_summary_path="/fake/dataset-summary.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             dataset_id="ds_test",
         )
@@ -435,14 +384,14 @@ class TestStage2MaterializerConstructorApi:
     def test_constructor_accepts_is_last_dataset(self):
         """_is_last_dataset parameter is stored."""
         try:
-            from perturb_data_lab.materializers import Stage2Materializer
+            from perturb_data_lab.materializers import DatasetMaterializer
         except ImportError:
-            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+            pytest.skip("DatasetMaterializer import unavailable (anndata not installed)")
         from perturb_data_lab.materializers.models import OutputRoots
 
-        mat = Stage2Materializer(
+        mat = DatasetMaterializer(
             source_path="/fake/source.h5ad",
-            review_bundle_path="/fake/bundle.yaml",
+            inspection_summary_path="/fake/dataset-summary.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             dataset_id="ds_test",
             _is_last_dataset=True,
@@ -452,14 +401,14 @@ class TestStage2MaterializerConstructorApi:
     def test_constructor_is_last_dataset_default_false(self):
         """_is_last_dataset defaults to False."""
         try:
-            from perturb_data_lab.materializers import Stage2Materializer
+            from perturb_data_lab.materializers import DatasetMaterializer
         except ImportError:
-            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+            pytest.skip("DatasetMaterializer import unavailable (anndata not installed)")
         from perturb_data_lab.materializers.models import OutputRoots
 
-        mat = Stage2Materializer(
+        mat = DatasetMaterializer(
             source_path="/fake/source.h5ad",
-            review_bundle_path="/fake/bundle.yaml",
+            inspection_summary_path="/fake/dataset-summary.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             dataset_id="ds_test",
         )
@@ -468,14 +417,14 @@ class TestStage2MaterializerConstructorApi:
     def test_dataset_index_and_global_row_start_defaults(self):
         """dataset_index and global_row_start have sensible defaults."""
         try:
-            from perturb_data_lab.materializers import Stage2Materializer
+            from perturb_data_lab.materializers import DatasetMaterializer
         except ImportError:
-            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+            pytest.skip("DatasetMaterializer import unavailable (anndata not installed)")
         from perturb_data_lab.materializers.models import OutputRoots
 
-        mat = Stage2Materializer(
+        mat = DatasetMaterializer(
             source_path="/fake/source.h5ad",
-            review_bundle_path="/fake/bundle.yaml",
+            inspection_summary_path="/fake/dataset-summary.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             dataset_id="ds_test",
         )
@@ -485,14 +434,14 @@ class TestStage2MaterializerConstructorApi:
     def test_constructor_accepts_dataset_index_and_global_row_start(self):
         """dataset_index and global_row_start can be set via constructor."""
         try:
-            from perturb_data_lab.materializers import Stage2Materializer
+            from perturb_data_lab.materializers import DatasetMaterializer
         except ImportError:
-            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+            pytest.skip("DatasetMaterializer import unavailable (anndata not installed)")
         from perturb_data_lab.materializers.models import OutputRoots
 
-        mat = Stage2Materializer(
+        mat = DatasetMaterializer(
             source_path="/fake/source.h5ad",
-            review_bundle_path="/fake/bundle.yaml",
+            inspection_summary_path="/fake/dataset-summary.yaml",
             output_roots=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             dataset_id="ds_test",
             dataset_index=3,
@@ -502,20 +451,20 @@ class TestStage2MaterializerConstructorApi:
         assert mat.global_row_start == 1500
 
 
-class TestStage2MaterializerReviewGate:
-    """Test Stage 2 respects non-pass review bundles."""
+class TestDatasetMaterializerInspectionGate:
+    """Test DatasetMaterializer respects non-pass inspection summaries."""
 
     def test_materialize_rejects_needs_review_bundle_before_loading_h5ad(
         self,
         tmp_path: Path,
     ):
         try:
-            from perturb_data_lab.materializers import Stage2Materializer
+            from perturb_data_lab.materializers import DatasetMaterializer
         except ImportError:
-            pytest.skip("Stage2Materializer import unavailable (anndata not installed)")
+            pytest.skip("DatasetMaterializer import unavailable (anndata not installed)")
 
-        review_bundle = tmp_path / "dataset-summary.yaml"
-        review_bundle.write_text(
+        inspection_summary = tmp_path / "dataset-summary.yaml"
+        inspection_summary.write_text(
             yaml.safe_dump(
                 {
                     "kind": "dataset-summary",
@@ -572,9 +521,9 @@ class TestStage2MaterializerReviewGate:
             encoding="utf-8",
         )
 
-        materializer = Stage2Materializer(
+        materializer = DatasetMaterializer(
             source_path="/missing/source.h5ad",
-            review_bundle_path=str(review_bundle),
+            inspection_summary_path=str(inspection_summary),
             output_roots=OutputRoots(
                 metadata_root=str(tmp_path / "meta"),
                 matrix_root=str(tmp_path / "matrix"),

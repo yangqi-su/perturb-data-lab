@@ -11,11 +11,6 @@ canonicalize     Canonicalize using corpus-local final schemas.
 recalc-hvg       Recalculate per-dataset hvg.parquet files for a corpus.
 corpus-validate  Validate a corpus for logical completeness.
 corpus-gc        Garbage-collect orphaned Lance fragments not in the corpus ledger.
-
-Removed (Phase 2 consolidation):
-  stage2-materialize → merged into materialize
-  corpus-create → merged into materialize --mode create
-  corpus-append  → merged into materialize --mode append
 """
 
 from __future__ import annotations
@@ -45,17 +40,17 @@ class _DatasetInput:
     """A single dataset input parsed from CLI flags."""
     source: str
     dataset_id: str
-    review_bundle: str
+    inspection_summary: str
 
 
 def _parse_input_list_csv(csv_path: Path) -> list[_DatasetInput]:
-    """Parse a CSV input list with columns: source, dataset_id, review_bundle."""
+    """Parse a CSV input list with source, dataset_id, inspection_summary."""
     inputs: list[_DatasetInput] = []
     with open(csv_path, newline="") as fh:
         reader = csv.DictReader(fh)
         if reader.fieldnames is None:
             raise ValueError(f"CSV file {csv_path} has no header row")
-        missing = {"source", "dataset_id", "review_bundle"} - set(reader.fieldnames)
+        missing = {"source", "dataset_id", "inspection_summary"} - set(reader.fieldnames)
         if missing:
             raise ValueError(
                 f"CSV missing required columns: {', '.join(sorted(missing))}"
@@ -65,7 +60,7 @@ def _parse_input_list_csv(csv_path: Path) -> list[_DatasetInput]:
                 _DatasetInput(
                     source=row["source"].strip(),
                     dataset_id=row["dataset_id"].strip(),
-                    review_bundle=row["review_bundle"].strip(),
+                    inspection_summary=row["inspection_summary"].strip(),
                 )
             )
     if not inputs:
@@ -76,35 +71,35 @@ def _parse_input_list_csv(csv_path: Path) -> list[_DatasetInput]:
 def _scan_input_dir(
     input_dir: Path,
     *,
-    review_bundle_dir: Path | None = None,
+    inspection_summary_dir: Path | None = None,
 ) -> list[_DatasetInput]:
     """Scan a directory for .h5ad files and build _DatasetInput entries.
 
     dataset_id is derived from the filename stem
     (e.g. dummy_00_counts -> dummy_00_counts).
-    Review bundles are expected at:
-        {review_bundle_dir or input_dir}/{dataset_id}-summary.yaml
+    Inspection summaries are expected at:
+        {inspection_summary_dir or input_dir}/{dataset_id}-summary.yaml
     """
     h5ad_files = sorted(p for p in input_dir.iterdir() if p.suffix == ".h5ad")
     if not h5ad_files:
         raise FileNotFoundError(f"No .h5ad files found in {input_dir}")
 
-    bundle_dir = review_bundle_dir or input_dir
+    summary_dir = inspection_summary_dir or input_dir
     inputs: list[_DatasetInput] = []
     for h5ad_path in h5ad_files:
         dataset_id = h5ad_path.stem
-        bundle_path = bundle_dir / f"{dataset_id}-summary.yaml"
-        if not bundle_path.exists():
+        summary_path = summary_dir / f"{dataset_id}-summary.yaml"
+        if not summary_path.exists():
             raise FileNotFoundError(
-                f"Review bundle not found for {dataset_id}: expected {bundle_path}. "
-                "Use --review-bundle-dir to specify an alternate location, "
-                "or use --rerun-stage1 to run inspection as preflight."
+                f"Inspection summary not found for {dataset_id}: expected {summary_path}. "
+                "Use --inspection-summary-dir to specify an alternate location, "
+                "or use --rerun-inspection to run inspection as preflight."
             )
         inputs.append(
             _DatasetInput(
                 source=str(h5ad_path),
                 dataset_id=dataset_id,
-                review_bundle=str(bundle_path),
+                inspection_summary=str(summary_path),
             )
         )
     return inputs
@@ -138,15 +133,15 @@ def _resolve_inputs(args: argparse.Namespace) -> list[_DatasetInput]:
         if not getattr(args, "dataset_id", None):
             print("[error] --dataset-id is required with --source", file=sys.stderr)
             sys.exit(1)
-        review_bundle = getattr(args, "review_bundle", None)
-        if not review_bundle:
-            print("[error] --review-bundle is required with --source", file=sys.stderr)
+        inspection_summary = getattr(args, "inspection_summary", None)
+        if not inspection_summary:
+            print("[error] --inspection-summary is required with --source", file=sys.stderr)
             sys.exit(1)
         sources.append(
             _DatasetInput(
                 source=args.source,
                 dataset_id=args.dataset_id,
-                review_bundle=review_bundle,
+                inspection_summary=inspection_summary,
             )
         )
     elif has_input_list:
@@ -160,12 +155,12 @@ def _resolve_inputs(args: argparse.Namespace) -> list[_DatasetInput]:
         if not input_dir.is_dir():
             print(f"[error] input directory not found: {input_dir}", file=sys.stderr)
             sys.exit(1)
-        bundle_dir = (
-            Path(args.review_bundle_dir)
-            if getattr(args, "review_bundle_dir", None)
+        summary_dir = (
+            Path(args.inspection_summary_dir)
+            if getattr(args, "inspection_summary_dir", None)
             else None
         )
-        sources = _scan_input_dir(input_dir, review_bundle_dir=bundle_dir)
+        sources = _scan_input_dir(input_dir, inspection_summary_dir=summary_dir)
 
     # Validate each source exists
     for ds in sources:
@@ -173,12 +168,12 @@ def _resolve_inputs(args: argparse.Namespace) -> list[_DatasetInput]:
         if not src.exists():
             print(f"[error] source h5ad not found: {src}", file=sys.stderr)
             sys.exit(1)
-        if not getattr(args, "rerun_stage1", False):
-            bundle = Path(ds.review_bundle)
-            if not bundle.exists():
+        if not getattr(args, "rerun_inspection", False):
+            summary = Path(ds.inspection_summary)
+            if not summary.exists():
                 print(
-                    f"[error] review bundle not found: {bundle}; "
-                    "pass --rerun-stage1 to run Stage 1 as preflight",
+                    f"[error] inspection summary not found: {summary}; "
+                    "pass --rerun-inspection to run inspection as preflight",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -203,11 +198,7 @@ def _is_aggregate(backend: str, topology: str) -> bool:
 
 
 def _resolve_effective_topology(backend: str, topology: str) -> str:
-    """Resolve the effective topology from backend + requested topology.
-
-    Phase 5 removes the old Lance-specific aggregate forcing so federated Lance
-    can be selected explicitly and through the public CLI defaults.
-    """
+    """Resolve the effective topology from backend + requested topology."""
     if topology not in TOPOLOGY_CHOICES:
         raise ValueError(
             f"unsupported topology {topology!r}; expected one of {TOPOLOGY_CHOICES}"
@@ -295,7 +286,7 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
         ),
         Path(args.output_dir),
     )
-    print(f"[inspect] wrote review bundle {artifacts.review_bundle}")
+    print(f"[inspect] wrote inspection summary {artifacts.review_bundle}")
 
 
 # ---------------------------------------------------------------------------
@@ -327,22 +318,22 @@ def _add_materialize_args(sub: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Path to a CSV file listing datasets to materialize. "
-            "Required columns: source, dataset_id, review_bundle."
+            "Required columns: source, dataset_id, inspection_summary."
         ),
     )
     input_group.add_argument(
         "--input-dir",
         default=None,
         help=(
-            "Directory to scan for .h5ad files. Review bundles are expected "
-            "alongside as {stem}-summary.yaml. Use --review-bundle-dir for "
+            "Directory to scan for .h5ad files. Inspection summaries are expected "
+            "alongside as {stem}-summary.yaml. Use --inspection-summary-dir for "
             "alternate locations."
         ),
     )
     sub.add_argument(
-        "--review-bundle-dir",
+        "--inspection-summary-dir",
         default=None,
-        help="Directory containing review bundles when using --input-dir.",
+        help="Directory containing inspection summaries when using --input-dir.",
     )
 
     # Single-dataset identifiers (only used with --source)
@@ -351,11 +342,10 @@ def _add_materialize_args(sub: argparse.ArgumentParser) -> None:
         default=None,
         help="Stable dataset identifier (required with --source).",
     )
-    # Review bundle for single dataset mode
     sub.add_argument(
-        "--review-bundle",
+        "--inspection-summary",
         default=None,
-        help="Path to the Stage 1 dataset-summary.yaml (required with --source).",
+        help="Path to dataset-summary.yaml (required with --source).",
     )
 
     # Corpus output
@@ -396,11 +386,11 @@ def _add_materialize_args(sub: argparse.ArgumentParser) -> None:
 
     # Materializer options
     sub.add_argument(
-        "--rerun-stage1",
+        "--rerun-inspection",
         action="store_true",
         help=(
-            "If set, rerun Stage 1 inspection before materialization as a preflight "
-            "and use the resulting dataset-summary.yaml as the gating artifact."
+            "If set, rerun inspection before materialization and use the "
+            "resulting dataset-summary.yaml."
         ),
     )
     sub.add_argument(
@@ -438,7 +428,7 @@ def _materialize_dataset(
 
     In aggregate mode, writer_state is carried between calls.
     """
-    from .materializers import Stage2Materializer
+    from .materializers import DatasetMaterializer
     from .materializers.models import OutputRoots
 
     if dry_run:
@@ -469,14 +459,14 @@ def _materialize_dataset(
     print(f"    source: {ds.source}")
     print(f"    mode: {mode}")
 
-    materializer = Stage2Materializer(
+    materializer = DatasetMaterializer(
         source_path=ds.source,
-        review_bundle_path=ds.review_bundle,
+        inspection_summary_path=ds.inspection_summary,
         output_roots=output_roots,
         dataset_id=ds.dataset_id,
         backend=backend,
         topology=effective_topology,
-        rerun_stage1=args.rerun_stage1,
+        rerun_inspection=args.rerun_inspection,
         n_hvg=getattr(args, "n_hvg", 2000),
         corpus_index_path=corpus_index_path,
         corpus_id=args.corpus_id,
@@ -962,7 +952,7 @@ def _cmd_recalc_hvg(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# draft-schema (Phase 3)
+# draft-schema
 # ---------------------------------------------------------------------------
 
 
@@ -1096,7 +1086,7 @@ def _cmd_draft_schema(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# canonicalize (Phase 3 simplified CLI)
+# canonicalize
 # ---------------------------------------------------------------------------
 
 
@@ -1321,7 +1311,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_draft_schema_args(p_draft)
 
-    # canonicalize (new — Phase 3)
+    # canonicalize
     p_can = sub.add_parser(
         "canonicalize",
         help="Transform raw obs/var sidecars into canonical parquet files.",

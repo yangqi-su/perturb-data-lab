@@ -1,74 +1,39 @@
-"""Stage 2 materializer — schema-independent, Stage-1-gated, count-first.
+"""Dataset materialization orchestration.
 
-Phase 3 canonical materializer (expression-first, tokenizer-free) is preserved
-as the legacy schema-first path. Stage 2 adds:
-
-- ``Stage2Materializer``: schema-independent materialization entry that accepts
-  a Stage 1 ``dataset-summary.yaml`` as the only gating artifact (no schema.yaml)
-- Count-first path driven by the Stage 1 approved count source decision
-- Parquet raw metadata sidecars (SQLite deprecated for new artifacts)
-- Backend/topology separation in all interfaces
-
-All materialization writes go to repo-local real directories only.
-Never write to protected symlink roots (data/, pertTF/, perturb/).
+The materializer reads an inspected ``dataset-summary.yaml``, streams the selected
+count matrix into the configured backend, and writes the per-dataset metadata
+sidecars needed by corpus loaders.
 """
 
 from __future__ import annotations
 
-import json
 import shutil
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
 import anndata as ad
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 from scipy.sparse import csr_matrix, issparse
 
 from .backends import build_backend_fn
+from .metadata_writers import (
+    write_feature_provenance_parquet,
+    write_hvg_ranking_parquet,
+    write_raw_cell_metadata_parquet,
+    write_raw_feature_metadata_parquet,
+    write_size_factor_parquet,
+)
 from .obs_filter import ObsFilterError, filter_obs_rows
 
-
-def _safe_serialize(val: Any) -> Any:
-    """Serialize a value to a JSON-safe representation.
-
-    Handles numpy scalars, pandas NA/NaN, and other common types
-    that json.dumps cannot serialize directly.
-    """
-    if val is None or (isinstance(val, float) and (val != val)):  # NaN check
-        return None
-    if isinstance(val, (np.integer,)):
-        return int(val)
-    if isinstance(val, (np.floating,)):
-        return float(val)
-    if isinstance(val, (np.bool_,)):
-        return bool(val)
-    if hasattr(val, "item"):
-        return val.item()
-    if isinstance(val, pd.CategoricalDtype):
-        return str(val)
-    try:
-        if pd.isna(val):
-            return None
-    except (TypeError, ValueError):
-        pass
-    if isinstance(val, (str, int, float, bool)):
-        return val
-    return str(val)
-
 from .models import (
-    CorpusIndexDocument,
     CountSourceSpec,
-    DatasetJoinRecord,
-    GlobalMetadataDocument,
     MaterializationManifest,
     OutputRoots,
     ProvenanceSpec,
 )
-from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
+from ..contracts import CONTRACT_VERSION
 from ..inspectors.models import DatasetSummaryDocument
 
 
@@ -94,23 +59,15 @@ def _slice_matrix_chunk_as_csr(
     return csr_matrix(matrix_chunk)
 
 
-# ---------------------------------------------------------------------------
-# Stage 2 Materializer — schema-independent, Stage-1-gated, count-first
-# ---------------------------------------------------------------------------
-
-
-class Stage2Materializer:
-    """Schema-independent materialization entry point for Stage 2.
-
-    This class provides a Stage-1-gated, count-first materialization path.
+class DatasetMaterializer:
+    """Materialize one inspected dataset into a corpus backend.
 
     Inputs
     ------
     source_path : str
         Absolute path to the source h5ad file.
-    review_bundle_path : str
-        Path to the Stage 1 ``dataset-summary.yaml`` that gates this materialization.
-        This is the only required gating artifact; no ``schema.yaml`` is accepted.
+    inspection_summary_path : str
+        Path to the ``dataset-summary.yaml`` produced by inspection.
     output_roots : OutputRoots
         ``metadata_root`` and ``matrix_root`` for this dataset's outputs.
     dataset_id : str
@@ -119,10 +76,9 @@ class Stage2Materializer:
         Storage backend: ``lance`` (default) or ``zarr``.
     topology : str
         Corpus topology: ``federated`` (default) or ``aggregate``.
-    rerun_stage1 : bool, default False
-        If True, reruns Stage 1 inspection before materialization as a preflight
-        step. The resulting ``dataset-summary.yaml`` replaces ``review_bundle_path``
-        as the gating artifact.
+    rerun_inspection : bool, default False
+        If True, reruns inspection before materialization and uses the resulting
+        ``dataset-summary.yaml``.
     n_hvg : int, default 2000
         Number of top-dispersion genes to select as HVGs.
     chunk_rows : int, default 100000
@@ -162,31 +118,21 @@ class Stage2Materializer:
         dataset in the series, triggering backend finalization.
         Only meaningful for aggregate topology.
 
-    Contract
-    --------
-    This materializer does NOT accept ``schema_path``. Canonical metadata mapping
-    is deferred to a later stage. The count path is driven exclusively by the
-    Stage 1 ``count_source_decision`` in the review bundle. Integer verification
-    occurs after any approved recovery step. Raw ``obs`` and ``var`` are preserved
-    in Parquet sidecars. SQLite is not produced for new artifacts.
-
-    Backend-Topology Separation
+    Backend/topology separation
     ---------------------------
     ``backend`` names the storage format only. ``topology`` names the corpus
-    organization only. The combination determines the supported subset per
-    STAGE2_CONTRACT.md Section 10. The minimum supported combination is
-    ``lance`` × ``federated``.
+    organization only.
     """
 
     def __init__(
         self,
         source_path: str,
-        review_bundle_path: str,
+        inspection_summary_path: str,
         output_roots: OutputRoots,
         dataset_id: str,
         backend: str = "lance",
         topology: str = "federated",
-        rerun_stage1: bool = False,
+        rerun_inspection: bool = False,
         n_hvg: int = 2000,
         chunk_rows: int = 100_000,
         corpus_index_path: str | None = None,
@@ -205,12 +151,12 @@ class Stage2Materializer:
         assert backend in {"lance", "zarr"}, f"unknown backend: {backend}"
         assert topology in {"federated", "aggregate"}, f"unknown topology: {topology}"
         self.source_path = source_path
-        self.review_bundle_path = review_bundle_path
+        self.inspection_summary_path = inspection_summary_path
         self.output_roots = output_roots
         self.dataset_id = dataset_id
         self.backend = backend
         self.topology = topology
-        self.rerun_stage1 = rerun_stage1
+        self.rerun_inspection = rerun_inspection
         self.n_hvg = n_hvg
         self.chunk_rows = chunk_rows
         self.corpus_index_path = corpus_index_path
@@ -228,31 +174,27 @@ class Stage2Materializer:
             )
 
     def materialize(self) -> MaterializationManifest:
-        """Run Stage 2 materialization gated by Stage 1 review bundle."""
-        # --- Stage 1 gate: resolve review bundle path ---
-        if self.rerun_stage1:
-            summary_path = self._rerun_stage1_preflight()
+        """Run materialization gated by the inspection summary."""
+        if self.rerun_inspection:
+            summary_path = self._rerun_inspection_preflight()
         else:
-            summary_path = Path(self.review_bundle_path)
+            summary_path = Path(self.inspection_summary_path)
             if not summary_path.exists():
                 raise FileNotFoundError(
-                    f"review bundle not found: {summary_path}; "
-                    "pass rerun_stage1=True to run Stage 1 as preflight"
+                    f"inspection summary not found: {summary_path}; "
+                    "pass rerun_inspection=True to run inspection as preflight"
                 )
 
-        # --- Load and validate Stage 1 summary ---
         summary = DatasetSummaryDocument.from_yaml_file(summary_path)
 
         if summary.materialization_readiness != "pass":
             raise ValueError(
                 f"materialization_readiness is '{summary.materialization_readiness}' "
                 f"(expected 'pass') for dataset {self.dataset_id}; "
-                f"gate review bundle: {summary_path}"
+                f"inspection summary: {summary_path}"
             )
 
-        # --- Extract approved count-source decision ---
         decision = summary.count_source_decision
-        # Map Stage 1 field names to CountSourceSpec fields
         count_source = CountSourceSpec(
             selected=decision.selected_candidate,
             integer_only=(decision.status == "pass"),
@@ -297,27 +239,28 @@ class Stage2Materializer:
             matrix_root.mkdir(parents=True, exist_ok=True)
 
             # Keep dataset meta self-contained by copying the authoritative
-            # Stage 1 inspection summary into meta_root/dataset-summary.yaml.
+            # inspection summary into meta_root/dataset-summary.yaml.
             summary_copy_path = meta_root / "dataset-summary.yaml"
             if summary_path.resolve() != summary_copy_path.resolve():
                 shutil.copy2(summary_path, summary_copy_path)
 
             # --- Write raw cell metadata (Parquet, not SQLite) ---
-            raw_cell_meta_parquet_path = self._write_raw_cell_metadata_parquet(
+            raw_cell_meta_parquet_path = write_raw_cell_metadata_parquet(
                 obs=filtered_obs,
                 source_row_indices=(retained_source_rows if filter_applied else None),
                 meta_root=meta_root,
+                dataset_id=self.dataset_id,
             )
 
             # --- Write raw feature metadata (Parquet) ---
             var_mem = var_ref.to_memory() if hasattr(var_ref, "to_memory") else var_ref
-            raw_feature_meta_parquet_path = self._write_raw_feature_metadata_parquet(
+            raw_feature_meta_parquet_path = write_raw_feature_metadata_parquet(
                 var_mem=var_mem,
                 meta_root=meta_root,
             )
 
             # --- Write feature provenance Parquet ---
-            provenance_spec_path = self._write_feature_provenance_parquet(
+            provenance_spec_path = write_feature_provenance_parquet(
                 var_index=var_index,
                 n_vars=n_vars,
                 meta_root=meta_root,
@@ -367,7 +310,7 @@ class Stage2Materializer:
                 cell_count=n_obs,
                 feature_count=n_vars,
                 notes=(
-                    f"materialized via Stage2Materializer (schema-independent, count-first)",
+                    "materialized via DatasetMaterializer",
                     f"topology={self.topology}",
                     *(
                         (
@@ -383,8 +326,6 @@ class Stage2Materializer:
             manifest_path = meta_root / "materialization-manifest.yaml"
             manifest.write_yaml(manifest_path)
 
-            # --- Phase 4: Corpus registration ---
-            # If register=True, register this dataset with corpus-index.yaml.
             if self.register:
                 from .models import CorpusRegistrationInfo
                 from .registration import register_materialization
@@ -430,17 +371,14 @@ class Stage2Materializer:
                 f"materialized artifact path is outside corpus root: {artifact_path}"
             ) from exc
 
-    def _rerun_stage1_preflight(self) -> Path:
-        """Re-run Stage 1 inspection as preflight and return the summary path."""
+    def _rerun_inspection_preflight(self) -> Path:
+        """Re-run inspection as preflight and return the summary path."""
         from ..inspectors.workflow import inspect_target, InspectionTarget
-        from ..inspectors.models import InspectionBatchConfig
 
-        # Stage 1 writes to the same parent directory as the review bundle's dataset folder
-        review_bundle = Path(self.review_bundle_path)
-        output_root = review_bundle.parent.parent  # go up to dataset dir, then to run dir
-        dataset_id = review_bundle.parent.name  # dataset dir name
+        summary_path = Path(self.inspection_summary_path)
+        output_root = summary_path.parent.parent
+        dataset_id = summary_path.parent.name
 
-        # Construct a temporary InspectionTarget for the rerun
         source_h5ad = Path(self.source_path)
         source_release = self.dataset_id
 
@@ -450,10 +388,7 @@ class Stage2Materializer:
             source_release=source_release,
         )
 
-        # Run inspection; it writes dataset-summary.yaml into output_root/dataset_id/
         artifacts = inspect_target(target, Path(output_root))
-
-        # Return the path to the newly written summary
         return artifacts.review_bundle
 
     def _select_count_matrix(self, adata: ad.AnnData, selected: str) -> Any:
@@ -470,149 +405,6 @@ class Stage2Materializer:
             return adata.layers[layer_name]
         else:
             return adata.X
-
-    def _write_raw_cell_metadata_parquet(
-        self,
-        obs: pd.DataFrame,
-        source_row_indices: np.ndarray | None,
-        meta_root: Path,
-    ) -> Path:
-        """Write raw cell metadata (obs) as a Parquet sidecar.
-
-        Each row contains:
-        - cell_id: the obs index value (string)
-        - dataset_id: stable dataset identifier
-        - optional source_row_index/source_obs_index provenance for filtered runs
-        - raw_fields: JSON string of all obs fields for this cell
-
-        This is the Stage 2 Parquet replacement for the legacy SQLite
-        raw cell metadata store.
-        """
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
-        parquet_path = meta_root / "raw-obs.parquet"
-        n = len(obs)
-
-        cell_ids = [str(idx) for idx in obs.index]
-        dataset_ids = [self.dataset_id] * n
-
-        # Efficiently build raw_fields as JSON strings per row.
-        # Use Series.to_list() for each column and avoid iterrows().
-        col_names = [
-            col for col in obs.columns if col not in {"source_row_index", "source_obs_index"}
-        ]
-        col_lists = {col: obs[col].apply(_safe_serialize).to_list() for col in col_names}
-
-        raw_fields = [
-            json.dumps({col: col_lists[col][i] for col in col_names})
-            for i in range(n)
-        ]
-
-        columns: dict[str, pa.Array] = {
-            "cell_id": pa.array(cell_ids, type=pa.string()),
-            "dataset_id": pa.array(dataset_ids, type=pa.string()),
-            "raw_fields": pa.array(raw_fields, type=pa.string()),
-        }
-        if source_row_indices is not None:
-            columns["source_row_index"] = pa.array(
-                source_row_indices.tolist(), type=pa.int64()
-            )
-            columns["source_obs_index"] = pa.array(cell_ids, type=pa.string())
-        table = pa.table(columns)
-        pq.write_table(table, parquet_path)
-        return parquet_path
-
-    def _write_raw_feature_metadata_parquet(
-        self,
-        var_mem: pd.DataFrame,
-        meta_root: Path,
-    ) -> Path:
-        """Write raw feature metadata (var) as a Parquet sidecar.
-
-        Each row contains:
-        - origin_index: the feature index in the original var ordering
-        - feature_id: the var index value (gene identifier)
-        - raw_var: JSON string of all var fields for this feature
-        """
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
-        parquet_path = meta_root / "raw-var.parquet"
-        n = len(var_mem)
-
-        origin_indices = list(range(n))
-        feature_ids = [str(idx) for idx in var_mem.index]
-
-        # Efficient vectorized approach: column-wise apply, then combine
-        col_names = list(var_mem.columns)
-        col_lists = {col: var_mem[col].apply(_safe_serialize).to_list() for col in col_names}
-
-        raw_var = [
-            json.dumps({col: col_lists[col][i] for col in col_names})
-            for i in range(n)
-        ]
-
-        table = pa.table({
-            "origin_index": pa.array(origin_indices, type=pa.int32()),
-            "feature_id": pa.array(feature_ids, type=pa.string()),
-            "raw_var": pa.array(raw_var, type=pa.string()),
-        })
-        pq.write_table(table, parquet_path)
-        return parquet_path
-
-    def _write_feature_provenance_parquet(
-        self,
-        var_index: pd.Index,
-        n_vars: int,
-        meta_root: Path,
-        count_source_selected: str = ".X",
-        source_path: str = "",
-    ) -> Path:
-        """Write a feature provenance Parquet recording feature ID ordering.
-
-        Tracks the per-dataset feature ordering (origin_index in original dataset
-        var order) and provenance info (source h5ad, count source selected).
-        Used by canonicalize-meta to rebuild the corpus feature set.
-        """
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
-        parquet_path = meta_root / "feature-provenance.parquet"
-
-        origin_indices = list(range(n_vars))
-        feature_ids = [str(var_index[i]) for i in range(n_vars)]
-
-        table = pa.table({
-            "origin_index": pa.array(origin_indices, type=pa.int32()),
-            "feature_id": pa.array(feature_ids, type=pa.string()),
-            "count_source": pa.array(
-                [count_source_selected] * n_vars, type=pa.string()
-            ),
-            "source_path": pa.array(
-                [source_path] * n_vars, type=pa.string()
-            ),
-        })
-        pq.write_table(table, parquet_path)
-        return parquet_path
-
-    def _write_size_factor_parquet(
-        self,
-        size_factors: np.ndarray,
-        cell_ids: pd.Index,
-        meta_root: Path,
-    ) -> Path:
-        """Write per-cell size factors as a separate Parquet (not in cells parquet).
-
-        The array must already be normalized (median-normalized, clamped).
-        """
-        parquet_path = meta_root / "size-factor.parquet"
-        table = pa.table({
-            "cell_id": pa.array([str(c) for c in cell_ids], type=pa.string()),
-            "size_factor": pa.array(size_factors.tolist(), type=pa.float64()),
-        })
-        pq.write_table(table, parquet_path)
-        return parquet_path
 
     def _assert_backend_outputs_exist(self, backend_paths: dict[str, Path]) -> None:
         for name, path in backend_paths.items():
@@ -692,90 +484,21 @@ class Stage2Materializer:
         size_factors = np.where(np.isnan(size_factors), 1.0, size_factors)
         size_factors = size_factors.astype(np.float32)
 
-        size_factor_parquet_path = self._write_size_factor_parquet(
+        size_factor_parquet_path = write_size_factor_parquet(
             size_factors=size_factors,
             cell_ids=cell_ids,
             meta_root=Path(self.output_roots.metadata_root),
         )
-        hvg_ranking_path = self._write_hvg_ranking_parquet(
-            sum_log1p=sum_log1p,
-            sum_log1p_sq=sum_log1p_sq,
-            n_cells_total=n_cells_total,
-            feature_ids=feature_ids,
-            meta_root=Path(self.output_roots.metadata_root),
-        )
-
-        return (all_paths, size_factor_parquet_path, hvg_ranking_path)
-
-    def _write_hvg_ranking_parquet(
-        self,
-        *,
-        sum_log1p: np.ndarray,
-        sum_log1p_sq: np.ndarray,
-        n_cells_total: int,
-        feature_ids: Sequence[str],
-        meta_root: Path,
-    ) -> Path:
-        """Write the canonical per-dataset HVG ranking artifact."""
-        from .chunk_translation import _build_hvg_ranking_table
-
-        table = _build_hvg_ranking_table(
+        hvg_ranking_path = write_hvg_ranking_parquet(
             sum_log1p=sum_log1p,
             sum_log1p_sq=sum_log1p_sq,
             n_cells_total=n_cells_total,
             feature_ids=feature_ids,
             n_hvg=self.n_hvg,
-        )
-        output_path = meta_root / "hvg.parquet"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(table, output_path)
-        return output_path
-
-
-# ---------------------------------------------------------------------------
-# Canonical sparse per-cell record contract (existing)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class CanonicalCellRecord:
-    """Canonical logical row representation for a single cell.
-
-    Sparse per-cell storage contract:
-    - expressed_gene_indices: int32[]  — column indices of expressed genes
-    - expression_counts: int32[]       — count for each expressed gene
-    - canonical metadata columns
-    - preserved raw metadata fields
-    - size_factor: float
-    - stable cell and dataset identifiers
-
-    Both arrays must be the same length. Missing canonical fields use
-    the MISSING_VALUE_LITERAL sentinel.
-    """
-
-    expressed_gene_indices: tuple[int, ...]
-    expression_counts: tuple[int, ...]
-    cell_id: str
-    dataset_id: str
-    size_factor: float
-    canonical_perturbation: dict[str, str]
-    canonical_context: dict[str, str]
-    raw_fields: dict[str, Any]
-
-    def is_integer_sparse(self) -> bool:
-        return all(isinstance(v, int) for v in self.expression_counts) and all(
-            isinstance(idx, int) for idx in self.expressed_gene_indices
+            meta_root=Path(self.output_roots.metadata_root),
         )
 
-    def to_csr_matrix_parts(
-        self, total_genes: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Convert to CSR components: data, indices, indptr."""
-        n = len(self.expression_counts)
-        data = np.array(self.expression_counts, dtype=np.int32)
-        indices = np.array(self.expressed_gene_indices, dtype=np.int32)
-        indptr = np.array([0, n], dtype=np.int32)
-        return data, indices, indptr
+        return (all_paths, size_factor_parquet_path, hvg_ranking_path)
 
 
 class _RowSubsetMatrixView:
@@ -795,134 +518,3 @@ class _RowSubsetMatrixView:
 
     def local_slice(self, start: int, end: int) -> Any:
         return self._matrix[self._row_indices[start:end]]
-
-
-# ---------------------------------------------------------------------------
-# Corpus index updater
-# ---------------------------------------------------------------------------
-
-
-def update_corpus_index(
-    corpus_index_path: Path,
-    new_dataset_record: DatasetJoinRecord,
-    global_metadata: GlobalMetadataDocument | None = None,
-    backend: str | None = None,
-    topology: str | None = None,
-) -> CorpusIndexDocument:
-    """Load an existing corpus index, append the new dataset record, and save.
-
-    If corpus_index_path does not exist, create a new index and also write
-    a new ``global-metadata.yaml`` next to the index.
-
-    This function always appends; it does not overwrite existing dataset entries.
-
-    The new dataset record's ``global_start``/``global_end`` are computed
-    automatically from the existing corpus's total cell count, forming a
-    deterministic, contiguous, non-overlapping partition of corpus cells.
-    The ``cell_count`` field of ``new_dataset_record`` must be set to the
-    number of cells in the new dataset for range computation to be correct.
-
-    Tokenizer is NOT managed here — the corpus feature set is maintained separately
-    by ``canonicalize-meta``.
-
-    Parameters
-    ----------
-    corpus_index_path : Path
-        Path to the corpus index YAML file.
-    new_dataset_record : DatasetJoinRecord
-        The dataset join record for the new dataset. Must have ``cell_count`` set.
-        ``global_start``/``global_end`` in the input are ignored; they are
-        recomputed from the existing corpus.
-    global_metadata : GlobalMetadataDocument | None
-        Global metadata for new corpus creation.  Required when creating
-        a new corpus; ignored for existing corpora.
-    backend : str | None
-        Backend declaration for the corpus (e.g., "lance", "zarr"). Required when creating a new corpus; written to
-        ``global-metadata.yaml``.
-    topology : str | None
-        Corpus topology ("federated" or "aggregate"). Required for new corpus
-        creation unless supplied through ``global_metadata``.
-    """
-    corpus_root = corpus_index_path.parent.resolve()
-
-    # Convert manifest_path to relative to corpus_root for portability.
-    manifest_path_input = Path(new_dataset_record.manifest_path)
-    if manifest_path_input.is_absolute():
-        manifest_path_relative = manifest_path_input.resolve().relative_to(corpus_root)
-    else:
-        manifest_path_relative = manifest_path_input
-
-    if corpus_index_path.exists():
-        corpus = CorpusIndexDocument.from_yaml_file(corpus_index_path)
-        existing_ids = {d.dataset_id for d in corpus.datasets}
-        if new_dataset_record.dataset_id in existing_ids:
-            raise ValueError(
-                f"dataset {new_dataset_record.dataset_id} already exists in corpus index; "
-                "use a different dataset_id to avoid duplication."
-            )
-        # Compute total cells in existing corpus
-        total_existing_cells = sum(d.cell_count for d in corpus.datasets)
-        # Compute global range for the new dataset
-        new_global_start = total_existing_cells
-        new_global_end = total_existing_cells + new_dataset_record.cell_count
-        # Build updated record with computed global range
-        new_record = DatasetJoinRecord(
-            dataset_id=new_dataset_record.dataset_id,
-            dataset_index=len(corpus.datasets),
-            join_mode=new_dataset_record.join_mode,
-            manifest_path=str(manifest_path_relative),
-            cell_count=new_dataset_record.cell_count,
-            global_start=new_global_start,
-            global_end=new_global_end,
-        )
-        datasets = list(corpus.datasets) + [new_record]
-        corpus_id = corpus.corpus_id
-        global_meta = corpus.global_metadata
-    else:
-        # For new corpus, global range is [0, cell_count)
-        new_record = DatasetJoinRecord(
-            dataset_id=new_dataset_record.dataset_id,
-            dataset_index=0,
-            join_mode=new_dataset_record.join_mode,
-            manifest_path=str(manifest_path_relative),
-            cell_count=new_dataset_record.cell_count,
-            global_start=0,
-            global_end=new_dataset_record.cell_count,
-        )
-        datasets = [new_record]
-        corpus_id = "perturb-data-lab-v0"
-        # Build global metadata dict for new corpus
-        if global_metadata is None:
-            if backend is None:
-                raise ValueError("backend is required when creating a corpus index")
-            if topology is None:
-                raise ValueError("topology is required when creating a corpus index")
-            assert backend in {"lance", "zarr"}, f"unknown backend: {backend}"
-            assert topology in {"federated", "aggregate"}, f"unknown topology: {topology}"
-        gmeta_dict: dict[str, Any] = {
-            "kind": "global-metadata",
-            "contract_version": CONTRACT_VERSION,
-            "schema_version": CONTRACT_VERSION,
-            "missing_value_literal": MISSING_VALUE_LITERAL,
-            "raw_field_policy": "preserve-unchanged",
-            "backend": backend,
-            "topology": topology,
-        }
-        if global_metadata is not None:
-            gmeta_dict = global_metadata.to_dict()
-        global_meta = gmeta_dict
-        # Write global-metadata.yaml only when we have meaningful content
-        if gmeta_dict:
-            global_meta_path = corpus_index_path.parent / "global-metadata.yaml"
-            GlobalMetadataDocument.from_dict(gmeta_dict).write_yaml(global_meta_path)
-
-    updated = CorpusIndexDocument(
-        kind="corpus-index",
-        contract_version=CONTRACT_VERSION,
-        corpus_id=corpus_id,
-        global_metadata=global_meta,
-        datasets=tuple(datasets),
-    )
-    updated.write_yaml(corpus_index_path)
-
-    return updated

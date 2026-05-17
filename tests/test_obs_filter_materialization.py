@@ -16,7 +16,7 @@ from perturb_data_lab.inspectors.models import (
     InspectionBatchConfig,
 )
 from perturb_data_lab.inspectors.workflow import run_batch
-from perturb_data_lab.materializers import Stage2Materializer
+from perturb_data_lab.materializers import DatasetMaterializer
 from perturb_data_lab.materializers.models import OutputRoots
 from perturb_data_lab.materializers.obs_filter import ObsFilterError, filter_obs_rows
 
@@ -71,7 +71,7 @@ def test_filter_obs_rows_rejects_unknown_columns() -> None:
         filter_obs_rows(obs, "missing == 'treated'")
 
 
-def test_stage2_materializer_applies_obs_filter_and_preserves_source_identity(
+def test_dataset_materializer_applies_obs_filter_and_preserves_source_identity(
     tmp_path: Path,
 ) -> None:
     counts = csr_matrix(
@@ -109,9 +109,9 @@ def test_stage2_materializer_applies_obs_filter_and_preserves_source_identity(
 
     meta_root = tmp_path / "materialized" / "metadata"
     matrix_root = tmp_path / "materialized" / "matrix"
-    manifest = Stage2Materializer(
+    manifest = DatasetMaterializer(
         source_path=str(source_path),
-        review_bundle_path=str(summary_path),
+        inspection_summary_path=str(summary_path),
         output_roots=OutputRoots(
             metadata_root=str(meta_root),
             matrix_root=str(matrix_root),
@@ -151,7 +151,7 @@ def test_stage2_materializer_applies_obs_filter_and_preserves_source_identity(
     assert "obs_filter retained 1/4 rows" in manifest.notes
 
 
-def test_stage2_materializer_rejects_invalid_obs_filter_before_writing_outputs(
+def test_dataset_materializer_rejects_invalid_obs_filter_before_writing_outputs(
     tmp_path: Path,
 ) -> None:
     counts = csr_matrix(np.array([[1, 0], [0, 2]], dtype=np.int32))
@@ -168,9 +168,9 @@ def test_stage2_materializer_rejects_invalid_obs_filter_before_writing_outputs(
 
     meta_root = tmp_path / "out" / "metadata"
     matrix_root = tmp_path / "out" / "matrix"
-    materializer = Stage2Materializer(
+    materializer = DatasetMaterializer(
         source_path=str(source_path),
-        review_bundle_path=str(summary_path),
+        inspection_summary_path=str(summary_path),
         output_roots=OutputRoots(
             metadata_root=str(meta_root),
             matrix_root=str(matrix_root),
