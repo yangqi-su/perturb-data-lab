@@ -167,7 +167,6 @@ def register_materialization(
             kind="global-metadata",
             contract_version="0.3.0",
             schema_version="0.3.0",
-            feature_registry_id="",
             missing_value_literal="",
             raw_field_policy="preserve-unchanged",
             backend=backend,

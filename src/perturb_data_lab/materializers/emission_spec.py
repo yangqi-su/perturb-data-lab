@@ -23,7 +23,7 @@ class CorpusEmissionSpec:
     """Corpus-level emission spec controlling which fields loaders emit at runtime.
 
     The spec is written as ``corpus-emission-spec.yaml`` next to
-    ``corpus-index.yaml`` and ``tokenizer.json`` during corpus creation.
+    ``corpus-index.yaml`` during corpus creation.
 
     At runtime, a loader reads this spec and includes only the listed
     fields in the ``CellState`` it returns.  Fields not listed in the

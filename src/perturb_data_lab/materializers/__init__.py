@@ -26,8 +26,6 @@ _EXPORT_MAP = {
     # Core classes
     "CanonicalCellRecord": (".core", "CanonicalCellRecord"),
     "update_corpus_index": (".core", "update_corpus_index"),
-    # Tokenizer (available but NOT used during materialization)
-    "CorpusTokenizer": (".tokenizer", "CorpusTokenizer"),
     # Emission spec
     "CorpusEmissionSpec": (".emission_spec", "CorpusEmissionSpec"),
     # Models
@@ -81,8 +79,6 @@ __all__ = [
     # Core classes
     "CanonicalCellRecord",
     "update_corpus_index",
-    # Tokenizer (available but NOT used during materialization)
-    "CorpusTokenizer",
     # Emission spec
     "CorpusEmissionSpec",
     # Models

@@ -23,7 +23,6 @@ import pytest
 from perturb_data_lab.contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
 from perturb_data_lab.materializers import (
     CorpusEmissionSpec,
-    CorpusTokenizer,
     update_corpus_index,
 )
 from perturb_data_lab.materializers.chunk_translation import (
@@ -240,8 +239,6 @@ class TestUpdateCorpusIndexWithEmissionSpec:
 
         meta = yaml.safe_load(global_meta_path.read_text())
         assert meta["emission_spec_path"] == "corpus-emission-spec.yaml"
-        # tokenizer_path is None in Phase 3 (tokenizer-free architecture)
-        assert meta.get("tokenizer_path") is None
 
 
 # ---------------------------------------------------------------------------
