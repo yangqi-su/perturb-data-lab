@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from .expression import ExpressionBatch
 from .gpu_pipeline import GPUSparsePipeline
-from .index import _normalize_global_row_indices
+from .index import _normalize_candidate_row_indices
 
 __all__ = [
     "ExpressionBatch",
@@ -42,25 +42,6 @@ _LOADER_METADATA_RESERVED_OVERRIDES: frozenset[str] = frozenset(
 )
 
 
-def _normalize_batch_indices(indices: torch.Tensor | np.ndarray | Sequence[int]) -> np.ndarray:
-    if isinstance(indices, torch.Tensor):
-        return indices.detach().cpu().numpy().astype(np.int64, copy=False)
-    return np.asarray(indices, dtype=np.int64)
-
-
-def _normalize_candidate_row_indices(
-    metadata_index: "MetadataIndex",
-    row_indices: Sequence[int] | np.ndarray | None,
-) -> np.ndarray | None:
-    return _normalize_global_row_indices(
-        row_indices,
-        start=0,
-        end=len(metadata_index),
-        field_name="row_indices",
-        none_policy="none",
-    )
-
-
 def _normalize_metadata_columns(
     metadata_index: "MetadataIndex",
     metadata_columns: Sequence[str] | None,
@@ -89,55 +70,34 @@ def _normalize_metadata_columns(
     return tuple(normalized)
 
 
-def _optional_float32(values: Any) -> np.ndarray | None:
-    if values is None:
-        return None
-    arr = np.asarray(values, dtype=np.float32)
-    if arr.size == 0 or np.isnan(arr).all():
-        return None
-    return arr
-
-
-def _gather_batch_metadata(
-    corpus: Any,
-    global_row_index: torch.Tensor | np.ndarray | Sequence[int],
-    metadata_columns: tuple[str, ...],
-) -> dict[str, Any]:
-    indices = _normalize_batch_indices(global_row_index)
-    columns = ["dataset_index"]
-    if "size_factor" in corpus.metadata_index.df.columns:
-        columns.append("size_factor")
-    columns.extend(column for column in metadata_columns if column not in columns)
-    return corpus.metadata_index.take(indices, columns)
-
-
-def _attach_required_batch_metadata(
+def _attach_pipeline_metadata(
     corpus: Any,
     raw_batch: dict[str, Any],
     metadata_columns: tuple[str, ...],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    gathered = _gather_batch_metadata(
-        corpus,
-        raw_batch["global_row_index"],
-        metadata_columns,
-    )
+    global_row_index = raw_batch["global_row_index"]
+    if isinstance(global_row_index, torch.Tensor):
+        indices = global_row_index.detach().cpu().numpy().astype(np.int64, copy=False)
+    else:
+        indices = np.asarray(global_row_index, dtype=np.int64)
+
+    columns = ["dataset_index"]
+    if "size_factor" in corpus.metadata_index.df.columns:
+        columns.append("size_factor")
+    columns.extend(column for column in metadata_columns if column not in columns)
+
+    gathered = corpus.metadata_index.take(indices, columns)
     resolved = dict(raw_batch)
     resolved["dataset_index"] = np.asarray(gathered["dataset_index"], dtype=np.int32)
-    size_factor = _optional_float32(gathered.get("size_factor"))
+    if "size_factor" in gathered:
+        size_factor = np.asarray(gathered["size_factor"], dtype=np.float32)
+        if size_factor.size == 0 or np.isnan(size_factor).all():
+            size_factor = None
+    else:
+        size_factor = None
     if size_factor is not None:
         resolved["size_factor"] = size_factor
     return resolved, gathered
-
-
-def _attach_requested_metadata(
-    batch: dict[str, Any],
-    gathered: dict[str, Any],
-    metadata_columns: tuple[str, ...],
-) -> dict[str, Any]:
-    if not metadata_columns:
-        return batch
-    batch["meta_columns"] = {column: gathered[column] for column in metadata_columns}
-    return batch
 
 
 class CorpusRandomBatchSampler:
@@ -208,7 +168,7 @@ class ContextBatchSampler:
         self,
         *,
         metadata_index: "MetadataIndex",
-        context_columns: Sequence[str],
+        context_columns: Sequence[str] | None,
         batch_size: int,
         row_indices: Sequence[int] | np.ndarray | None = None,
         drop_last: bool = False,
@@ -282,17 +242,15 @@ class ExpressionBatchDataset:
         return [self._reader.read_expression_flat(list(indices))]
 
 
-def _unwrap_single_prebatched_item(items: list[dict[str, Any]], *, collate_name: str) -> dict[str, Any]:
-    if not items:
-        raise ValueError(f"{collate_name} received empty list")
-    if len(items) != 1:
-        raise ValueError(f"{collate_name} expected a single pre-batched item, got {len(items)}")
-    return items[0]
-
-
 def collate_expression_batch(items: list[ExpressionBatch]) -> dict[str, Any]:
     """Unwrap one expression-only batch and convert arrays to torch tensors."""
-    batch = _unwrap_single_prebatched_item(items, collate_name="collate_expression_batch")
+    if not items:
+        raise ValueError("collate_expression_batch received empty list")
+    if len(items) != 1:
+        raise ValueError(
+            f"collate_expression_batch expected a single pre-batched item, got {len(items)}"
+        )
+    batch = items[0]
     return {
         "batch_size": batch.batch_size,
         "global_row_index": torch.as_tensor(batch.global_row_index, dtype=torch.long),
@@ -300,15 +258,6 @@ def collate_expression_batch(items: list[ExpressionBatch]) -> dict[str, Any]:
         "expressed_gene_indices": torch.as_tensor(batch.expressed_gene_indices, dtype=torch.long),
         "expression_counts": torch.as_tensor(batch.expression_counts, dtype=torch.float32),
     }
-
-
-def _normalize_sampler_kind(sampler: str) -> str:
-    if not isinstance(sampler, str):
-        raise TypeError("sampler must be a string")
-    kind = sampler.strip().lower().replace("-", "_")
-    if kind not in {"corpus_random", "context"}:
-        raise ValueError("sampler must be one of 'corpus_random' or 'context'")
-    return kind
 
 
 def _build_sampler(
@@ -322,7 +271,11 @@ def _build_sampler(
     context_columns: Sequence[str] | None,
     row_indices: Sequence[int] | np.ndarray | None,
 ) -> Any:
-    kind = _normalize_sampler_kind(sampler)
+    if not isinstance(sampler, str):
+        raise TypeError("sampler must be a string")
+    kind = sampler.strip().lower().replace("-", "_")
+    if kind not in {"corpus_random", "context"}:
+        raise ValueError("sampler must be one of 'corpus_random' or 'context'")
     if kind == "corpus_random":
         return CorpusRandomBatchSampler(
             metadata_index=corpus.metadata_index,
@@ -334,7 +287,7 @@ def _build_sampler(
     return ContextBatchSampler(
         metadata_index=corpus.metadata_index,
         batch_size=batch_size,
-        context_columns=_normalize_context_columns(context_columns),
+        context_columns=context_columns,
         row_indices=row_indices,
         drop_last=drop_last,
         shuffle=shuffle,
@@ -441,7 +394,7 @@ def build_loader(
 
     def _iterator() -> Iterator[dict[str, Any]]:
         for expression_batch in data_loader:
-            raw_batch, gathered = _attach_required_batch_metadata(
+            raw_batch, gathered = _attach_pipeline_metadata(
                 corpus,
                 expression_batch,
                 resolved_metadata_columns,
@@ -454,6 +407,11 @@ def build_loader(
                 hvg_weight=hvg_weight,
                 hvg_top_k=hvg_top_k,
             )
-            yield _attach_requested_metadata(processed, gathered, resolved_metadata_columns)
+            if resolved_metadata_columns:
+                processed["meta_columns"] = {
+                    column: gathered[column]
+                    for column in resolved_metadata_columns
+                }
+            yield processed
 
     return _iterator()

@@ -14,8 +14,8 @@ from torch.utils.data import DataLoader
 
 from ..feature_registry import FeatureRegistry
 from ..gpu_pipeline import GPUSparsePipeline
-from ..index import MetadataIndex
-from ..loaders import ExpressionBatch, _normalize_candidate_row_indices
+from ..index import MetadataIndex, _normalize_candidate_row_indices
+from ..loaders import ExpressionBatch
 
 if TYPE_CHECKING:
     from ..corpus_loader import Corpus

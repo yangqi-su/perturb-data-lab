@@ -206,7 +206,22 @@ def _resolve_canonical_obs_projection(
     context: str,
 ) -> list[str]:
     """Resolve canonical-core parquet projection plus optional extras."""
-    extras = _normalize_extra_metadata_columns(extra_metadata_columns)
+    if extra_metadata_columns is None:
+        extras: tuple[str, ...] = ()
+    else:
+        if isinstance(extra_metadata_columns, (str, bytes)):
+            raise TypeError("extra_metadata_columns must be a sequence of column names")
+
+        normalized_extras: list[str] = []
+        seen: set[str] = set()
+        for name in extra_metadata_columns:
+            if not isinstance(name, str) or not name:
+                raise ValueError("extra_metadata_columns must contain non-empty strings")
+            if name not in seen:
+                seen.add(name)
+                normalized_extras.append(name)
+        extras = tuple(normalized_extras)
+
     available = set(available_columns)
     missing = [name for name in extras if name not in available]
     if missing:
@@ -224,27 +239,6 @@ def _resolve_canonical_obs_projection(
         column_name for column_name in extras if column_name not in projection
     )
     return projection
-
-
-def _normalize_extra_metadata_columns(
-    extra_metadata_columns: Sequence[str] | None,
-) -> tuple[str, ...]:
-    """Validate and deduplicate requested extra metadata columns."""
-    if extra_metadata_columns is None:
-        return ()
-    if isinstance(extra_metadata_columns, (str, bytes)):
-        raise TypeError("extra_metadata_columns must be a sequence of column names")
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for name in extra_metadata_columns:
-        if not isinstance(name, str) or not name:
-            raise ValueError("extra_metadata_columns must contain non-empty strings")
-        if name in seen:
-            continue
-        seen.add(name)
-        normalized.append(name)
-    return tuple(normalized)
 
 
 def _normalize_global_row_indices(
@@ -274,6 +268,19 @@ def _normalize_global_row_indices(
     if np.any(normalized < int(start)) or np.any(normalized >= int(end)):
         raise IndexError(f"{field_name} contains out-of-range corpus-global row indices")
     return normalized.copy()
+
+
+def _normalize_candidate_row_indices(
+    metadata_index: MetadataIndex,
+    row_indices: Sequence[int] | np.ndarray | None,
+) -> np.ndarray | None:
+    return _normalize_global_row_indices(
+        row_indices,
+        start=0,
+        end=len(metadata_index),
+        field_name="row_indices",
+        none_policy="none",
+    )
 
 
 def _null_if_legacy_missing(expr: pl.Expr) -> pl.Expr:
