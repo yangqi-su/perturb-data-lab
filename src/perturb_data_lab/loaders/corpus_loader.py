@@ -85,24 +85,14 @@ class Corpus:
 # Backend name normalisation
 # ---------------------------------------------------------------------------
 
-_BACKEND_NORMALIZE: dict[str, str] = {
-    "lance": "lance",
-    "zarr": "zarr",
-    "lancedb": "lance",
-}
-
-
 def _normalize_backend(raw: str) -> str:
     """Map corpus-index backend strings to ``build_expression_reader`` keys."""
-    if not raw:
-        raise ValueError("corpus-index.yaml global_metadata.backend is empty")
-    norm = _BACKEND_NORMALIZE.get(raw)
-    if norm is None:
+    if raw not in {"lance", "zarr"}:
         raise ValueError(
             f"Unsupported corpus backend '{raw}'. "
-            f"Supported: {sorted(_BACKEND_NORMALIZE.keys())}"
+            "Supported: ['lance', 'zarr']"
         )
-    return norm
+    return raw
 
 
 def _build_range_entries(

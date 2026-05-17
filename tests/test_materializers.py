@@ -17,13 +17,9 @@ from perturb_data_lab.materializers import (
 from perturb_data_lab.materializers.models import (
     CountSourceSpec,
     DatasetJoinRecord,
-    FeatureRegistryEntry,
-    FeatureRegistryManifest,
     MaterializationManifest,
     OutputRoots,
     ProvenanceSpec,
-    SizeFactorEntry,
-    SizeFactorManifest,
 )
 
 
@@ -73,83 +69,6 @@ class TestCanonicalCellRecord:
         np.testing.assert_array_equal(indptr, [0, 3])
 
 
-class TestFeatureRegistryAppend:
-    """Test append-only feature registry logic."""
-
-    def test_new_registry_starts_at_zero(self):
-        manifest = FeatureRegistryManifest(
-            kind="feature-registry",
-            contract_version="0.1.0",
-            registry_id="test-reg",
-            append_only=True,
-            namespace="test",
-            feature_id_field="gene_id",
-            feature_label_field="gene_symbol",
-            default_missing_value="NA",
-            entries=(),
-        )
-        assert len(manifest.entries) == 0
-
-    def test_registry_append_preserves_existing_ids(self):
-        existing = FeatureRegistryManifest(
-            kind="feature-registry",
-            contract_version="0.1.0",
-            registry_id="test-reg",
-            append_only=True,
-            namespace="test",
-            feature_id_field="gene_id",
-            feature_label_field="gene_symbol",
-            default_missing_value="NA",
-            entries=(
-                FeatureRegistryEntry(
-                    token_id=0,
-                    feature_id="ENSG1",
-                    feature_label="GENE1",
-                    namespace="test",
-                ),
-                FeatureRegistryEntry(
-                    token_id=1,
-                    feature_id="ENSG2",
-                    feature_label="GENE2",
-                    namespace="test",
-                ),
-            ),
-        )
-
-        # Simulate appending new genes
-        new_genes = ["ENSG3", "ENSG4"]
-        existing_ids = {e.feature_id for e in existing.entries}
-        start_token = max(e.token_id for e in existing.entries) + 1
-
-        new_entries = []
-        for token_id, gene_id in enumerate(new_genes, start=start_token):
-            if gene_id not in existing_ids:
-                new_entries.append(
-                    FeatureRegistryEntry(
-                        token_id=token_id,
-                        feature_id=gene_id,
-                        feature_label=gene_id,
-                        namespace="test",
-                    )
-                )
-
-        combined = FeatureRegistryManifest(
-            kind="feature-registry",
-            contract_version="0.1.0",
-            registry_id="test-reg",
-            append_only=True,
-            namespace="test",
-            feature_id_field="gene_id",
-            feature_label_field="gene_symbol",
-            default_missing_value="NA",
-            entries=(*existing.entries, *new_entries),
-        )
-
-        assert len(combined.entries) == 4
-        assert combined.entries[0].token_id == 0
-        assert combined.entries[2].token_id == 2  # appended, not overwritten
-
-
 class TestCorpusIndexUpdate:
     """Test corpus index append logic."""
 
@@ -159,10 +78,10 @@ class TestCorpusIndexUpdate:
             record = DatasetJoinRecord(
                 dataset_id="ds_001",
                 join_mode="create_new",
-                manifest_path="/tmp/meta/materialization-manifest.yaml",
+                manifest_path="meta/materialization-manifest.yaml",
                 cell_count=1000,
             )
-            updated = update_corpus_index(idx_path, record)
+            updated = update_corpus_index(idx_path, record, backend="lance", topology="aggregate")
             assert updated.corpus_id == "perturb-data-lab-v0"
             assert len(updated.datasets) == 1
             assert updated.datasets[0].dataset_id == "ds_001"
@@ -179,10 +98,10 @@ class TestCorpusIndexUpdate:
             record1 = DatasetJoinRecord(
                 dataset_id="ds_001",
                 join_mode="create_new",
-                manifest_path="/tmp/ds_001.yaml",
+                manifest_path="ds_001.yaml",
                 cell_count=500,
             )
-            updated1 = update_corpus_index(idx_path, record1)
+            updated1 = update_corpus_index(idx_path, record1, backend="lance", topology="aggregate")
             assert updated1.datasets[0].global_start == 0
             assert updated1.datasets[0].global_end == 500
 
@@ -190,10 +109,10 @@ class TestCorpusIndexUpdate:
             record2 = DatasetJoinRecord(
                 dataset_id="ds_002",
                 join_mode="append_routed",
-                manifest_path="/tmp/ds_002.yaml",
+                manifest_path="ds_002.yaml",
                 cell_count=300,
             )
-            updated2 = update_corpus_index(idx_path, record2)
+            updated2 = update_corpus_index(idx_path, record2, backend="lance", topology="aggregate")
 
             assert len(updated2.datasets) == 2
             assert updated2.datasets[1].dataset_id == "ds_002"
@@ -207,15 +126,15 @@ class TestCorpusIndexUpdate:
             record = DatasetJoinRecord(
                 dataset_id="ds_001",
                 join_mode="create_new",
-                manifest_path="/tmp/ds_001.yaml",
+                manifest_path="ds_001.yaml",
                 cell_count=1000,
             )
-            update_corpus_index(idx_path, record)
+            update_corpus_index(idx_path, record, backend="lance", topology="aggregate")
 
             duplicate = DatasetJoinRecord(
                 dataset_id="ds_001",
                 join_mode="append_routed",
-                manifest_path="/tmp/ds_001_dup.yaml",
+                manifest_path="ds_001_dup.yaml",
                 cell_count=500,
             )
             with pytest.raises(ValueError, match="already exists in corpus index"):
@@ -230,10 +149,10 @@ class TestCorpusIndexUpdate:
                 record = DatasetJoinRecord(
                     dataset_id=f"ds_{i:03d}",
                     join_mode="create_new" if i == 0 else "append_routed",
-                    manifest_path=f"/tmp/ds_{i:03d}.yaml",
+                    manifest_path=f"ds_{i:03d}.yaml",
                     cell_count=cc,
                 )
-                update_corpus_index(idx_path, record)
+                update_corpus_index(idx_path, record, backend="lance", topology="aggregate")
 
             # Reload and verify
             from perturb_data_lab.materializers.models import CorpusIndexDocument
@@ -301,6 +220,40 @@ class TestMaterializationManifest:
             assert loaded.topology == "aggregate"
             assert loaded.cell_count == 500
 
+    def test_manifest_rejects_legacy_route_alias(self, tmp_path: Path):
+        payload = {
+            "kind": "materialization-manifest",
+            "contract_version": "0.3.0",
+            "dataset_id": "ds_appended",
+            "route": "append",
+            "backend": "lance",
+            "topology": "aggregate",
+            "count_source": {"selected": ".X", "integer_only": True},
+            "outputs": {"metadata_root": "meta/ds", "matrix_root": "matrix"},
+            "provenance": {"source_path": "/data/ds.h5ad", "review_bundle": "meta/ds/dataset-summary.yaml"},
+        }
+        path = tmp_path / "manifest.yaml"
+        path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+        with pytest.raises(ValueError, match="invalid route"):
+            MaterializationManifest.from_yaml_file(path)
+
+    def test_manifest_rejects_legacy_backend_alias(self, tmp_path: Path):
+        payload = {
+            "kind": "materialization-manifest",
+            "contract_version": "0.3.0",
+            "dataset_id": "ds_appended",
+            "route": "append_routed",
+            "backend": "lancedb-aggregated",
+            "topology": "aggregate",
+            "count_source": {"selected": ".X", "integer_only": True},
+            "outputs": {"metadata_root": "meta/ds", "matrix_root": "matrix"},
+            "provenance": {"source_path": "/data/ds.h5ad", "review_bundle": "meta/ds/dataset-summary.yaml"},
+        }
+        path = tmp_path / "manifest.yaml"
+        path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+        with pytest.raises(ValueError, match="invalid backend"):
+            MaterializationManifest.from_yaml_file(path)
+
 
 class TestManifestToJoinRecordRoute:
     """Test manifest route propagation to DatasetJoinRecord and corpus ledger."""
@@ -322,8 +275,8 @@ class TestManifestToJoinRecordRoute:
                 source_path="/data/create.h5ad",
                 review_bundle="/reviewed-schema.yaml",
             ),
-            raw_cell_meta_path="/meta/create/meta.parquet",
-            provenance_spec_path="/meta/create/prov.parquet",
+            raw_cell_meta_path="meta/create/raw-obs.parquet",
+            provenance_spec_path="meta/create/feature-provenance.parquet",
             cell_count=1000,
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -350,8 +303,8 @@ class TestManifestToJoinRecordRoute:
                 source_path="/data/append.h5ad",
                 review_bundle="/reviewed-schema.yaml",
             ),
-            raw_cell_meta_path="/meta/append/meta.parquet",
-            provenance_spec_path="/meta/append/prov.parquet",
+            raw_cell_meta_path="meta/append/raw-obs.parquet",
+            provenance_spec_path="meta/append/feature-provenance.parquet",
             cell_count=500,
         )
         with tempfile.TemporaryDirectory() as tmpdir:

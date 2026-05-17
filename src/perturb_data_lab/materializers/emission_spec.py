@@ -32,8 +32,6 @@ class CorpusEmissionSpec:
 
     The ``hvg_ranking_path`` field points to the canonical per-dataset
     ``hvg.parquet`` ranking artifact written during materialization.
-    ``hvg_sidecar_path`` is retained only as a legacy fallback for older corpora
-    that still ship ``hvg.npy`` / ``nonhvg.npy`` sidecars.
     """
 
     kind: str = "corpus-emission-spec"
@@ -60,7 +58,6 @@ class CorpusEmissionSpec:
         )
     )
     output_convention: str = "dict"  # only "dict" for now
-    hvg_sidecar_path: str | None = None  # relative path from corpus root (legacy)
     hvg_ranking_path: str | None = None  # relative path from corpus root
     default_n_hvg: int | None = None
 
@@ -72,7 +69,6 @@ class CorpusEmissionSpec:
             "perturbation_fields": list(self.perturbation_fields),
             "context_fields": list(self.context_fields),
             "output_convention": self.output_convention,
-            "hvg_sidecar_path": self.hvg_sidecar_path,
             "hvg_ranking_path": self.hvg_ranking_path,
             "default_n_hvg": self.default_n_hvg,
         }
@@ -93,7 +89,6 @@ class CorpusEmissionSpec:
             perturbation_fields=tuple(str(f) for f in data.get("perturbation_fields", [])),
             context_fields=tuple(str(f) for f in data.get("context_fields", [])),
             output_convention=str(data.get("output_convention", "dict")),
-            hvg_sidecar_path=data.get("hvg_sidecar_path"),
             hvg_ranking_path=data.get("hvg_ranking_path"),
             default_n_hvg=(
                 int(data["default_n_hvg"])

@@ -16,19 +16,16 @@ Never write to protected symlink roots (data/, pertTF/, perturb/).
 from __future__ import annotations
 
 import json
-import math
 import shutil
-import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-import scipy.sparse as sp
 from scipy.sparse import csr_matrix, issparse
 
 from .backends import build_backend_fn
@@ -63,22 +60,13 @@ def _safe_serialize(val: Any) -> Any:
     return str(val)
 
 from .models import (
-    CellMetadataRecord,
     CorpusIndexDocument,
     CountSourceSpec,
     DatasetJoinRecord,
-    DatasetMetadataSummary,
-    FeatureProvenanceSpec,
     GlobalMetadataDocument,
     MaterializationManifest,
     OutputRoots,
     ProvenanceSpec,
-    QAManifest,
-    QAMetric,
-    RawCellMetadataRecord,
-    RawFeatureMetadataRecord,
-    SizeFactorManifest,
-    SizeFactorEntry,
 )
 from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
 from ..inspectors.models import DatasetSummaryDocument
@@ -143,20 +131,18 @@ class Stage2Materializer:
         increase per-chunk memory. Must be positive.
     corpus_index_path : str | None, default None
         Path to ``corpus-index.yaml`` for corpus registration. Required when
-        ``register=True``. When provided, the corpus ledger
-        (``corpus-index.yaml``) is updated after materialization.
+        ``register=True``.
     corpus_id : str | None, default None
-        Corpus identifier. Required when registering a new corpus; inferred from
-        existing ledger for append operations.
+        Corpus identifier. Required when registering a new corpus.
     register : bool, default False
-        If True, automatically register this dataset with the corpus ledger
+        If True, automatically register this dataset with ``corpus-index.yaml``
         after successful materialization. Requires ``corpus_index_path`` to be set.
         When True, the returned manifest's ``corpus_registration`` field is
         populated and the manifest YAML is rewritten with registration metadata.
     mode : str, default "create"
         Materialization mode: ``"create"`` (first dataset in a new corpus) or
         ``"append"`` (subsequent dataset appended to an existing corpus).
-        Controls the manifest ``route`` field and the ledger ``join_mode``.
+        Controls the manifest ``route`` field and corpus-index ``join_mode``.
         ``"create"`` produces ``route="create_new"``; ``"append"`` produces
         ``route="append_routed"``.
     dataset_index : int, default 0
@@ -216,6 +202,8 @@ class Stage2Materializer:
             raise ValueError(
                 f"mode must be 'create' or 'append', got {mode!r}"
             )
+        assert backend in {"lance", "zarr"}, f"unknown backend: {backend}"
+        assert topology in {"federated", "aggregate"}, f"unknown topology: {topology}"
         self.source_path = source_path
         self.review_bundle_path = review_bundle_path
         self.output_roots = output_roots
@@ -328,15 +316,6 @@ class Stage2Materializer:
                 meta_root=meta_root,
             )
 
-            # --- Write per-dataset metadata summary ---
-            metadata_summary_path = self._write_metadata_summary(
-                obs=filtered_obs,
-                var_mem=var_mem,
-                meta_root=meta_root,
-                source_obs_rows=source_obs_rows,
-                obs_filter=summary.obs_filter,
-            )
-
             # --- Write feature provenance Parquet ---
             provenance_spec_path = self._write_feature_provenance_parquet(
                 var_index=var_index,
@@ -350,36 +329,19 @@ class Stage2Materializer:
             # HVG statistics are accumulated during the chunk loop via np.add.at.
             # Global size factors are computed after the loop from all row_sums.
             # Size factors and the canonical HVG ranking parquet are written after the loop.
-            backend_result: tuple[dict[str, Path], np.ndarray, Path] | dict[str, Path]
-            backend_result = self._write_cells(
+            backend_paths, size_factor_parquet_path, hvg_ranking_path = self._write_cells(
                 count_matrix=count_matrix,
                 matrix_root=matrix_root,
                 cell_ids=filtered_obs.index,
                 feature_ids=tuple(str(v) for v in var_index),
                 needs_recovery=count_source.uses_recovery,
             )
-            if isinstance(backend_result, tuple):
-                backend_paths, size_factors, hvg_ranking_path = backend_result
-                size_factor_parquet_path = self._write_size_factor_parquet(
-                    size_factors=size_factors,
-                    cell_ids=filtered_obs.index,
-                    meta_root=meta_root,
-                )
-            else:
-                backend_paths = backend_result
-                size_factor_parquet_path = None
-                hvg_ranking_path = None
+            self._assert_backend_outputs_exist(backend_paths)
 
-            # --- Run QA checks ---
-            qa_metrics, all_passed = self._run_qa_checks(backend_paths, count_matrix)
-            qa_manifest = QAManifest(
-                kind="qa-manifest",
-                contract_version=CONTRACT_VERSION,
-                metrics=qa_metrics,
-                all_passed=all_passed,
+            manifest_outputs = OutputRoots(
+                metadata_root=self._manifest_artifact_path(meta_root),
+                matrix_root=self._manifest_artifact_path(matrix_root),
             )
-            qa_path = meta_root / "qa-manifest.yaml"
-            qa_manifest.write_yaml(qa_path)
 
             # --- Build final manifest ---
             manifest = MaterializationManifest(
@@ -390,22 +352,18 @@ class Stage2Materializer:
                 backend=self.backend,
                 topology=self.topology,
                 count_source=count_source,
-                outputs=self.output_roots,
+                outputs=manifest_outputs,
                 provenance=ProvenanceSpec(
                     source_path=str(source_h5ad),
-                    review_bundle=str(summary_path),
+                    review_bundle=self._manifest_artifact_path(summary_copy_path),
                 ),
-                raw_cell_meta_path=str(raw_cell_meta_parquet_path),
-                raw_feature_meta_path=str(raw_feature_meta_parquet_path),
-                metadata_summary_path=str(metadata_summary_path),
-                provenance_spec_path=str(provenance_spec_path),
-                size_factor_parquet_path=(
-                    str(size_factor_parquet_path) if size_factor_parquet_path else None
-                ),
-                qa_manifest_path=str(qa_path),
-                hvg_ranking_path=(str(hvg_ranking_path) if hvg_ranking_path else None),
+                raw_cell_meta_path=self._manifest_artifact_path(raw_cell_meta_parquet_path),
+                raw_feature_meta_path=self._manifest_artifact_path(raw_feature_meta_parquet_path),
+                provenance_spec_path=self._manifest_artifact_path(provenance_spec_path),
+                size_factor_parquet_path=self._manifest_artifact_path(size_factor_parquet_path),
+                hvg_ranking_path=self._manifest_artifact_path(hvg_ranking_path),
                 default_n_hvg=self.n_hvg,
-                integer_verified=all_passed,
+                integer_verified=True,
                 cell_count=n_obs,
                 feature_count=n_vars,
                 notes=(
@@ -442,47 +400,35 @@ class Stage2Materializer:
                 reg_info = CorpusRegistrationInfo(
                     corpus_id=resolved_corpus_id,
                     is_create=is_create,
-                    corpus_index_path=str(Path(self.corpus_index_path).resolve()),
+                    corpus_index_path=self._manifest_artifact_path(Path(self.corpus_index_path)),
                     dataset_index=join_record.dataset_index,
                     global_start=join_record.global_start,
                     global_end=join_record.global_end,
                 )
-                manifest = MaterializationManifest(
-                    kind=manifest.kind,
-                    contract_version=manifest.contract_version,
-                    dataset_id=manifest.dataset_id,
-                    route=manifest.route,
-                    backend=manifest.backend,
-                    topology=manifest.topology,
-                    count_source=manifest.count_source,
-                    outputs=manifest.outputs,
-                    provenance=manifest.provenance,
-                    raw_cell_meta_path=manifest.raw_cell_meta_path,
-                    raw_feature_meta_path=manifest.raw_feature_meta_path,
-                    accepted_schema_path=manifest.accepted_schema_path,
-                    metadata_summary_path=manifest.metadata_summary_path,
-                    provenance_spec_path=manifest.provenance_spec_path,
-                    feature_meta_paths=manifest.feature_meta_paths,
-                    size_factor_manifest_path=manifest.size_factor_manifest_path,
-                    size_factor_parquet_path=manifest.size_factor_parquet_path,
-                    qa_manifest_path=manifest.qa_manifest_path,
-                    hvg_sidecar_path=manifest.hvg_sidecar_path,
-                    hvg_ranking_path=manifest.hvg_ranking_path,
-                    default_n_hvg=manifest.default_n_hvg,
-                    integer_verified=manifest.integer_verified,
-                    cell_count=manifest.cell_count,
-                    feature_count=manifest.feature_count,
-                    corpus_registration=reg_info,
-                    notes=manifest.notes,
-                )
+                manifest = replace(manifest, corpus_registration=reg_info)
                 # Re-write manifest with registration info
-                manifest_path.write_text(manifest.to_yaml())
+                manifest_path.write_text(manifest.to_yaml(), encoding="utf-8")
 
             return manifest
 
         finally:
             if getattr(adata, "file", None) is not None:
                 adata.file.close()
+
+    def _manifest_artifact_path(self, path: Path | str | None) -> str | None:
+        if path is None:
+            return None
+        artifact_path = Path(path)
+        if self.corpus_index_path is None:
+            return str(artifact_path)
+
+        corpus_root = Path(self.corpus_index_path).parent.resolve()
+        try:
+            return str(artifact_path.resolve().relative_to(corpus_root))
+        except ValueError as exc:
+            raise ValueError(
+                f"materialized artifact path is outside corpus root: {artifact_path}"
+            ) from exc
 
     def _rerun_stage1_preflight(self) -> Path:
         """Re-run Stage 1 inspection as preflight and return the summary path."""
@@ -615,64 +561,6 @@ class Stage2Materializer:
         pq.write_table(table, parquet_path)
         return parquet_path
 
-    def _write_metadata_summary(
-        self,
-        obs: pd.DataFrame,
-        var_mem: pd.DataFrame,
-        meta_root: Path,
-        *,
-        source_obs_rows: int,
-        obs_filter: str | None,
-    ) -> Path:
-        """Write a per-dataset metadata summary YAML file.
-
-        Summarizes field-level coverage statistics (null fractions, dtypes)
-        extracted from the raw obs/var before any canonical mapping.
-        """
-        obs_null_fractions: dict[str, float] = {}
-        obs_dtypes: dict[str, str] = {}
-        for col in obs.columns:
-            obs_null_fractions[col] = float(obs[col].isna().mean())
-            obs_dtypes[col] = str(obs[col].dtype)
-
-        var_null_fractions: dict[str, float] = {}
-        var_dtypes: dict[str, str] = {}
-        for col in var_mem.columns:
-            var_null_fractions[col] = float(var_mem[col].isna().mean())
-            var_dtypes[col] = str(var_mem[col].dtype)
-
-        summary = DatasetMetadataSummary(
-            kind="dataset-metadata-summary",
-            contract_version=CONTRACT_VERSION,
-            dataset_id=self.dataset_id,
-            source_path=self.source_path,
-            obs_field_count=len(obs.columns),
-            var_field_count=len(var_mem.columns),
-            obs_null_fractions=obs_null_fractions,
-            var_null_fractions=var_null_fractions,
-            obs_dtypes=obs_dtypes,
-            var_dtypes=var_dtypes,
-            obs_rows=len(obs),
-            var_rows=len(var_mem),
-            obs_index_name=str(obs.index.name or "index"),
-            var_index_name=str(var_mem.index.name or "index"),
-            notes=(
-                f"materialized via Stage2Materializer (schema-independent)",
-                *(
-                    (
-                        f"obs_filter retained {len(obs)}/{source_obs_rows} rows",
-                        f"obs_filter expression: {obs_filter}",
-                    )
-                    if obs_filter is not None and obs_filter.strip()
-                    else ()
-                ),
-            ),
-        )
-
-        summary_path = meta_root / "metadata-summary.yaml"
-        summary.write_yaml(summary_path)
-        return summary_path
-
     def _write_feature_provenance_parquet(
         self,
         var_index: pd.Index,
@@ -726,20 +614,10 @@ class Stage2Materializer:
         pq.write_table(table, parquet_path)
         return parquet_path
 
-    def _run_qa_checks(
-        self,
-        backend_paths: dict[str, Path],
-        original_matrix: Any,
-    ) -> tuple[tuple[QAMetric, ...], bool]:
-        """Run QA checks on written output artifacts."""
-        metrics = []
+    def _assert_backend_outputs_exist(self, backend_paths: dict[str, Path]) -> None:
         for name, path in backend_paths.items():
             if not path.exists():
-                metrics.append(QAMetric(name=f"{name}_exists", value=0.0, threshold=1.0))
-            else:
-                metrics.append(QAMetric(name=f"{name}_exists", value=1.0, threshold=1.0))
-        all_passed = all(m.passed() for m in metrics)
-        return tuple(metrics), all_passed
+                raise FileNotFoundError(f"backend output {name!r} was not written: {path}")
 
     def _write_cells(
         self,
@@ -749,7 +627,7 @@ class Stage2Materializer:
         cell_ids: pd.Index,
         feature_ids: Sequence[str],
         needs_recovery: bool = False,
-    ) -> tuple[dict[str, Path], np.ndarray, Path] | dict[str, Path]:
+    ) -> tuple[dict[str, Path], Path, Path]:
         """Write sparse cell data using the configured backend and topology.
 
         This method dispatches to either ``_write_cells_federated`` (single dataset)
@@ -810,14 +688,14 @@ class Stage2Materializer:
         cell_ids: pd.Index,
         feature_ids: Sequence[str],
         needs_recovery: bool = False,
-    ) -> tuple[dict[str, Path], np.ndarray, Path]:
+    ) -> tuple[dict[str, Path], Path, Path]:
         """Write federated (single-dataset) sparse cell data.
 
         Loops over the count matrix in chunks, calls ``_translate_chunk()`` per chunk,
         accumulates row sums and HVG statistics during the loop, then computes
         global size factors and writes ``hvg.parquet`` after the loop.
 
-        Returns ``(paths_dict, size_factors_array, hvg_ranking_path)``.
+        Returns ``(paths_dict, size_factor_parquet_path, hvg_ranking_path)``.
         """
         from .chunk_translation import DatasetSpec, _translate_chunk
 
@@ -924,7 +802,7 @@ class Stage2Materializer:
             meta_root=meta_root,
         )
 
-        return (all_paths, size_factors, hvg_ranking_path)
+        return (all_paths, size_factor_parquet_path, hvg_ranking_path)
 
     def _write_cells_aggregate(
         self,
@@ -934,7 +812,7 @@ class Stage2Materializer:
         cell_ids: pd.Index,
         feature_ids: Sequence[str],
         needs_recovery: bool = False,
-    ) -> tuple[dict[str, Path], np.ndarray, Path]:
+    ) -> tuple[dict[str, Path], Path, Path]:
         """Write aggregate (multi-dataset corpus) sparse cell data.
 
         Loops over the count matrix in chunks, calling the aggregate backend
@@ -946,7 +824,7 @@ class Stage2Materializer:
         Global size factors and the canonical HVG ranking parquet are written
         after the loop (same as federated).
 
-        Returns ``(paths_dict, size_factors_array, hvg_ranking_path)`` — same
+        Returns ``(paths_dict, size_factor_parquet_path, hvg_ranking_path)`` — same
         format as ``_write_cells_federated``.
 
         Note: Only ``lance`` and ``zarr`` backends support aggregate topology in
@@ -1055,7 +933,7 @@ class Stage2Materializer:
             meta_root=meta_root,
         )
 
-        return (all_paths, size_factors, hvg_ranking_path)
+        return (all_paths, size_factor_parquet_path, hvg_ranking_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1169,20 +1047,16 @@ def update_corpus_index(
         Backend declaration for the corpus (e.g., "lance", "zarr"). Required when creating a new corpus; written to
         ``global-metadata.yaml``.
     topology : str | None
-        Corpus topology for the Parquet ledger entry (e.g., "federated",
-        "aggregate"). Required for new corpus creation; inferred from ``backend``
-        for known backends (lance → aggregate, others → federated) when not
-        explicitly provided.
+        Corpus topology ("federated" or "aggregate"). Required for new corpus
+        creation unless supplied through ``global_metadata``.
     """
-    corpus_root = corpus_index_path.parent
+    corpus_root = corpus_index_path.parent.resolve()
 
     # Convert manifest_path to relative to corpus_root for portability.
-    # If the manifest is outside corpus_root, store the absolute path as fallback.
     manifest_path_input = Path(new_dataset_record.manifest_path)
-    try:
-        manifest_path_relative = manifest_path_input.relative_to(corpus_root)
-    except ValueError:
-        # Manifest is outside corpus_root — store absolute path
+    if manifest_path_input.is_absolute():
+        manifest_path_relative = manifest_path_input.resolve().relative_to(corpus_root)
+    else:
         manifest_path_relative = manifest_path_input
 
     if corpus_index_path.exists():
@@ -1225,15 +1099,22 @@ def update_corpus_index(
         datasets = [new_record]
         corpus_id = "perturb-data-lab-v0"
         # Build global metadata dict for new corpus
+        if global_metadata is None:
+            if backend is None:
+                raise ValueError("backend is required when creating a corpus index")
+            if topology is None:
+                raise ValueError("topology is required when creating a corpus index")
+            assert backend in {"lance", "zarr"}, f"unknown backend: {backend}"
+            assert topology in {"federated", "aggregate"}, f"unknown topology: {topology}"
         gmeta_dict: dict[str, Any] = {
             "kind": "global-metadata",
             "contract_version": CONTRACT_VERSION,
             "schema_version": CONTRACT_VERSION,
             "missing_value_literal": MISSING_VALUE_LITERAL,
             "raw_field_policy": "preserve-unchanged",
+            "backend": backend,
+            "topology": topology,
         }
-        if backend is not None:
-            gmeta_dict["backend"] = backend
         if global_metadata is not None:
             gmeta_dict = global_metadata.to_dict()
         if emission_spec_path is not None:

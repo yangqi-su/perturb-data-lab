@@ -871,7 +871,7 @@ class TestCanonicalizeDiscovery:
         assert backend == "lance"
         assert topology == "aggregate"
 
-    def test_infer_backend_topology_falls_back_to_manifest(self, tmp_path: Path):
+    def test_infer_backend_topology_requires_global_metadata(self, tmp_path: Path):
         corpus_root = tmp_path / "corpus"
         corpus_root.mkdir()
 
@@ -914,9 +914,8 @@ class TestCanonicalizeDiscovery:
             }],
         }))
 
-        backend, topology = _infer_backend_topology_from_corpus(corpus_root)
-        assert backend == "lance"
-        assert topology == "aggregate"
+        with pytest.raises(ValueError, match="global_metadata.backend is missing"):
+            _infer_backend_topology_from_corpus(corpus_root)
 
     def test_infer_backend_topology_raises_when_unknown(self, tmp_path: Path):
         corpus_root = tmp_path / "corpus"
@@ -928,7 +927,7 @@ class TestCanonicalizeDiscovery:
             "global_metadata": {},
             "datasets": [],
         }))
-        with pytest.raises(ValueError, match="cannot auto-detect backend"):
+        with pytest.raises(ValueError, match="global_metadata.backend is missing"):
             _infer_backend_topology_from_corpus(corpus_root)
 
     def test_resolve_sidecars_from_corpus(self, tmp_path: Path):

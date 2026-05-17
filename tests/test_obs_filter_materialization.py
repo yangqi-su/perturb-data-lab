@@ -122,9 +122,8 @@ def test_stage2_materializer_applies_obs_filter_and_preserves_source_identity(
     assert indices == (1, 2)
     assert values == (2, 5)
 
-    metadata_summary = (meta_root / "metadata-summary.yaml").read_text(encoding="utf-8")
-    assert "obs_rows: 1" in metadata_summary
-    assert "obs_filter retained 1/4 rows" in metadata_summary
+    assert not (meta_root / "metadata-summary.yaml").exists()
+    assert "obs_filter retained 1/4 rows" in manifest.notes
 
 
 def test_stage2_materializer_rejects_invalid_obs_filter_before_writing_outputs(

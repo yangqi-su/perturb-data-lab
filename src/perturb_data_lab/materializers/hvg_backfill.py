@@ -93,23 +93,16 @@ def _infer_backend_topology(
 ) -> tuple[str, str]:
     backend = corpus.global_metadata.get("backend")
     topology = corpus.global_metadata.get("topology")
-
-    if (backend is None or topology is None) and corpus.datasets:
-        first_manifest_path = _resolve_manifest_path(
-            corpus_root,
-            corpus.datasets[0].manifest_path,
-        )
-        if first_manifest_path.exists():
-            manifest = MaterializationManifest.from_yaml_file(first_manifest_path)
-            backend = backend or manifest.backend
-            topology = topology or manifest.topology
-
     if backend is None:
         raise ValueError(
-            f"cannot infer backend from {corpus_root / 'corpus-index.yaml'}"
+            f"corpus-index.yaml global_metadata.backend is missing at {corpus_root}"
         )
     if topology is None:
-        topology = "aggregate" if backend == "lance" else "federated"
+        raise ValueError(
+            f"corpus-index.yaml global_metadata.topology is missing at {corpus_root}"
+        )
+    assert backend in {"lance", "zarr"}, f"unknown backend: {backend}"
+    assert topology in {"federated", "aggregate"}, f"unknown topology: {topology}"
     return str(backend), str(topology)
 
 
@@ -385,7 +378,7 @@ def backfill_hvg_rankings_for_corpus(
         if update_manifests:
             updated_manifest = replace(
                 manifest,
-                hvg_ranking_path=str(output_path),
+                hvg_ranking_path=str(output_path.relative_to(corpus_root)),
                 default_n_hvg=effective_n_hvg,
             )
             updated_manifest.write_yaml(manifest_path)

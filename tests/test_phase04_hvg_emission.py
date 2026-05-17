@@ -231,6 +231,8 @@ class TestUpdateCorpusIndexWithEmissionSpec:
             corpus_index_path=corpus_index,
             new_dataset_record=dataset_record,
             emission_spec_path="corpus-emission-spec.yaml",
+            backend="lance",
+            topology="aggregate",
         )
         # Verify global-metadata.yaml was written
         global_meta_path = tmp_path / "global-metadata.yaml"

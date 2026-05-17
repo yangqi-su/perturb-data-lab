@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Mapping, TypeVar
+from typing import Any, Mapping
 
 import yaml
 
 from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
-
-T = TypeVar("T")
 
 
 def _serialize(value: Any) -> Any:
@@ -27,10 +25,6 @@ def _serialize(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _serialize(val) for key, val in value.items()}
     return value
-
-
-def _coerce_tuple(data: Any, item_type: type[T]) -> tuple[T, ...]:
-    return tuple(item_type.from_dict(item) for item in data or [])
 
 
 @dataclass(frozen=True)
@@ -97,113 +91,6 @@ class ProvenanceSpec:
 
 
 @dataclass(frozen=True)
-class FeatureManifestEntry:
-    token_id: int
-    feature_id: str
-    feature_label: str
-    namespace: str
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "FeatureManifestEntry":
-        return cls(
-            token_id=int(data["token_id"]),
-            feature_id=str(data["feature_id"]),
-            feature_label=str(data["feature_label"]),
-            namespace=str(data.get("namespace", "unknown")),
-        )
-
-
-@dataclass(frozen=True)
-class RawCellMetadataRecord:
-    """A single cell's raw metadata record — fields directly from h5ad obs, no canonical mapping applied.
-
-    This record preserves the full obs row as the user saw it in the source h5ad,
-    before any canonical field resolution. It is the authoritative source for
-    canonical cell metadata rebuild in ``canonicalize-meta``.
-    """
-
-    cell_id: str
-    dataset_id: str
-    raw_fields: dict[str, Any]
-
-    def to_dict(self) -> dict[str, Any]:
-        return _serialize(self)
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "RawCellMetadataRecord":
-        return cls(
-            cell_id=str(data["cell_id"]),
-            dataset_id=str(data["dataset_id"]),
-            raw_fields=dict(data.get("raw_fields", {})),
-        )
-
-
-@dataclass(frozen=True)
-class RawFeatureMetadataRecord:
-    """A single feature's raw metadata record — fields directly from h5ad var, no canonical mapping applied.
-
-    This record preserves the full var row as the user saw it in the source h5ad,
-    before any canonical field resolution. It is the authoritative source for
-    canonical feature metadata rebuild in ``canonicalize-meta``.
-    """
-
-    origin_index: int
-    feature_id: str
-    raw_fields: dict[str, Any]
-
-    def to_dict(self) -> dict[str, Any]:
-        return _serialize(self)
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "RawFeatureMetadataRecord":
-        return cls(
-            origin_index=int(data["origin_index"]),
-            feature_id=str(data["feature_id"]),
-            raw_fields=dict(data.get("raw_fields", {})),
-        )
-
-    def write_yaml(self, output_path: Path) -> None:
-        """Serialize to YAML and write to output_path."""
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(self.to_yaml(), encoding="utf-8")
-
-    def to_yaml(self) -> str:
-        return yaml.safe_dump(self.to_dict(), sort_keys=False)
-
-
-@dataclass(frozen=True)
-class SizeFactorEntry:
-    cell_id: str
-    size_factor: float
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "SizeFactorEntry":
-        return cls(cell_id=str(data["cell_id"]), size_factor=float(data["size_factor"]))
-
-
-@dataclass(frozen=True)
-class QAMetric:
-    name: str
-    value: float
-    threshold: float | None = None
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "QAMetric":
-        return cls(
-            name=str(data["name"]),
-            value=float(data["value"]),
-            threshold=float(data["threshold"])
-            if data.get("threshold") is not None
-            else None,
-        )
-
-    def passed(self) -> bool:
-        if self.threshold is None:
-            return True
-        return self.value <= self.threshold
-
-
-@dataclass(frozen=True)
 class CorpusRegistrationInfo:
     """Registration metadata produced when Stage2Materializer registers with a corpus.
 
@@ -240,23 +127,15 @@ class MaterializationManifest(YamlDocument):
     contract_version: str
     dataset_id: str
     route: str  # create_new | append_routed
-    backend: str  # lance | zarr (legacy lance/zarr aliases normalized on read)
+    backend: str  # lance | zarr
     topology: str  # federated | aggregate (Stage 2 contract: backend and topology are separate)
     count_source: CountSourceSpec
     outputs: OutputRoots
     provenance: ProvenanceSpec
-    # New Phase 3 dataset-local artifact paths (tokenizer removed)
-    raw_cell_meta_path: str | None = None  # Parquet: raw cell metadata (no canonical mapping); SQLite deprecated
-    raw_feature_meta_path: str | None = None  # Parquet: raw feature metadata (no canonical mapping)
-    accepted_schema_path: str | None = None  # optional audit copy of accepted schema; NOT read back
-    metadata_summary_path: str | None = None  # per-dataset metadata summary (field coverage, null fractions)
+    raw_cell_meta_path: str | None = None  # raw-obs.parquet
+    raw_feature_meta_path: str | None = None  # raw-var.parquet
     provenance_spec_path: str | None = None  # feature-order/provenance artifact
-    # Existing paths
-    feature_meta_paths: dict[str, str] | None = None  # canonical feature metadata (origin + token parquet paths)
-    size_factor_manifest_path: str | None = None  # deprecated: YAML size-factor manifest (no longer written)
     size_factor_parquet_path: str | None = None  # Parquet: per-cell size factors (separate from cells parquet)
-    qa_manifest_path: str | None = None
-    hvg_sidecar_path: str | None = None  # legacy fallback for older corpora
     hvg_ranking_path: str | None = None  # canonical per-dataset hvg.parquet artifact
     default_n_hvg: int | None = None
     integer_verified: bool = False
@@ -280,51 +159,20 @@ class MaterializationManifest(YamlDocument):
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "MaterializationManifest":
-        backend_raw = data.get("backend", "lance")
-        # Normalize retained legacy backend aliases to the slim-main names.
-        _LEGACY_BACKEND_MAP = {
-            "zarr-ts": "zarr",
-            "lancedb-aggregated": "lance",
-            "zarr-aggregated": "zarr",
-        }
-        backend_normalized = _LEGACY_BACKEND_MAP.get(backend_raw, backend_raw)
-        # Normalize legacy route names to contract names
-        route_raw = data.get("route", "create_new")
-        if route_raw == "create_new":
-            route_normalized = "create_new"
-        elif route_raw in ("append_routed", "append"):
-            route_normalized = "append_routed"
-        else:
-            route_normalized = route_raw
-        # Normalize topology: legacy retained aliases had topology baked in.
-        # "lancedb-aggregated" implies topology="aggregate"; others are federated.
-        topo_raw = data.get("topology")
-        if topo_raw is None:
-            topo_normalized = "aggregate" if backend_normalized == "lance" else "federated"
-        else:
-            topo_normalized = str(topo_raw)
         document = cls(
             kind=str(data["kind"]),
             contract_version=str(data["contract_version"]),
             dataset_id=str(data["dataset_id"]),
-            route=route_normalized,
-            backend=backend_normalized,
-            topology=topo_normalized,
+            route=str(data["route"]),
+            backend=str(data["backend"]),
+            topology=str(data["topology"]),
             count_source=CountSourceSpec.from_dict(data["count_source"]),
             outputs=OutputRoots.from_dict(data["outputs"]),
             provenance=ProvenanceSpec.from_dict(data["provenance"]),
             raw_cell_meta_path=data.get("raw_cell_meta_path"),
             raw_feature_meta_path=data.get("raw_feature_meta_path"),
-            accepted_schema_path=data.get("accepted_schema_path"),
-            metadata_summary_path=data.get("metadata_summary_path"),
             provenance_spec_path=data.get("provenance_spec_path"),
-            feature_meta_paths={
-                k: str(v) for k, v in (data.get("feature_meta_paths") or {}).items()
-            },
-            size_factor_manifest_path=data.get("size_factor_manifest_path"),
             size_factor_parquet_path=data.get("size_factor_parquet_path"),
-            qa_manifest_path=data.get("qa_manifest_path"),
-            hvg_sidecar_path=data.get("hvg_sidecar_path"),
             hvg_ranking_path=data.get("hvg_ranking_path"),
             default_n_hvg=(
                 int(data["default_n_hvg"])
@@ -347,223 +195,6 @@ class MaterializationManifest(YamlDocument):
     @classmethod
     def from_yaml_file(cls, file_path: Path) -> "MaterializationManifest":
         return cls.from_dict(cls._load_yaml_dict(file_path))
-
-
-@dataclass(frozen=True)
-class FeatureRegistryEntry:
-    token_id: int
-    feature_id: str
-    feature_label: str
-    namespace: str
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "FeatureRegistryEntry":
-        return cls(
-            token_id=int(data["token_id"]),
-            feature_id=str(data["feature_id"]),
-            feature_label=str(data["feature_label"]),
-            namespace=str(data.get("namespace", "unknown")),
-        )
-
-
-@dataclass(frozen=True)
-class FeatureRegistryManifest(YamlDocument):
-    kind: str
-    contract_version: str
-    registry_id: str
-    append_only: bool
-    namespace: str
-    feature_id_field: str
-    feature_label_field: str
-    default_missing_value: str
-    entries: tuple[FeatureRegistryEntry, ...]
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "FeatureRegistryManifest":
-        return cls(
-            kind=str(data["kind"]),
-            contract_version=str(data["contract_version"]),
-            registry_id=str(data["registry_id"]),
-            append_only=bool(data.get("append_only", True)),
-            namespace=str(data.get("namespace", "unknown")),
-            feature_id_field=str(data.get("feature_id_field", "gene_id")),
-            feature_label_field=str(data.get("feature_label_field", "gene_symbol")),
-            default_missing_value=str(
-                data.get("default_missing_value", MISSING_VALUE_LITERAL)
-            ),
-            entries=tuple(
-                FeatureRegistryEntry.from_dict(e) for e in data.get("entries", [])
-            ),
-        )
-
-    @classmethod
-    def from_yaml_file(cls, file_path: Path) -> "FeatureRegistryManifest":
-        return cls.from_dict(cls._load_yaml_dict(file_path))
-
-    def to_dict(self) -> dict[str, Any]:
-        payload = super().to_dict()
-        payload["entries"] = [
-            e.to_dict() if isinstance(e, YamlDocument) else e
-            for e in payload["entries"]
-        ]
-        return payload
-
-
-@dataclass(frozen=True)
-class SizeFactorManifest(YamlDocument):
-    kind: str
-    contract_version: str
-    method: str  # e.g. sum, median
-    entries: tuple[SizeFactorEntry, ...]
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "SizeFactorManifest":
-        return cls(
-            kind=str(data["kind"]),
-            contract_version=str(data["contract_version"]),
-            method=str(data.get("method", "sum")),
-            entries=tuple(
-                SizeFactorEntry.from_dict(e) for e in data.get("entries", [])
-            ),
-        )
-
-    @classmethod
-    def from_yaml_file(cls, file_path: Path) -> "SizeFactorManifest":
-        return cls.from_dict(cls._load_yaml_dict(file_path))
-
-
-@dataclass(frozen=True)
-class QAManifest(YamlDocument):
-    kind: str
-    contract_version: str
-    metrics: tuple[QAMetric, ...]
-    all_passed: bool
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "QAManifest":
-        metrics = tuple(QAMetric.from_dict(m) for m in data.get("metrics", []))
-        all_passed = all(m.passed() for m in metrics)
-        return cls(
-            kind=str(data["kind"]),
-            contract_version=str(data["contract_version"]),
-            metrics=metrics,
-            all_passed=all_passed,
-        )
-
-    @classmethod
-    def from_yaml_file(cls, file_path: Path) -> "QAManifest":
-        return cls.from_dict(cls._load_yaml_dict(file_path))
-
-
-@dataclass(frozen=True)
-class DatasetMetadataSummary(YamlDocument):
-    """Per-dataset metadata summary persisted during materialization for later schema review.
-
-    This summary provides field-level coverage statistics (null fractions,
-    dtype, unique value counts) extracted from the raw obs/var before any canonical
-    mapping. It is written as a dataset-local artifact alongside the accepted schema
-    and can be used to assist schema review when onboarding new datasets.
-    """
-
-    kind: str
-    contract_version: str
-    dataset_id: str
-    source_path: str
-    obs_field_count: int
-    var_field_count: int
-    obs_null_fractions: dict[str, float]
-    var_null_fractions: dict[str, float]
-    obs_dtypes: dict[str, str]
-    var_dtypes: dict[str, str]
-    obs_rows: int
-    var_rows: int
-    obs_index_name: str
-    var_index_name: str
-    notes: tuple[str, ...] = ()
-
-    def validate(self) -> None:
-        if self.kind != "dataset-metadata-summary":
-            raise ValueError("dataset metadata summary kind mismatch")
-        if self.contract_version != CONTRACT_VERSION:
-            raise ValueError("dataset metadata summary contract version mismatch")
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "DatasetMetadataSummary":
-        document = cls(
-            kind=str(data["kind"]),
-            contract_version=str(data["contract_version"]),
-            dataset_id=str(data["dataset_id"]),
-            source_path=str(data["source_path"]),
-            obs_field_count=int(data.get("obs_field_count", 0)),
-            var_field_count=int(data.get("var_field_count", 0)),
-            obs_null_fractions=dict(data.get("obs_null_fractions", {})),
-            var_null_fractions=dict(data.get("var_null_fractions", {})),
-            obs_dtypes=dict(data.get("obs_dtypes", {})),
-            var_dtypes=dict(data.get("var_dtypes", {})),
-            obs_rows=int(data.get("obs_rows", 0)),
-            var_rows=int(data.get("var_rows", 0)),
-            obs_index_name=str(data.get("obs_index_name", "")),
-            var_index_name=str(data.get("var_index_name", "")),
-            notes=tuple(str(item) for item in data.get("notes", [])),
-        )
-        document.validate()
-        return document
-
-
-@dataclass(frozen=True)
-class FeatureProvenanceSpec(YamlDocument):
-    """Feature-order and provenance artifact written during materialization.
-
-    Records the per-dataset feature ordering (origin_index in original dataset
-    var order) and the provenance of each feature (source h5ad, source var index,
-    accepted schema used). Used by ``canonicalize-meta`` to rebuild the corpus
-    feature set without requiring a tokenizer.
-    """
-
-    feature_count: int
-    source_path: str
-    schema_path: str
-    count_source: CountSourceSpec
-    origin_index_to_feature_id: dict[int, str]
-    notes: tuple[str, ...] = ()
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "FeatureProvenanceSpec":
-        return cls(
-            feature_count=int(data.get("feature_count", 0)),
-            source_path=str(data.get("source_path", "")),
-            schema_path=str(data.get("schema_path", "")),
-            count_source=CountSourceSpec.from_dict(data.get("count_source", {})),
-            origin_index_to_feature_id=dict(data.get("origin_index_to_feature_id", {})),
-            notes=tuple(str(item) for item in data.get("notes", [])),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return _serialize(self)
-
-
-@dataclass(frozen=True)
-class CellMetadataRecord:
-    cell_id: str
-    dataset_id: str
-    raw_fields: dict[str, Any]
-    canonical_perturbation: dict[str, str]
-    canonical_context: dict[str, str]
-    size_factor: float
-
-    def to_dict(self) -> dict[str, Any]:
-        return _serialize(self)
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "CellMetadataRecord":
-        return cls(
-            cell_id=str(data["cell_id"]),
-            dataset_id=str(data["dataset_id"]),
-            raw_fields=dict(data.get("raw_fields", {})),
-            canonical_perturbation=dict(data.get("canonical_perturbation", {})),
-            canonical_context=dict(data.get("canonical_context", {})),
-            size_factor=float(data.get("size_factor", 1.0)),
-        )
 
 
 @dataclass(frozen=True)
@@ -683,7 +314,7 @@ class GlobalMetadataDocument(YamlDocument):
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "GlobalMetadataDocument":
-        return cls(
+        document = cls(
             kind=str(data["kind"]),
             contract_version=str(data["contract_version"]),
             schema_version=str(data.get("schema_version", "0.1.0")),
@@ -691,11 +322,13 @@ class GlobalMetadataDocument(YamlDocument):
                 data.get("missing_value_literal", MISSING_VALUE_LITERAL)
             ),
             raw_field_policy=str(data.get("raw_field_policy", "preserve-unchanged")),
-            backend=data.get("backend"),  # may be None for backward compat with older files
+            backend=data.get("backend"),
             topology=data.get("topology"),
             emission_spec_path=data.get("emission_spec_path"),
             notes=tuple(str(item) for item in data.get("notes", [])),
         )
+        document.validate()
+        return document
 
     @classmethod
     def from_yaml_file(cls, file_path: Path) -> "GlobalMetadataDocument":

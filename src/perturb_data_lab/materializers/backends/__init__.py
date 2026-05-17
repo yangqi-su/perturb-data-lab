@@ -79,21 +79,6 @@ AVAILABLE_WRITERS: dict[str, dict[str, Any]] = {
     },
 }
 
-_REMOVED_BACKENDS: frozenset[str] = frozenset(
-    {
-        "arrow-hf",
-        "arrow-parquet",
-        "arrow-ipc",
-        "hf-datasets",
-        "webdataset",
-        "tiledb",
-        "csr-memmap",
-        "csr_memmap",
-        "parquet",
-    }
-)
-
-
 def build_backend_fn(backend: str, topology: str = "federated"):
     """Select backend materialization function by canonical name and topology.
 
@@ -115,21 +100,7 @@ def build_backend_fn(backend: str, topology: str = "federated"):
     KeyError
         If the backend/topology combination is not supported.
     """
-    if backend not in AVAILABLE_WRITERS:
-        if backend in _REMOVED_BACKENDS:
-            raise KeyError(
-                f"backend '{backend}' is not supported in slim main; only "
-                "'lance' and 'zarr' remain available. Use the preserved "
-                "experimental snapshot branch for removed backends."
-            )
-        raise KeyError(
-            f"unknown backend: {backend}; "
-            f"available backends: {list(AVAILABLE_WRITERS)}"
-        )
+    assert backend in AVAILABLE_WRITERS, f"unknown backend: {backend}"
     topo_map = AVAILABLE_WRITERS[backend]
-    if topology not in topo_map:
-        raise KeyError(
-            f"unknown topology '{topology}' for backend '{backend}'; "
-            f"available topologies: {list(topo_map)}"
-        )
+    assert topology in topo_map, f"unknown topology: {topology}"
     return topo_map[topology]

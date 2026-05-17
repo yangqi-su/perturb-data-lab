@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .core import update_corpus_index
 from .models import (
+    CorpusIndexDocument,
     DatasetJoinRecord,
     GlobalMetadataDocument,
     MaterializationManifest,
@@ -41,15 +42,14 @@ def manifest_to_join_record(
     -----
     - manifest_path is stored relative to corpus_root when possible
     - cell_count is taken from manifest.cell_count
-    - feature_count lives in the ledger entry, not DatasetJoinRecord
     """
-    manifest_dir = Path(manifest.raw_cell_meta_path or manifest.provenance_spec_path).parent
+    corpus_root = corpus_root.resolve()
+    manifest_artifact = manifest.raw_cell_meta_path or manifest.provenance_spec_path
+    if manifest_artifact is None:
+        raise ValueError("manifest must contain raw_cell_meta_path or provenance_spec_path")
+    manifest_dir = _resolve_manifest_artifact(corpus_root, manifest_artifact).parent
     manifest_yaml = manifest_dir / "materialization-manifest.yaml"
-    try:
-        manifest_path_relative = manifest_yaml.relative_to(corpus_root)
-    except ValueError:
-        # Manifest is outside corpus_root — store absolute path as fallback
-        manifest_path_relative = manifest_yaml
+    manifest_path_relative = manifest_yaml.relative_to(corpus_root)
 
     return DatasetJoinRecord(
         dataset_id=manifest.dataset_id,
@@ -83,16 +83,14 @@ def register_materialization(
         The filled manifest from Stage2Materializer.materialize().
     corpus_index_path : Path
         Path to corpus-index.yaml (or where it will be written for new corpora).
-        Path to corpus-index.yaml.
     corpus_id : str | None
-        Corpus identifier. Required for new corpus creation; inferred from
-        existing ledger for append operations.
+        Corpus identifier. Required for new corpus creation.
     backend : str | None
-        Storage backend (e.g., "arrow-hf"). Required for new corpus creation.
-        For append, the backend is inherited from existing corpus metadata.
+        Storage backend ("lance" or "zarr"). Required for registration and
+        checked against existing corpus metadata on append.
     topology : str | None
         Corpus topology ("federated" or "aggregate"). Required for new corpus
-        creation. For append, inferred from existing corpus metadata.
+        creation and checked against existing corpus metadata on append.
 
     Returns
     -------
@@ -115,8 +113,8 @@ def register_materialization(
     """
     corpus_root = corpus_index_path.parent
 
-    # Verify key manifest outputs exist before registering
-    _verify_manifest_outputs(manifest)
+    # Verify current required artifacts exist before registering.
+    _verify_manifest_outputs(manifest, corpus_root)
 
     # Determine if corpus exists by checking the corpus index.
     yaml_exists = corpus_index_path.exists()
@@ -138,8 +136,12 @@ def register_materialization(
                 "pass it explicitly (e.g., backend='lance')"
             )
         if topology is None:
-            # Infer from backend per contract backend-topology matrix
-            topology = "aggregate" if backend == "lance" else "federated"
+            raise ValueError(
+                "topology is required for new corpus registration; "
+                "pass it explicitly (e.g., topology='federated')"
+            )
+        assert backend in {"lance", "zarr"}, f"unknown backend: {backend}"
+        assert topology in {"federated", "aggregate"}, f"unknown topology: {topology}"
 
         # Build GlobalMetadataDocument for new corpus creation
         global_meta = GlobalMetadataDocument(
@@ -154,20 +156,18 @@ def register_materialization(
     else:
         # --- Append to existing corpus ---
         global_meta = None
-
-        # Read existing metadata to inherit backend/topology/corpus_id
-        existing_yaml = corpus_root / "global-metadata.yaml"
-        if existing_yaml.exists():
-            existing_meta = GlobalMetadataDocument.from_yaml_file(existing_yaml)
-            if backend is None:
-                backend = existing_meta.backend
-            if topology is None:
-                topology = existing_meta.topology
+        existing_corpus = CorpusIndexDocument.from_yaml_file(corpus_index_path)
+        existing_backend = existing_corpus.global_metadata["backend"]
+        existing_topology = existing_corpus.global_metadata["topology"]
+        assert backend == existing_backend, (
+            f"backend mismatch: selected {backend}, corpus has {existing_backend}"
+        )
+        assert topology == existing_topology, (
+            f"topology mismatch: selected {topology}, corpus has {existing_topology}"
+        )
 
         # Read corpus_id from the existing corpus index if not provided.
         if corpus_id is None:
-            from .models import CorpusIndexDocument
-            existing_corpus = CorpusIndexDocument.from_yaml_file(corpus_index_path)
             corpus_id = existing_corpus.corpus_id
 
     # Call update_corpus_index which writes corpus-index.yaml.
@@ -198,50 +198,36 @@ def register_materialization(
     return registered_record, resolved_corpus_id, is_create
 
 
-def _verify_manifest_outputs(manifest: MaterializationManifest) -> None:
-    """Verify that key manifest outputs exist on disk.
+def _resolve_manifest_artifact(corpus_root: Path, path_str: str) -> Path:
+    corpus_root = corpus_root.resolve()
+    path = Path(path_str)
+    if not path.is_absolute():
+        path = corpus_root / path
+    path = path.resolve()
+    path.relative_to(corpus_root)
+    return path
 
-    Parameters
-    ----------
-    manifest : MaterializationManifest
-        The manifest to verify.
 
-    Raises
-    ------
-    FileNotFoundError
-        If any required output path does not exist on disk.
-    """
-    import warnings
-
-    # Paths that must exist for a valid materialization
-    required_paths = [
-        manifest.raw_cell_meta_path,
-        manifest.raw_feature_meta_path,
-        manifest.metadata_summary_path,
-        manifest.provenance_spec_path,
-        manifest.size_factor_manifest_path,
-        manifest.qa_manifest_path,
-    ]
-
-    for path_str in required_paths:
+def _verify_manifest_outputs(manifest: MaterializationManifest, corpus_root: Path) -> None:
+    required_paths = {
+        "raw_cell_meta_path": manifest.raw_cell_meta_path,
+        "raw_feature_meta_path": manifest.raw_feature_meta_path,
+        "provenance_spec_path": manifest.provenance_spec_path,
+        "size_factor_parquet_path": manifest.size_factor_parquet_path,
+        "hvg_ranking_path": manifest.hvg_ranking_path,
+    }
+    for name, path_str in required_paths.items():
         if path_str is None:
-            continue
-        p = Path(path_str)
-        if not p.exists():
-            warnings.warn(
-                f"manifest output not found on disk: {p}; "
-                "registration will proceed but artifact completeness is not guaranteed",
-                UserWarning,
-                stacklevel=3,
-            )
+            raise ValueError(f"manifest is missing required artifact path: {name}")
+        path = _resolve_manifest_artifact(corpus_root, path_str)
+        if not path.exists():
+            raise FileNotFoundError(f"manifest artifact not found for {name}: {path}")
 
-    # Verify matrix root has some content
-    matrix_root = Path(manifest.outputs.matrix_root)
+    matrix_root = _resolve_manifest_artifact(corpus_root, manifest.outputs.matrix_root)
     if not matrix_root.exists():
-        raise FileNotFoundError(
-            f"matrix_root does not exist: {matrix_root}; "
-            "materialization may have failed"
-        )
+        raise FileNotFoundError(f"matrix_root does not exist: {matrix_root}")
+    if not any(matrix_root.iterdir()):
+        raise FileNotFoundError(f"matrix_root is empty: {matrix_root}")
 
 
 def corpus_exists(corpus_root: Path) -> bool:

@@ -158,7 +158,7 @@ def build_phase1_blueprint() -> Phase1Blueprint:
                 name="feature-registry",
                 scope="corpus",
                 review_format="yaml",
-                runtime_model="FeatureRegistryManifest",
+                runtime_model="FeatureRegistry",
                 owner_repo="perturb-data-lab",
                 purpose="Tracks append-only feature vocabulary and namespace provenance.",
             ),

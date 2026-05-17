@@ -27,7 +27,7 @@ def test_materializer_backend_matrix_is_lance_and_zarr_only(
     ["arrow-parquet", "arrow-ipc", "hf-datasets", "webdataset", "tiledb", "csr-memmap"],
 )
 def test_removed_materializer_backends_raise_clear_error(backend: str) -> None:
-    with pytest.raises(KeyError, match="not supported in slim main"):
+    with pytest.raises(AssertionError, match="unknown backend"):
         build_backend_fn(backend, "federated")
 
 

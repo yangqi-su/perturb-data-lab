@@ -514,27 +514,23 @@ def _load_corpus_index(corpus_root: Path):
 
 
 def _infer_backend_topology_from_corpus(corpus_root: Path) -> tuple[str, str]:
-    from .materializers.models import MaterializationManifest
-
     corpus = _load_corpus_index(corpus_root)
     gmeta = corpus.global_metadata or {}
 
     backend = gmeta.get("backend")
     topology = gmeta.get("topology")
-
-    if (backend is None or topology is None) and corpus.datasets:
-        first_manifest_path = corpus_root / corpus.datasets[0].manifest_path
-        if first_manifest_path.exists():
-            manifest = MaterializationManifest.from_yaml_file(first_manifest_path)
-            backend = backend or manifest.backend
-            topology = topology or manifest.topology
-
     if backend is None:
         raise ValueError(
-            f"cannot auto-detect backend from {corpus_root / 'corpus-index.yaml'}"
+            f"corpus-index.yaml global_metadata.backend is missing at {corpus_root}"
         )
     if topology is None:
-        topology = "aggregate" if backend == "lance" else "federated"
+        raise ValueError(
+            f"corpus-index.yaml global_metadata.topology is missing at {corpus_root}"
+        )
+    if backend not in BACKEND_CHOICES:
+        raise ValueError(f"unknown backend in corpus-index.yaml: {backend}")
+    if topology not in TOPOLOGY_CHOICES:
+        raise ValueError(f"unknown topology in corpus-index.yaml: {topology}")
 
     return str(backend), str(topology)
 

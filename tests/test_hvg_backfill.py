@@ -100,7 +100,6 @@ def _write_manifest(
             review_bundle=f"/fake/{dataset_id}-summary.yaml",
         ),
         raw_feature_meta_path=raw_feature_meta_path,
-        hvg_sidecar_path=str(corpus_root / "meta" / dataset_id / "hvg_sidecar"),
         cell_count=cell_count,
         feature_count=feature_count,
     )
@@ -241,7 +240,7 @@ class TestHVGBackfill:
             assert output_path == tmp_path / "meta" / dataset.dataset_id / "hvg.parquet"
             assert dataset.row_count == dataset.feature_count == 3
             assert table["feature_id"].tolist()
-            assert manifest.hvg_ranking_path == str(output_path)
+            assert manifest.hvg_ranking_path == f"meta/{dataset.dataset_id}/hvg.parquet"
             assert manifest.default_n_hvg == 2
             assert dataset.manifest_updated is True
             assert dataset.sha256
