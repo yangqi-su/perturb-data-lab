@@ -20,6 +20,7 @@ from perturb_data_lab.loaders import (
     collate_expression_batch,
 )
 from perturb_data_lab.loaders.corpus_loader import Corpus, load_corpus
+from perturb_data_lab.loaders.validation import validate_corpus_structure
 
 
 N_GENES = 8
@@ -208,6 +209,41 @@ def test_expression_reader_and_take_metadata_use_global_rows(tmp_path: Path) -> 
     assert expression.batch_size == 3
     assert metadata["dataset_id"] == ("mock_00", "mock_01", "mock_01")
     np.testing.assert_array_equal(metadata["dataset_index"], [0, 1, 1])
+
+
+def test_validate_corpus_structure_checks_aggregate_corpus(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+
+    report = validate_corpus_structure(tmp_path, sample_n=4, seed=1)
+
+    assert report["status"] == "success"
+    assert report["backend"] == "lance"
+    assert report["topology"] == "aggregate"
+    assert report["dataset_count"] == 2
+    assert report["total_rows"] == 9
+
+
+def test_validate_corpus_structure_checks_federated_corpus(tmp_path: Path) -> None:
+    _build_federated_lance_corpus(tmp_path)
+
+    report = validate_corpus_structure(tmp_path, sample_n=4, seed=1)
+
+    assert report["status"] == "success"
+    assert report["topology"] == "federated"
+    assert report["matrix"]["checked_layout"] == "federated"
+
+
+def test_validate_corpus_structure_rejects_bad_ranges(tmp_path: Path) -> None:
+    _build_aggregate_lance_corpus(tmp_path)
+    index_path = tmp_path / "corpus-index.yaml"
+    with open(index_path, encoding="utf-8") as handle:
+        doc = yaml.safe_load(handle)
+    doc["datasets"][1]["global_start"] = 5
+    with open(index_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(doc, handle)
+
+    with pytest.raises(AssertionError, match="global ranges"):
+        validate_corpus_structure(tmp_path)
 
 
 def test_expression_dataset_is_expression_only(tmp_path: Path) -> None:
