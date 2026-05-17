@@ -17,9 +17,34 @@ from perturb_data_lab.inspectors.models import (
 )
 from perturb_data_lab.inspectors.workflow import run_batch
 from perturb_data_lab.materializers import Stage2Materializer
-from perturb_data_lab.materializers.backends.zarr import read_zarr_cell
 from perturb_data_lab.materializers.models import OutputRoots
 from perturb_data_lab.materializers.obs_filter import ObsFilterError, filter_obs_rows
+
+
+def _read_zarr_cell(
+    indices_path: Path,
+    counts_path: Path,
+    row_index: int,
+    *,
+    row_offsets_path: Path,
+    size_factor_path: Path | None = None,
+) -> tuple[tuple[int, ...], tuple[int, ...], float]:
+    import zarr
+
+    row_offsets = zarr.open(str(row_offsets_path), mode="r")["row_offsets"][:]
+    indices = zarr.open(str(indices_path), mode="r")["indices"]
+    counts = zarr.open(str(counts_path), mode="r")["counts"]
+    start = int(row_offsets[row_index])
+    stop = int(row_offsets[row_index + 1])
+    sf = 1.0
+    if size_factor_path is not None:
+        sf_table = pq.read_table(size_factor_path)
+        sf = float(sf_table["size_factor"][row_index].as_py())
+    return (
+        tuple(indices[start:stop].astype(np.int32).tolist()),
+        tuple(counts[start:stop].astype(np.int32).tolist()),
+        sf,
+    )
 
 
 def test_filter_obs_rows_supports_membership_nulls_and_parentheses() -> None:
@@ -112,7 +137,7 @@ def test_stage2_materializer_applies_obs_filter_and_preserves_source_identity(
     assert sf_table.column("cell_id").to_pylist() == ["cell-3"]
     assert sf_table.num_rows == 1
 
-    indices, values, _ = read_zarr_cell(
+    indices, values, _ = _read_zarr_cell(
         matrix_root / "tiny_filtered-indices.zarr",
         matrix_root / "tiny_filtered-counts.zarr",
         0,

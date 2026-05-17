@@ -9,7 +9,6 @@ from typing import Any
 import numpy as np
 import polars as pl
 import pytest
-import pyarrow as pa
 from scipy import sparse
 from scipy.stats import t as student_t
 import yaml
@@ -103,25 +102,16 @@ def _bundle_for_rows(global_start: int, rows: list[dict[str, Any]]) -> ChunkBund
     gene_indices: list[int] = []
     counts: list[int] = []
     row_sums: list[float] = []
-    expressed_gene_indices = [row["expressed_gene_indices"] for row in rows]
-    expression_counts = [row["expression_counts"] for row in rows]
-    for genes, values in zip(expressed_gene_indices, expression_counts, strict=True):
+    for row in rows:
+        genes = row["expressed_gene_indices"]
+        values = row["expression_counts"]
         gene_indices.extend(genes)
         counts.extend(values)
         indptr.append(indptr[-1] + len(genes))
         row_sums.append(float(np.sum(values)))
 
     return ChunkBundle(
-        table=pa.table(
-            {
-                "global_row_index": pa.array(
-                    np.arange(global_start, global_start + len(rows), dtype=np.int64),
-                    type=pa.int64(),
-                ),
-                "expressed_gene_indices": pa.array(expressed_gene_indices, type=pa.list_(pa.int32())),
-                "expression_counts": pa.array(expression_counts, type=pa.list_(pa.int32())),
-            }
-        ),
+        global_row_index=np.arange(global_start, global_start + len(rows), dtype=np.int64),
         row_sums=np.asarray(row_sums, dtype=np.float64),
         indptr=np.asarray(indptr, dtype=np.int64),
         indices=np.asarray(gene_indices, dtype=np.int32),
