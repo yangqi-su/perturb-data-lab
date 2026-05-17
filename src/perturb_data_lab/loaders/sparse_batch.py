@@ -122,20 +122,35 @@ class SparseBatchProcessor:
         if mask is None:
             return None
         normalized = np.asarray(mask, dtype=bool)
-        if normalized.shape != (self._global_vocab,):
-            raise ValueError("sampling_gene_mask must have one entry per global gene")
-        tokenizable_counts = (self._has_gene_np & normalized).sum(axis=1)
-        too_small = np.flatnonzero(tokenizable_counts < self._seq_len)
-        if too_small.size:
-            details = ", ".join(
-                f"dataset {int(ds_idx)} has {int(tokenizable_counts[ds_idx])} genes"
-                for ds_idx in too_small.tolist()
-            )
-            raise ValueError(
-                "sampling_gene_mask leaves fewer tokenizable genes than seq_len: "
-                f"{details}"
-            )
+        assert normalized.shape == (
+            self._global_vocab,
+        ), "sampling_gene_mask must have one entry per global gene"
         return normalized
+
+    def _normalize_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        totals = probs.sum(dim=1, keepdim=True)
+        return torch.where(totals > 0, probs / totals.clamp_min(1.0), probs)
+
+    def _sample_gene_ids(
+        self,
+        probs: torch.Tensor,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        safe_probs = probs.clone()
+        empty_rows = safe_probs.sum(dim=1) == 0
+        safe_probs[empty_rows, 0] = 1.0
+        sampled = torch.multinomial(
+            safe_probs,
+            self._seq_len,
+            replacement=False,
+            generator=generator,
+        )
+        sampled_is_real = probs.gather(1, sampled) > 0
+        return torch.where(
+            sampled_is_real,
+            sampled,
+            torch.full_like(sampled, self._pad_token_id),
+        )
 
     # ------------------------------------------------------------------
     # Weighted probability construction
@@ -171,9 +186,7 @@ class SparseBatchProcessor:
             if has_gene_t is None:
                 raise ValueError("has_gene_t required for masked uniform mode")
             valid_genes = has_gene_t[dataset_indices] & sampling_gene_mask_t.unsqueeze(0)
-            probs = valid_genes.float()
-            probs /= probs.sum(dim=1, keepdim=True)
-            return probs
+            return self._normalize_probs(valid_genes.float())
 
         if sampling_mode == "expressed":
             # Expressed-biased: expressed genes get weight bonus
@@ -212,8 +225,7 @@ class SparseBatchProcessor:
             # Expressed genes get expressed_weight bonus on top of base 1.0
             if n_valid > 0:
                 probs[valid_rows, valid_cols] += float(expressed_weight)
-            probs /= probs.sum(dim=1, keepdim=True)
-            return probs
+            return self._normalize_probs(probs)
 
         if sampling_mode == "hvg":
             # HVG-biased: HVG genes get weight bonus per dataset
@@ -235,8 +247,7 @@ class SparseBatchProcessor:
 
             probs = valid_genes.float()
             probs += hvgs.float() * float(hvg_weight)
-            probs /= probs.sum(dim=1, keepdim=True)
-            return probs
+            return self._normalize_probs(probs)
 
         raise ValueError(
             f"Unknown sampling_mode: {sampling_mode!r}. "
@@ -419,12 +430,7 @@ class SparseBatchProcessor:
                     hvg_rank_t=hvg_rank_t,
                     sampling_gene_mask_t=sampling_gene_mask_t,
                 )
-                sampled_gids = torch.multinomial(
-                    probs,
-                    num_samples=self._seq_len,
-                    replacement=False,
-                    generator=generator,
-                )
+                sampled_gids = self._sample_gene_ids(probs, generator)
 
             # No expressed genes → all exact_match False, all counts 0
             exact_match = torch.zeros(
@@ -521,12 +527,7 @@ class SparseBatchProcessor:
                 hvg_rank_t=hvg_rank_t,
                 sampling_gene_mask_t=sampling_gene_mask_t,
             )
-            sampled_gids = torch.multinomial(
-                probs,
-                num_samples=self._seq_len,
-                replacement=False,
-                generator=generator,
-            )  # (batch_size, seq_len)
+            sampled_gids = self._sample_gene_ids(probs, generator)
             # Free probability tensor (may be large for expressed mode)
             del probs
 

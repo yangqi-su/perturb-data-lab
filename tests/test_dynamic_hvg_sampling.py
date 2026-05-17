@@ -294,6 +294,29 @@ def test_hvg_weighted_probs_zero_absent_genes(tmp_path: Path) -> None:
     )
 
 
+def test_sampling_gene_mask_pads_when_valid_genes_are_fewer_than_seq_len(tmp_path: Path) -> None:
+    registry = _build_feature_registry_with_partial_vocab(tmp_path)
+    pipeline = SparseBatchProcessor(
+        registry,
+        seq_len=3,
+        sampling_gene_mask=np.asarray([True, False, False, False]),
+    )
+
+    batch = {
+        "expressed_gene_indices": np.asarray([0], dtype=np.int32),
+        "expression_counts": np.asarray([5], dtype=np.float32),
+        "row_offsets": np.asarray([0, 1], dtype=np.int64),
+        "dataset_index": np.asarray([0], dtype=np.int64),
+        "global_row_index": np.asarray([0], dtype=np.int64),
+        "batch_size": 1,
+    }
+    out = pipeline.process_batch(batch, device="cpu")
+
+    assert out["sampled_gene_ids"].tolist() == [[0, -1, -1]]
+    assert out["sampled_counts"].tolist() == [[5.0, -1.0, -1.0]]
+    assert out["valid_mask"].tolist() == [[True, False, False]]
+
+
 def test_cpu_and_gpu_loader_routes_share_hvg_top_k_semantics(tmp_path: Path) -> None:
     corpus = load_corpus(str(_build_runtime_hvg_corpus(tmp_path)))
     loader_kwargs = {

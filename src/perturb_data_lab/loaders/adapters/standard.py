@@ -330,15 +330,6 @@ def _build_dataloader_kwargs(
     return kwargs
 
 
-def _normalize_missing_token_policy(policy: str) -> str:
-    if not isinstance(policy, str):
-        raise TypeError("missing_token_policy must be a string")
-    normalized = policy.strip().lower().replace("-", "_")
-    if normalized not in {"exclude", "pad"}:
-        raise ValueError("missing_token_policy must be one of 'exclude' or 'pad'")
-    return normalized
-
-
 def build_loader(
     corpus: Any,
     *,
@@ -376,7 +367,10 @@ def build_loader(
     resolved_batch_size = int(batch_size)
     if resolved_batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    resolved_missing_policy = _normalize_missing_token_policy(missing_token_policy)
+    assert missing_token_policy in {
+        "exclude",
+        "pad",
+    }, "missing_token_policy must be one of 'exclude' or 'pad'"
     if gene_token_mapper is not None:
         gene_token_mapper.check_feature_registry(corpus.feature_registry)
 
@@ -410,7 +404,7 @@ def build_loader(
         seq_len=resolved_seq_len,
         sampling_gene_mask=(
             gene_token_mapper.tokenizable_by_global_id
-            if gene_token_mapper is not None and resolved_missing_policy == "exclude"
+            if gene_token_mapper is not None and missing_token_policy == "exclude"
             and not bool(gene_token_mapper.tokenizable_by_global_id.all())
             else None
         ),

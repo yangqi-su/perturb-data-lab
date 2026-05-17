@@ -50,15 +50,6 @@ def _check_unique_strings(values: Sequence[Any], *, field_name: str) -> None:
         raise ValueError(f"{field_name} must be unique")
 
 
-def _normalize_missing_token_policy(policy: str) -> str:
-    if not isinstance(policy, str):
-        raise TypeError("missing_token_policy must be a string")
-    normalized = policy.strip().lower().replace("-", "_")
-    if normalized not in {"exclude", "pad"}:
-        raise ValueError("missing_token_policy must be one of 'exclude' or 'pad'")
-    return normalized
-
-
 def _ordered_unique(labels: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(labels))
 
@@ -808,7 +799,11 @@ class PertTFPairedBatchBuilder:
         self.config = resolved_adapter.config
         self.seq_len = int(seq_len)
         self.device = torch.device("cpu" if device is None else device)
-        self.missing_token_policy = _normalize_missing_token_policy(missing_token_policy)
+        assert missing_token_policy in {
+            "exclude",
+            "pad",
+        }, "missing_token_policy must be one of 'exclude' or 'pad'"
+        self.missing_token_policy = missing_token_policy
         self._gene_token_mapper = self.adapter.gene_token_mapper
         self._pipeline = SparseBatchProcessor(
             corpus.feature_registry,
