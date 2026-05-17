@@ -232,6 +232,7 @@ def test_dynamic_hvg_top_k_changes_weighted_probs_without_rematerialization(tmp_
     pipeline = SparseBatchProcessor(corpus.feature_registry, seq_len=2)
     device = torch.device("cpu")
     cached = pipeline._cached_tensors(device)
+    hvg_t, hvg_rank_t = pipeline._cached_hvg_tensors(device)
     dataset_indices = torch.tensor([0], dtype=torch.long, device=device)
 
     probs_top1 = pipeline._build_weighted_probs(
@@ -242,8 +243,8 @@ def test_dynamic_hvg_top_k_changes_weighted_probs_without_rematerialization(tmp_
         hvg_weight=3.0,
         hvg_top_k=1,
         has_gene_t=cached["has_gene"],
-        hvg_t=cached["hvg_mask"],
-        hvg_rank_t=cached["hvg_rank"],
+        hvg_t=hvg_t,
+        hvg_rank_t=hvg_rank_t,
     )
     probs_top3 = pipeline._build_weighted_probs(
         device,
@@ -253,8 +254,8 @@ def test_dynamic_hvg_top_k_changes_weighted_probs_without_rematerialization(tmp_
         hvg_weight=3.0,
         hvg_top_k=3,
         has_gene_t=cached["has_gene"],
-        hvg_t=cached["hvg_mask"],
-        hvg_rank_t=cached["hvg_rank"],
+        hvg_t=hvg_t,
+        hvg_rank_t=hvg_rank_t,
     )
 
     np.testing.assert_allclose(
@@ -274,6 +275,7 @@ def test_hvg_weighted_probs_zero_absent_genes(tmp_path: Path) -> None:
     pipeline = SparseBatchProcessor(registry, seq_len=2)
     device = torch.device("cpu")
     cached = pipeline._cached_tensors(device)
+    hvg_t, hvg_rank_t = pipeline._cached_hvg_tensors(device)
 
     probs = pipeline._build_weighted_probs(
         device,
@@ -283,8 +285,8 @@ def test_hvg_weighted_probs_zero_absent_genes(tmp_path: Path) -> None:
         hvg_weight=3.0,
         hvg_top_k=5,
         has_gene_t=cached["has_gene"],
-        hvg_t=cached["hvg_mask"],
-        hvg_rank_t=cached["hvg_rank"],
+        hvg_t=hvg_t,
+        hvg_rank_t=hvg_rank_t,
     )
 
     np.testing.assert_allclose(
@@ -292,6 +294,71 @@ def test_hvg_weighted_probs_zero_absent_genes(tmp_path: Path) -> None:
         np.asarray([0.5, 0.5, 0.0, 0.0], dtype=np.float32),
         rtol=1e-6,
     )
+
+
+def test_expressed_sampling_uses_dataset_gene_pool(tmp_path: Path) -> None:
+    registry = _build_feature_registry_with_partial_vocab(tmp_path)
+    pipeline = SparseBatchProcessor(registry, seq_len=2)
+    device = torch.device("cpu")
+    cached = pipeline._cached_tensors(device)
+    dataset_indices = torch.tensor([0], dtype=torch.long, device=device)
+
+    probs = pipeline._build_weighted_probs(
+        device,
+        1,
+        dataset_indices,
+        global_genes_sorted=torch.tensor([[0]], dtype=torch.long, device=device),
+        sampling_mode="expressed",
+        expressed_weight=3.0,
+        has_gene_t=cached["has_gene"],
+    )
+    no_expressed_probs = pipeline._build_weighted_probs(
+        device,
+        1,
+        dataset_indices,
+        sampling_mode="expressed",
+        expressed_weight=3.0,
+        has_gene_t=cached["has_gene"],
+    )
+
+    np.testing.assert_allclose(
+        probs.cpu().numpy()[0],
+        np.asarray([4.0, 1.0, 0.0, 0.0], dtype=np.float32) / 5.0,
+        rtol=1e-6,
+    )
+    np.testing.assert_allclose(
+        no_expressed_probs.cpu().numpy()[0],
+        np.asarray([0.5, 0.5, 0.0, 0.0], dtype=np.float32),
+        rtol=1e-6,
+    )
+
+
+def test_hvg_tensors_are_cached_only_for_hvg_sampling(tmp_path: Path) -> None:
+    registry = _build_feature_registry_with_partial_vocab(tmp_path)
+    pipeline = SparseBatchProcessor(registry, seq_len=2)
+    device = torch.device("cpu")
+
+    cached = pipeline._cached_tensors(device)
+    assert "hvg_mask" not in cached
+    assert "hvg_rank" not in cached
+
+    batch = {
+        "expressed_gene_indices": np.asarray([0], dtype=np.int32),
+        "expression_counts": np.asarray([5], dtype=np.float32),
+        "row_offsets": np.asarray([0, 1], dtype=np.int64),
+        "dataset_index": np.asarray([0], dtype=np.int64),
+        "global_row_index": np.asarray([0], dtype=np.int64),
+        "batch_size": 1,
+    }
+    pipeline.process_batch(batch, device=device, sampling_mode="uniform")
+    cached = pipeline._cached_tensors(device)
+    assert "hvg_mask" not in cached
+    assert "hvg_rank" not in cached
+
+    pipeline._cached_hvg_tensors(device)
+    cached = pipeline._cached_tensors(device)
+    assert "hvg_mask" in cached
+    assert "hvg_rank" in cached
 
 
 def test_sampling_gene_mask_pads_when_valid_genes_are_fewer_than_seq_len(tmp_path: Path) -> None:

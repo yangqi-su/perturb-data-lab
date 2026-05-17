@@ -69,8 +69,6 @@ class SparseBatchProcessor:
         self._local_to_global_np = registry.local_to_global_map
         self._gene_prob_np = registry.dataset_gene_prob
         self._has_gene_np = registry.dataset_has_gene
-        self._hvg_mask_np = registry.hvg_mask
-        self._hvg_rank_np = registry.hvg_rank_matrix
         self._max_local_vocab = registry.max_local_vocab
         self._global_vocab = registry.global_vocab_size
         self._sampling_gene_mask_np = self._normalize_sampling_gene_mask(sampling_gene_mask)
@@ -105,18 +103,27 @@ class SparseBatchProcessor:
                 "has_gene": torch.as_tensor(
                     self._has_gene_np, dtype=torch.bool, device=device
                 ),
-                "hvg_mask": torch.as_tensor(
-                    self._hvg_mask_np, dtype=torch.bool, device=device
-                ),
-                "hvg_rank": torch.as_tensor(
-                    self._hvg_rank_np, dtype=torch.int32, device=device
-                ),
             }
             if self._sampling_gene_mask_np is not None:
                 self._device_caches[key]["sampling_gene_mask"] = torch.as_tensor(
                     self._sampling_gene_mask_np, dtype=torch.bool, device=device
                 )
         return self._device_caches[key]
+
+    def _cached_hvg_tensors(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        cached = self._cached_tensors(device)
+        if "hvg_mask" not in cached:
+            cached["hvg_mask"] = torch.as_tensor(
+                self._registry.hvg_mask,
+                dtype=torch.bool,
+                device=device,
+            )
+            cached["hvg_rank"] = torch.as_tensor(
+                self._registry.hvg_rank_matrix,
+                dtype=torch.int32,
+                device=device,
+            )
+        return cached["hvg_mask"], cached["hvg_rank"]
 
     def _normalize_sampling_gene_mask(self, mask: np.ndarray | None) -> np.ndarray | None:
         if mask is None:
@@ -152,6 +159,73 @@ class SparseBatchProcessor:
             torch.full_like(sampled, self._pad_token_id),
         )
 
+    def _validate_sampled_gene_ids(
+        self,
+        sampled_gene_ids: torch.Tensor,
+        *,
+        bsz: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        sampled_gids = sampled_gene_ids.to(
+            dtype=torch.long,
+            device=device,
+            non_blocking=True,
+        )
+        if sampled_gids.shape != (bsz, self._seq_len):
+            raise ValueError(
+                f"sampled_gene_ids shape {tuple(sampled_gids.shape)} "
+                f"!= expected ({bsz}, {self._seq_len})"
+            )
+        return sampled_gids
+
+    def _valid_gene_mask(
+        self,
+        sampled_gids: torch.Tensor,
+        dataset_indices: torch.Tensor,
+        has_gene_t: torch.Tensor,
+    ) -> torch.Tensor:
+        valid_rows = has_gene_t[dataset_indices]
+        safe_gids = sampled_gids.clamp(0, self._global_vocab - 1)
+        in_vocab = (sampled_gids >= 0) & (sampled_gids < self._global_vocab)
+        return valid_rows.gather(1, safe_gids) & in_vocab
+
+    def _finalize_result(
+        self,
+        *,
+        bsz: int,
+        sampled_gids: torch.Tensor,
+        sampled_counts: torch.Tensor,
+        exact_match: torch.Tensor,
+        dataset_indices: torch.Tensor,
+        global_row_index: torch.Tensor,
+        has_gene_t: torch.Tensor,
+        size_factor: torch.Tensor | None,
+    ) -> dict[str, Any]:
+        valid_mask = self._valid_gene_mask(sampled_gids, dataset_indices, has_gene_t)
+        final_gene_ids = torch.where(
+            valid_mask,
+            sampled_gids,
+            torch.full_like(sampled_gids, self._pad_token_id),
+        )
+        final_counts = torch.where(
+            valid_mask,
+            sampled_counts,
+            torch.full_like(sampled_counts, self._invalid_count_value),
+        )
+        result = {
+            "batch_size": bsz,
+            "seq_len": self._seq_len,
+            "sampled_gene_ids": final_gene_ids,
+            "sampled_counts": final_counts,
+            "valid_mask": valid_mask,
+            "exact_match_mask": exact_match,
+            "dataset_index": dataset_indices,
+            "global_row_index": global_row_index,
+        }
+        if size_factor is not None:
+            result["size_factor"] = size_factor
+        return result
+
     # ------------------------------------------------------------------
     # Weighted probability construction
     # ------------------------------------------------------------------
@@ -175,7 +249,8 @@ class SparseBatchProcessor:
     ) -> torch.Tensor:
         """Build per-cell probability tensors for weighted ``multinomial`` sampling.
 
-        Returns ``(bsz, global_vocab)`` float32 tensor where each row sums to 1.0.
+        Rows with at least one valid gene sum to 1.0; empty rows stay zero and
+        are padded after sampling.
         """
         if sampling_mode == "uniform":
             # Uniform probabilities over each cell's dataset valid gene pool
@@ -190,16 +265,23 @@ class SparseBatchProcessor:
 
         if sampling_mode == "expressed":
             # Expressed-biased: expressed genes get weight bonus
+            if has_gene_t is None:
+                raise ValueError("has_gene_t required for expressed mode")
+
+            valid_genes = has_gene_t[dataset_indices]
+            if sampling_gene_mask_t is not None:
+                valid_genes = valid_genes & sampling_gene_mask_t.unsqueeze(0)
+            probs = valid_genes.float()
+
             if global_genes_sorted is None:
-                raise ValueError("global_genes_sorted required for expressed mode")
+                return self._normalize_probs(probs)
 
             max_nnz = global_genes_sorted.shape[1]
 
-            # Build (bsz, global_vocab) binary mask efficiently using scatter
-            valid_positions = global_genes_sorted < self._global_vocab  # (bsz, max_nnz)
-            if sampling_gene_mask_t is not None:
-                safe_genes = global_genes_sorted.clamp(0, self._global_vocab - 1)
-                valid_positions &= sampling_gene_mask_t[safe_genes]
+            # Upweight expressed genes only if they are valid for that dataset.
+            safe_genes = global_genes_sorted.clamp(0, self._global_vocab - 1)
+            in_vocab = global_genes_sorted < self._global_vocab
+            valid_positions = in_vocab & valid_genes.gather(1, safe_genes)
             n_valid = int(valid_positions.sum().item())
 
             if n_valid > 0:
@@ -214,14 +296,6 @@ class SparseBatchProcessor:
                 valid_rows = torch.empty(0, dtype=torch.long, device=device)
                 valid_cols = torch.empty(0, dtype=torch.long, device=device)
 
-            if sampling_gene_mask_t is None:
-                probs = torch.ones(
-                    (bsz, self._global_vocab), dtype=torch.float32, device=device
-                )
-            else:
-                if has_gene_t is None:
-                    raise ValueError("has_gene_t required for masked expressed mode")
-                probs = (has_gene_t[dataset_indices] & sampling_gene_mask_t.unsqueeze(0)).float()
             # Expressed genes get expressed_weight bonus on top of base 1.0
             if n_valid > 0:
                 probs[valid_rows, valid_cols] += float(expressed_weight)
@@ -330,8 +404,10 @@ class SparseBatchProcessor:
         local_to_global_t = cached["local_to_global"]
         gene_prob_t = cached["gene_prob"]
         has_gene_t = cached["has_gene"]
-        hvg_t = cached["hvg_mask"]
-        hvg_rank_t = cached["hvg_rank"]
+        hvg_t = None
+        hvg_rank_t = None
+        if sampling_mode == "hvg" and sampled_gene_ids is None:
+            hvg_t, hvg_rank_t = self._cached_hvg_tensors(device)
         sampling_gene_mask_t = cached.get("sampling_gene_mask")
 
         # ---- Move flat arrays to device ----
@@ -359,27 +435,22 @@ class SparseBatchProcessor:
         bsz = int(batch["batch_size"])
         # Validate empty batch short-circuit
         if bsz == 0:
-            result = {
-                "batch_size": 0,
-                "seq_len": self._seq_len,
-                "sampled_gene_ids": torch.empty(
+            return self._finalize_result(
+                bsz=0,
+                sampled_gids=torch.empty(
                     (0, self._seq_len), dtype=torch.long, device=device
                 ),
-                "sampled_counts": torch.empty(
+                sampled_counts=torch.empty(
                     (0, self._seq_len), dtype=torch.float32, device=device
                 ),
-                "valid_mask": torch.empty(
+                exact_match=torch.empty(
                     (0, self._seq_len), dtype=torch.bool, device=device
                 ),
-                "exact_match_mask": torch.empty(
-                    (0, self._seq_len), dtype=torch.bool, device=device
-                ),
-                "dataset_index": dataset_indices,
-                "global_row_index": global_row_index,
-            }
-            if size_factor is not None:
-                result["size_factor"] = size_factor
-            return result
+                dataset_indices=dataset_indices,
+                global_row_index=global_row_index,
+                has_gene_t=has_gene_t,
+                size_factor=size_factor,
+            )
 
         # ---- Compute per-cell NNZ lengths ----
         row_lengths = row_offsets[1:] - row_offsets[:-1]  # (batch_size,)
@@ -405,14 +476,11 @@ class SparseBatchProcessor:
         if max_nnz == 0:
             # Sample gene IDs from per-dataset probability pools
             if sampled_gene_ids is not None:
-                sampled_gids = sampled_gene_ids.to(
-                    dtype=torch.long, device=device, non_blocking=True
+                sampled_gids = self._validate_sampled_gene_ids(
+                    sampled_gene_ids,
+                    bsz=bsz,
+                    device=device,
                 )
-                if sampled_gids.shape != (bsz, self._seq_len):
-                    raise ValueError(
-                        f"sampled_gene_ids shape {tuple(sampled_gids.shape)} "
-                        f"!= expected ({bsz}, {self._seq_len})"
-                    )
             else:
                 probs = self._build_weighted_probs(
                     device,
@@ -439,38 +507,16 @@ class SparseBatchProcessor:
             sampled_counts = torch.zeros(
                 (bsz, self._seq_len), dtype=torch.float32, device=device
             )
-
-            # Valid mask from dataset_has_gene
-            valid_rows = has_gene_t[dataset_indices]
-            safe_gids = sampled_gids.clamp(0, self._global_vocab - 1)
-            in_vocab = (sampled_gids >= 0) & (sampled_gids < self._global_vocab)
-            valid_mask = valid_rows.gather(1, safe_gids) & in_vocab
-
-            # Replace invalid positions with sentinels
-            final_gene_ids = torch.where(
-                valid_mask,
-                sampled_gids,
-                torch.full_like(sampled_gids, self._pad_token_id),
+            return self._finalize_result(
+                bsz=bsz,
+                sampled_gids=sampled_gids,
+                sampled_counts=sampled_counts,
+                exact_match=exact_match,
+                dataset_indices=dataset_indices,
+                global_row_index=global_row_index,
+                has_gene_t=has_gene_t,
+                size_factor=size_factor,
             )
-            final_counts = torch.where(
-                valid_mask,
-                sampled_counts,
-                torch.full_like(sampled_counts, self._invalid_count_value),
-            )
-
-            result = {
-                "batch_size": bsz,
-                "seq_len": self._seq_len,
-                "sampled_gene_ids": final_gene_ids,
-                "sampled_counts": final_counts,
-                "valid_mask": valid_mask,
-                "exact_match_mask": exact_match,
-                "dataset_index": dataset_indices,
-                "global_row_index": global_row_index,
-            }
-            if size_factor is not None:
-                result["size_factor"] = size_factor
-            return result
 
         # ---- Local→Global resolution ----
         is_padding = padded_local_genes >= self._max_local_vocab
@@ -502,14 +548,11 @@ class SparseBatchProcessor:
 
         # ---- Sample global gene IDs from per-dataset probability pools ----
         if sampled_gene_ids is not None:
-            sampled_gids = sampled_gene_ids.to(
-                dtype=torch.long, device=device, non_blocking=True
+            sampled_gids = self._validate_sampled_gene_ids(
+                sampled_gene_ids,
+                bsz=bsz,
+                device=device,
             )
-            if sampled_gids.shape != (bsz, self._seq_len):
-                raise ValueError(
-                    f"sampled_gene_ids shape {tuple(sampled_gids.shape)} "
-                    f"!= expected ({bsz}, {self._seq_len})"
-                )
         else:
             # Build weighted probabilities based on sampling mode
             probs = self._build_weighted_probs(
@@ -552,35 +595,13 @@ class SparseBatchProcessor:
             torch.zeros_like(gathered_counts),
         )
 
-        # ---- Valid mask: sampled gene is valid for this cell's dataset ----
-        # Index into has_gene: (batch_size, global_vocab)[:, sampled_gid]
-        valid_rows = has_gene_t[dataset_indices]  # (batch_size, global_vocab)
-        safe_gids = sampled_gids.clamp(0, self._global_vocab - 1)
-        in_vocab = (sampled_gids >= 0) & (sampled_gids < self._global_vocab)
-        valid_mask = valid_rows.gather(1, safe_gids) & in_vocab  # (batch_size, seq_len)
-
-        # Replace invalid positions with sentinels
-        final_gene_ids = torch.where(
-            valid_mask,
-            sampled_gids,
-            torch.full_like(sampled_gids, self._pad_token_id),
+        return self._finalize_result(
+            bsz=bsz,
+            sampled_gids=sampled_gids,
+            sampled_counts=sampled_counts,
+            exact_match=exact_match,
+            dataset_indices=dataset_indices,
+            global_row_index=global_row_index,
+            has_gene_t=has_gene_t,
+            size_factor=size_factor,
         )
-        final_counts = torch.where(
-            valid_mask,
-            sampled_counts,
-            torch.full_like(sampled_counts, self._invalid_count_value),
-        )
-
-        result = {
-            "batch_size": bsz,
-            "seq_len": self._seq_len,
-            "sampled_gene_ids": final_gene_ids,
-            "sampled_counts": final_counts,
-            "valid_mask": valid_mask,
-            "exact_match_mask": exact_match,
-            "dataset_index": dataset_indices,
-            "global_row_index": global_row_index,
-        }
-        if size_factor is not None:
-            result["size_factor"] = size_factor
-        return result
