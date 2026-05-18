@@ -288,7 +288,7 @@ class InspectionBatchConfig(YamlDocument):
 @dataclass(frozen=True)
 class InspectionBatchRecord:
     dataset_id: str
-    review_bundle: str  # absolute path to the authoritative review bundle for this dataset
+    inspection_summary: str
     selected_count_source: str
     materialization_readiness: str
 

@@ -253,7 +253,6 @@ class TestMaterializeDatasetRouting:
                     cell_count = 7
                     feature_count = 3
                     route = "append_routed"
-                    corpus_registration = None
 
                 return _Manifest()
 
@@ -310,7 +309,6 @@ class TestMaterializeDatasetRouting:
                     cell_count = 7
                     feature_count = 3
                     route = "append_routed"
-                    corpus_registration = None
 
                 return _Manifest()
 
@@ -568,6 +566,10 @@ class TestCorpusValidateCmd:
                     "dataset_id": "ds1",
                     "join_mode": "create_new",
                     "manifest_path": str(tmp_path / "missing-manifest.yaml"),
+                    "dataset_index": 0,
+                    "cell_count": 0,
+                    "global_start": 0,
+                    "global_end": 0,
                 }
             ],
         }
@@ -599,7 +601,7 @@ class TestCorpusValidateCmd:
             },
             "provenance": {
                 "source_path": "/fake.h5ad",
-                "review_bundle": "/fake.yaml",
+                "inspection_summary_path": "/fake.yaml",
             },
         }
         manifest_path.write_text(yaml.safe_dump(manifest_data), encoding="utf-8")
@@ -614,6 +616,10 @@ class TestCorpusValidateCmd:
                     "dataset_id": "ds1",
                     "join_mode": "create_new",
                     "manifest_path": str(manifest_path),
+                    "dataset_index": 0,
+                    "cell_count": 0,
+                    "global_start": 0,
+                    "global_end": 0,
                 }
             ],
         }
@@ -659,6 +665,10 @@ class TestCorpusGcCmd:
                     "dataset_id": "ds1",
                     "join_mode": "create_new",
                     "manifest_path": "ds1/meta/materialization-manifest.yaml",
+                    "dataset_index": 0,
+                    "cell_count": 0,
+                    "global_start": 0,
+                    "global_end": 0,
                 }
             ],
         }
@@ -687,6 +697,10 @@ class TestCorpusGcCmd:
                     "dataset_id": "ds1",
                     "join_mode": "create_new",
                     "manifest_path": "ds1/meta/materialization-manifest.yaml",
+                    "dataset_index": 0,
+                    "cell_count": 0,
+                    "global_start": 0,
+                    "global_end": 0,
                 }
             ],
         }
@@ -890,7 +904,7 @@ class TestCanonicalizeDiscovery:
             },
             "provenance": {
                 "source_path": "/fake.h5ad",
-                "review_bundle": "/fake.yaml",
+                "inspection_summary_path": "/fake.yaml",
             },
             "raw_cell_meta_path": str(manifest_dir / "raw-obs.parquet"),
             "raw_feature_meta_path": str(manifest_dir / "raw-var.parquet"),
@@ -952,7 +966,7 @@ class TestCanonicalizeDiscovery:
             },
             "provenance": {
                 "source_path": "/fake.h5ad",
-                "review_bundle": "/fake.yaml",
+                "inspection_summary_path": "/fake.yaml",
             },
             "raw_cell_meta_path": str(manifest_dir / "raw-obs.parquet"),
             "raw_feature_meta_path": str(manifest_dir / "raw-var.parquet"),
@@ -1008,7 +1022,7 @@ class TestCanonicalizeDiscovery:
             },
             "provenance": {
                 "source_path": "/fake.h5ad",
-                "review_bundle": "/fake.yaml",
+                "inspection_summary_path": "/fake.yaml",
             },
             "raw_cell_meta_path": str(manifest_dir / "raw-obs.parquet"),
             "raw_feature_meta_path": str(manifest_dir / "raw-var.parquet"),
@@ -1183,7 +1197,7 @@ class TestCanonicalizeCmd:
             },
             "provenance": {
                 "source_path": "/fake.h5ad",
-                "review_bundle": "/fake.yaml",
+                "inspection_summary_path": "/fake.yaml",
             },
             "raw_cell_meta_path": str(manifest_dir / "raw-obs.parquet"),
             "raw_feature_meta_path": str(manifest_dir / "raw-var.parquet"),
@@ -1344,7 +1358,7 @@ class TestInspectCmd:
         captured: dict[str, object] = {}
 
         class _Artifacts:
-            review_bundle = tmp_path / "out" / "dummy_00" / "dataset-summary.yaml"
+            inspection_summary = tmp_path / "out" / "dummy_00" / "dataset-summary.yaml"
 
         def _fake_inspect_target(target, output_root):
             captured["dataset_id"] = target.dataset_id

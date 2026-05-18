@@ -15,14 +15,10 @@ _EXPORT_MAP = {
     # Models
     "MaterializationManifest": (".models", "MaterializationManifest"),
     "CorpusIndexDocument": (".models", "CorpusIndexDocument"),
-    "GlobalMetadataDocument": (".models", "GlobalMetadataDocument"),
     "CountSourceSpec": (".models", "CountSourceSpec"),
     "OutputRoots": (".models", "OutputRoots"),
     "ProvenanceSpec": (".models", "ProvenanceSpec"),
-    "CorpusRegistrationInfo": (".models", "CorpusRegistrationInfo"),
     "register_materialization": (".registration", "register_materialization"),
-    "corpus_exists": (".registration", "corpus_exists"),
-    "manifest_to_join_record": (".registration", "manifest_to_join_record"),
 }
 
 
@@ -45,12 +41,8 @@ __all__ = [
     # Models
     "MaterializationManifest",
     "CorpusIndexDocument",
-    "GlobalMetadataDocument",
     "CountSourceSpec",
     "OutputRoots",
     "ProvenanceSpec",
-    "CorpusRegistrationInfo",
     "register_materialization",
-    "corpus_exists",
-    "manifest_to_join_record",
 ]

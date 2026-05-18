@@ -9,25 +9,9 @@ the Lance backend only.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
-import pyarrow as pa
 from scipy.sparse import csr_matrix, issparse
-
-
-HVG_RANKING_SCHEMA = pa.schema(
-    [
-        pa.field("origin_index", pa.int32()),
-        pa.field("feature_id", pa.string()),
-        pa.field("mean_log1p_expr", pa.float64()),
-        pa.field("variance_log1p_expr", pa.float64()),
-        pa.field("dispersion_log", pa.float64()),
-        pa.field("dispersion_norm", pa.float64()),
-        pa.field("hvg_rank", pa.int32()),
-        pa.field("selected_at_default_n_hvg", pa.bool_()),
-    ]
-)
 
 
 # ---------------------------------------------------------------------------
@@ -224,95 +208,4 @@ def _translate_chunk(
         indices=local_indices,
         counts=counts,
         row_count=row_count,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Seurat-style HVG selection
-# ---------------------------------------------------------------------------
-
-
-def _compute_hvg_ranking_arrays(
-    sum_log1p: np.ndarray,
-    sum_log1p_sq: np.ndarray,
-    n_cells_total: int,
-    n_vars: int,
-    n_hvg: int = 2000,
-) -> dict[str, np.ndarray]:
-    """Compute deterministic HVG ranking arrays from streaming accumulators.
-
-    Parameters
-    ----------
-    sum_log1p : np.ndarray
-        Per-gene sum of log1p(counts) accumulated via np.add.at during the chunk loop.
-    sum_log1p_sq : np.ndarray
-        Per-gene sum of log1p(counts)^2 accumulated via np.add.at during the chunk loop.
-    n_cells_total : int
-        Total number of cells across all chunks.
-    n_vars : int
-        Number of genes (features) in the dataset.
-    n_hvg : int, default 2000
-        Number of top-dispersion genes to mark as selected by default.
-
-    Returns
-    -------
-    dict[str, np.ndarray]
-        Arrays for the canonical HVG ranking artifact. ``hvg_rank`` is 1-indexed,
-        with ties broken by ``origin_index`` ascending after
-        ``dispersion_norm`` descending.
-    """
-    from ..pp.hvg import compute_hvg_ranking_arrays
-
-    if len(sum_log1p) != n_vars or len(sum_log1p_sq) != n_vars:
-        raise ValueError("streaming HVG accumulators must match n_vars")
-    return compute_hvg_ranking_arrays(
-        sum_log1p,
-        sum_log1p_sq,
-        n_cells_total,
-        n_hvg=n_hvg,
-    )
-
-
-def _build_hvg_ranking_table(
-    sum_log1p: np.ndarray,
-    sum_log1p_sq: np.ndarray,
-    n_cells_total: int,
-    feature_ids: Any,
-    *,
-    n_hvg: int = 2000,
-) -> pa.Table:
-    """Build the canonical per-dataset ``hvg.parquet`` ranking table.
-
-    ``mean_log1p_expr`` and ``variance_log1p_expr`` are computed directly from the
-    streaming log1p(count) accumulators. ``dispersion_log`` is the log of
-    ``variance_log1p_expr / mean_log1p_expr`` after the historical zero guard.
-    ``dispersion_norm`` preserves the existing Seurat-style mean-bin normalization,
-    including the legacy ``log1p(mean_log1p_expr)`` binning step used by the
-    previous fixed-top-N helper.
-    """
-
-    feature_id_list = [str(feature_id) for feature_id in feature_ids]
-    arrays = _compute_hvg_ranking_arrays(
-        sum_log1p=sum_log1p,
-        sum_log1p_sq=sum_log1p_sq,
-        n_cells_total=n_cells_total,
-        n_vars=len(feature_id_list),
-        n_hvg=n_hvg,
-    )
-    return pa.table(
-        {
-            "origin_index": pa.array(arrays["origin_index"], type=pa.int32()),
-            "feature_id": pa.array(feature_id_list, type=pa.string()),
-            "mean_log1p_expr": pa.array(arrays["mean_log1p_expr"], type=pa.float64()),
-            "variance_log1p_expr": pa.array(
-                arrays["variance_log1p_expr"], type=pa.float64()
-            ),
-            "dispersion_log": pa.array(arrays["dispersion_log"], type=pa.float64()),
-            "dispersion_norm": pa.array(arrays["dispersion_norm"], type=pa.float64()),
-            "hvg_rank": pa.array(arrays["hvg_rank"], type=pa.int32()),
-            "selected_at_default_n_hvg": pa.array(
-                arrays["selected_at_default_n_hvg"], type=pa.bool_()
-            ),
-        },
-        schema=HVG_RANKING_SCHEMA,
     )

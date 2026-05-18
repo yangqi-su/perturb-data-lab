@@ -8,12 +8,10 @@ sidecars needed by corpus loaders.
 from __future__ import annotations
 
 import shutil
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
 import anndata as ad
-import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix, issparse
 
@@ -25,8 +23,7 @@ from .metadata_writers import (
     write_raw_feature_metadata_parquet,
     write_size_factor_parquet,
 )
-from .obs_filter import ObsFilterError, filter_obs_rows
-
+from .streaming_stats import DatasetStreamingStats
 from .models import (
     CountSourceSpec,
     MaterializationManifest,
@@ -93,8 +90,6 @@ class DatasetMaterializer:
     register : bool, default False
         If True, automatically register this dataset with ``corpus-index.yaml``
         after successful materialization. Requires ``corpus_index_path`` to be set.
-        When True, the returned manifest's ``corpus_registration`` field is
-        populated and the manifest YAML is rewritten with registration metadata.
     mode : str, default "create"
         Materialization mode: ``"create"`` (first dataset in a new corpus) or
         ``"append"`` (subsequent dataset appended to an existing corpus).
@@ -193,6 +188,11 @@ class DatasetMaterializer:
                 f"(expected 'pass') for dataset {self.dataset_id}; "
                 f"inspection summary: {summary_path}"
             )
+        if summary.obs_filter is not None and summary.obs_filter.strip():
+            raise ValueError(
+                "materialization no longer applies obs_filter; create a pre-filtered h5ad "
+                f"for dataset {self.dataset_id} before materialization"
+            )
 
         decision = summary.count_source_decision
         count_source = CountSourceSpec(
@@ -208,15 +208,8 @@ class DatasetMaterializer:
         adata = ad.read_h5ad(str(source_h5ad), backed="r")
         try:
             source_obs = adata.obs.to_memory() if hasattr(adata.obs, "to_memory") else adata.obs
-            retained_source_rows = filter_obs_rows(source_obs, summary.obs_filter)
-            if len(retained_source_rows) == 0:
-                raise ObsFilterError(
-                    f"obs_filter retained zero rows for dataset {self.dataset_id}"
-                )
-            filtered_obs = source_obs.iloc[retained_source_rows].copy()
+            filtered_obs = source_obs.copy()
             n_obs = len(filtered_obs)
-            filter_applied = summary.obs_filter is not None and bool(summary.obs_filter.strip())
-            source_obs_rows = int(adata.n_obs)
 
             # Determine var space for the selected count source
             if count_source.selected == ".raw.X":
@@ -229,8 +222,6 @@ class DatasetMaterializer:
                 var_index = adata.var.index
 
             count_matrix = self._select_count_matrix(adata, count_source.selected)
-            if filter_applied:
-                count_matrix = _RowSubsetMatrixView(count_matrix, retained_source_rows)
 
             # --- Ensure output directories exist ---
             meta_root = Path(self.output_roots.metadata_root)
@@ -247,7 +238,7 @@ class DatasetMaterializer:
             # --- Write raw cell metadata (Parquet, not SQLite) ---
             raw_cell_meta_parquet_path = write_raw_cell_metadata_parquet(
                 obs=filtered_obs,
-                source_row_indices=(retained_source_rows if filter_applied else None),
+                source_row_indices=None,
                 meta_root=meta_root,
                 dataset_id=self.dataset_id,
             )
@@ -269,7 +260,7 @@ class DatasetMaterializer:
             )
 
             # --- Write backend-specific sparse cell data ---
-            # HVG statistics are accumulated during the chunk loop via np.add.at.
+            # HVG and size-factor inputs are accumulated during the chunk loop.
             # Global size factors are computed after the loop from all row_sums.
             # Size factors and the canonical HVG ranking parquet are written after the loop.
             backend_paths, size_factor_parquet_path, hvg_ranking_path = self._write_cells(
@@ -298,7 +289,7 @@ class DatasetMaterializer:
                 outputs=manifest_outputs,
                 provenance=ProvenanceSpec(
                     source_path=str(source_h5ad),
-                    review_bundle=self._manifest_artifact_path(summary_copy_path),
+                    inspection_summary_path=self._manifest_artifact_path(summary_copy_path),
                 ),
                 raw_cell_meta_path=self._manifest_artifact_path(raw_cell_meta_parquet_path),
                 raw_feature_meta_path=self._manifest_artifact_path(raw_feature_meta_parquet_path),
@@ -312,13 +303,6 @@ class DatasetMaterializer:
                 notes=(
                     "materialized via DatasetMaterializer",
                     f"topology={self.topology}",
-                    *(
-                        (
-                            f"obs_filter retained {n_obs}/{source_obs_rows} rows",
-                        )
-                        if filter_applied
-                        else ()
-                    ),
                 ),
             )
             manifest.validate()
@@ -327,28 +311,16 @@ class DatasetMaterializer:
             manifest.write_yaml(manifest_path)
 
             if self.register:
-                from .models import CorpusRegistrationInfo
                 from .registration import register_materialization
 
-                join_record, resolved_corpus_id, is_create = register_materialization(
+                register_materialization(
                     manifest=manifest,
+                    manifest_path=manifest_path,
                     corpus_index_path=Path(self.corpus_index_path),
                     corpus_id=self.corpus_id,
                     backend=self.backend,
                     topology=self.topology,
                 )
-                # Attach registration info to the manifest and rewrite
-                reg_info = CorpusRegistrationInfo(
-                    corpus_id=resolved_corpus_id,
-                    is_create=is_create,
-                    corpus_index_path=self._manifest_artifact_path(Path(self.corpus_index_path)),
-                    dataset_index=join_record.dataset_index,
-                    global_start=join_record.global_start,
-                    global_end=join_record.global_end,
-                )
-                manifest = replace(manifest, corpus_registration=reg_info)
-                # Re-write manifest with registration info
-                manifest_path.write_text(manifest.to_yaml(), encoding="utf-8")
 
             return manifest
 
@@ -389,7 +361,7 @@ class DatasetMaterializer:
         )
 
         artifacts = inspect_target(target, Path(output_root))
-        return artifacts.review_bundle
+        return artifacts.inspection_summary
 
     def _select_count_matrix(self, adata: ad.AnnData, selected: str) -> Any:
         """Select the count matrix from the AnnData based on the approved candidate."""
@@ -436,10 +408,7 @@ class DatasetMaterializer:
         )
 
         all_paths: dict[str, Path] = {}
-        all_row_sums: list[np.ndarray] = []
-        sum_log1p = np.zeros(n_vars, dtype=np.float64)
-        sum_log1p_sq = np.zeros(n_vars, dtype=np.float64)
-        n_cells_total = 0
+        stats = DatasetStreamingStats(n_vars)
 
         for chunk_start in range(0, n_obs, self.chunk_rows):
             chunk_end = min(chunk_start + self.chunk_rows, n_obs)
@@ -456,11 +425,7 @@ class DatasetMaterializer:
                 needs_recovery=needs_recovery,
             )
 
-            all_row_sums.append(bundle.row_sums)
-            log1p_counts = np.log1p(bundle.counts.astype(np.float64))
-            np.add.at(sum_log1p, bundle.indices, log1p_counts)
-            np.add.at(sum_log1p_sq, bundle.indices, log1p_counts ** 2)
-            n_cells_total += bundle.row_count
+            stats.update(bundle)
 
             paths, writer_state = backend_fn(
                 bundle=bundle,
@@ -474,47 +439,18 @@ class DatasetMaterializer:
         if self.topology == "aggregate":
             self.writer_state = writer_state
 
-        global_row_sums = np.concatenate(all_row_sums)
-        global_median = float(np.median(global_row_sums))
-        if global_median > 0:
-            size_factors = global_row_sums / global_median
-        else:
-            size_factors = np.ones_like(global_row_sums)
-        size_factors = np.where(size_factors <= 0, 1.0, size_factors)
-        size_factors = np.where(np.isnan(size_factors), 1.0, size_factors)
-        size_factors = size_factors.astype(np.float32)
-
         size_factor_parquet_path = write_size_factor_parquet(
-            size_factors=size_factors,
+            size_factors=stats.size_factors(),
             cell_ids=cell_ids,
             meta_root=Path(self.output_roots.metadata_root),
         )
         hvg_ranking_path = write_hvg_ranking_parquet(
-            sum_log1p=sum_log1p,
-            sum_log1p_sq=sum_log1p_sq,
-            n_cells_total=n_cells_total,
+            sum_log1p=stats.sum_log1p,
+            sum_log1p_sq=stats.sum_log1p_sq,
+            n_cells_total=stats.n_cells_total,
             feature_ids=feature_ids,
             n_hvg=self.n_hvg,
             meta_root=Path(self.output_roots.metadata_root),
         )
 
         return (all_paths, size_factor_parquet_path, hvg_ranking_path)
-
-
-class _RowSubsetMatrixView:
-    """Minimal row-subset view for backed count matrices."""
-
-    def __init__(self, matrix: Any, row_indices: np.ndarray):
-        self._matrix = matrix
-        self._row_indices = np.asarray(row_indices, dtype=np.int64)
-        self.shape = (len(self._row_indices), int(matrix.shape[1]))
-
-    def __getitem__(self, key: Any) -> Any:
-        if isinstance(key, slice):
-            rows = self._row_indices[key]
-        else:
-            rows = self._row_indices[key]
-        return self._matrix[rows]
-
-    def local_slice(self, start: int, end: int) -> Any:
-        return self._matrix[self._row_indices[start:end]]

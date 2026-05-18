@@ -94,7 +94,7 @@ def _write_manifest(
         ),
         provenance=ProvenanceSpec(
             source_path=f"/fake/{dataset_id}.h5ad",
-            review_bundle=f"/fake/{dataset_id}-summary.yaml",
+            inspection_summary_path=f"/fake/{dataset_id}-summary.yaml",
         ),
         raw_feature_meta_path=raw_feature_meta_path,
         cell_count=cell_count,

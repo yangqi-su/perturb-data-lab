@@ -5,18 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
 from .models import (
     CorpusIndexDocument,
     DatasetJoinRecord,
-    GlobalMetadataDocument,
 )
 
 
 def update_corpus_index(
     corpus_index_path: Path,
     new_dataset_record: DatasetJoinRecord,
-    global_metadata: GlobalMetadataDocument | None = None,
+    corpus_id: str | None = None,
     backend: str | None = None,
     topology: str | None = None,
 ) -> CorpusIndexDocument:
@@ -50,7 +51,21 @@ def update_corpus_index(
         datasets = list(corpus.datasets) + [new_record]
         corpus_id = corpus.corpus_id
         global_meta = corpus.global_metadata
+        if backend is not None and backend != global_meta["backend"]:
+            raise ValueError(f"backend mismatch: selected {backend}, corpus has {global_meta['backend']}")
+        if topology is not None and topology != global_meta["topology"]:
+            raise ValueError(f"topology mismatch: selected {topology}, corpus has {global_meta['topology']}")
     else:
+        if corpus_id is None:
+            raise ValueError("corpus_id is required when creating a corpus index")
+        if backend is None:
+            raise ValueError("backend is required when creating a corpus index")
+        if topology is None:
+            raise ValueError("topology is required when creating a corpus index")
+        if backend not in {"lance", "zarr"}:
+            raise ValueError(f"unknown backend: {backend}")
+        if topology not in {"federated", "aggregate"}:
+            raise ValueError(f"unknown topology: {topology}")
         new_record = DatasetJoinRecord(
             dataset_id=new_dataset_record.dataset_id,
             dataset_index=0,
@@ -61,14 +76,6 @@ def update_corpus_index(
             global_end=new_dataset_record.cell_count,
         )
         datasets = [new_record]
-        corpus_id = "perturb-data-lab-v0"
-        if global_metadata is None:
-            if backend is None:
-                raise ValueError("backend is required when creating a corpus index")
-            if topology is None:
-                raise ValueError("topology is required when creating a corpus index")
-            assert backend in {"lance", "zarr"}, f"unknown backend: {backend}"
-            assert topology in {"federated", "aggregate"}, f"unknown topology: {topology}"
         gmeta_dict: dict[str, Any] = {
             "kind": "global-metadata",
             "contract_version": CONTRACT_VERSION,
@@ -78,12 +85,13 @@ def update_corpus_index(
             "backend": backend,
             "topology": topology,
         }
-        if global_metadata is not None:
-            gmeta_dict = global_metadata.to_dict()
         global_meta = gmeta_dict
-        if gmeta_dict:
-            global_meta_path = corpus_index_path.parent / "global-metadata.yaml"
-            GlobalMetadataDocument.from_dict(gmeta_dict).write_yaml(global_meta_path)
+        global_meta_path = corpus_index_path.parent / "global-metadata.yaml"
+        global_meta_path.parent.mkdir(parents=True, exist_ok=True)
+        global_meta_path.write_text(
+            yaml.safe_dump(gmeta_dict, sort_keys=False),
+            encoding="utf-8",
+        )
 
     updated = CorpusIndexDocument(
         kind="corpus-index",

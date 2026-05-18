@@ -198,7 +198,7 @@ def build_phase1_blueprint() -> Phase1Blueprint:
                 name="global-metadata",
                 scope="global",
                 review_format="yaml",
-                runtime_model="GlobalMetadataDocument",
+                runtime_model="dict",
                 owner_repo="perturb-data-lab",
                 purpose="Captures corpus-wide defaults, schema versions, and registry pointers.",
             ),

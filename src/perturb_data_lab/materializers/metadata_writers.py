@@ -12,6 +12,20 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
+HVG_RANKING_SCHEMA = pa.schema(
+    [
+        pa.field("origin_index", pa.int32()),
+        pa.field("feature_id", pa.string()),
+        pa.field("mean_log1p_expr", pa.float64()),
+        pa.field("variance_log1p_expr", pa.float64()),
+        pa.field("dispersion_log", pa.float64()),
+        pa.field("dispersion_norm", pa.float64()),
+        pa.field("hvg_rank", pa.int32()),
+        pa.field("selected_at_default_n_hvg", pa.bool_()),
+    ]
+)
+
+
 def _safe_serialize(val: Any) -> Any:
     """Serialize common numpy/pandas values into JSON-safe scalars."""
     if val is None or (isinstance(val, float) and (val != val)):  # NaN check
@@ -143,8 +157,6 @@ def write_hvg_ranking_parquet(
     meta_root: Path,
 ) -> Path:
     """Write the per-dataset HVG ranking artifact."""
-    from .chunk_translation import _build_hvg_ranking_table
-
     table = _build_hvg_ranking_table(
         sum_log1p=sum_log1p,
         sum_log1p_sq=sum_log1p_sq,
@@ -156,3 +168,42 @@ def write_hvg_ranking_parquet(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, output_path)
     return output_path
+
+
+def _build_hvg_ranking_table(
+    sum_log1p: np.ndarray,
+    sum_log1p_sq: np.ndarray,
+    n_cells_total: int,
+    feature_ids: Sequence[str],
+    *,
+    n_hvg: int = 2000,
+) -> pa.Table:
+    """Build the canonical per-dataset ``hvg.parquet`` ranking table."""
+    from ..pp.hvg import compute_hvg_ranking_arrays
+
+    feature_id_list = [str(feature_id) for feature_id in feature_ids]
+    if len(sum_log1p) != len(feature_id_list) or len(sum_log1p_sq) != len(feature_id_list):
+        raise ValueError("streaming HVG accumulators must match feature_ids")
+    arrays = compute_hvg_ranking_arrays(
+        sum_log1p,
+        sum_log1p_sq,
+        n_cells_total,
+        n_hvg=n_hvg,
+    )
+    return pa.table(
+        {
+            "origin_index": pa.array(arrays["origin_index"], type=pa.int32()),
+            "feature_id": pa.array(feature_id_list, type=pa.string()),
+            "mean_log1p_expr": pa.array(arrays["mean_log1p_expr"], type=pa.float64()),
+            "variance_log1p_expr": pa.array(
+                arrays["variance_log1p_expr"], type=pa.float64()
+            ),
+            "dispersion_log": pa.array(arrays["dispersion_log"], type=pa.float64()),
+            "dispersion_norm": pa.array(arrays["dispersion_norm"], type=pa.float64()),
+            "hvg_rank": pa.array(arrays["hvg_rank"], type=pa.int32()),
+            "selected_at_default_n_hvg": pa.array(
+                arrays["selected_at_default_n_hvg"], type=pa.bool_()
+            ),
+        },
+        schema=HVG_RANKING_SCHEMA,
+    )

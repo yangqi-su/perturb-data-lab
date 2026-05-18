@@ -16,7 +16,7 @@ from perturb_data_lab.contracts import CONTRACT_VERSION
 from perturb_data_lab.materializers import (
     update_corpus_index,
 )
-from perturb_data_lab.materializers.chunk_translation import (
+from perturb_data_lab.materializers.metadata_writers import (
     HVG_RANKING_SCHEMA,
     _build_hvg_ranking_table,
 )
@@ -119,7 +119,7 @@ class TestMaterializationManifestHVGRoundTrip:
             ),
             provenance=ProvenanceSpec(
                 source_path="/path/to/source.h5ad",
-                review_bundle="/path/to/dataset-summary.yaml",
+                inspection_summary_path="/path/to/dataset-summary.yaml",
             ),
             hvg_ranking_path=str(tmp_path / "meta/hvg.parquet"),
             default_n_hvg=2000,
@@ -152,6 +152,7 @@ class TestUpdateCorpusIndexGlobalMetadata:
         update_corpus_index(
             corpus_index_path=corpus_index,
             new_dataset_record=dataset_record,
+            corpus_id="test-v0",
             backend="lance",
             topology="aggregate",
         )
@@ -189,7 +190,7 @@ class TestMaterializationManifestHVGRecord:
             outputs=output_roots,
             provenance=ProvenanceSpec(
                 source_path="/fake/source.h5ad",
-                review_bundle="/fake/dataset-summary.yaml",
+                inspection_summary_path="/fake/dataset-summary.yaml",
             ),
             hvg_ranking_path=str(tmp_path / "meta/hvg.parquet"),
             default_n_hvg=1500,

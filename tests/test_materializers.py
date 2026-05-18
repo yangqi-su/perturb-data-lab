@@ -30,8 +30,14 @@ class TestCorpusIndexUpdate:
                 manifest_path="meta/materialization-manifest.yaml",
                 cell_count=1000,
             )
-            updated = update_corpus_index(idx_path, record, backend="lance", topology="aggregate")
-            assert updated.corpus_id == "perturb-data-lab-v0"
+            updated = update_corpus_index(
+                idx_path,
+                record,
+                corpus_id="test-v0",
+                backend="lance",
+                topology="aggregate",
+            )
+            assert updated.corpus_id == "test-v0"
             assert len(updated.datasets) == 1
             assert updated.datasets[0].dataset_id == "ds_001"
             # For new corpus, global range = [0, cell_count)
@@ -50,7 +56,13 @@ class TestCorpusIndexUpdate:
                 manifest_path="ds_001.yaml",
                 cell_count=500,
             )
-            updated1 = update_corpus_index(idx_path, record1, backend="lance", topology="aggregate")
+            updated1 = update_corpus_index(
+                idx_path,
+                record1,
+                corpus_id="test-v0",
+                backend="lance",
+                topology="aggregate",
+            )
             assert updated1.datasets[0].global_start == 0
             assert updated1.datasets[0].global_end == 500
 
@@ -78,7 +90,13 @@ class TestCorpusIndexUpdate:
                 manifest_path="ds_001.yaml",
                 cell_count=1000,
             )
-            update_corpus_index(idx_path, record, backend="lance", topology="aggregate")
+            update_corpus_index(
+                idx_path,
+                record,
+                corpus_id="test-v0",
+                backend="lance",
+                topology="aggregate",
+            )
 
             duplicate = DatasetJoinRecord(
                 dataset_id="ds_001",
@@ -101,7 +119,13 @@ class TestCorpusIndexUpdate:
                     manifest_path=f"ds_{i:03d}.yaml",
                     cell_count=cc,
                 )
-                update_corpus_index(idx_path, record, backend="lance", topology="aggregate")
+                update_corpus_index(
+                    idx_path,
+                    record,
+                    corpus_id="test-v0",
+                    backend="lance",
+                    topology="aggregate",
+                )
 
             # Reload and verify
             from perturb_data_lab.materializers.models import CorpusIndexDocument
@@ -130,7 +154,7 @@ class TestMaterializationManifest:
             outputs=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             provenance=ProvenanceSpec(
                 source_path="/data/test.h5ad",
-                review_bundle="/reviewed-schema.yaml",
+                inspection_summary_path="/dataset-summary.yaml",
             ),
             integer_verified=True,
         )
@@ -155,7 +179,7 @@ class TestMaterializationManifest:
             outputs=OutputRoots(metadata_root="/meta", matrix_root="/matrix"),
             provenance=ProvenanceSpec(
                 source_path="/data/appended.h5ad",
-                review_bundle="/reviewed-schema.yaml",
+                inspection_summary_path="/dataset-summary.yaml",
             ),
             integer_verified=True,
             cell_count=500,
@@ -179,7 +203,7 @@ class TestMaterializationManifest:
             "topology": "aggregate",
             "count_source": {"selected": ".X", "integer_only": True},
             "outputs": {"metadata_root": "meta/ds", "matrix_root": "matrix"},
-            "provenance": {"source_path": "/data/ds.h5ad", "review_bundle": "meta/ds/dataset-summary.yaml"},
+            "provenance": {"source_path": "/data/ds.h5ad", "inspection_summary_path": "meta/ds/dataset-summary.yaml"},
         }
         path = tmp_path / "manifest.yaml"
         path.write_text(yaml.safe_dump(payload), encoding="utf-8")
@@ -196,7 +220,7 @@ class TestMaterializationManifest:
             "topology": "aggregate",
             "count_source": {"selected": ".X", "integer_only": True},
             "outputs": {"metadata_root": "meta/ds", "matrix_root": "matrix"},
-            "provenance": {"source_path": "/data/ds.h5ad", "review_bundle": "meta/ds/dataset-summary.yaml"},
+            "provenance": {"source_path": "/data/ds.h5ad", "inspection_summary_path": "meta/ds/dataset-summary.yaml"},
         }
         path = tmp_path / "manifest.yaml"
         path.write_text(yaml.safe_dump(payload), encoding="utf-8")
@@ -204,64 +228,8 @@ class TestMaterializationManifest:
             MaterializationManifest.from_yaml_file(path)
 
 
-class TestManifestToJoinRecordRoute:
-    """Test manifest route propagation to DatasetJoinRecord."""
-
-    def test_create_new_route_propagates_to_join_record(self):
-        """manifest_to_join_record preserves create_new route."""
-        from perturb_data_lab.materializers import manifest_to_join_record
-
-        manifest = MaterializationManifest(
-            kind="materialization-manifest",
-            contract_version="0.3.0",
-            dataset_id="ds_create",
-            route="create_new",
-            backend="lance",
-            topology="aggregate",
-            count_source=CountSourceSpec(selected=".X", integer_only=True),
-            outputs=OutputRoots(metadata_root="/meta/create", matrix_root="/matrix/create"),
-            provenance=ProvenanceSpec(
-                source_path="/data/create.h5ad",
-                review_bundle="/reviewed-schema.yaml",
-            ),
-            raw_cell_meta_path="meta/create/raw-obs.parquet",
-            provenance_spec_path="meta/create/feature-provenance.parquet",
-            cell_count=1000,
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            corpus_root = Path(tmpdir) / "corpus"
-            corpus_root.mkdir()
-            record = manifest_to_join_record(manifest, corpus_root)
-            assert record.join_mode == "create_new"
-            assert record.dataset_id == "ds_create"
-
-    def test_append_routed_route_propagates_to_join_record(self):
-        """manifest_to_join_record preserves append_routed route."""
-        from perturb_data_lab.materializers import manifest_to_join_record
-
-        manifest = MaterializationManifest(
-            kind="materialization-manifest",
-            contract_version="0.3.0",
-            dataset_id="ds_append",
-            route="append_routed",
-            backend="lance",
-            topology="aggregate",
-            count_source=CountSourceSpec(selected=".X", integer_only=True),
-            outputs=OutputRoots(metadata_root="/meta/append", matrix_root="/matrix/append"),
-            provenance=ProvenanceSpec(
-                source_path="/data/append.h5ad",
-                review_bundle="/reviewed-schema.yaml",
-            ),
-            raw_cell_meta_path="meta/append/raw-obs.parquet",
-            provenance_spec_path="meta/append/feature-provenance.parquet",
-            cell_count=500,
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            corpus_root = Path(tmpdir) / "corpus"
-            corpus_root.mkdir()
-            record = manifest_to_join_record(manifest, corpus_root)
-            assert record.join_mode == "append_routed"
-            assert record.dataset_id == "ds_append"
+class TestCorpusIndexRoutes:
+    """Test route propagation to corpus-index records."""
 
     def test_corpus_index_writes_append_routed_join_mode(self):
         """Corpus index records append_routed for appended datasets."""
@@ -275,7 +243,13 @@ class TestManifestToJoinRecordRoute:
                 manifest_path="ds_first/manifest.yaml",
                 cell_count=1000,
             )
-            update_corpus_index(idx_path, record1, backend="lance", topology="aggregate")
+            update_corpus_index(
+                idx_path,
+                record1,
+                corpus_id="test-v0",
+                backend="lance",
+                topology="aggregate",
+            )
 
             # Append second dataset
             record2 = DatasetJoinRecord(
@@ -454,7 +428,7 @@ class TestDatasetMaterializerConstructorApi:
 class TestDatasetMaterializerInspectionGate:
     """Test DatasetMaterializer respects non-pass inspection summaries."""
 
-    def test_materialize_rejects_needs_review_bundle_before_loading_h5ad(
+    def test_materialize_rejects_needs_review_before_loading_h5ad(
         self,
         tmp_path: Path,
     ):

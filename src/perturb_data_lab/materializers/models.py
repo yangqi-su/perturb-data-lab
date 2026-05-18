@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 import yaml
 
-from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
+from ..contracts import CONTRACT_VERSION
 
 
 def _serialize(value: Any) -> Any:
@@ -56,9 +56,9 @@ class CountSourceSpec:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "CountSourceSpec":
         return cls(
-            selected=str(data["selected"]),
-            integer_only=bool(data.get("integer_only", True)),
-            uses_recovery=bool(data.get("uses_recovery", False)),
+            selected=data["selected"],
+            integer_only=data["integer_only"],
+            uses_recovery=data.get("uses_recovery", False),
         )
 
 
@@ -70,54 +70,21 @@ class OutputRoots:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "OutputRoots":
         return cls(
-            metadata_root=str(data["metadata_root"]),
-            matrix_root=str(data["matrix_root"]),
+            metadata_root=data["metadata_root"],
+            matrix_root=data["matrix_root"],
         )
 
 
 @dataclass(frozen=True)
 class ProvenanceSpec:
     source_path: str
-    review_bundle: str  # dataset-summary.yaml copied into the materialized dataset
-    accepted_schema_copy: str | None = None  # optional audit copy, NOT read back
+    inspection_summary_path: str  # dataset-summary.yaml copied into the materialized dataset
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ProvenanceSpec":
         return cls(
-            source_path=str(data["source_path"]),
-            review_bundle=str(data.get("review_bundle", "")),
-            accepted_schema_copy=data.get("accepted_schema_copy"),
-        )
-
-
-@dataclass(frozen=True)
-class CorpusRegistrationInfo:
-    """Registration metadata written after a dataset joins a corpus.
-
-    This is written into the MaterializationManifest when register=True is set
-    on DatasetMaterializer. It records whether the dataset was registered as a
-    new corpus creation or an append, and the paths to the corpus artifacts.
-    """
-
-    corpus_id: str
-    is_create: bool  # True = new corpus, False = append to existing
-    corpus_index_path: str  # path to corpus-index.yaml
-    dataset_index: int      # assigned dataset index in the corpus
-    global_start: int       # inclusive start of global cell range
-    global_end: int         # exclusive end of global cell range
-
-    def to_dict(self) -> dict[str, Any]:
-        return _serialize(self)
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "CorpusRegistrationInfo":
-        return cls(
-            corpus_id=str(data["corpus_id"]),
-            is_create=bool(data["is_create"]),
-            corpus_index_path=str(data["corpus_index_path"]),
-            dataset_index=int(data["dataset_index"]),
-            global_start=int(data["global_start"]),
-            global_end=int(data["global_end"]),
+            source_path=data["source_path"],
+            inspection_summary_path=data["inspection_summary_path"],
         )
 
 
@@ -141,8 +108,6 @@ class MaterializationManifest(YamlDocument):
     integer_verified: bool = False
     cell_count: int = 0  # number of cells materialized (set by materialize() for corpus index use)
     feature_count: int = 0  # number of features in dataset-local feature space
-    # Corpus registration info, set when DatasetMaterializer.register=True.
-    corpus_registration: CorpusRegistrationInfo | None = None
     notes: tuple[str, ...] = ()
 
     def validate(self) -> None:
@@ -160,12 +125,12 @@ class MaterializationManifest(YamlDocument):
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "MaterializationManifest":
         document = cls(
-            kind=str(data["kind"]),
-            contract_version=str(data["contract_version"]),
-            dataset_id=str(data["dataset_id"]),
-            route=str(data["route"]),
-            backend=str(data["backend"]),
-            topology=str(data["topology"]),
+            kind=data["kind"],
+            contract_version=data["contract_version"],
+            dataset_id=data["dataset_id"],
+            route=data["route"],
+            backend=data["backend"],
+            topology=data["topology"],
             count_source=CountSourceSpec.from_dict(data["count_source"]),
             outputs=OutputRoots.from_dict(data["outputs"]),
             provenance=ProvenanceSpec.from_dict(data["provenance"]),
@@ -174,20 +139,11 @@ class MaterializationManifest(YamlDocument):
             provenance_spec_path=data.get("provenance_spec_path"),
             size_factor_parquet_path=data.get("size_factor_parquet_path"),
             hvg_ranking_path=data.get("hvg_ranking_path"),
-            default_n_hvg=(
-                int(data["default_n_hvg"])
-                if data.get("default_n_hvg") is not None
-                else None
-            ),
-            integer_verified=bool(data.get("integer_verified", False)),
-            cell_count=int(data.get("cell_count", 0)),
-            feature_count=int(data.get("feature_count", 0)),
-            corpus_registration=(
-                CorpusRegistrationInfo.from_dict(data["corpus_registration"])
-                if data.get("corpus_registration") is not None
-                else None
-            ),
-            notes=tuple(str(item) for item in data.get("notes", [])),
+            default_n_hvg=data.get("default_n_hvg"),
+            integer_verified=data.get("integer_verified", False),
+            cell_count=data.get("cell_count", 0),
+            feature_count=data.get("feature_count", 0),
+            notes=tuple(data.get("notes", ())),
         )
         document.validate()
         return document
@@ -199,30 +155,7 @@ class MaterializationManifest(YamlDocument):
 
 @dataclass(frozen=True)
 class DatasetJoinRecord:
-    """A single dataset's entry in the corpus index.
-
-    This record is the authoritative source for dataset membership, append
-    order, and global cell routing within the Arrow/HF-only plan scope.
-
-    Fields required for correct routing:
-    - ``dataset_id`` — stable dataset identifier
-    - ``join_mode`` — ``create_new`` or ``append_routed``
-    - ``manifest_path`` — relative path from corpus root to the dataset's manifest
-    - ``cell_count`` — number of cells in this dataset (used for global range computation)
-    - ``global_start`` — inclusive start of this dataset's cell range in the corpus
-    - ``global_end`` — exclusive end of this dataset's cell range in the corpus
-
-    The ``global_start``/``global_end`` fields form a deterministic, contiguous,
-    non-overlapping partition of the corpus and are the sole authority for
-    global-index-to-dataset routing. They are set by ``update_corpus_index`` when
-    appending a new dataset to the corpus, based on the total cell count before
-    the new dataset is added.
-
-    Deferred (out of plan scope):
-    - Tokenizer and token-id semantics are handled separately.
-    - Unified in-memory canonical metadata is handled separately.
-    - ``canonicalize-meta`` is explicitly deferred.
-    """
+    """One dataset's membership record in ``corpus-index.yaml``."""
 
     dataset_id: str
     join_mode: str
@@ -253,15 +186,17 @@ class DatasetJoinRecord:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DatasetJoinRecord":
-        return cls(
-            dataset_id=str(data["dataset_id"]),
-            dataset_index=int(data.get("dataset_index", 0)),
-            join_mode=str(data["join_mode"]),
-            manifest_path=str(data["manifest_path"]),
-            cell_count=int(data.get("cell_count", 0)),
-            global_start=int(data.get("global_start", 0)),
-            global_end=int(data.get("global_end", 0)),
+        record = cls(
+            dataset_id=data["dataset_id"],
+            dataset_index=data["dataset_index"],
+            join_mode=data["join_mode"],
+            manifest_path=data["manifest_path"],
+            cell_count=data["cell_count"],
+            global_start=data["global_start"],
+            global_end=data["global_end"],
         )
+        record.validate()
+        return record
 
 
 @dataclass(frozen=True)
@@ -274,60 +209,16 @@ class CorpusIndexDocument(YamlDocument):
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "CorpusIndexDocument":
-        dataset_payloads = []
-        for idx, item in enumerate(data.get("datasets", [])):
-            payload = dict(item)
-            payload.setdefault("dataset_index", idx)
-            dataset_payloads.append(payload)
         return cls(
-            kind=str(data["kind"]),
-            contract_version=str(data["contract_version"]),
-            corpus_id=str(data["corpus_id"]),
-            global_metadata=dict(data.get("global_metadata", {})),
+            kind=data["kind"],
+            contract_version=data["contract_version"],
+            corpus_id=data["corpus_id"],
+            global_metadata=dict(data["global_metadata"]),
             datasets=tuple(
-                DatasetJoinRecord.from_dict(d) for d in dataset_payloads
+                DatasetJoinRecord.from_dict(d) for d in data["datasets"]
             ),
         )
 
     @classmethod
     def from_yaml_file(cls, file_path: Path) -> "CorpusIndexDocument":
-        return cls.from_dict(cls._load_yaml_dict(file_path))
-
-
-@dataclass(frozen=True)
-class GlobalMetadataDocument(YamlDocument):
-    kind: str
-    contract_version: str
-    schema_version: str
-    missing_value_literal: str
-    raw_field_policy: str
-    backend: str | None = None  # lance | zarr
-    topology: str | None = None  # federated | aggregate
-    notes: tuple[str, ...] = ()
-
-    def validate(self) -> None:
-        if self.backend is not None and self.backend not in {"zarr", "lance"}:
-            raise ValueError(f"invalid backend in global-metadata: {self.backend}")
-        if self.topology is not None and self.topology not in {"federated", "aggregate"}:
-            raise ValueError(f"invalid topology in global-metadata: {self.topology}")
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "GlobalMetadataDocument":
-        document = cls(
-            kind=str(data["kind"]),
-            contract_version=str(data["contract_version"]),
-            schema_version=str(data.get("schema_version", "0.1.0")),
-            missing_value_literal=str(
-                data.get("missing_value_literal", MISSING_VALUE_LITERAL)
-            ),
-            raw_field_policy=str(data.get("raw_field_policy", "preserve-unchanged")),
-            backend=data.get("backend"),
-            topology=data.get("topology"),
-            notes=tuple(str(item) for item in data.get("notes", [])),
-        )
-        document.validate()
-        return document
-
-    @classmethod
-    def from_yaml_file(cls, file_path: Path) -> "GlobalMetadataDocument":
         return cls.from_dict(cls._load_yaml_dict(file_path))

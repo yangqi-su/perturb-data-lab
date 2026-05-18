@@ -64,7 +64,7 @@ _BOOLEAN_CONTROL_LABELS: frozenset[str] = frozenset(
 @dataclass(frozen=True)
 class InspectionArtifacts:
     dataset_id: str
-    review_bundle: Path  # absolute path to this dataset's review bundle (dataset-summary.yaml)
+    inspection_summary: Path
     selected_count_source: str
     materialization_readiness: str
 
@@ -642,7 +642,7 @@ def inspect_target(target: InspectionTarget, output_root: Path) -> InspectionArt
     )
     return InspectionArtifacts(
         dataset_id=target.dataset_id,
-        review_bundle=summary_path,
+        inspection_summary=summary_path,
         selected_count_source=count_decision.selected_candidate,
         materialization_readiness=readiness,
     )
@@ -651,15 +651,14 @@ def inspect_target(target: InspectionTarget, output_root: Path) -> InspectionArt
 def run_batch(
     config: InspectionBatchConfig, workers: int = 1
 ) -> InspectionBatchManifest:
-    """Thin batch wrapper: run Stage 1 inspection on each configured dataset.
+    """Thin batch wrapper: inspect each configured dataset.
 
     This function is a pure aggregator — it calls ``inspect_target()`` for each
     dataset and records one manifest entry per dataset. The manifest is a batch
-    index; the authoritative artifact for any dataset is its review bundle
+    index; the authoritative artifact for any dataset is its inspection summary
     (dataset-summary.yaml) on disk, not the manifest itself.
 
-    Each manifest record points to exactly one review bundle path. No schema.yaml
-    or other Stage 1 dual-artifact output is produced or recorded.
+    Each manifest record points to exactly one inspection summary path.
     """
     output_root = Path(config.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -681,7 +680,7 @@ def run_batch(
         records=tuple(
             InspectionBatchRecord(
                 dataset_id=artifact.dataset_id,
-                review_bundle=str(artifact.review_bundle),
+                inspection_summary=str(artifact.inspection_summary),
                 selected_count_source=artifact.selected_count_source,
                 materialization_readiness=artifact.materialization_readiness,
             )

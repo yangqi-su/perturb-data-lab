@@ -286,7 +286,7 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
         ),
         Path(args.output_dir),
     )
-    print(f"[inspect] wrote inspection summary {artifacts.review_bundle}")
+    print(f"[inspect] wrote inspection summary {artifacts.inspection_summary}")
 
 
 # ---------------------------------------------------------------------------
@@ -483,11 +483,6 @@ def _materialize_dataset(
     print(f"    cell_count: {manifest.cell_count}")
     print(f"    feature_count: {manifest.feature_count}")
     print(f"    route: {manifest.route}")
-    if manifest.corpus_registration is not None:
-        reg = manifest.corpus_registration
-        print(f"    corpus registration: {reg.corpus_id} is_create={reg.is_create}")
-        print(f"    global range: [{reg.global_start}, {reg.global_end})")
-
     # Return updated state
     next_global_start = global_row_start + manifest.cell_count
     next_writer_state = materializer.writer_state
@@ -527,8 +522,6 @@ def _infer_backend_topology_from_corpus(corpus_root: Path) -> tuple[str, str]:
 
 def _cmd_materialize(args: argparse.Namespace) -> None:
     """Unified materialize command supporting create/append, single/bulk, dry-run."""
-    from .materializers.registration import corpus_exists as _corpus_exists
-
     # --- Resolve and validate inputs ---
     sources = _resolve_inputs(args)
     total = len(sources)
@@ -552,7 +545,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        if _corpus_exists(corpus_root):
+        if (corpus_root / "corpus-index.yaml").exists():
             print(
                 f"[error] --mode create but corpus already exists at {corpus_root}. "
                 "Use --mode append to add datasets, or remove the existing corpus.",
@@ -567,7 +560,7 @@ def _cmd_materialize(args: argparse.Namespace) -> None:
             requested_topology,
         )
     else:  # append
-        if not _corpus_exists(corpus_root):
+        if not (corpus_root / "corpus-index.yaml").exists():
             print(
                 f"[error] --mode append but no corpus found at {corpus_root}. "
                 "Use --mode create to create a new corpus.",
