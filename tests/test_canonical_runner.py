@@ -29,7 +29,7 @@ from perturb_data_lab.canonical.runner import (
     build_canonical_vocab,
     run_canonicalization,
 )
-from perturb_data_lab.inspectors.transforms import TRANSFORM_CATALOG, get_transform
+from perturb_data_lab.canonical.transforms import TRANSFORM_CATALOG, get_transform
 
 # ---------------------------------------------------------------------------
 # Helpers

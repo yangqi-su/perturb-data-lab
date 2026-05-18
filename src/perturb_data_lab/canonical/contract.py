@@ -341,7 +341,7 @@ class ExtensibleColumn:
 class TransformRule:
     """A single named transform with its keyword arguments.
 
-    References transform functions defined in ``inspectors/transforms.py``.
+    References transform functions defined in ``canonical/transforms.py``.
     """
 
     name: str

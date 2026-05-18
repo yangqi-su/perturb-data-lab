@@ -239,21 +239,6 @@ class DatasetSummaryDocument(YamlDocument):
 
 
 @dataclass(frozen=True)
-class CountSourceSpec:
-    selected: str
-    integer_only: bool
-    uses_recovery: bool = False
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "CountSourceSpec":
-        return cls(
-            selected=str(data["selected"]),
-            integer_only=bool(data.get("integer_only", True)),
-            uses_recovery=bool(data.get("uses_recovery", False)),
-        )
-
-
-@dataclass(frozen=True)
 class InspectionTarget:
     dataset_id: str
     source_path: str

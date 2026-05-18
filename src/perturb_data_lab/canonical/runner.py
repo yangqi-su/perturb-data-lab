@@ -19,7 +19,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ..contracts import CONTRACT_VERSION, MISSING_VALUE_LITERAL
-from ..inspectors import transforms as _xforms
 from .contract import (
     CANONICAL_OBS_MUST_HAVE,
     CANONICAL_VAR_MUST_HAVE,
@@ -30,6 +29,7 @@ from .contract import (
     ObsColumnMapping,
     VarColumnMapping,
 )
+from . import transforms as _xforms
 
 __all__ = [
     "CanonicalizationRunner",

@@ -25,10 +25,7 @@ import pandas as pd
 import pytest
 from scipy.sparse import csr_matrix
 
-from perturb_data_lab.inspectors.models import (
-    CountSourceDecision,
-    CountSourceSpec,
-)
+from perturb_data_lab.inspectors.models import CountSourceDecision
 from perturb_data_lab.inspectors.workflow import (
     _attempt_reverse_normalization,
     _audit_matrix_candidate,

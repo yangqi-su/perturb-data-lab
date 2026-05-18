@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from perturb_data_lab.inspectors.transforms import (
+from perturb_data_lab.canonical.transforms import (
     TRANSFORM_CATALOG,
     build_transform,
     coalesce_values,
